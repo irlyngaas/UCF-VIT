@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "UCF_VIT"
+version = "0.0.1"
+authors =[
+    {name="Xiao Wang", email="wangx2@ornl.gov"},
+    {name="Isaac Lyngaas", email="irlyngaas@ornl.gov"}
+]
+description = ""
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+]
+dependencies = [
+
+]
+
+[project.urls]
+"Homepage" = "https://github.com/irlyngaas/UCF-VIT"
+"Bug Tracker" = "https://github.com/irlyngaas/UCF-VIT/issues"
+
