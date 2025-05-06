@@ -1,0 +1,83 @@
+Bootstrap: docker
+From: savannah.ornl.gov/olcf-container-images/frontier/ubuntu/gnu/cpe:24.11
+
+
+%environment
+export ROCM_PATH=/opt/rocm
+export LD_LIBRARY_PATH="/opt/rocm/lib:/opt/rocm/lib64:$LD_LIBRARY_PATH"
+export PATH="/opt/rocm/bin:$PATH"
+export PYTORCH_DIR=/pytorch
+export PYTHONPATH=${PYTORCH_DIR}:${PYTHONPATH}
+export CONDA_DIR=/conda/envs/vit
+export PATH=${CONDA_DIR}/bin:/conda/bin:$PATH
+export MPICH_SMP_SINGLE_COPY_MODE=NONE
+
+#Remove trailing : to avoid including CWD to system search paths
+export C_INCLUDE_PATH=${C_INCLUDE_PATH%:}
+export CPLUS_INCLUDE_PATH=${CPLUS_INCLUDE_PATH%:}
+
+# Enable conda on apptainer run (https://github.com/apptainer/singularity/issues/5075)
+action="${0##*/}"
+if [ "$action" == "shell" ]; then
+    if [ "${SINGULARITY_SHELL:-}" == "/bin/bash" ]; then
+        set -- --noprofile --init-file /.singularity_bash
+    elif test -z "${SINGULARITY_SHELL:-}"; then
+        export SINGULARITY_SHELL=/bin/bash
+        set -- --noprofile --init-file /.singularity_bash
+    fi
+fi
+
+
+%post -c /bin/bash
+# Misc setup
+export ROCM_PATH=/opt/rocm
+export LD_LIBRARY_PATH="/opt/rocm/lib:/opt/rocm/lib64:$LD_LIBRARY_PATH"
+export PATH="/opt/rocm/bin:$PATH"
+export MPICH_SMP_SINGLE_COPY_MODE=NONE
+
+#Remove trailing : to avoid including CWD to system search paths
+export C_INCLUDE_PATH=${C_INCLUDE_PATH%:}
+export CPLUS_INCLUDE_PATH=${CPLUS_INCLUDE_PATH%:}
+
+# Installing some prerequisites
+sudo apt-get install -y lua53 lua53-luaposix lua-lmod which
+sudo apt-get install -y libtool autoconf automake tar wget
+
+# Install CONDA and required conda packages
+export CONDA_DIR=/conda/envs/vit
+export PATH=${CONDA_DIR}/bin:/conda/bin:$PATH
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh && \
+  bash /tmp/miniconda.sh -b -p /conda && \
+  rm -f /tmp/miniconda.sh && \
+  . /conda/etc/profile.d/conda.sh && \
+  . /conda/bin/activate && \
+  conda create -n vit python=3.11 -y
+  conda install -n vit -y git
+
+echo "## Activate conda environment" >> /.singularity_bashrc
+echo "conda activate vit" >> /.singularity_bashrc
+
+# Install PyTorch
+ROCM_VERSION=6.2.4
+TORCH_URL="https://download.pytorch.org/whl/rocm${ROCM_VERSION}"
+TORCH_VERSION=2.6.0+rocm6.2.4
+TORCHVISION_VERSION=0.21.0
+TORCHAUDIO_VERSION=2.6.0
+PYTHON_VERSION=3.11
+PYTHON_COMPACT_VERSION=${PYTHON_VERSION//./}
+
+export PYTORCH_DIR=/pytorch
+export PYTHONPATH=${PYTORCH_DIR}:${PYTHONPATH}
+${CONDA_DIR}/bin/pip install torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} torchaudio==${TORCHAUDIO_VERSION} -t ${PYTORCH_DIR} --index-url ${TORCH_URL}
+#pip install torch==.6.0+rocm6.2.4 torchvision==0.21.0 torchaudio===2.6.0+rocm6.2.4 --index-url https://download.pytorch.org/whl/rocm6.2.4
+
+# Install UCF_VIT
+#mkdir -p /source
+#cd /source
+#git clone https://github.com/irlyngaas/UCF-VIT.git
+#${CONDA_DIR}/bin/python -m pip install -e /source/UCF-VIT --verbose
+
+%runscript
+exec /bin/bash --noprofile --init-file /.singularity_bash "$@"
+%startscript
+exec /bin/bash --noprofile --init-file /.singularity_bash "$@"
