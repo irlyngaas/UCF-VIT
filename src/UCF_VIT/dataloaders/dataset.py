@@ -16,7 +16,6 @@ class NpyReader(IterableDataset):
     def __init__(
         self,
         file_list,
-        label_list,
         num_channels_available,
         num_channels_used,
         start_idx,
@@ -29,6 +28,7 @@ class NpyReader(IterableDataset):
         twoD: bool = False,
         return_label: bool = False,
         keys_to_add: int = 1,
+        dataset: str = "imagenet",
     ) -> None:
         super().__init__()
         self.num_channels_available = num_channels_available
@@ -37,8 +37,6 @@ class NpyReader(IterableDataset):
         end_idx = int(end_idx * len(file_list))
         file_list = file_list[start_idx:end_idx]
         self.file_list = file_list
-        label_list = label_list[start_idx:end_idx]
-        self.label_list = label_list
         self.multi_dataset_training = multi_dataset_training
         self.data_par_size = data_par_size
         self.twoD = twoD
@@ -47,6 +45,7 @@ class NpyReader(IterableDataset):
         self.gx = gx
         self.keys_to_add = keys_to_add
         self.ddp_group = ddp_group
+        self.dataset = dataset
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -90,82 +89,37 @@ class NpyReader(IterableDataset):
             iter_start = worker_id * per_worker
             iter_end = iter_start + per_worker
 
-        #print ("global rank %d: ddp rank %d iter_start,iter_end = %d %d"%(torch.distributed.get_rank(), ddp_rank,iter_start, iter_end))
+        #print ("global rank %d: ddp rank %d, num_workers_per_ddp %d, worker_info_id %d, worker id %d, iter_start,iter_end = %d %d"%(torch.distributed.get_rank(), ddp_rank, num_workers_per_ddp, worker_info.id, worker_id, iter_start, iter_end), flush=True)
         for m in range(self.keys_to_add):
             start_it = iter_start + m*int(len(self.file_list)/self.keys_to_add)
             end_it = iter_end + m*int(len(self.file_list)/self.keys_to_add)
             for idx in range(iter_start, iter_end):
                 path = self.file_list[idx]
-                data = Image.open(path).convert("RGB")
-                data = np.array(data) 
-                data = cv.resize(data, dsize=[256,256])
-                data = np.moveaxis(data,-1,0)
+                if self.dataset == "imagenet":
+                    data = Image.open(path).convert("RGB")
+                    data = np.array(data) 
+                    data = cv.resize(data, dsize=[256,256])
+                    data = np.moveaxis(data,-1,0)
 
-
-
-
-                #if self.num_channels_used == 1:
-                #    if self.npy_files:
-                #        data = np.load(path)
-                #    else:
-                #        data = nib.load(path)
-                #        data = np.array(data.dataobj).astype(np.float32)
-                #    if not self.norm_stats:
-                #        data = (data-data.min())/(data.max()-data.min())
-                #    else:
-                #        minimum = self.norm_stats[path].item()['0']['min']
-                #        maximum = self.norm_stats[path].item()['0']['max']
-                #        data = (data-minimum)/(maximum-minimum)
-
-                #if self.return_label:
-                #    assert self.norm_stats, "No labelling currently setup for basic_ct, so can't run segmentation"
-                #    label_suffix = self.norm_stats[path].item()['0']['label_suffix']
-                #    assert label_suffix != "NONE", "No labels available, can't run segementation on this dataset"
-                #    data_path = Path(path)
-                #    path2 = data_path.parent.absolute()
-                #    path3 = path2.parent.absolute()
-                #    path4= os.path.join(path3,'labelsTr', data_path.stem+label_suffix)
-                #    label = nib.load(path4)
-                #    label = np.array(label.dataobj).astype(np.int64)
-
+                    data_path = Path(path)
+                    parent = data_path.parent.absolute()
+                    parent2 = parent.parent.absolute()
+                    stem1 = parent.stem
+                    classes = sorted(os.listdir(os.path.join(parent2)))
+                    class_to_idx = {cls_name: idx for idx, cls_name in enumerate(classes)}
+                    label = class_to_idx[stem1]
 
                 if self.return_label:
-                    yield data, self.label_list[idx], self.variables
+                    yield data, label, self.variables
                 else:
                     yield data, self.variables
 
-                #if self.twoD:
-                #    for i in range(data.shape[-1]):
-                #        if self.num_channels_used == 1:
-                #            if self.return_label:
-                #                yield np.expand_dims(data[:,:,i],axis=0), label, self.variables
-                #            else:
-                #                yield np.expand_dims(data[:,:,i],axis=0), self.variables
-                #        else:
-                #            if self.return_label:
-                #                yield data[:,:,:,i], label, self.variables
-                #            else:
-                #                yield data[:,:,:,i], self.variables
-                #else:
-                #    if self.num_channels_used == 1:
-                #        if self.return_label:
-                #            yield np.expand_dims(data,axis=0), label, self.variables
-                #        else:
-                #            yield np.expand_dims(data,axis=0), self.variables
-                #    else:
-                #        if self.return_label:
-                #            yield data, label, self.variables
-                #        else:
-                #            yield data, self.variables
-
 class ImageBlockDataIter(IterableDataset):
     def __init__(
-        self, dataset: NpyReader, num_channels_available: int = 1, num_channels_used: int = 1, tile_size_x: int = 64, tile_size_y: int = 64, tile_size_z: int = None, twoD: bool = True, return_label: bool = False, tile_overlap: float = 0.0, use_all_data: bool = False,
+        self, dataset: NpyReader, tile_size_x: int = 64, tile_size_y: int = 64, tile_size_z: int = None, twoD: bool = True, return_label: bool = False, tile_overlap: float = 0.0, use_all_data: bool = False,
     ) -> None:
         super().__init__()
         self.dataset = dataset
-        self.num_channels_available = num_channels_available
-        self.num_channels_used = num_channels_used
         self.twoD = twoD
         self.tile_size_x = tile_size_x
         self.tile_size_y = tile_size_y

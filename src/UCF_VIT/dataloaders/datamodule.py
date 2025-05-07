@@ -201,34 +201,31 @@ class NativePytorchDataModule(torch.nn.Module):
 
 
         self.dict_lister_trains = {}
-        self.dict_label_trains = {}
         if self.dataset == "imagenet":
             for k, root_dir in dict_root_dirs.items():
+                #TODO: Add shuffling for data_par_size if it doesn't divide 1000 equally
                 classes = sorted(os.listdir(root_dir))
-                class_to_idx = {cls_name: idx for idx, cls_name in enumerate(classes)}
                 if len(classes) > data_par_size:
                     classes_to_combine = int(len(classes) // data_par_size)
                 img_list = []
-                label_list = []
                 classes_counter = 0
                 num_data_roots = 0
                 for cls_name in classes: 
                     if classes_counter == classes_to_combine:
                         classes_counter = 0
                         img_list = []
-                        label_list = []
                     cls_dir = os.path.join(root_dir, cls_name)
                     for img_path in glob.glob(os.path.join(cls_dir,"*.JPEG")):
                         img_list.append(img_path)
-                        label_list.append(class_to_idx[cls_name])
                     classes_counter += 1
                 
                     if classes_counter == classes_to_combine:
                         img_dict = {num_data_roots: img_list}
                         self.dict_lister_trains.update(img_dict)
-                        label_dict = {num_data_roots: label_list}
-                        self.dict_label_trains.update(label_dict)
                         num_data_roots +=1
+
+                    if num_data_roots > data_par_size-1:
+                        break
             assert num_data_roots <= data_par_size, "the number of data parallel GPUs (data_par_size) needs to be at least equal to the number of datasets. Try to increase data_par_size"
 
         self.dict_data_train: Optional[Dict] = None
@@ -248,7 +245,6 @@ class NativePytorchDataModule(torch.nn.Module):
             dict_data_train = {}
             for i, k in enumerate(self.dict_lister_trains.keys()):
                 lister_train = self.dict_lister_trains[k]
-                label_train = self.dict_label_trains[k]
                 if self.dataset == "imagenet":
                     keys_to_add = 1
                 else:
@@ -256,24 +252,18 @@ class NativePytorchDataModule(torch.nn.Module):
                 list_indices = np.arange(0,len(lister_train))
                 indices = np.random.choice(list_indices,len(lister_train), replace=False)
                 _lister_train = []
-                _label_train = []
                 for j in range(len(indices)):
                     _lister_train.append(lister_train[indices[j]])
-                    _label_train.append(label_train[indices[j]])
                 if keys_to_add > 1:
                     for i in range(keys_to_add-1):
                         list_indices = np.arange(0,len(lister_train))
                         indices = np.random.choice(list_indices, len(lister_train), replace=False)
                         _balance_train = []
-                        _balance_label = []
                         for j in range(len(indices)):
                             _balance_train.append(lister_train[indices[j]])
-                            _balance_label.append(label_train[indices[j]])
                         _lister_train.extend(_balance_train)
-                        _label_train.extend(_balance_label)
 
                 lister_train = _lister_train
-                label_train = _label_train
                 if self.dataset == "imagenet":
                     start_idx = self.dict_start_idx["imagenet"]
                     end_idx = self.dict_end_idx["imagenet"]
@@ -295,7 +285,6 @@ class NativePytorchDataModule(torch.nn.Module):
                         ImageBlockDataIter(
                                 NpyReader(
                                     lister_train,
-                                    label_train,
                                     num_channels_available,
                                     num_channels_used,
                                     gx = self.gx,
@@ -307,9 +296,8 @@ class NativePytorchDataModule(torch.nn.Module):
                                     return_label = return_label,
                                     keys_to_add = keys_to_add,
                                     ddp_group = self.ddp_group,
+                                    dataset=self.dataset
                                 ),
-                            num_channels_available,
-                            num_channels_used,
                             self.tile_size_x,
                             self.tile_size_y,
                             self.tile_size_z,

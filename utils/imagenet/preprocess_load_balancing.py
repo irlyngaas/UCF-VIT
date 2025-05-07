@@ -47,6 +47,7 @@ def main():
         class_to_idx = {cls_name: idx for idx, cls_name in enumerate(classes)}
         if len(classes) > num_total_ddp_ranks:
             classes_to_combine = int(len(classes) // num_total_ddp_ranks)
+        print("CLASSES_TO_COMBINE", classes_to_combine)
         img_list = []
         classes_counter = 0
         num_data_roots = 0
@@ -63,6 +64,9 @@ def main():
                 img_dict = {num_data_roots: img_list}
                 dict_lister_trains.update(img_dict)
                 num_data_roots +=1
+
+            if num_data_roots > num_total_ddp_ranks-1:
+                break
         
     print("KEYS", dict_lister_trains.keys())
     print("NUM_DATA_ROOTS", num_data_roots, flush=True)
@@ -242,6 +246,7 @@ def main():
         tiles_per_rank.append(np.floor(num_images_per_rank[i])*tiles_per_image[i])
     print("Tiles Per Rank", tiles_per_rank)
     print("Batches Per Rank", batches_per_rank)
+    print("Min Batches Per Rank", min(batches_per_rank))
 
 if __name__ == "__main__":
     main()
