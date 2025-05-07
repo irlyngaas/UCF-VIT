@@ -189,6 +189,7 @@ class VIT(nn.Module):
         self.single_channel = single_channel
         self.use_varemb = use_varemb
         self.aggregated_variables = 1 #Change this to an argument when adding different variable aggregation strategies
+        self.class_token = class_token
 
 
         #ASSUMES INPUT HAS ALREADY BEEN ADAPTIVELY PATCHED
@@ -305,7 +306,7 @@ class VIT(nn.Module):
                         self.pos_embed.shape[-1],
                         int(self.img_size[0] / self.patch_size),
                         int(self.img_size[1] / self.patch_size),
-                        cls_token=False,
+                        cls_token=self.class_token,
                     )
                 else: #3D
                     pos_embed = get_3d_sincos_pos_embed(
@@ -313,7 +314,7 @@ class VIT(nn.Module):
                         int(self.img_size[0] / self.patch_size),
                         int(self.img_size[1] / self.patch_size),
                         int(self.img_size[2] / self.patch_size),
-                        cls_token=False,
+                        cls_token=self.class_token,
                     )
                 self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
