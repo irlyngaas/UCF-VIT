@@ -1,14 +1,14 @@
 #!/bin/bash
 #SBATCH -A stf006
-#SBATCH -J classification_simple
+#SBATCH -J masked_simple
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:8
 #SBATCH --ntasks-per-node=8
 #SBATCH --cpus-per-task=7
 #SBATCH -t 00:20:00
 #SBATCH -p batch
-#SBATCH -o classification_simple-%j.out
-#SBATCH -e classification_simple-%j.out
+#SBATCH -o masked_simple-%j.out
+#SBATCH -e masked_simple-%j.out
 
 [ -z $JOBID ] && JOBID=$SLURM_JOB_ID
 [ -z $JOBSIZE ] && JOBSIZE=$SLURM_JOB_NUM_NODES
@@ -35,4 +35,4 @@ export OMP_NUM_THREADS=7
 export PYTHONPATH=$PWD:$PYTHONPATH
 
 time srun -n $((SLURM_JOB_NUM_NODES*8)) \
-python ../../training_scripts/train_class_simple.py ../../configs/imagenet/classification/base_config.yaml
+python ../../training_scripts/train_masked_simple.py ../../configs/imagenet/mae/base_config.yaml
