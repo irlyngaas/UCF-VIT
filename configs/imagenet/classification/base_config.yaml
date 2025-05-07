@@ -43,7 +43,7 @@ model:
       drop_rate: 0.0
       twoD: True
       use_varemb: False
-      adaptive_patching: True
+      adaptive_patching: False
       fixed_length: 196
       separate_channels: False
       gauss_filter_order: 3
@@ -89,5 +89,4 @@ load_balancing:
   batches_per_rank_epoch: {
     'imagenet': 4935,
   }
-  #dataset_group_list: '8'
   dataset_group_list: '1:1:1:1:1:1:1:1'
