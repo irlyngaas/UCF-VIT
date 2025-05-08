@@ -102,6 +102,8 @@ def main(device):
 
     twoD = conf['model']['net']['init_args']['twoD']
 
+    assert twoD, "SAP not currently implemented for 3D data"
+
     use_varemb = conf['model']['net']['init_args']['use_varemb']
 
     adaptive_patching = conf['model']['net']['init_args']['adaptive_patching']
