@@ -572,6 +572,7 @@ class ProcessChannels(IterableDataset):
         self.return_label = return_label
         self.adaptive_patching = adaptive_patching
         self.separate_channels = separate_channels
+        self.patch_size = patch_size
         self.gauss_filter_order = gauss_filter_order
         self.twoD = twoD
         self._dataset = _dataset
@@ -630,14 +631,19 @@ class ProcessChannels(IterableDataset):
                             if self.adaptive_patching:
                                 np_image = yield_x_list[i].pop()
                                 if self.single_channel:
-                                    seq_image, seq_size, seq_pos = self.patchify(np.expand_dims(np_image,axis=-1))
+                                    seq_image, seq_size, seq_pos, qdt = self.patchify(np.expand_dims(np_image,axis=-1))
+                                    if self._dataset != "imagenet":
+                                        np_label = yield_label_list[i].pop()
+                                        seq_label, _, _ = qdt.serialize_labels(np.expand_dims(np_label,axis=-1), size=(self.patch_size,self.patch_size,self.num_channels))
+                                        seq_label = np.asarray(seq_label)
+                                        seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size, -1, self.num_channels])
                                 else:
                                     if self.separate_channels:
                                         seq_image_list = []
                                         seq_size_list = []
                                         seq_pos_list = []
                                         for j in range(self.num_channels):
-                                            seq_image, seq_size, seq_pos = self.patchify(np.expand_dims(np_image[j],axis=-1))
+                                            seq_image, seq_size, seq_pos, qdt = self.patchify(np.expand_dims(np_image[j],axis=-1))
                                             seq_image_list.append(seq_image)
                                             seq_size_list.append(seq_size)
                                             seq_pos_list.append(seq_pos)
@@ -646,11 +652,19 @@ class ProcessChannels(IterableDataset):
                                         seq_pos = np.stack([seq_pos_list[k] for k in range(len(seq_pos_list))])
 
                                     else:
-                                        seq_image, seq_size, seq_pos = self.patchify(np.moveaxis(np_image,0,-1))
+                                        seq_image, seq_size, seq_pos, qdt = self.patchify(np.moveaxis(np_image,0,-1))
+                                        if self._dataset != "imagenet":
+                                            np_label = yield_label_list[i].pop()
+                                            seq_label, _, _ = qdt.serialize_labels(np.expand_dims(np_label,axis=-1), size=(self.patch_size,self.patch_size,self.num_channels))
+                                            seq_label = np.asarray(seq_label)
+                                            seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size, -1, self.num_channels])
+
                                 if self._dataset == "imagenet":
                                     yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_label_list[i].pop(), yield_var_list[i].pop()
                                 else:
-                                    yield np_image, seq_image, seq_size, seq_pos, yield_label_list[i].pop(), yield_var_list[i].pop()
+                                    #yield np_image, seq_image, seq_size, seq_pos, yield_label_list[i].pop(), yield_var_list[i].pop()
+                                    #yield np.asarray(np_image,dtype=np.float32),seq_image, seq_size, seq_pos, np.asarray(np_label,dtype=np.uint8), seq_label, yield_var_list[i].pop(), qdt
+                                    yield np_image, seq_image, seq_size, seq_pos, np.asarray(np_label,dtype=np.uint8), seq_label, yield_var_list[i].pop()
                             else:
                                 if self._dataset == "imagenet":
                                     np_image = yield_x_list[i].pop()
@@ -662,14 +676,14 @@ class ProcessChannels(IterableDataset):
                             if self.adaptive_patching:
                                 np_image = yield_x_list[i].pop()
                                 if self.single_channel:
-                                    seq_image, seq_size, seq_pos = self.patchify(np.expand_dims(np_image,axis=-1))
+                                    seq_image, seq_size, seq_pos, _ = self.patchify(np.expand_dims(np_image,axis=-1))
                                 else:
                                     if self.separate_channels:
                                         seq_image_list = []
                                         seq_size_list = []
                                         seq_pos_list = []
                                         for j in range(self.num_channels):
-                                            seq_image, seq_size, seq_pos = self.patchify(np.expand_dims(np_image[j],axis=-1))
+                                            seq_image, seq_size, seq_pos, _ = self.patchify(np.expand_dims(np_image[j],axis=-1))
                                             seq_image_list.append(seq_image)
                                             seq_size_list.append(seq_size)
                                             seq_pos_list.append(seq_pos)
@@ -678,7 +692,7 @@ class ProcessChannels(IterableDataset):
                                         seq_pos = np.stack([seq_pos_list[k] for k in range(len(seq_pos_list))])
 
                                     else:
-                                        seq_image, seq_size, seq_pos = self.patchify(np.moveaxis(np_image,0,-1))
+                                        seq_image, seq_size, seq_pos, _ = self.patchify(np.moveaxis(np_image,0,-1))
                                 if self._dataset == "imagenet":
                                     yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_var_list[i].pop()
                                 else:

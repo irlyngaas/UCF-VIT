@@ -7,6 +7,7 @@ import torchdata.datapipes as dp
 from torch.utils.data import DataLoader
 from pathlib import Path
 import glob
+import torch.nn.functional as F
 
 from .dataset import (
     FileReader,
@@ -16,7 +17,7 @@ from .dataset import (
     ProcessChannels,
 )
 
-def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_channels, dataset):
+def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_channels, dataset, num_classes):
     if adaptive_patching:
         if return_label:
             if single_channel:
@@ -28,8 +29,14 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                     label = torch.stack([torch.tensor(batch[i][4]) for i in range(len(batch))])
                 else:
                     label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][4],axis=0)) for i in range(len(batch))])
+                seq_label_list = []
+                for i in range(len(batch)):
+                    seq_mask = torch.from_numpy(batch[i][5]).long()
+                    seq_mask = F.one_hot(seq_mask.squeeze(-1), num_classes=num_classes)
+                    seq_label_list.append(seq_mask.permute(2, 0, 1).float())
+                seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
                 variables = []
-                variables.append(batch[0][5])
+                variables.append(batch[0][6])
             else:
                 inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
                 seq = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
@@ -43,9 +50,15 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                     label = torch.stack([torch.tensor(batch[i][4]) for i in range(len(batch))])
                 else:
                     label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][4],axis=0)) for i in range(len(batch))])
-                variables = batch[0][5]
+                seq_label_list = []
+                for i in range(len(batch)):
+                    seq_mask = torch.from_numpy(batch[i][5]).long()
+                    seq_mask = F.one_hot(seq_mask.squeeze(-1), num_classes=num_classes)
+                    seq_label_list.append(seq_mask.permute(2, 0, 1).float())
+                seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
+                variables = batch[0][6]
                 
-            return (inp, seq, size, pos, label, variables)
+            return (inp, seq, size, pos, label, seq_label, variables)
         else:
             if single_channel:
                 inp = torch.stack([torch.from_numpy(np.expand_dims(batch[i][0],axis=0)) for i in range(len(batch))])
@@ -161,6 +174,7 @@ class NativePytorchDataModule(torch.nn.Module):
         num_samples_to_stitch: Optional[Dict] = None,
         chunk_size: Optional[Dict] = None,
         dict_out_variables: Optional[Dict] = None,
+        num_classes: Optional[int] = None,
     ):
         super().__init__()
         if num_workers > 1:
@@ -202,6 +216,9 @@ class NativePytorchDataModule(torch.nn.Module):
         self.data_par_size = data_par_size
         self.ddp_group = ddp_group
         self.dataset = dataset
+
+        #Optional Inputs
+        self.num_classes = num_classes
 
         in_variables = {}
         for k, list_out in dict_in_variables.items():
@@ -399,6 +416,6 @@ class NativePytorchDataModule(torch.nn.Module):
             drop_last=True,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            collate_fn=lambda batch: collate_fn(batch, return_label=self.return_label, single_channel=self.single_channel, adaptive_patching = self.adaptive_patching, separate_channels=self.separate_channels, dataset=self.dataset),
+            collate_fn=lambda batch: collate_fn(batch, return_label=self.return_label, single_channel=self.single_channel, adaptive_patching = self.adaptive_patching, separate_channels=self.separate_channels, dataset=self.dataset, num_classes=self.num_classes),
         )
 

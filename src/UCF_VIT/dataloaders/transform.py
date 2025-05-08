@@ -49,7 +49,7 @@ class Patchify(torch.nn.Module):
             seq_img = np.reshape(seq_img, [-1, self.patch_size*self.patch_size])
 
         seq_pos = np.asarray(seq_pos)
-        return seq_img, seq_size, seq_pos
+        return seq_img, seq_size, seq_pos, qdt
 
 class Patchify_3D(torch.nn.Module):
     #TODO: Pass dtype for preferred return dtype
@@ -105,4 +105,4 @@ class Patchify_3D(torch.nn.Module):
             seq_img = np.reshape(seq_img, [-1, self.patch_size*self.patch_size*self.patch_size])
 
         seq_pos = np.asarray(seq_pos)
-        return seq_img, seq_size, seq_pos
+        return seq_img, seq_size, seq_pos, qdt

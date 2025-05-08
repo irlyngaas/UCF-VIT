@@ -172,6 +172,39 @@ class FixedQuadTree:
         assert len(seq_patch)==self.fixed_length, "Not equal fixed legnth."
         assert len(seq_size)==self.fixed_length, "Not equal fixed legnth."
         return seq_patch, seq_size, seq_pos
+
+    def serialize_labels(self, img, size=(8,8,3)):
+        
+        seq_patch = []
+        seq_size = []
+        seq_pos = []
+        for bbox,value in self.nodes:
+            seq_patch.append(bbox.get_area(img))
+            seq_size.append(bbox.get_size()[0])
+            seq_pos.append(bbox.get_center())
+            
+        h2,w2,c2 = size
+        
+        for i in range(len(seq_patch)):
+            h1, w1, c1 = seq_patch[i].shape
+            assert h1==w1, "Need squared input."
+            seq_patch[i] = cv.resize(seq_patch[i], (h2, w2), interpolation=cv.INTER_NEAREST)
+            # assert seq_patch[i].shape == (h2,w2,c2), "Wrong shape {} get, need {}".format(seq_patch[i].shape, (h2,w2,c2))
+        if len(seq_patch)<self.fixed_length:
+            # import pdb
+            # pdb.set_trace()
+            if c2 > 1:
+                seq_patch += [np.zeros(shape=(h2,w2,c2))] * (self.fixed_length-len(seq_patch))
+            else:
+                seq_patch += [np.zeros(shape=(h2,w2))] * (self.fixed_length-len(seq_patch))
+            seq_size += [0]*(self.fixed_length-len(seq_size))
+            seq_pos += [tuple([-1,-1])]*(self.fixed_length-len(seq_pos))
+        elif len(seq_patch)>self.fixed_length:
+            pass
+            # random_drop
+        assert len(seq_patch)==self.fixed_length, "Not equal fixed legnth."
+        assert len(seq_size)==self.fixed_length, "Not equal fixed legnth."
+        return seq_patch, seq_size, seq_pos
     
     def deserialize(self, seq, patch_size, channel):
 
