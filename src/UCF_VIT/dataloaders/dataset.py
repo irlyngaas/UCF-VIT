@@ -348,7 +348,7 @@ class ImageBlockDataIter_3D(IterableDataset):
 
                 if self.twoD:
                     if self.use_all_data:
-                        num_blocks_z = np.ceil(data.shape[3]/self.tile_size_z)
+                        num_blocks_z = int(np.ceil(data.shape[3]/self.tile_size_z))
                     else:
                         num_blocks_z = data.shape[3]//self.tile_size_z
                 else:
@@ -610,7 +610,7 @@ class ProcessChannels(IterableDataset):
                 if self.single_channel:
                     if self.return_label:
                         yield_x_list[i].append(x[0][i])
-                        yield_label_list[i].append(x[1][i])
+                        yield_label_list[i].append(x[1])
                         yield_var_list[i].append(x[2][i])
                     else:
                         yield_x_list[i].append(x[0][i])
