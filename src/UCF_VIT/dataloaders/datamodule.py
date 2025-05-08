@@ -9,13 +9,14 @@ from pathlib import Path
 import glob
 
 from .dataset import (
-    ImageBlockDataIter,
-    NpyReader,
+    FileReader,
+    ImageBlockDataIter_2D,
+    ImageBlockDataIter_3D,
     ShuffleIterableDataset,
     ProcessChannels,
 )
 
-def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_channels):
+def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_channels, dataset):
     if adaptive_patching:
         if return_label:
             if single_channel:
@@ -23,7 +24,10 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                 seq = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
                 size = torch.stack([torch.from_numpy(np.expand_dims(batch[i][2],axis=0)) for i in range(len(batch))])
                 pos = torch.stack([torch.from_numpy(np.expand_dims(batch[i][3],axis=0)) for i in range(len(batch))])
-                label = torch.stack([torch.tensor(batch[i][4]) for i in range(len(batch))])
+                if dataset == "imagenet":
+                    label = torch.stack([torch.tensor(batch[i][4]) for i in range(len(batch))])
+                else:
+                    label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][4],axis=0)) for i in range(len(batch))])
                 variables = []
                 variables.append(batch[0][5])
             else:
@@ -35,7 +39,10 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                 else:
                     size = torch.stack([torch.from_numpy(np.expand_dims(batch[i][2],axis=0)) for i in range(len(batch))])
                     pos = torch.stack([torch.from_numpy(np.expand_dims(batch[i][3],axis=0)) for i in range(len(batch))])
-                label = torch.stack([torch.tensor(batch[i][4]) for i in range(len(batch))])
+                if dataset == "imagenet":
+                    label = torch.stack([torch.tensor(batch[i][4]) for i in range(len(batch))])
+                else:
+                    label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][4],axis=0)) for i in range(len(batch))])
                 variables = batch[0][5]
                 
             return (inp, seq, size, pos, label, variables)
@@ -63,12 +70,18 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
         if return_label:
             if single_channel:
                 inp = torch.stack([torch.from_numpy(np.expand_dims(batch[i][0],axis=0)) for i in range(len(batch))])
-                label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
+                if dataset == "imagenet":
+                    label = torch.stack([torch.tensor(batch[i][1]) for i in range(len(batch))])
+                else:
+                    label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
                 variables = []
                 variables.append(batch[0][2])
             else:
                 inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
-                label = torch.stack([torch.tensor(batch[i][1]) for i in range(len(batch))])
+                if dataset == "imagenet":
+                    label = torch.stack([torch.tensor(batch[i][1]) for i in range(len(batch))])
+                else:
+                    label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
                 variables = batch[0][2]
                 
             return (inp, label, variables)
@@ -227,6 +240,9 @@ class NativePytorchDataModule(torch.nn.Module):
                     if num_data_roots > data_par_size-1:
                         break
             assert num_data_roots <= data_par_size, "the number of data parallel GPUs (data_par_size) needs to be at least equal to the number of datasets. Try to increase data_par_size"
+        else:
+            self.dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in dict_root_dirs.items() }
+           
 
         self.dict_data_train: Optional[Dict] = None
 
@@ -249,18 +265,10 @@ class NativePytorchDataModule(torch.nn.Module):
                     keys_to_add = 1
                 else:
                     keys_to_add = int(np.ceil(self.max_balance/self.batches_per_rank_epoch[k]))
-                list_indices = np.arange(0,len(lister_train))
-                indices = np.random.choice(list_indices,len(lister_train), replace=False)
-                _lister_train = []
-                for j in range(len(indices)):
-                    _lister_train.append(lister_train[indices[j]])
+                _lister_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
                 if keys_to_add > 1:
                     for i in range(keys_to_add-1):
-                        list_indices = np.arange(0,len(lister_train))
-                        indices = np.random.choice(list_indices, len(lister_train), replace=False)
-                        _balance_train = []
-                        for j in range(len(indices)):
-                            _balance_train.append(lister_train[indices[j]])
+                        _balance_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
                         _lister_train.extend(_balance_train)
 
                 lister_train = _lister_train
@@ -280,44 +288,86 @@ class NativePytorchDataModule(torch.nn.Module):
                     num_channels_used = self.num_channels_used[k]
                 single_channel = self.single_channel
                 return_label = self.return_label
-                dict_data_train[k] = ProcessChannels(
-                    ShuffleIterableDataset(
-                        ImageBlockDataIter(
-                                NpyReader(
-                                    lister_train,
-                                    num_channels_available,
-                                    num_channels_used,
-                                    gx = self.gx,
-                                    start_idx=start_idx,
-                                    end_idx=end_idx,
-                                    variables=variables,
-                                    multi_dataset_training=True,
-                                    data_par_size = self.data_par_size,
-                                    return_label = return_label,
-                                    keys_to_add = keys_to_add,
-                                    ddp_group = self.ddp_group,
-                                    dataset=self.dataset
-                                ),
-                            self.tile_size_x,
-                            self.tile_size_y,
-                            self.tile_size_z,
-                            self.twoD,
-                            return_label = return_label,
-                            tile_overlap = self.tile_overlap,
-                            use_all_data = self.use_all_data,
+                if self.dataset == "imagenet":
+                    dict_data_train[k] = ProcessChannels(
+                        ShuffleIterableDataset(
+                            ImageBlockDataIter_2D(
+                                    FileReader(
+                                        lister_train,
+                                        num_channels_available,
+                                        gx = self.gx,
+                                        start_idx=start_idx,
+                                        end_idx=end_idx,
+                                        variables=variables,
+                                        multi_dataset_training=True,
+                                        data_par_size = self.data_par_size,
+                                        return_label = return_label,
+                                        keys_to_add = keys_to_add,
+                                        ddp_group = self.ddp_group,
+                                        dataset=self.dataset
+                                    ),
+                                self.tile_size_x,
+                                self.tile_size_y,
+                                self.tile_size_z,
+                                return_label = return_label,
+                                tile_overlap = self.tile_overlap,
+                                use_all_data = self.use_all_data,
+                                classification = True,
+                            ),
+                            buffer_size
                         ),
-                        buffer_size
-                    ),
-                    num_channels_used,
-                    single_channel,
-                    self.batch_size,
-                    return_label,
-                    self.adaptive_patching,
-                    self.separate_channels,
-                    self.patch_size,
-                    self.fixed_length,
-                    self.gauss_filter_order,
-                )
+                        num_channels_used,
+                        single_channel,
+                        self.batch_size,
+                        return_label,
+                        self.adaptive_patching,
+                        self.separate_channels,
+                        self.patch_size,
+                        self.fixed_length,
+                        self.gauss_filter_order,
+                        self.twoD,
+                        self.dataset,
+                    )
+                else:
+                    dict_data_train[k] = ProcessChannels(
+                        ShuffleIterableDataset(
+                            ImageBlockDataIter_3D(
+                                    FileReader(
+                                        lister_train,
+                                        num_channels_available,
+                                        gx = self.gx,
+                                        start_idx=start_idx,
+                                        end_idx=end_idx,
+                                        variables=variables,
+                                        multi_dataset_training=True,
+                                        data_par_size = self.data_par_size,
+                                        return_label = return_label,
+                                        keys_to_add = keys_to_add,
+                                        ddp_group = self.ddp_group,
+                                        dataset=self.dataset
+                                    ),
+                                self.tile_size_x,
+                                self.tile_size_y,
+                                self.tile_size_z,
+                                self.twoD,
+                                return_label = return_label,
+                                tile_overlap = self.tile_overlap,
+                                use_all_data = self.use_all_data,
+                            ),
+                            buffer_size
+                        ),
+                        num_channels_used,
+                        single_channel,
+                        self.batch_size,
+                        return_label,
+                        self.adaptive_patching,
+                        self.separate_channels,
+                        self.patch_size,
+                        self.fixed_length,
+                        self.gauss_filter_order,
+                        self.twoD,
+                        self.dataset,
+                    )
             self.dict_data_train = dict_data_train
 
     def train_dataloader(self):
@@ -349,6 +399,6 @@ class NativePytorchDataModule(torch.nn.Module):
             drop_last=True,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            collate_fn=lambda batch: collate_fn(batch, return_label=self.return_label, single_channel=self.single_channel, adaptive_patching = self.adaptive_patching, separate_channels=self.separate_channels),
+            collate_fn=lambda batch: collate_fn(batch, return_label=self.return_label, single_channel=self.single_channel, adaptive_patching = self.adaptive_patching, separate_channels=self.separate_channels, dataset=self.dataset),
         )
 
