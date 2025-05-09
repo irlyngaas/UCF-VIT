@@ -174,7 +174,7 @@ def main(device):
         gauss_filter_order = conf['model']['net']['init_args']['gauss_filter_order']
 
         if not twoD:
-            assert separate_channels, "Adaptive Patching in 3D with multiple channels (non-separated) is not currently implemented"
+            assert not separate_channels, "Adaptive Patching in 3D with multiple channels (non-separated) is not currently implemented"
     else:
         fixed_length = None
         separate_channels = None
