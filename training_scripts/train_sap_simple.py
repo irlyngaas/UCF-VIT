@@ -25,7 +25,10 @@ from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 def training_step_adaptive(data, seq, label, seq_label, size, pos, variables, net: SAP, patch_size, twoD, batch_idx, inference_path, epoch, world_rank, single_channel, num_classes, sqrt_len):
 
     #seq = torch.reshape(seq, shape=(-1,1,patch_size*sqrt_len, patch_size*sqrt_len))
-    seq_label = torch.reshape(seq_label, shape=(-1,num_classes,patch_size*sqrt_len, patch_size*sqrt_len))
+    if twoD:
+        seq_label = torch.reshape(seq_label, shape=(-1,num_classes,patch_size*sqrt_len, patch_size*sqrt_len))
+    else:
+        seq_label = torch.reshape(seq_label, shape=(-1,num_classes,patch_size*sqrt_len, patch_size*sqrt_len, patch_size*sqrt_len))
         
     output = net.forward(seq, variables)
     criterion = DiceBLoss(num_class=num_classes)
@@ -102,8 +105,6 @@ def main(device):
 
     twoD = conf['model']['net']['init_args']['twoD']
 
-    assert twoD, "SAP not currently implemented for 3D data"
-
     use_varemb = conf['model']['net']['init_args']['use_varemb']
 
     adaptive_patching = conf['model']['net']['init_args']['adaptive_patching']
@@ -115,7 +116,7 @@ def main(device):
     gauss_filter_order = conf['model']['net']['init_args']['gauss_filter_order']
 
     if not twoD:
-        assert separate_channels, "Adaptive Patching in 3D with multiple channels (non-separated) is not currently implemented"
+        assert not separate_channels, "Adaptive Patching in 3D with multiple channels (non-separated) is not currently implemented"
 
     dataset = conf['data']['dataset']
     assert dataset in ["basic_ct"], "This training script only supports basic_ct dataloader for now"
@@ -183,7 +184,16 @@ def main(device):
         for i,k in enumerate(num_channels_used):
             if num_channels_used[k] > 1:
                 max_channels = num_channels_used[k]
-    sqrt_len=int(math.sqrt(fixed_length))
+    if twoD:
+        assert math.sqrt(fixed_length) % 1 == 0, "sqrt of fixed length needs to be a whole number"
+        sqrt_len=int(math.sqrt(fixed_length))
+        assert fixed_length % 3 == 1 % 3, "Quadtree fixed length needs to be 3n+1, where n is some integer"
+    else:
+        #assert math.pow(fixed_length, 1/3) % 1 == 0, "cube root of fixed length needs to be a whole number"
+        assert np.abs(np.rint(math.pow(fixed_length,1/3)) - math.pow(fixed_length, 1/3)) < 0.0001, "cube root of fixed length needs to be a whole number"
+        sqrt_len=int(np.rint(math.pow(fixed_length,1/3)))
+        assert fixed_length % 7 == 1 % 7, "Octtree fixed length needs to be 7n+1, where n is some integer"
+        
 
     model = SAP(
         img_size=tile_size,
@@ -374,7 +384,7 @@ def main(device):
             seq = seq.to(device)
             seq_label = seq_label.to(device)
             #loss = training_step_adaptive(data, seq, label, seq_label, size, pos, variables, model, patch_size, twoD, batch_idx, inference_path, epoch, world_rank, single_channel, qdt_list, num_classes,sqrt_len)
-            loss = training_step_adaptive(data, seq, label, seq_label, size, pos, variables, model, patch_size, twoD, batch_idx, inference_path, epoch, world_rank, single_channel, num_classes,sqrt_len)
+            loss = training_step_adaptive(data, seq, label, seq_label, size, pos, variables, model, patch_size, twoD, batch_idx, inference_path, epoch, world_rank, single_channel, num_classes, sqrt_len)
 
             epoch_loss += loss.detach()
     

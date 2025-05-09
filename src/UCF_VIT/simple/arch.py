@@ -454,22 +454,39 @@ class SAP(VIT):
         #Remove decoder from VIT
         self.head = None 
 
-        self.neck = nn.Sequential(
-                nn.ConvTranspose2d(
-                    self.embed_dim,
-                    256,
-                    kernel_size=(self.patch_size, self.patch_size),
-                    stride=(self.patch_size, self.patch_size),
-                    bias=False,
-                )
-        )
-        self.mask_header = nn.Sequential(nn.Conv2d(256, self.num_classes,1))
+        if self.twoD:
+            self.neck = nn.Sequential(
+                    nn.ConvTranspose2d(
+                        self.embed_dim,
+                        256,
+                        kernel_size=(self.patch_size, self.patch_size),
+                        stride=(self.patch_size, self.patch_size),
+                        bias=False,
+                    )
+            )
+            self.mask_header = nn.Sequential(nn.Conv2d(256, self.num_classes,1))
+        else:
+            self.neck = nn.Sequential(
+                    nn.ConvTranspose3d(
+                        self.embed_dim,
+                        256,
+                        kernel_size=(self.patch_size, self.patch_size, self.patch_size),
+                        stride=(self.patch_size, self.patch_size, self.patch_size),
+                        bias=False,
+                    )
+            )
+            self.mask_header = nn.Sequential(nn.Conv3d(256, self.num_classes,1))
 
         self.init_weights('')
 
     def mask_head(self, x: torch.Tensor):
-        x = rearrange(x, 'b (p1 p2) c -> b p1 p2 c', p1=self.sqrt_len, p2=self.sqrt_len)
-        x = self.neck(x.permute(0,3,1,2))
+        if self.twoD:
+            x = rearrange(x, 'b (p1 p2) c -> b p1 p2 c', p1=self.sqrt_len, p2=self.sqrt_len)
+            x = self.neck(x.permute(0,3,1,2))
+        else:
+            x = rearrange(x, 'b (p1 p2 p3) c -> b p1 p2 p3 c', p1=self.sqrt_len, p2=self.sqrt_len, p3=self.sqrt_len)
+            x = self.neck(x.permute(0,4,1,2,3))
+            
         x = self.mask_header(x)
         return x
 
