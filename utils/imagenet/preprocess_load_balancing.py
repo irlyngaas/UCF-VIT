@@ -13,11 +13,23 @@ import cv2 as cv
 
 def main():
     config_path = sys.argv[1]
-    num_total_ddp_ranks = int(sys.argv[2])
+    num_total_ranks = int(sys.argv[2])
 
     print("config_path ",config_path,flush=True)
-
     conf = yaml.load(open(config_path,'r'),Loader=yaml.FullLoader)
+
+    fsdp_size = conf['parallelism']['fsdp_size']
+
+    simple_ddp_size = conf['parallelism']['simple_ddp_size']
+
+    tensor_par_size = conf['parallelism']['tensor_par_size']
+
+    data_par_size = fsdp_size * simple_ddp_size
+    num_total_ddp_ranks = data_par_size
+
+    assert data_par_size * tensor_par_size == num_total_ranks, "Need to use all ranks"
+
+
     dict_root_dirs = conf['data']['dict_root_dirs']
     dict_start_idx = conf['data']['dict_start_idx']
     dict_end_idx = conf['data']['dict_end_idx']

@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader
 from pathlib import Path
 import glob
 import torch.nn.functional as F
+import torch.distributed as dist
 
 from .dataset import (
     FileReader,
@@ -167,8 +168,8 @@ class NativePytorchDataModule(torch.nn.Module):
         separate_channels: bool = False,
         gauss_filter_order: int = 3,
         data_par_size: int = 1,
-        ddp_group = None,
-        dataset = "imagenet",
+        dataset: str = "imagenet",
+        ddp_group: Optional[dist.ProcessGroup] = None,
         nx: Optional[Dict] = None,
         ny: Optional[Dict] = None,
         nz: Optional[Dict] = None,

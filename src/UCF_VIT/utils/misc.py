@@ -1,4 +1,5 @@
 import torch
+import torch.distributed as dist
 from UCF_VIT.utils.lr_scheduler import LinearWarmupCosineAnnealingLR
 
 def patchify( data, patch_size, twoD):
@@ -115,3 +116,114 @@ def interpolate_pos_embed_adaptive(model, checkpoint_model, new_size=127):
             checkpoint_model["decoder_pos_embed"] = new_pos_tokens
 
             del new_pos_tokens
+
+def init_par_groups(world_rank, data_par_size, tensor_par_size, seq_par_size, fsdp_size, simple_ddp_size):
+
+    tensor_par_group = None
+
+    for i in range(data_par_size *seq_par_size):
+        ranks = [j for j in range(i*tensor_par_size,(i+1)*tensor_par_size)]
+
+        #if world_rank==0:
+        #    print("i ",i," data_par_size ",data_par_size," SEQ_PAR_SIZE ",seq_par_size," TENSOR_PAR_SIZE ",tensor_par_size," tensor_par_group ranks ",ranks)
+
+        group = dist.new_group(ranks)
+
+        if world_rank in ranks:
+            tensor_par_group = group
+
+
+
+
+    seq_par_group = None
+
+    for t in range(data_par_size):
+        for i in range(tensor_par_size):
+            ranks = [t*tensor_par_size*seq_par_size+i+j*tensor_par_size for j in range(seq_par_size)]
+
+            #if world_rank==0:
+            #    print("i ",i," data_par_size ",data_par_size," SEQ_PAR_SIZE ",seq_par_size, " TENSOR_PAR_SIZE ",tensor_par_size," seq_par_group ranks ",ranks,flush=True)
+
+            group = dist.new_group(ranks)
+
+            if world_rank in ranks:
+
+                seq_par_group = group
+
+
+
+
+    ddp_group = None
+
+    fsdp_group = None
+
+    simple_ddp_group = None
+
+    for i in range(tensor_par_size *seq_par_size):
+        ranks = [i+j*tensor_par_size *seq_par_size for j in range(data_par_size)]
+
+        for k in range(simple_ddp_size):
+            fsdp_begin_idx = k*fsdp_size
+            fsdp_end_idx = (k+1)*fsdp_size
+            fsdp_ranks = ranks[fsdp_begin_idx:fsdp_end_idx]
+
+
+            #if world_rank==0:
+            #    print("i ",i," data_par_size ",data_par_size," SEQ_PAR_SIZE ",seq_par_size," TENSOR_PAR_SIZE ",tensor_par_size," fsdp_ranks",fsdp_ranks)
+
+
+            group = dist.new_group(fsdp_ranks)
+
+            if world_rank in fsdp_ranks:
+
+                fsdp_group = group
+
+
+        for k in range(fsdp_size):
+            simple_ddp_begin_idx = k
+            simple_ddp_end_idx = len(ranks)
+            simple_ddp_ranks = ranks[simple_ddp_begin_idx:simple_ddp_end_idx:fsdp_size]
+
+
+            #if world_rank==0:
+            #    print("i ",i," data_par_size ",data_par_size," SEQ_PAR_SIZE ",seq_par_size," TENSOR_PAR_SIZE ",tensor_par_size," simple_ddp_ranks",simple_ddp_ranks)
+
+
+            group = dist.new_group(simple_ddp_ranks)
+
+            if world_rank in simple_ddp_ranks:
+
+                simple_ddp_group = group
+
+
+
+        #if world_rank==0:
+        #    print("i ",i," data_par_size ",data_par_size," SEQ_PAR_SIZE ",seq_par_size," TENSOR_PAR_SIZE ",tensor_par_size," ddp_group ranks ",ranks)
+
+        group = dist.new_group(ranks)
+
+        if world_rank in ranks:
+
+            ddp_group = group
+
+
+
+
+
+
+    data_seq_ort_group = None
+
+    for i in range(tensor_par_size):
+        ranks = [i+tensor_par_size*j for j in range(data_par_size * seq_par_size)]
+
+        #if world_rank==0:
+        #    print("i ",i," data_par_size ",data_par_size," SEQ_PAR_SIZE ",seq_par_size," TENSOR_PAR_SIZE ",tensor_par_size," data_seq_ort_group ranks ",ranks)
+
+        group = dist.new_group(ranks)
+
+        if world_rank in ranks:
+
+            data_seq_ort_group = group
+
+
+    return seq_par_group, ddp_group, tensor_par_group, data_seq_ort_group, fsdp_group, simple_ddp_group
