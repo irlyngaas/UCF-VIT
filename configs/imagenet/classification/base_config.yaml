@@ -1,6 +1,7 @@
 # ---------------------------- TRAINER -------------------------------------------
 trainer:
   max_epochs: 600
+  data_type: "float32"
   checkpoint_path: "../../checkpoint/imagenet/classification/base"
   checkpoint_filename: "multi_last"
   checkpoint_filename_for_loading: "multi_last"
@@ -43,7 +44,7 @@ model:
       drop_rate: 0.0
       twoD: True
       use_varemb: False
-      adaptive_patching: False
+      adaptive_patching: True
       fixed_length: 196
       separate_channels: False
       gauss_filter_order: 3
