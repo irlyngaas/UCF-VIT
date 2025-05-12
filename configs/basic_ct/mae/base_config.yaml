@@ -1,6 +1,7 @@
 # ---------------------------- TRAINER -------------------------------------------
 trainer:
   max_epochs: 600
+  data_type: "float32"
   checkpoint_path: "../../checkpoint/basic_ct/mae/base"
   inference_path: "../../checkpoint/basic_ct/mae/base/inference"
   checkpoint_filename: "multi_last"
