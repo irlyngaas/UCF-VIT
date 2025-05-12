@@ -26,6 +26,8 @@ from UCF_VIT.utils.pos_embed import (
 
 from einops import rearrange
 
+from UCF_VIT.utils.fused_attn import FusedAttn
+
 from monai.networks.blocks import UnetrBasicBlock, UnetrPrUpBlock, UnetrUpBlock
 from monai.networks.blocks.dynunet_block import UnetOutBlock
 
@@ -128,6 +130,7 @@ class VIT(nn.Module):
             default_vars: List = None,
             single_channel: bool = False,
             use_varemb: bool = False,
+            FusedAttn_option = FusedAttn.NONE,
     ) -> None:
         """
         Args:
@@ -190,6 +193,7 @@ class VIT(nn.Module):
         self.use_varemb = use_varemb
         self.aggregated_variables = 1 #Change this to an argument when adding different variable aggregation strategies
         self.class_token = class_token
+        self.FusedAttn_option = FusedAttn_option
 
 
         #ASSUMES INPUT HAS ALREADY BEEN ADAPTIVELY PATCHED
@@ -238,6 +242,7 @@ class VIT(nn.Module):
             block_fn(
                 dim=embed_dim,
                 num_heads=num_heads,
+                fused_attn=FusedAttn_option,
                 mlp_ratio=mlp_ratio,
                 qkv_bias=qkv_bias,
                 qk_norm=qk_norm,
@@ -527,6 +532,7 @@ class MAE(VIT):
                 self.block_fn(
                     dim=self.decoder_embed_dim,
                     num_heads=self.decoder_num_heads,
+                    fused_attn=self.FusedAttn_option,
                     mlp_ratio=self.mlp_ratio_decoder,
                     qkv_bias=self.qkv_bias,
                     qk_norm=self.qk_norm,

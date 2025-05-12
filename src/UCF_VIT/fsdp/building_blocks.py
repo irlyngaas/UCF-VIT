@@ -30,6 +30,10 @@ from torch.jit import Final
 
 from UCF_VIT.utils.dist_functions import F_AllReduce_B_Identity
 from UCF_VIT.utils.dist_functions import F_Identity_B_AllReduce
+from UCF_VIT.utils.fused_attn import FusedAttn
+
+import xformers
+from xformers.components.attention.core import scaled_dot_product_attention as xformers_sdpa
 
 
 class PatchEmbed(nn.Module):
@@ -149,6 +153,7 @@ class Attention(nn.Module):
     def __init__(
             self,
             dim: int,
+            fused_attn: FusedAttn = FusedAttn.NONE,
             num_heads: int = 8,
             qkv_bias: bool = False,
             qk_norm: bool = False,
@@ -163,7 +168,7 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
-        self.fused_attn = use_fused_attn()
+        self.fused_attn = fused_attn
         self.tensor_par_size = tensor_par_size
         self.tensor_par_group = tensor_par_group
 
@@ -184,20 +189,26 @@ class Attention(nn.Module):
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
 
-        if self.fused_attn:
+        if self.fused_attn == FusedAttn.CK:
+            x = xformers.ops.memory_efficient_attention(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                p=self.attn_drop.p,
+                op=xformers.ops.MemoryEfficientAttentionCkOp
+            )
+        elif self.fused_attn == FusedAttn.DEFAULT:
             x = F.scaled_dot_product_attention(
                 q, k, v,
                 dropout_p=self.attn_drop.p if self.training else 0.,
             )
-        else:
+        else: # FusedAttn.NONE
             q = q * self.scale
             attn = q @ k.transpose(-2, -1)
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
             x = attn @ v
+            x = x.transpose(1,2)
 
         x = x.reshape(B, N, C // self.tensor_par_size)
-        #x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
 
@@ -211,6 +222,7 @@ class Block(nn.Module):
             self,
             dim: int,
             num_heads: int,
+            fused_attn: FusedAttn = FusedAttn.NONE,
             mlp_ratio: float = 4.,
             qkv_bias: bool = False,
             qk_norm: bool = False,
@@ -228,6 +240,7 @@ class Block(nn.Module):
         self.norm1 = norm_layer(dim)
         self.attn = Attention(
             dim,
+            fused_attn=fused_attn,
             num_heads=num_heads,
             qkv_bias=qkv_bias,
             qk_norm=qk_norm,

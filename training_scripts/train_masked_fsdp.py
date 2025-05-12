@@ -13,8 +13,6 @@ import time
 import yaml
 from einops import rearrange
 from torch.nn import Sequential
-
-
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import (
    size_based_auto_wrap_policy, wrap, transformer_auto_wrap_policy,
@@ -25,15 +23,16 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
    CheckpointImpl,
    apply_activation_checkpointing,
 )
-
 import functools
 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
+from timm.layers import use_fused_attn
 
 from UCF_VIT.fsdp.arch import MAE
 from UCF_VIT.fsdp.building_blocks import Block
 from UCF_VIT.utils.metrics import masked_mse, adaptive_patching_mse
 from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, patchify, unpatchify, init_par_groups
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
+from UCF_VIT.utils.fused_attn import FusedAttn
 
 
 
@@ -318,10 +317,13 @@ def main(device):
             if num_channels_used[k] > 1:
                 max_channels = num_channels_used[k]
 
-    #if data_type == "bfloat16":
-    #    FusedAttn_option = FusedAttn.CK
-    #else:
-    #    FusedAttn_option = FusedAttn.DEFAULT
+    if data_type == "bfloat16":
+        FusedAttn_option = FusedAttn.CK
+    else:
+        if use_fused_attn():
+            FusedAttn_option = FusedAttn.DEFAULT
+        else:
+            FusedAttn_option = FusedAttn.NONE
 
 
     seq_par_group, ddp_group, tensor_par_group, data_seq_ort_group, fsdp_group, simple_ddp_group = init_par_groups(world_rank = world_rank, data_par_size = data_par_size, tensor_par_size = tensor_par_size, seq_par_size = seq_par_size, fsdp_size = fsdp_size, simple_ddp_size = simple_ddp_size)
@@ -347,8 +349,9 @@ def main(device):
         use_varemb=use_varemb,
         adaptive_patching=adaptive_patching,
         fixed_length=fixed_length,
-        tensor_par_size = tensor_par_size,
-        tensor_par_group = tensor_par_group,
+        tensor_par_size=tensor_par_size,
+        tensor_par_group=tensor_par_group,
+        FusedAttn_option=FusedAttn_option,
         class_token=False,
         weight_init='skip',
     ).to(device)

@@ -20,10 +20,12 @@ from monai.metrics import DiceMetric, GeneralizedDiceScore
 from monai.utils.enums import MetricReduction
 from monai.inferers import sliding_window_inference
 from functools import partial
+from timm.layers import use_fused_attn
 
 from UCF_VIT.simple.arch import UNETR, MAE
 from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
+from UCF_VIT.utils.fused_attn import FusedAttn
 
 
 
@@ -77,6 +79,10 @@ def main(device):
         print(conf,flush=True)
 
     max_epochs=conf['trainer']['max_epochs']
+
+    data_type = conf['trainer']['data_type']
+
+    assert data_type == "float32", "Only float32 training supported in this training script"
 
     checkpoint_path =conf['trainer']['checkpoint_path']
   
@@ -192,6 +198,11 @@ def main(device):
 
 #2. Initialize model, optimizer, and scheduler
 ##############################################################################################################
+    if use_fused_attn():
+        FusedAttn_option = FusedAttn.DEFAULT
+    else:
+        FusedAttn_option = FusedAttn.NONE
+
     if single_channel:
         max_channels = 1
     else:
@@ -216,6 +227,7 @@ def main(device):
         skip_connection=skip_connection,
         single_channel=single_channel,
         use_varemb=use_varemb,
+        FusedAttn_option=FusedAttn_option,
         class_token=False,
         weight_init='skip',
     ).to(device)

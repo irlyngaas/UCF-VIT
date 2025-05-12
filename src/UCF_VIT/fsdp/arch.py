@@ -26,6 +26,7 @@ from UCF_VIT.utils.pos_embed import (
 import torch.distributed as dist
 
 from UCF_VIT.utils.dist_functions import F_Identity_B_Broadcast,F_Broadcast_B_Identity, F_Identity_B_AllReduce
+from UCF_VIT.utils.fused_attn import FusedAttn
 
 from einops import rearrange
 
@@ -133,6 +134,7 @@ class VIT(nn.Module):
             use_varemb: bool = False,
             tensor_par_size: int = 1,
             tensor_par_group: Optional[dist.ProcessGroup] = None,
+            FusedAttn_option = FusedAttn.NONE,
     ) -> None:
         """
         Args:
@@ -197,6 +199,7 @@ class VIT(nn.Module):
         self.class_token = class_token
         self.tensor_par_size = tensor_par_size
         self.tensor_par_group = tensor_par_group
+        self.FusedAttn_option = FusedAttn_option
 
 
         #ASSUMES INPUT HAS ALREADY BEEN ADAPTIVELY PATCHED
@@ -245,6 +248,7 @@ class VIT(nn.Module):
             block_fn(
                 dim=embed_dim,
                 num_heads=num_heads,
+                fused_attn=FusedAttn_option,
                 mlp_ratio=mlp_ratio,
                 qkv_bias=qkv_bias,
                 qk_norm=qk_norm,
@@ -550,6 +554,7 @@ class MAE(VIT):
                 self.block_fn(
                     dim=self.decoder_embed_dim,
                     num_heads=self.decoder_num_heads,
+                    fused_attn=self.FusedAttn_option,
                     mlp_ratio=self.mlp_ratio_decoder,
                     qkv_bias=self.qkv_bias,
                     qk_norm=self.qk_norm,

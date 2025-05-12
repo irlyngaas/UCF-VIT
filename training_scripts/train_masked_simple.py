@@ -13,11 +13,13 @@ from torchvision.utils import save_image
 import time
 import yaml
 from einops import rearrange
+from timm.layers import use_fused_attn
 
 from UCF_VIT.simple.arch import MAE
 from UCF_VIT.utils.metrics import masked_mse, adaptive_patching_mse
 from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, patchify, unpatchify
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
+from UCF_VIT.utils.fused_attn import FusedAttn
 
 def training_step_adaptive(data, seq, size, pos, variables, net: MAE, patch_size, twoD, loss_fn, batch_idx, inference_path, epoch, world_rank, single_channel):
 
@@ -105,6 +107,10 @@ def main(device):
         print(conf,flush=True)
 
     max_epochs = conf['trainer']['max_epochs']
+
+    data_type = conf['trainer']['data_type']
+
+    assert data_type == "float32", "Only float32 training supported in this training script"
 
     checkpoint_path = conf['trainer']['checkpoint_path']
   
@@ -274,6 +280,11 @@ def main(device):
 
 #2. Initialize model, optimizer, and scheduler
 ##############################################################################################################
+    if use_fused_attn():
+        FusedAttn_option = FusedAttn.DEFAULT
+    else:
+        FusedAttn_option = FusedAttn.NONE
+
     #Find correct in_chans to use
     if single_channel:
         max_channels = 1
@@ -303,6 +314,7 @@ def main(device):
         use_varemb=use_varemb,
         adaptive_patching=adaptive_patching,
         fixed_length=fixed_length,
+        FusedAttn_option=FusedAttn_option,
         class_token=False,
         weight_init='skip',
     ).to(device)
