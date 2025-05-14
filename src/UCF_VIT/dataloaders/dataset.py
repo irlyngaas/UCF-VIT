@@ -1133,16 +1133,13 @@ class ProcessChannels(IterableDataset):
                                     if self._dataset != "imagenet":
                                         np_label = yield_label_list[i].pop()
                                         seq_label_list = []
-                                        for i in range(len(np_label)):
+                                        for j in range(len(np_label)):
                                             if self.twoD:
-                                                #if self.num_labels == 1:
-                                                seq_label, _, _ = qdt.serialize_labels(np.expand_dims(np_label,axis=-1), size=(self.patch_size,self.patch_size,self.num_channels))
+                                                seq_label, _, _ = qdt.serialize_labels(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,self.num_channels))
                                                 seq_label = np.asarray(seq_label)
                                                 seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size, -1, self.num_channels])
                                             else:
-                                                #seq_label, _, _ = qdt.serialize_labels(np.expand_dims(np_label,axis=-1), size=(self.patch_size,self.patch_size,self.patch_size))
-                                                #if self.num_labels == 1:
-                                                seq_label, _, _ = qdt.serialize_labels(np_label, size=(self.patch_size,self.patch_size,self.patch_size))
+                                                seq_label, _, _ = qdt.serialize_labels(np_label[j], size=(self.patch_size,self.patch_size,self.patch_size))
                                                 seq_label = np.asarray(seq_label)
                                                 seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size*self.patch_size, -1, self.num_channels])
                                             seq_label_list.append(seq_label)
@@ -1165,16 +1162,13 @@ class ProcessChannels(IterableDataset):
                                         if self._dataset != "imagenet":
                                             np_label = yield_label_list[i].pop()
                                             seq_label_list = []
-                                            for i in range(len(np_label)):
+                                            for j in range(len(np_label)):
                                                 if self.twoD:
-                                                    #if self.num_labels == 1:
-                                                    seq_label, _, _ = qdt.serialize_labels(np.expand_dims(np_label,axis=-1), size=(self.patch_size,self.patch_size,self.num_channels))
+                                                    seq_label, _, _ = qdt.serialize_labels(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,self.num_channels))
                                                     seq_label = np.asarray(seq_label)
                                                     seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size, -1, self.num_channels])
                                                 else:
-                                                    #seq_label, _, _ = qdt.serialize_labels(np.expand_dims(np_label,axis=-1), size=(self.patch_size,self.patch_size,self.patch_size))
-                                                    #if self.num_labels == 1:
-                                                    seq_label, _, _ = qdt.serialize_labels(np_label, size=(self.patch_size,self.patch_size,self.patch_size))
+                                                    seq_label, _, _ = qdt.serialize_labels(np_label[j], size=(self.patch_size,self.patch_size,self.patch_size))
                                                     seq_label = np.asarray(seq_label)
                                                     seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size*self.patch_size, -1, self.num_channels])
                                                 seq_label_list.append(seq_label)
