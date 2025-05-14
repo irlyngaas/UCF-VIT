@@ -4,13 +4,12 @@ trainer:
   data_type: "float32"
   checkpoint_path: "../../checkpoint/turb/pred/base"
   checkpoint_filename: "multi_last"
-  checkpoint_filename_prefix: "odd"
+  checkpoint_filename_for_loading: "multi_last_odd" #multi_last_odd or multi_last_even
 
   resume_from_checkpoint: False
   use_pretrained_mae_model: False
   mae_checkpoint_path: "../../checkpoint/turb/mae/base"
-  mae_checkpoint_filename: "multi_last"
-  mae_checkpoint_filename_prefix: "odd"
+  mae_checkpoint_filename: "multi_last_odd" #multi_last_odd or multi_last_even
 
 # ---------------------------- PARALLELISM -------------------------------------
 parallelism:

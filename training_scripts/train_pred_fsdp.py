@@ -94,7 +94,7 @@ def main(device):
   
     checkpoint_filename = conf['trainer']['checkpoint_filename']
 
-    checkpoint_filename_prefix = conf['trainer']['checkpoint_filename_prefix']
+    checkpoint_filename_for_loading = conf['trainer']['checkpoint_filename_for_loading']
 
     resume_from_checkpoint = conf['trainer']['resume_from_checkpoint']
 
@@ -111,8 +111,6 @@ def main(device):
     mae_checkpoint_path = conf['trainer']['mae_checkpoint_path']
 
     mae_checkpoint_filename = conf['trainer']['mae_checkpoint_filename']
-
-    mae_checkpoint_filename_prefix = conf['trainer']['mae_checkpoint_filename_prefix']
  
     lr = float(conf['model']['lr'])
 
@@ -328,7 +326,7 @@ def main(device):
                 weight_init='skip',
             ).to(device)
             if world_rank< tensor_par_size:
-                if os.path.exists(checkpoint_path+"/"+mae_checkpoint_filename+"_rank_"+str(world_rank)+"_"+mae_checkpoint_filename_prefix+".ckpt"):
+                if os.path.exists(checkpoint_path+"/"+mae_checkpoint_filename+"_rank_"+str(world_rank)+".ckpt"):
                     print("use pretrain_mae model was set to True. Checkpoint path found.",flush=True)
 
                     print("rank",dist.get_rank(),"src_rank",world_rank,flush=True)
@@ -336,7 +334,7 @@ def main(device):
                     #map_location = 'cuda:'+str(device)
                     map_location = 'cpu'
 
-                    mae_checkpoint = torch.load(mae_checkpoint_path+"/"+mae_checkpoint_filename+"_rank_"+str(world_rank)+"_"+mae_checkpoint_filename_prefix+".ckpt",map_location=map_location)
+                    mae_checkpoint = torch.load(mae_checkpoint_path+"/"+mae_checkpoint_filename+"_rank_"+str(world_rank)+".ckpt",map_location=map_location)
                     model.load_state_dict(checkpoint['model_state_dict'])
                     epoch_start = checkpoint['epoch']
                     del checkpoint
@@ -400,7 +398,7 @@ def main(device):
 
     else: #Train from checkpoint 
         if world_rank< tensor_par_size:
-            if os.path.exists(checkpoint_path+"/"+checkpoint_filename+"_rank_"+str(world_rank)+"_"+checkpoint_filename_prefix+".ckpt"):
+            if os.path.exists(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(world_rank)+".ckpt"):
                 print("resume from checkpoint was set to True. Checkpoint path found.",flush=True)
 
                 print("rank",dist.get_rank(),"src_rank",world_rank,flush=True)
@@ -408,7 +406,7 @@ def main(device):
                 #map_location = 'cuda:'+str(device)
                 map_location = 'cpu'
 
-                checkpoint = torch.load(checkpoint_path+"/"+checkpoint_filename+"_rank_"+str(world_rank)+"_"+checkpoint_filename_prefix+".ckpt",map_location=map_location)
+                checkpoint = torch.load(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(world_rank)+".ckpt",map_location=map_location)
                 model.load_state_dict(checkpoint['model_state_dict'])
                 epoch_start = checkpoint['epoch']
                 loss_list = checkpoint['loss_list']
@@ -577,7 +575,7 @@ def main(device):
                     'optimizer_state_dict': optimizer_states,
                     'scheduler_state_dict': scheduler_states,
                     'loss_list' : loss_list,
-                    }, checkpoint_path+"/"+checkpoint_filename+"_rank_"+str(world_rank)+"_even.ckpt")
+                    }, checkpoint_path+"/"+checkpoint_filename+"_even_rank_"+str(world_rank)+".ckpt")
 
         if world_rank == 0 and epoch % 2 == 1:
      
@@ -588,7 +586,7 @@ def main(device):
                     'optimizer_state_dict': optimizer_states,
                     'scheduler_state_dict': scheduler_states,
                     'loss_list' : loss_list,
-                    }, checkpoint_path+"/"+checkpoint_filename+"_rank_"+str(world_rank)+"_odd.ckpt")
+                    }, checkpoint_path+"/"+checkpoint_filename+"_odd_rank_"+str(world_rank)+".ckpt")
      
         dist.barrier()
         del model_states
