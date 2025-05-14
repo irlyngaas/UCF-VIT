@@ -9,16 +9,39 @@ from pathlib import Path
 import glob
 import torch.nn.functional as F
 import torch.distributed as dist
+from pathlib import Path
+import re
 
 from .dataset import (
     FileReader,
     ImageBlockDataIter_2D,
     ImageBlockDataIter_3D,
+    ImageBlockDataIter_3D_Memmap,
     ShuffleIterableDataset,
     ProcessChannels,
 )
 
-def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_channels, dataset, num_classes):
+def get_file_prefix(sample_path):
+    '''
+    Function to find base path prefix and timestamp group for a file of type:
+    /lustre/orion/stf006/world-shared/muraligm/CFD135/data_iso/super_res/binary_data/P1F4R32_nx512ny512nz256_6vars/w_29.960000
+    with variable length of var-name and timestamp
+    '''
+    # Regular expression to identify the variable name and timestamp
+    pattern = r'/(.*)/([a-zA-Z0-9_]+)_([0-9]+\.[0-9]+)$'
+    # Extract the base path and timestamp
+    match = re.search(pattern, sample_path)
+    base_path_prefix = match.group(1)
+    timestamp = match.group(3)
+    #   if match:
+    #       base_path_prefix = match.group(1)
+    #       timestamp = match.group(3)
+    #       print(f"Base Path Prefix: {base_path_prefix}; timestamp: {timestamp}")
+    #   else:
+    #       print("No match found")
+    return "/"+base_path_prefix, timestamp
+
+def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_channels, dataset, num_classes, num_labels):
     if adaptive_patching:
         if return_label:
             if single_channel:
@@ -29,11 +52,22 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                 pos = torch.stack([torch.from_numpy(np.expand_dims(batch[i][3],axis=0)) for i in range(len(batch))])
                 if dataset == "imagenet":
                     label = torch.stack([torch.tensor(batch[i][4]) for i in range(len(batch))])
-                else:
+                elif dataset == "turb":
+                    if num_labels == 1:
+                        label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][4],axis=0)) for i in range(len(batch))])
+                    else:
+                        label = torch.stack([torch.from_numpy(batch[i][4]) for i in range(len(batch))])
+                    seq_label_list = []
+                    for i in range(len(batch)):
+                        for j in range(num_labels):
+                            seq_label_list.append([])
+                            seq_label_list[i].append(torch.from_numpy(batch[i][5][j]))
+                    seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
+                else: #dataset == "basic_ct"
                     label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][4],axis=0)) for i in range(len(batch))])
                     seq_label_list = []
                     for i in range(len(batch)):
-                        seq_mask = torch.from_numpy(batch[i][5]).long()
+                        seq_mask = torch.from_numpy(batch[i][5][0]).long()
                         seq_mask = F.one_hot(seq_mask.squeeze(-1), num_classes=num_classes)
                         seq_label_list.append(seq_mask.permute(2, 0, 1).float())
                     seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
@@ -51,11 +85,22 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                     pos = torch.stack([torch.from_numpy(np.expand_dims(batch[i][3],axis=0)) for i in range(len(batch))])
                 if dataset == "imagenet":
                     label = torch.stack([torch.tensor(batch[i][4]) for i in range(len(batch))])
-                else:
+                elif dataset == "turb":
+                    if num_labels == 1:
+                        label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][4],axis=0)) for i in range(len(batch))])
+                    else:
+                        label = torch.stack([torch.from_numpy(batch[i][4]) for i in range(len(batch))])
+                    seq_label_list = []
+                    for i in range(len(batch)):
+                        for j in range(num_labels):
+                            seq_label_list.append([])
+                            seq_label_list[i].append(torch.from_numpy(batch[i][5][j]))
+                    seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
+                else: #dataset == "basic_ct"
                     label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][4],axis=0)) for i in range(len(batch))])
                     seq_label_list = []
                     for i in range(len(batch)):
-                        seq_mask = torch.from_numpy(batch[i][5]).long()
+                        seq_mask = torch.from_numpy(batch[i][5][0]).long()
                         seq_mask = F.one_hot(seq_mask.squeeze(-1), num_classes=num_classes)
                         seq_label_list.append(seq_mask.permute(2, 0, 1).float())
                     seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
@@ -225,6 +270,8 @@ class NativePytorchDataModule(torch.nn.Module):
         #Optional Inputs
         self.num_classes = num_classes
 
+
+
         in_variables = {}
         for k, list_out in dict_in_variables.items():
             if list_out is not None:
@@ -233,6 +280,24 @@ class NativePytorchDataModule(torch.nn.Module):
             #in_variables[k] = [ x for x in in_variables[k] if x in DEFAULT_VARIABLE_LIST ]
             in_variables[k] = [ x for x in in_variables[k] ]
         self.dict_in_variables = in_variables
+        
+        if self.dataset == "turb":
+            self.nx = nx
+            self.ny = ny
+            self.nz = nz
+            self.nx_skip = nx_skip
+            self.ny_skip = ny_skip
+            self.nz_skip = nz_skip
+
+            out_variables = {}
+            for k, list_out in dict_out_variables.items():
+                if list_out is not None:
+                    out_variables[k] = list_out
+                #TODO: Add checking and mapping for out_variables
+                #out_variables[k] = [ x for x in out_variables[k] if x in DEFAULT_VARIABLE_LIST ]
+                out_variables[k] = [ x for x in out_variables[k] ]
+            self.dict_out_variables = out_variables
+
 
 
         self.dict_lister_trains = {}
@@ -262,6 +327,20 @@ class NativePytorchDataModule(torch.nn.Module):
                     if num_data_roots > data_par_size-1:
                         break
             assert num_data_roots <= data_par_size, "the number of data parallel GPUs (data_par_size) needs to be at least equal to the number of datasets. Try to increase data_par_size"
+        elif self.dataset == "turb":
+            lister = { k: list(dp.iter.FileLister(os.path.join(root_dir, ""))) for k, root_dir in dict_root_dirs.items() }
+            for i,k in enumerate(lister.keys()):
+                list_ = lister[k]
+                main_keys = []
+                for j in range(len(list_)):
+                    base_path_prefix, timestamp = get_file_prefix(list_[j])
+                    key = os.path.join(base_path_prefix, timestamp)
+                    main_keys.append(key)
+                used = set()
+                #Find all unique keys, since different channels are in separate files
+                unique_keys = [x for x in main_keys if x not in used and (used.add(x) or True)]
+                img_dict = {k: unique_keys}
+                self.dict_lister_trains.update(img_dict)
         else:
             self.dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in dict_root_dirs.items() }
            
@@ -350,6 +429,57 @@ class NativePytorchDataModule(torch.nn.Module):
                         self.twoD,
                         self.dataset,
                     )
+                elif self.dataset == "turb":
+                    dict_data_train[k] = ProcessChannels(
+                        ShuffleIterableDataset(
+                            ImageBlockDataIter_3D_Memmap(
+                                    FileReader(
+                                        lister_train,
+                                        num_channels_available,
+                                        gx = self.gx,
+                                        start_idx=start_idx,
+                                        end_idx=end_idx,
+                                        variables=variables,
+                                        multi_dataset_training=True,
+                                        data_par_size = self.data_par_size,
+                                        return_label = return_label,
+                                        keys_to_add = keys_to_add,
+                                        ddp_group = self.ddp_group,
+                                        dataset=self.dataset,
+                                        variables_out = self.dict_out_variables[k],
+                                        nx = self.nx[k],
+                                        ny = self.ny[k],
+                                        nz = self.nz[k],
+                                    ),
+                                self.tile_size_x,
+                                self.tile_size_y,
+                                self.tile_size_z,
+                                self.twoD,
+                                nx = self.nx[k],
+                                ny = self.ny[k],
+                                nz = self.nz[k],
+                                nx_skip = self.nx_skip[k],
+                                ny_skip = self.ny_skip[k],
+                                nz_skip = self.nz_skip[k],
+                                return_label = return_label,
+                                tile_overlap = self.tile_overlap,
+                                use_all_data = self.use_all_data,
+                            ),
+                            buffer_size
+                        ),
+                        num_channels_used,
+                        single_channel,
+                        self.batch_size,
+                        return_label,
+                        self.adaptive_patching,
+                        self.separate_channels,
+                        self.patch_size,
+                        self.fixed_length,
+                        self.gauss_filter_order,
+                        self.twoD,
+                        self.dataset,
+                        num_labels = len(self.dict_out_variables[k])
+                    )
                 else:
                     dict_data_train[k] = ProcessChannels(
                         ShuffleIterableDataset(
@@ -413,6 +543,10 @@ class NativePytorchDataModule(torch.nn.Module):
         for idx, k in enumerate(self.dict_data_train.keys()):
             if idx == group_id:
                 data_train = self.dict_data_train[k]
+                if self.dataset == "turb":
+                    num_labels = len(self.dict_out_variables[k])
+                else:
+                    num_labels = None
                 break
             
         return DataLoader(
@@ -421,6 +555,6 @@ class NativePytorchDataModule(torch.nn.Module):
             drop_last=True,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            collate_fn=lambda batch: collate_fn(batch, return_label=self.return_label, single_channel=self.single_channel, adaptive_patching = self.adaptive_patching, separate_channels=self.separate_channels, dataset=self.dataset, num_classes=self.num_classes),
+            collate_fn=lambda batch: collate_fn(batch, return_label=self.return_label, single_channel=self.single_channel, adaptive_patching = self.adaptive_patching, separate_channels=self.separate_channels, dataset=self.dataset, num_classes=self.num_classes, num_labels=num_labels),
         )
 
