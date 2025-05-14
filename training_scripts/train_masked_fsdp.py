@@ -592,6 +592,7 @@ def main(device):
                 scaler.update()
                 if scaler._scale < min_scale:
                     scaler._scale = torch.tensor(min_scale).to(scaler._scale)
+                scheduler.step()
             else:
                 loss.backward()
                 optimizer.step()
