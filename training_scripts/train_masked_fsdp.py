@@ -619,7 +619,7 @@ def main(device):
                     'optimizer_state_dict': optimizer_states,
                     'scheduler_state_dict': scheduler_states,
                     'loss_list' : loss_list,
-                    }, checkpoint_path+"/"+checkpoint_filename+"_rank_"+str(world_rank)+"_even.ckpt")
+                    }, checkpoint_path+"/"+checkpoint_filename+"_even_rank_"+str(world_rank)+".ckpt")
 
         if world_rank == 0 and epoch % 2 == 1:
             if world_rank < tensor_par_size:
@@ -629,7 +629,7 @@ def main(device):
                     'optimizer_state_dict': optimizer_states,
                     'scheduler_state_dict': scheduler_states,
                     'loss_list' : loss_list,
-                    }, checkpoint_path+"/"+checkpoint_filename+"_rank_"+str(world_rank)+"_odd.ckpt")
+                    }, checkpoint_path+"/"+checkpoint_filename+"_odd_rank_"+str(world_rank)+".ckpt")
 
         dist.barrier()
         del model_states
