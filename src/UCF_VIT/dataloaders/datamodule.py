@@ -546,7 +546,7 @@ class NativePytorchDataModule(torch.nn.Module):
                 if self.dataset == "turb":
                     num_labels = len(self.dict_out_variables[k])
                 else:
-                    num_labels = None
+                    num_labels = 1
                 break
             
         return DataLoader(
