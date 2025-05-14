@@ -18,7 +18,7 @@ from .dataset import (
     ProcessChannels,
 )
 
-def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_channels, dataset, num_classes):
+def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_channels, dataset, num_classes, num_labels):
     if adaptive_patching:
         if return_label:
             if single_channel:
@@ -30,12 +30,20 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                 if dataset == "imagenet":
                     label = torch.stack([torch.tensor(batch[i][4]) for i in range(len(batch))])
                 else:
-                    label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][4],axis=0)) for i in range(len(batch))])
+                    if num_labels == 1:
+                        label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][4],axis=0)) for i in range(len(batch))])
+                    else:
+                        label = torch.stack([torch.from_numpy(batch[i][4]) for i in range(len(batch))])
                     seq_label_list = []
                     for i in range(len(batch)):
-                        seq_mask = torch.from_numpy(batch[i][5]).long()
-                        seq_mask = F.one_hot(seq_mask.squeeze(-1), num_classes=num_classes)
-                        seq_label_list.append(seq_mask.permute(2, 0, 1).float())
+                        if dataset == "basic_ct":
+                            seq_mask = torch.from_numpy(batch[i][5]).long()
+                            seq_mask = F.one_hot(seq_mask.squeeze(-1), num_classes=num_classes)
+                            seq_label_list.append(seq_mask.permute(2, 0, 1).float())
+                        else:
+                            for j in range(num_labels):
+                                seq_label_list.append([])
+                                seq_label_list[i].append(torch.from_numpy(batch[i][5][j]))
                     seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
                 variables = []
                 variables.append(batch[0][6])
@@ -43,21 +51,31 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                 inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
                 seq = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
 
+                #TODO: Finish and Test separate_channels implementation
                 if separate_channels:
                     size = torch.stack([torch.from_numpy(batch[i][2]) for i in range(len(batch))])
                     pos = torch.stack([torch.from_numpy(batch[i][3]) for i in range(len(batch))])
                 else:
                     size = torch.stack([torch.from_numpy(np.expand_dims(batch[i][2],axis=0)) for i in range(len(batch))])
                     pos = torch.stack([torch.from_numpy(np.expand_dims(batch[i][3],axis=0)) for i in range(len(batch))])
+
                 if dataset == "imagenet":
                     label = torch.stack([torch.tensor(batch[i][4]) for i in range(len(batch))])
                 else:
-                    label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][4],axis=0)) for i in range(len(batch))])
+                    if num_labels == 1:
+                        label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][4],axis=0)) for i in range(len(batch))])
+                    else:
+                        label = torch.stack([torch.from_numpy(batch[i][4]) for i in range(len(batch))])
                     seq_label_list = []
                     for i in range(len(batch)):
-                        seq_mask = torch.from_numpy(batch[i][5]).long()
-                        seq_mask = F.one_hot(seq_mask.squeeze(-1), num_classes=num_classes)
-                        seq_label_list.append(seq_mask.permute(2, 0, 1).float())
+                        if dataset == "basic_ct":
+                            seq_mask = torch.from_numpy(batch[i][5]).long()
+                            seq_mask = F.one_hot(seq_mask.squeeze(-1), num_classes=num_classes)
+                            seq_label_list.append(seq_mask.permute(2, 0, 1).float())
+                        else:
+                            for j in range(num_labels):
+                                seq_label_list.append([])
+                                seq_label_list[i].append(torch.from_numpy(batch[i][5][j]))
                     seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
                 variables = batch[0][6]
             if dataset == "imagenet":                
@@ -75,6 +93,7 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
             else:
                 inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
                 seq = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
+                #TODO: Finish and Test separate_channels implementation
                 if separate_channels:
                     size = torch.stack([torch.from_numpy(batch[i][2]) for i in range(len(batch))])
                     pos = torch.stack([torch.from_numpy(batch[i][3]) for i in range(len(batch))])
@@ -91,7 +110,10 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                 if dataset == "imagenet":
                     label = torch.stack([torch.tensor(batch[i][1]) for i in range(len(batch))])
                 else:
-                    label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
+                    if num_labels == 1:
+                        label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
+                    else:
+                        label = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
                 variables = []
                 variables.append(batch[0][2])
             else:
@@ -99,7 +121,10 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                 if dataset == "imagenet":
                     label = torch.stack([torch.tensor(batch[i][1]) for i in range(len(batch))])
                 else:
-                    label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
+                    if num_labels == 1:
+                        label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
+                    else:
+                        label = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
                 variables = batch[0][2]
                 
             return (inp, label, variables)
@@ -413,6 +438,7 @@ class NativePytorchDataModule(torch.nn.Module):
         for idx, k in enumerate(self.dict_data_train.keys()):
             if idx == group_id:
                 data_train = self.dict_data_train[k]
+                num_labels = 1
                 break
             
         return DataLoader(
@@ -421,6 +447,6 @@ class NativePytorchDataModule(torch.nn.Module):
             drop_last=True,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            collate_fn=lambda batch: collate_fn(batch, return_label=self.return_label, single_channel=self.single_channel, adaptive_patching = self.adaptive_patching, separate_channels=self.separate_channels, dataset=self.dataset, num_classes=self.num_classes),
+            collate_fn=lambda batch: collate_fn(batch, return_label=self.return_label, single_channel=self.single_channel, adaptive_patching = self.adaptive_patching, separate_channels=self.separate_channels, dataset=self.dataset, num_classes=self.num_classes, num_labels=num_labels),
         )
 

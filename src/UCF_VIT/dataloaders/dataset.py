@@ -634,16 +634,36 @@ class ProcessChannels(IterableDataset):
                                     seq_image, seq_size, seq_pos, qdt = self.patchify(np.expand_dims(np_image,axis=-1))
                                     if self._dataset != "imagenet":
                                         np_label = yield_label_list[i].pop()
-                                        if self.twoD:
-                                            seq_label, _, _ = qdt.serialize_labels(np.expand_dims(np_label,axis=-1), size=(self.patch_size,self.patch_size,self.num_channels))
-                                            seq_label = np.asarray(seq_label)
-                                            seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size, -1, self.num_channels])
-                                        else:
-                                            #seq_label, _, _ = qdt.serialize_labels(np.expand_dims(np_label,axis=-1), size=(self.patch_size,self.patch_size,self.patch_size))
-                                            seq_label, _, _ = qdt.serialize_labels(np_label, size=(self.patch_size,self.patch_size,self.patch_size))
-                                            seq_label = np.asarray(seq_label)
-                                            seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size*self.patch_size, -1, self.num_channels])
+                                        seq_label_list = []
+                                        for j in range(len(np_label)):
+                                            if self.twoD:
+                                                if self.dataset == "basic_ct":
+                                                    seq_label, _, _ = qdt.serialize_labels(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,self.num_channels))
+                                                    seq_label = np.asarray(seq_label)
+                                                    seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size, -1, self.num_channels])
+                                                else:
+                                                    seq_label, _, _ = qdt.serialize(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,self.num_channels))
+                                                    seq_label = np.asarray(seq_label, dtype=np.float32)
+                                                    if self.num_channels > 1:
+                                                        seq_label = np.reshape(seq_label, [self.num_channels, -1, self.patch_size*self.patch_size])
+                                                    else:
+                                                        seq_label = np.reshape(seq_label, [-1, self.patch_size*self.patch_size])
+                                            else:
+                                                if self.dataset == "basic_ct":
+                                                    seq_label, _, _ = qdt.serialize_labels(np_label[j], size=(self.patch_size,self.patch_size,self.patch_size))
+                                                    seq_label = np.asarray(seq_label)
+                                                    seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size*self.patch_size, -1, self.num_channels])
+                                                else:
+                                                    seq_label, _, _ = qdt.serialize(np_label[j], size=(self.patch_size,self.patch_size,self.patch_size))
+                                                    seq_label = np.asarray(seq_label, dtype=np.float32)
+                                                    assert self.num_channels <=1, "num_channels >1 not implemented for 3D yet"
+                                                    if self.num_channels > 1:
+                                                        seq_label = np.reshape(seq_label, [self.num_channels, -1, self.patch_size*self.patch_size*self.patch_size])
+                                                    else:
+                                                        seq_label = np.reshape(seq_label, [-1, self.patch_size*self.patch_size*self.patch_size])
+                                            seq_label_list.append(seq_label)
                                 else:
+                                    #TODO: Finish Separate Channel implementation
                                     if self.separate_channels:
                                         seq_image_list = []
                                         seq_size_list = []
@@ -661,20 +681,42 @@ class ProcessChannels(IterableDataset):
                                         seq_image, seq_size, seq_pos, qdt = self.patchify(np.moveaxis(np_image,0,-1))
                                         if self._dataset != "imagenet":
                                             np_label = yield_label_list[i].pop()
-                                            if self.twoD:
-                                                seq_label, _, _ = qdt.serialize_labels(np.expand_dims(np_label,axis=-1), size=(self.patch_size,self.patch_size,self.num_channels))
-                                                seq_label = np.asarray(seq_label)
-                                                seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size, -1, self.num_channels])
-                                            else:
-                                                #seq_label, _, _ = qdt.serialize_labels(np.expand_dims(np_label,axis=-1), size=(self.patch_size,self.patch_size,self.patch_size))
-                                                seq_label, _, _ = qdt.serialize_labels(np_label, size=(self.patch_size,self.patch_size,self.patch_size))
-                                                seq_label = np.asarray(seq_label)
-                                                seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size*self.patch_size, -1, self.num_channels])
+                                            seq_label_list = []
+                                            for j in range(len(np_label)):
+                                                if self.twoD:
+                                                    if self.dataset == "basic_ct":
+                                                        seq_label, _, _ = qdt.serialize_labels(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,self.num_channels))
+                                                        seq_label = np.asarray(seq_label)
+                                                        seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size, -1, self.num_channels])
+                                                    else:
+                                                        seq_label, _, _ = qdt.serialize(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,self.num_channels))
+                                                        seq_label = np.asarray(seq_label, dtype=np.float32)
+                                                        if self.num_channels > 1:
+                                                            seq_label = np.reshape(seq_label, [self.num_channels, -1, self.patch_size*self.patch_size])
+                                                        else:
+                                                            seq_label = np.reshape(seq_label, [-1, self.patch_size*self.patch_size])
+                                                else:
+                                                    if self.dataset == "basic_ct":
+                                                        seq_label, _, _ = qdt.serialize_labels(np_label[j], size=(self.patch_size,self.patch_size,self.patch_size))
+                                                        seq_label = np.asarray(seq_label)
+                                                        seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size*self.patch_size, -1, self.num_channels])
+                                                    else:
+                                                        seq_label, _, _ = qdt.serialize(np_label[j], size=(self.patch_size,self.patch_size,self.patch_size))
+                                                        seq_label = np.asarray(seq_label, dtype=np.float32)
+                                                        assert self.num_channels <=1, "num_channels >1 not implemented for 3D yet"
+                                                        if self.num_channels > 1:
+                                                            seq_label = np.reshape(seq_label, [self.num_channels, -1, self.patch_size*self.patch_size*self.patch_size])
+                                                        else:
+                                                            seq_label = np.reshape(seq_label, [-1, self.patch_size*self.patch_size*self.patch_size])
+                                                seq_label_list.append(seq_label)
 
                                 if self._dataset == "imagenet":
                                     yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_label_list[i].pop(), yield_var_list[i].pop()
                                 else:
-                                    yield np_image, seq_image, seq_size, seq_pos, np.asarray(np_label,dtype=np.uint8), seq_label, yield_var_list[i].pop()
+                                    if self._dataset == "basic_ct":
+                                        yield np_image, seq_image, seq_size, seq_pos, np.asarray(np_label,dtype=np.uint8), seq_label_list, yield_var_list[i].pop()
+                                    else:
+                                        yield np_image, seq_image, seq_size, seq_pos, np_label, seq_label_list, yield_var_list[i].pop()
                             else:
                                 if self._dataset == "imagenet":
                                     np_image = yield_x_list[i].pop()
@@ -688,6 +730,7 @@ class ProcessChannels(IterableDataset):
                                 if self.single_channel:
                                     seq_image, seq_size, seq_pos, _ = self.patchify(np.expand_dims(np_image,axis=-1))
                                 else:
+                                    #TODO: Finish Separate Channel implementation
                                     if self.separate_channels:
                                         seq_image_list = []
                                         seq_size_list = []
