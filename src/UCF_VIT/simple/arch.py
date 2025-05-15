@@ -14,7 +14,7 @@ import torch.nn as nn
 from .building_blocks import Block, PatchEmbed, Mlp, DropPath, AttentionPoolLatent, PatchDropout, \
     trunc_normal_, resample_patch_embed, resample_abs_pos_embed, \
     get_act_layer, get_norm_layer, LayerType, \
-    MyUnetBlock
+    MyUnetBlock, EmbeddingDenseLayer
 
 from timm.models._manipulate import named_apply, checkpoint_seq
 
@@ -22,6 +22,7 @@ from UCF_VIT.utils.pos_embed import (
     get_1d_sincos_pos_embed_from_grid,
     get_2d_sincos_pos_embed,
     get_3d_sincos_pos_embed,
+    SinusoidalEmbeddings,
 )
 
 from einops import rearrange
@@ -1053,4 +1054,174 @@ class UNETR(VIT):
             x = self.forward_features(x, variables)
             intermediates = None
             x = self.forward_head(x, intermediates, enc1)
+        return x
+
+class DiffusionVIT(VIT):
+
+    def __init__(self, *args, **kwargs):
+        self.linear_decoder = kwargs.pop('linear_decoder', '')
+        self.decoder_depth = kwargs.pop('decoder_depth', '')
+        self.decoder_embed_dim = kwargs.pop('decoder_embed_dim', '')
+        self.decoder_num_heads = kwargs.pop('decoder_num_heads', '')
+        self.mlp_ratio_decoder = kwargs.pop('mlp_ratio_decoder', '')
+        self.time_steps = kwargs.pop('time_steps', '')
+        super().__init__(*args, **kwargs)
+        #Remove decoder from VIT
+        self.head = None 
+
+        self.temporalEmbeddings = SinusoidalEmbeddings(time_steps=self.time_steps, embed_dim=self.embed_dim)
+        self.timeEmbeddingMap = EmbeddingDenseLayer(self.embed_dim, self.embed_dim, 0.5) # dropout_prob = 0.5
+
+        if self.linear_decoder:
+            self.decoder_pred = nn.Linear(self.embed_dim, self.patch_dim)
+        else:
+            self.decoder_pred = nn.Linear(self.decoder_embed_dim, self.patch_dim)
+
+        if not self.linear_decoder:
+            self.decoder_embed = nn.Linear(self.embed_dim, self.decoder_embed_dim)
+            self.decoder_norm = nn.LayerNorm(self.decoder_embed_dim)
+            if self.adaptive_patching:
+                self.decoder_pos_embed = nn.Parameter(torch.randn(1, self.num_patches, self.decoder_embed_dim) * .02)
+            else:
+                self.decoder_pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, self.decoder_embed_dim))
+            dpr = [x.item() for x in torch.linspace(0, self.drop_path_rate, self.decoder_depth)]  # stochastic depth decay rule
+            #ASSUME same settings as Transformer Encoder for now
+            self.decoder_blocks = nn.Sequential(*[
+                self.block_fn(
+                    dim=self.decoder_embed_dim,
+                    num_heads=self.decoder_num_heads,
+                    fused_attn=self.FusedAttn_option,
+                    mlp_ratio=self.mlp_ratio_decoder,
+                    qkv_bias=self.qkv_bias,
+                    qk_norm=self.qk_norm,
+                    init_values=self.init_values,
+                    proj_drop=self.proj_drop_rate,
+                    attn_drop=self.attn_drop_rate,
+                    drop_path=dpr[i],
+                    norm_layer=self.norm_layer,
+                    act_layer=self.act_layer,
+                    mlp_layer=self.mlp_layer,
+                )
+                for i in range(self.decoder_depth)])
+        else:
+            self.decoder_pos_embed = None
+
+        self.init_weights('')
+
+    def init_weights(self, mode: str = '') -> None:
+        head_bias = 0.
+        if not self.adaptive_patching:
+            if self.pos_embed is not None:
+                #trunc_normal_(self.pos_embed, std=.02)
+                if self.twoD:
+                    pos_embed = get_2d_sincos_pos_embed(
+                        self.pos_embed.shape[-1],
+                        int(self.img_size[0] / self.patch_size),
+                        int(self.img_size[1] / self.patch_size),
+                        cls_token=False,
+                    )
+                else: #3D
+                    pos_embed = get_3d_sincos_pos_embed(
+                        self.pos_embed.shape[-1],
+                        int(self.img_size[0] / self.patch_size),
+                        int(self.img_size[1] / self.patch_size),
+                        int(self.img_size[2] / self.patch_size),
+                        cls_token=False,
+                    )
+                self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+
+            if self.decoder_pos_embed is not None:
+                if self.twoD:
+                    decoder_pos_embed = get_2d_sincos_pos_embed(
+                        self.decoder_pos_embed.shape[-1],
+                        int(self.img_size[0] / self.patch_size),
+                        int(self.img_size[1] / self.patch_size),
+                        cls_token=False,
+                    )
+                else: #3D
+                    decoder_pos_embed = get_3d_sincos_pos_embed(
+                        self.decoder_pos_embed.shape[-1],
+                        int(self.img_size[0] / self.patch_size),
+                        int(self.img_size[1] / self.patch_size),
+                        int(self.img_size[2] / self.patch_size),
+                        cls_token=False,
+                    )
+                self.decoder_pos_embed.data.copy_(torch.from_numpy(decoder_pos_embed).float().unsqueeze(0))
+
+        if self.cls_token is not None:
+            nn.init.normal_(self.cls_token, std=1e-6)
+    
+        if not self.adaptive_patching:
+            if self.use_varemb:
+                for i in range(len(self.token_embeds)):
+                    w = self.token_embeds[i].proj.weight.data
+                    trunc_normal_(w.view([w.shape[0], -1]), std=0.02)
+            else:
+                w = self.token_embeds.proj.weight.data
+                trunc_normal_(w.view([w.shape[0], -1]), std=0.02)
+
+        if self.use_varemb:
+            var_embed = get_1d_sincos_pos_embed_from_grid(self.var_embed.shape[-1], np.arange(len(self.default_vars)))
+            self.var_embed.data.copy_(torch.from_numpy(var_embed).float().unsqueeze(0))
+
+        named_apply(get_init_weights_vit(head_bias), self)
+
+    def forward_features(self, x: torch.Tensor, t, variables) -> torch.Tensor:
+        if self.use_varemb:
+            embeds = []
+            if isinstance(variables, list):
+                variables = tuple(variables)
+            var_ids = self.get_var_ids(variables, x.device)
+            for i in range(len(var_ids)):
+                id = var_ids[i]
+                if self.single_channel:
+                    if self.adaptive_patching:
+                        x = self.token_embeds[id](torch.squeeze(x)) # B, L, D 
+                    else:
+                        x = self.token_embeds[id](x) # B, L, D 
+                    break #Should only be one channel
+                else:
+                    if self.adaptive_patching:
+                        embeds.append(self.token_embeds[id](torch.squeeze(x[:,i : i+1])))
+                    else:
+                        embeds.append(self.token_embeds[id](x[:,i : i+1]))
+                    
+            var_embed = self.get_var_emb(self.var_embed, variables) # 1, V, D
+            if not self.single_channel: #V > 1
+                x = torch.stack(embeds, dim=1)  # B, L, D -> B, V, L, D
+                x = x + var_embed.unsqueeze(2)  # 1, V, D -> 1, V, 1, D
+                x = self.aggregate_variables(x)  # B, V~ , L, D, where V~ is the aggregated variables
+            else: # V=1
+                #x -> B, L, D
+                var_embed = var_embed.unsqueeze(2) # 1, V=1, D -> 1, V=1, L=1, D
+                x = x + var_embed.squeeze(1)  # 1, V=1, L=1, D -> 1, L=1, D
+        else:
+            if self.adaptive_patching:
+                x = rearrange(x, 'b c s p -> b s (p c)')
+                x = self.token_embeds(x)
+            else:
+                x = self.token_embeds(x)
+               
+        x = self._pos_embed(x)
+        x = self.patch_drop(x)
+        time_emb = self.temporalEmbeddings(x,t)
+        time_emb = self.timeEmbeddingMap(time_emb.to(x.dtype))[:,None,:]
+        x = x + time_emb
+        x = self.blocks(x)
+        x = self.norm(x)
+        return x
+
+    def forward_head(self, x: torch.Tensor):
+        x = self.pool(x)
+        if not self.linear_decoder:
+            x = self.decoder_embed(x)
+            x = x + self.decoder_pos_embed
+            x = self.decoder_blocks(x)
+            x = self.decoder_norm(x)
+        return self.decoder_pred(x)
+
+    def forward(self, x: torch.Tensor, t, variables) -> torch.Tensor:
+        t = t.to('cpu')
+        x = self.forward_features(x, t, variables)
+        x = self.forward_head(x)
         return x
