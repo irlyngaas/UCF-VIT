@@ -344,8 +344,6 @@ def main(device):
                     data, variables = batch
                     data = data.to(device)
                     t = torch.randint(0,num_time_steps,(batch_size,))
-                    #t = torch.randint(0,num_time_steps,(batch_size,)).to(device)
-                    #t = torch.randint(0,num_time_steps,(batch_size,)).to('cpu')
                     e = torch.randn_like(data, requires_grad=False)
                     if twoD:
                         a = ddpm_scheduler.alpha[t].view(batch_size,1,1,1).to(device)
