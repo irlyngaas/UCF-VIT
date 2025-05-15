@@ -200,6 +200,9 @@ def main(device):
 
     mask_ratio = conf['model']['net']['init_args']['mask_ratio']
 
+    #use_scaler = conf['model']['net']['init_args']['use_scaler']
+    use_scaler = True
+
     #Datset specific options
     if dataset == "turb":
         nx = conf['dataset_options']['nx']
@@ -420,6 +423,11 @@ def main(device):
 
     dist.barrier()
 
+    if use_scaler:
+        #scaler = GradScaler(init_scale=8192, growth_interval=100)
+        scaler = ShardedGradScaler(init_scale=8192, growth_interval=100)
+        min_scale= 128
+
 #3. Initialize Dataloader
 ##############################################################################################################
     data_module = NativePytorchDataModule(dict_root_dirs=dict_root_dirs,
@@ -521,10 +529,18 @@ def main(device):
             if world_rank==0:
                 print("epoch: ",epoch,"batch_idx",batch_idx,"world_rank",world_rank,"it_loss ",loss, flush=True)
     
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
+            if use_scaler:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                if scaler._scale < min_scale:
+                    scaler._scale = torch.tensor(min_scale).to(scaler._scale)
+            else:
+                loss.backward()
+                optimizer.step()
+
             scheduler.step()
+            optimizer.zero_grad()
         loss_list.append(epoch_loss)
 
 
