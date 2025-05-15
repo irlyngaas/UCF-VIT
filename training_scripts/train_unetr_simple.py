@@ -33,32 +33,10 @@ def training_step(data, label, variables, net: UNETR, patch_size, twoD):
 
     output = net.forward(data, variables)
 
-    #criterion = nn.CrossEntropyLoss()
     criterion = DiceCELoss(to_onehot_y=True, softmax=True, squared_pred=True, smooth_nr=0.0, smooth_dr=1e-6)
     loss = criterion(output,label)
 
     return loss, output
-
-def test_step(data, label, variables, net: UNETR, tile_size, twoD):
-    if twoD:
-        inf_size = [tile_size[0], tile_size[1]]
-    else:
-        inf_size = [tile_size[0], tile_size[1], tile_size[2]]
-    model_inferer = partial(
-                        sliding_window_inference,
-                        roi_size=inf_size,
-                        #sw_batch_size=args.sw_batch_size,
-                        sw_batch_size=1,
-                        predictor=net,
-                        #overlap=args.infer_overlap,
-                        overlap=0.5,
-                        variables = variables,
-                    )
-
-    output = model_inferer(data)
-
-    return output
-
 
 def main(device):
 #1. Load arguments from config file and setup parallelization
@@ -351,38 +329,7 @@ def main(device):
 
     train_dataloader = data_module.train_dataloader()
     
-##4. Initialize Test Dataloader
-###############################################################################################################
-    data_module_test = NativePytorchDataModule(dict_root_dirs=dict_root_dirs,
-        dict_start_idx=dict_start_idx,
-        dict_end_idx=dict_end_idx,
-        dict_buffer_sizes=dict_buffer_sizes,
-        dict_in_variables=dict_in_variables,
-        num_channels_available = num_channels_available,
-        num_channels_used = num_channels_used,
-        batch_size=1,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        #TODO: Move to arguments 
-        tile_size_x = 256,
-        tile_size_y = 256,
-        tile_size_z = 256,
-        twoD = twoD,
-        single_channel = single_channel,
-        return_label = True,
-        dataset_group_list = dataset_group_list,
-        batches_per_rank_epoch = batches_per_rank_epoch,
-        tile_overlap = tile_overlap,
-        use_all_data = use_all_data,
-        data_par_size = dist.get_world_size(),
-        dataset = dataset,
-    ).to(device)
-
-    data_module_test.setup()
-
-    test_dataloader = data_module_test.train_dataloader()
-
-#5. Training Loop
+#4. Training Loop
 ##############################################################################################################
     post_label = AsDiscrete(to_onehot=num_classes)
     post_pred = AsDiscrete(argmax=True, to_onehot=num_classes)
@@ -434,27 +381,6 @@ def main(device):
         if world_rank==0:
             print("epoch: ",epoch," epoch_loss ",epoch_loss, flush=True)
 
-        #only do full evaluation every 5 epochs
-        if (epoch+1) % 1 == 0: 
-            with torch.no_grad():
-                model.eval()
-                for batch_idx, batch in enumerate(test_dataloader):
-
-                    data, label, variables = batch
-                    data = data.to(device)
-                    label = label.to(device)
-
-                    output = test_step(data, label, variables, model, tile_size, twoD)
-
-                    train_labels_list = decollate_batch(label)
-                    train_labels_convert = [post_label(train_label_tensor) for train_label_tensor in train_labels_list]
-                    train_outputs_list = decollate_batch(output)
-                    train_output_convert = [post_pred(train_pred_tensor) for train_pred_tensor in train_outputs_list]
-                    acc = dice_acc(y_pred=train_output_convert, y=train_labels_convert)
-    
-                    if world_rank==0:
-                        print("Test epoch: ",epoch,"batch_idx",batch_idx,"world_rank",world_rank,"acc", acc, flush=True)
-    
         if world_rank ==0:    
             # Check whether the specified checkpointing path exists or not
             isExist = os.path.exists(checkpoint_path)

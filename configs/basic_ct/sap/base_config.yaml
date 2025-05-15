@@ -3,7 +3,6 @@ trainer:
   max_epochs: 600
   data_type: "float32"
   checkpoint_path: "../../checkpoint/basic_ct/sap/base"
-  inference_path: "../../checkpoint/basic_ct/sap/base/inference"
   checkpoint_filename: "multi_last"
   checkpoint_filename_for_loading: "multi_last_odd" #multi_last_odd or multi_last_even
 

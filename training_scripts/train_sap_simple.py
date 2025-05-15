@@ -24,7 +24,7 @@ from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.utils.fused_attn import FusedAttn
 
 #TODO: Add qdt_list back for visualization
-def training_step_adaptive(data, seq, label, seq_label, size, pos, variables, net: SAP, patch_size, twoD, batch_idx, inference_path, epoch, world_rank, single_channel, num_classes, sqrt_len):
+def training_step_adaptive(data, seq, label, seq_label, size, pos, variables, net: SAP, patch_size, twoD, num_classes, sqrt_len):
 
     #seq = torch.reshape(seq, shape=(-1,1,patch_size*sqrt_len, patch_size*sqrt_len))
     if twoD:
@@ -66,8 +66,6 @@ def main(device):
     checkpoint_filename = conf['trainer']['checkpoint_filename']
 
     checkpoint_filename_for_loading = conf['trainer']['checkpoint_filename_for_loading']
-
-    inference_path = conf['trainer']['inference_path']
 
     resume_from_checkpoint = conf['trainer']['resume_from_checkpoint']
 
@@ -364,12 +362,6 @@ def main(device):
 
 #4. Training Loop
 ##############################################################################################################
-    isExist = os.path.exists(inference_path)
-    if not isExist:
-        # Create a new directory because it does not exist
-        os.makedirs(inference_path,exist_ok=True)
-        print("The new inference directory is created!")        
-
     #Find max batches
     iterations_per_epoch = 0
     for i,k in enumerate(batches_per_rank_epoch):
@@ -396,8 +388,7 @@ def main(device):
             data, seq, size, pos, label, seq_label, variables = batch
             seq = seq.to(device)
             seq_label = seq_label.to(device)
-            #loss = training_step_adaptive(data, seq, label, seq_label, size, pos, variables, model, patch_size, twoD, batch_idx, inference_path, epoch, world_rank, single_channel, qdt_list, num_classes,sqrt_len)
-            loss = training_step_adaptive(data, seq, label, seq_label, size, pos, variables, model, patch_size, twoD, batch_idx, inference_path, epoch, world_rank, single_channel, num_classes, sqrt_len)
+            loss = training_step_adaptive(data, seq, label, seq_label, size, pos, variables, model, patch_size, twoD, num_classes, sqrt_len)
 
             epoch_loss += loss.detach()
     

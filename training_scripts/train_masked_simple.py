@@ -21,7 +21,7 @@ from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, patchif
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.utils.fused_attn import FusedAttn
 
-def training_step_adaptive(data, seq, size, pos, variables, net: MAE, patch_size, twoD, loss_fn, batch_idx, inference_path, epoch, world_rank, single_channel):
+def training_step_adaptive(data, seq, size, pos, variables, net: MAE, patch_size, twoD, loss_fn):
 
         
     output, mask = net.forward(seq, variables)
@@ -36,7 +36,7 @@ def training_step_adaptive(data, seq, size, pos, variables, net: MAE, patch_size
 
     return loss
 
-def training_step(data, variables, net: MAE, patch_size, twoD, loss_fn, batch_idx, inference_path, epoch, world_rank, single_channel):
+def training_step(data, variables, net: MAE, patch_size, twoD, loss_fn):
 
     if loss_fn == "maskMSE":
         output, mask = net.forward(data, variables)
@@ -49,41 +49,6 @@ def training_step(data, variables, net: MAE, patch_size, twoD, loss_fn, batch_id
         criterion = nn.MSELoss()
         target = patchify(data, patch_size, twoD)
         loss = criterion(output,target)
-
-    if world_rank == 0:
-        if single_channel:
-            if batch_idx == 0 or batch_idx == 1 or batch_idx == 2 or batch_idx == 3:
-                pred_unpatched = unpatchify(output, data, patch_size, twoD)
-                pred_unpatched = torch.clip(pred_unpatched, min=0.0, max=1.0)
-
-                num_channels = data.shape[1]
-                #Save a single item of batch for visualization
-                for i in range(num_channels):
-                    if twoD:
-                        save_image(data[0,i,:,:], inference_path+'/gt_epoch'+str(epoch)+'_channel'+str(i)+'.png')
-                        save_image(pred_unpatched[0,i,:,:], inference_path+'/pred_epoch'+str(epoch)+'_channel'+str(i)+'.png')
-
-                    else:
-                        #Save a middle slice for 3D visualization
-                        save_image(data[0,i,:,int(patch_size/2),:], inference_path+'/gt_epoch'+str(epoch)+'_channel'+str(i)+'.png')
-                        save_image(pred_unpatched[0,i,:,int(patch_size/2),:], inference_path+'/pred_epoch'+str(epoch)+'_channel'+str(i)+'.png')
-        else:
-            if batch_idx == 0:
-                pred_unpatched = unpatchify(output, data, patch_size, twoD)
-                pred_unpatched = torch.clip(pred_unpatched, min=0.0, max=1.0)
-
-                num_channels = data.shape[1]
-                #Save a single item of batch for visualization
-                for i in range(num_channels):
-                    if twoD:
-                        save_image(data[0,i,:,:], inference_path+'/gt_epoch'+str(epoch)+'_channel'+str(i)+'.png')
-                        save_image(pred_unpatched[0,i,:,:], inference_path+'/pred_epoch'+str(epoch)+'_channel'+str(i)+'.png')
-
-                    else:
-                        #Save a middle slice for 3D visualization
-                        save_image(data[0,i,:,int(patch_size/2),:], inference_path+'/gt_epoch'+str(epoch)+'_channel'+str(i)+'.png')
-                        save_image(pred_unpatched[0,i,:,int(patch_size/2),:], inference_path+'/pred_epoch'+str(epoch)+'_channel'+str(i)+'.png')
-        
 
     return loss
 
@@ -117,8 +82,6 @@ def main(device):
     checkpoint_filename = conf['trainer']['checkpoint_filename']
 
     checkpoint_filename_for_loading = conf['trainer']['checkpoint_filename_for_loading']
-
-    inference_path = conf['trainer']['inference_path']
 
     resume_from_checkpoint = conf['trainer']['resume_from_checkpoint']
  
@@ -396,12 +359,6 @@ def main(device):
 
 #4. Training Loop
 ##############################################################################################################
-    isExist = os.path.exists(inference_path)
-    if not isExist:
-        # Create a new directory because it does not exist
-        os.makedirs(inference_path,exist_ok=True)
-        print("The new inference directory is created!")        
-
     #Find max batches
     iterations_per_epoch = 0
     for i,k in enumerate(batches_per_rank_epoch):
@@ -426,12 +383,12 @@ def main(device):
             if adaptive_patching:
                 data, seq, size, pos, variables = batch
                 seq = seq.to(device)
-                loss = training_step_adaptive(data, seq, size, pos, variables, model, patch_size, twoD, loss_fn, batch_idx, inference_path, epoch, world_rank, single_channel)
+                loss = training_step_adaptive(data, seq, size, pos, variables, model, patch_size, twoD, loss_fn)
 
             else:
                 data, variables = batch
                 data = data.to(device)
-                loss = training_step(data, variables, model, patch_size, twoD, loss_fn, batch_idx, inference_path, epoch, world_rank, single_channel)
+                loss = training_step(data, variables, model, patch_size, twoD, loss_fn)
 
             epoch_loss += loss.detach()
     
