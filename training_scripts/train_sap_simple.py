@@ -117,7 +117,6 @@ def main(device):
 
     fixed_length = conf['model']['net']['init_args']['fixed_length']
     separate_channels = conf['model']['net']['init_args']['separate_channels']
-    gauss_filter_order = conf['model']['net']['init_args']['gauss_filter_order']
 
     if not twoD:
         assert not separate_channels, "Adaptive Patching in 3D with multiple channels (non-separated) is not currently implemented"
@@ -350,7 +349,6 @@ def main(device):
         adaptive_patching = adaptive_patching,
         fixed_length = fixed_length,
         separate_channels = separate_channels,
-        gauss_filter_order = gauss_filter_order,
         data_par_size = dist.get_world_size(),
         dataset = dataset,
         num_classes = num_classes,

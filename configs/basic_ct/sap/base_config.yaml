@@ -46,7 +46,6 @@ model:
       adaptive_patching: True
       fixed_length: 4096
       separate_channels: False
-      gauss_filter_order: 3
 
       decoder_embed_dim: 576
       decoder_depth: 8

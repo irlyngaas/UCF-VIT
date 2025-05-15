@@ -53,7 +53,6 @@ model:
       adaptive_patching: False
       fixed_length: 196
       separate_channels: False
-      gauss_filter_order: 3
       num_time_steps: 1000
 
 # ---------------------------- DATA -------------------------------------------

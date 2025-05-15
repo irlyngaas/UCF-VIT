@@ -104,11 +104,9 @@ def main(device):
     if adaptive_patching:
         fixed_length = conf['model']['net']['init_args']['fixed_length']
         separate_channels = conf['model']['net']['init_args']['separate_channels']
-        gauss_filter_order = conf['model']['net']['init_args']['gauss_filter_order']
     else:
         fixed_length = None
         separate_channels = None
-        gauss_filter_order = None
 
     dataset = conf['data']['dataset']
     assert dataset in ["imagenet"], "This training script only supports imagenet"
@@ -256,7 +254,6 @@ def main(device):
         adaptive_patching = adaptive_patching,
         fixed_length = fixed_length,
         separate_channels = separate_channels,
-        gauss_filter_order = gauss_filter_order,
         data_par_size = dist.get_world_size(),
         dataset = dataset,
     ).to(device)

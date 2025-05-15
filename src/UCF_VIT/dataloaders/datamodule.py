@@ -191,7 +191,6 @@ class NativePytorchDataModule(torch.nn.Module):
         adaptive_patching: bool = False,
         fixed_length: int = 4096,
         separate_channels: bool = False,
-        gauss_filter_order: int = 3,
         data_par_size: int = 1,
         dataset: str = "imagenet",
         ddp_group: Optional[dist.ProcessGroup] = None,
@@ -242,7 +241,6 @@ class NativePytorchDataModule(torch.nn.Module):
         self.adaptive_patching = adaptive_patching
         self.fixed_length = fixed_length
         self.separate_channels = separate_channels
-        self.gauss_filter_order = gauss_filter_order
         self.data_par_size = data_par_size
         self.ddp_group = ddp_group
         self.dataset = dataset
@@ -371,7 +369,6 @@ class NativePytorchDataModule(torch.nn.Module):
                         self.separate_channels,
                         self.patch_size,
                         self.fixed_length,
-                        self.gauss_filter_order,
                         self.twoD,
                         self.dataset,
                     )
@@ -411,7 +408,6 @@ class NativePytorchDataModule(torch.nn.Module):
                         self.separate_channels,
                         self.patch_size,
                         self.fixed_length,
-                        self.gauss_filter_order,
                         self.twoD,
                         self.dataset,
                     )

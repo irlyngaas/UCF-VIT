@@ -559,7 +559,7 @@ class ShuffleIterableDataset(IterableDataset):
             yield buf.pop()
 
 class ProcessChannels(IterableDataset):
-    def __init__(self, dataset, num_channels: int, single_channel: bool, batch_size: int, return_label: bool, adaptive_patching: bool, separate_channels: bool, patch_size: int, fixed_length: int, gauss_filter_order: int, twoD: bool, _dataset: str) -> None:
+    def __init__(self, dataset, num_channels: int, single_channel: bool, batch_size: int, return_label: bool, adaptive_patching: bool, separate_channels: bool, patch_size: int, fixed_length: int, twoD: bool, _dataset: str) -> None:
         super().__init__()
         self.dataset = dataset
         self.num_channels = num_channels
@@ -573,26 +573,25 @@ class ProcessChannels(IterableDataset):
         self.adaptive_patching = adaptive_patching
         self.separate_channels = separate_channels
         self.patch_size = patch_size
-        self.gauss_filter_order = gauss_filter_order
         self.twoD = twoD
         self._dataset = _dataset
         if self.adaptive_patching:
             if self.single_channel:
                 if self.twoD:
-                    self.patchify = Patchify(fixed_length=fixed_length, patch_size=patch_size, num_channels=1, sths=[self.gauss_filter_order], dataset=self._dataset)
+                    self.patchify = Patchify(fixed_length=fixed_length, patch_size=patch_size, num_channels=1, dataset=self._dataset)
                 else:
-                    self.patchify = Patchify_3D(fixed_length=fixed_length, patch_size=patch_size, num_channels=1, sths=[self.gauss_filter_order], dataset=self._dataset)
+                    self.patchify = Patchify_3D(fixed_length=fixed_length, patch_size=patch_size, num_channels=1, dataset=self._dataset)
             else:
                 if self.separate_channels:
                     if self.twoD:
-                        self.patchify = Patchify(fixed_length=fixed_length, patch_size=patch_size, num_channels=1, sths=[self.gauss_filter_order], dataset=self._dataset)
+                        self.patchify = Patchify(fixed_length=fixed_length, patch_size=patch_size, num_channels=1, dataset=self._dataset)
                     else:
-                        self.patchify = Patchify_3D(fixed_length=fixed_length, patch_size=patch_size, num_channels=1, sths=[self.gauss_filter_order], dataset=self._dataset)
+                        self.patchify = Patchify_3D(fixed_length=fixed_length, patch_size=patch_size, num_channels=1, dataset=self._dataset)
                 else:
                     if self.twoD:
-                        self.patchify = Patchify(fixed_length=fixed_length, patch_size=patch_size, num_channels=num_channels, sths=[self.gauss_filter_order], dataset=self._dataset)
+                        self.patchify = Patchify(fixed_length=fixed_length, patch_size=patch_size, num_channels=num_channels, dataset=self._dataset)
                     else:
-                        self.patchify = Patchify_3D(fixed_length=fixed_length, patch_size=patch_size, num_channels=num_channels, sths=[self.gauss_filter_order], dataset=self._dataset)
+                        self.patchify = Patchify_3D(fixed_length=fixed_length, patch_size=patch_size, num_channels=num_channels, dataset=self._dataset)
 
     def __iter__(self):
         yield_x_list = []

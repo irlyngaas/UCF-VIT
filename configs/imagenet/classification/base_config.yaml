@@ -47,7 +47,6 @@ model:
       adaptive_patching: True
       fixed_length: 196
       separate_channels: False
-      gauss_filter_order: 3
 
 # ---------------------------- DATA -------------------------------------------
 data:

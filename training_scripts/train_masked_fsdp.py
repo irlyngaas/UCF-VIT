@@ -161,66 +161,20 @@ def main(device):
     if adaptive_patching:
         fixed_length = conf['model']['net']['init_args']['fixed_length']
         separate_channels = conf['model']['net']['init_args']['separate_channels']
-        gauss_filter_order = conf['model']['net']['init_args']['gauss_filter_order']
 
         if not twoD:
             assert not separate_channels, "Adaptive Patching in 3D with multiple channels (non-separated) is not currently implemented"
     else:
         fixed_length = None
         separate_channels = None
-        gauss_filter_order = None
 
     #use_scaler = conf['model']['net']['init_args']['use_scaler']
     use_scaler = True
 
     dataset = conf['data']['dataset']
-    assert dataset in ["mri", "basic_ct", "imagenet", "turb", "s8d"], "This training script only supports mri,basic_ct, imagenet, s8d, and turb datasets"
+    assert dataset in ["mri", "basic_ct", "imagenet"], "This training script only supports basic_ct and imagenet datasets"
 
     dict_root_dirs = conf['data']['dict_root_dirs']
-
-    if dataset == "turb":
-        nx = conf['data']['nx']
-
-        ny = conf['data']['ny']
-
-        nz = conf['data']['nz']
-
-        nx_skip = conf['data']['nx_skip']
-
-        ny_skip = conf['data']['ny_skip']
-
-        nz_skip = conf['data']['nz_skip']
-    elif dataset == "s8d":
-        nx = conf['data']['nx']
-
-        ny = conf['data']['ny']
-
-        nz = None
-
-        nx_skip = None
-
-        ny_skip = None
-
-        nz_skip = None
-    else:
-        nx = None
-
-        ny = None
-
-        nz = None
-
-        nx_skip = None
-
-        ny_skip = None
-
-        nz_skip = None
-
-    if dataset == "s8d":
-        num_samples_to_stitch = conf['data']['num_samples_to_stitch']
-        chunk_size = conf['data']['chunk_size']
-    else:
-        num_samples_to_stitch = None
-        chunk_size = None
 
     dict_start_idx = conf['data']['dict_start_idx']
 
@@ -252,7 +206,7 @@ def main(device):
 
     tile_size_x = tile_size[0]
     tile_size_y = tile_size[1]
-    if dataset == "imagenet" or dataset == "s8d_2d":
+    if dataset == "imagenet":
         tile_size_z = None
     else:
         tile_size_z = tile_size[2]
@@ -260,7 +214,7 @@ def main(device):
     
     assert (tile_size_x%patch_size)==0, "tile_size_x % patch_size must be 0"
     assert (tile_size_y%patch_size)==0, "tile_size_y % patch_size must be 0"
-    if dataset != "imagenet" and dataset != "s8d_2d":
+    if dataset != "imagenet":
         assert (tile_size_z%patch_size)==0, "tile_size_z % patch_size must be 0"
 
     data_par_size = fsdp_size * simple_ddp_size
@@ -481,7 +435,6 @@ def main(device):
         adaptive_patching = adaptive_patching,
         fixed_length = fixed_length,
         separate_channels = separate_channels,
-        gauss_filter_order = gauss_filter_order,
         data_par_size = data_par_size,
         ddp_group = ddp_group,
         dataset = dataset,
