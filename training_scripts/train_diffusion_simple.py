@@ -22,7 +22,7 @@ from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.utils.fused_attn import FusedAttn
 from UCF_VIT.ddpm.ddpm import DDPM_Scheduler
 
-def training_step_adaptive(data, seq, size, pos, variables, net: DiffusionVIT, patch_size, twoD, loss_fn, batch_idx, inference_path, epoch, world_rank, single_channel):
+def training_step_adaptive(data, seq, size, pos, variables, net: DiffusionVIT, patch_size, twoD, loss_fn):
 
         
     output, mask = net.forward(seq, variables)
@@ -77,8 +77,6 @@ def main(device):
     checkpoint_filename = conf['trainer']['checkpoint_filename']
 
     checkpoint_filename_for_loading = conf['trainer']['checkpoint_filename_for_loading']
-
-    inference_path = conf['trainer']['inference_path']
 
     resume_from_checkpoint = conf['trainer']['resume_from_checkpoint']
  
@@ -307,12 +305,6 @@ def main(device):
 
 #4. Training Loop
 ##############################################################################################################
-    isExist = os.path.exists(inference_path)
-    if not isExist:
-        # Create a new directory because it does not exist
-        os.makedirs(inference_path,exist_ok=True)
-        print("The new inference directory is created!")        
-
     #Find max batches
     iterations_per_epoch = 0
     for i,k in enumerate(batches_per_rank_epoch):
@@ -338,7 +330,7 @@ def main(device):
                 if adaptive_patching:
                     data, seq, size, pos, variables = batch
                     seq = seq.to(device)
-                    loss = training_step_adaptive(data, seq, size, pos, variables, model, patch_size, twoD, loss_fn, batch_idx, inference_path, epoch, world_rank, single_channel)
+                    loss = training_step_adaptive(data, seq, size, pos, variables, model, patch_size, twoD, loss_fn)
 
                 else:
                     data, variables = batch
