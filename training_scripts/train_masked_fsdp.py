@@ -225,15 +225,6 @@ def main(device):
 
 #2. Initialize model, optimizer, and scheduler
 ##############################################################################################################
-    #Find correct in_chans to use
-    if single_channel:
-        max_channels = 1
-    else:
-        max_channels = 1
-        for i,k in enumerate(num_channels_used):
-            if num_channels_used[k] > 1:
-                max_channels = num_channels_used[k]
-
     if data_type == "bfloat16":
         FusedAttn_option = FusedAttn.CK
     else:
@@ -242,6 +233,14 @@ def main(device):
         else:
             FusedAttn_option = FusedAttn.NONE
 
+    #Find correct in_chans to use
+    if single_channel:
+        max_channels = 1
+    else:
+        max_channels = 1
+        for i,k in enumerate(num_channels_used):
+            if num_channels_used[k] > 1:
+                max_channels = num_channels_used[k]
 
     seq_par_group, ddp_group, tensor_par_group, data_seq_ort_group, fsdp_group, simple_ddp_group = init_par_groups(world_rank = world_rank, data_par_size = data_par_size, tensor_par_size = tensor_par_size, seq_par_size = seq_par_size, fsdp_size = fsdp_size, simple_ddp_size = simple_ddp_size)
 
@@ -360,7 +359,6 @@ def main(device):
         buffer_dtype=precision_dt,
     )
 
-
     #add hybrid sharded FSDP
     if fsdp_size > 1 and simple_ddp_size > 1:
         model = FSDP(model, device_id=local_rank, process_group= (fsdp_group,simple_ddp_group), sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.HYBRID_SHARD, auto_wrap_policy = my_auto_wrap_policy, mixed_precision=bfloatPolicy, forward_prefetch=True, limit_all_gathers = False )
@@ -372,24 +370,16 @@ def main(device):
         model = FSDP(model, device_id=local_rank, process_group= simple_ddp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.NO_SHARD, auto_wrap_policy = my_auto_wrap_policy, mixed_precision=bfloatPolicy, forward_prefetch=True, limit_all_gathers = False )
 
     check_fn = lambda submodule: isinstance(submodule, Block)
-
-
-
     apply_activation_checkpointing(
         model, checkpoint_wrapper_fn=checkpoint_wrapper, check_fn=check_fn
     )
 
-    #local_rank = int(os.environ['SLURM_LOCALID'])
-    ##model = DDP(model,device_ids=[local_rank],output_device=[local_rank])
-    ##find_unused_parameters=True is needed under these circumstances
-    #model = DDP(model,device_ids=[local_rank],output_device=[local_rank],find_unused_parameters=True)
- 
     optimizer = configure_optimizer(model,lr,beta_1,beta_2,weight_decay)
     scheduler = configure_scheduler(optimizer,warmup_steps,max_steps,warmup_start_lr,eta_min)
 
     if resume_from_checkpoint:
 
-        print("optimizer resume from checkpoint was set to True. Checkpoint path found.",flush=True)
+        print("optimizer resume from checkpoint was set to True",flush=True)
 
         src_rank = world_rank - tensor_par_size * dist.get_rank(group=data_seq_ort_group)
 
@@ -404,7 +394,6 @@ def main(device):
         del checkpoint
 
     if use_scaler:
-        #scaler = GradScaler(init_scale=8192, growth_interval=100)
         scaler = ShardedGradScaler(init_scale=8192, growth_interval=100)
         min_scale= 128
 
@@ -438,14 +427,6 @@ def main(device):
         data_par_size = data_par_size,
         ddp_group = ddp_group,
         dataset = dataset,
-        nx = nx,
-        ny = ny,
-        nz = nz,
-        nx_skip = nx_skip,
-        ny_skip = ny_skip,
-        nz_skip = nz_skip,
-        num_samples_to_stitch = num_samples_to_stitch,
-        chunk_size = chunk_size,
     ).to(device)
 
     data_module.setup()
@@ -468,9 +449,6 @@ def main(device):
         if world_rank==0:
             print("epoch ",epoch,flush=True)
 
-        if epoch != epoch_start:
-            data_module.reset(epoch)
-        
         counter = 0
         for batch_idx, batch in enumerate(train_dataloader):
             counter = counter + 1
@@ -502,15 +480,13 @@ def main(device):
                 scaler.update()
                 if scaler._scale < min_scale:
                     scaler._scale = torch.tensor(min_scale).to(scaler._scale)
-                scheduler.step()
             else:
                 loss.backward()
                 optimizer.step()
-                scheduler.step()
+            scheduler.step()
 
             optimizer.zero_grad()
         loss_list.append(epoch_loss)
-
 
         if world_rank==0:
             print("epoch: ",epoch," epoch_loss ",epoch_loss, flush=True)
@@ -521,7 +497,7 @@ def main(device):
 
 
         #Alternating saving in to odd and even checkpoint file to avoid losing progress
-        if world_rank == 0 and epoch % 2 == 0:
+        if epoch % 2 == 0:
      
             if world_rank < tensor_par_size:
                 torch.save({
@@ -532,7 +508,7 @@ def main(device):
                     'loss_list' : loss_list,
                     }, checkpoint_path+"/"+checkpoint_filename+"_even_rank_"+str(world_rank)+".ckpt")
 
-        if world_rank == 0 and epoch % 2 == 1:
+        if epoch % 2 == 1:
             if world_rank < tensor_par_size:
                 torch.save({
                     'epoch': epoch_start+max_epochs,
