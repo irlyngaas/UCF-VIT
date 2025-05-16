@@ -243,6 +243,14 @@ def main(device):
 
 #2. Initialize model, optimizer, and scheduler
 ##############################################################################################################
+    if data_type == "bfloat16":
+        FusedAttn_option = FusedAttn.CK
+    else:
+        if use_fused_attn():
+            FusedAttn_option = FusedAttn.DEFAULT
+        else:
+            FusedAttn_option = FusedAttn.NONE
+
     #Find correct in_chans to use
     if single_channel:
         max_channels = 1
@@ -251,13 +259,6 @@ def main(device):
         for i,k in enumerate(num_channels_used):
             if num_channels_used[k] > 1:
                 max_channels = num_channels_used[k]
-    if data_type == "bfloat16":
-        FusedAttn_option = FusedAttn.CK
-    else:
-        if use_fused_attn():
-            FusedAttn_option = FusedAttn.DEFAULT
-        else:
-            FusedAttn_option = FusedAttn.NONE
 
     seq_par_group, ddp_group, tensor_par_group, data_seq_ort_group, fsdp_group, simple_ddp_group = init_par_groups(world_rank = world_rank, data_par_size = data_par_size, tensor_par_size = tensor_par_size, seq_par_size = seq_par_size, fsdp_size = fsdp_size, simple_ddp_size = simple_ddp_size)
 
@@ -285,10 +286,6 @@ def main(device):
         weight_init='skip',
     ).to(device)
 
-    #model = DDP(model,device_ids=[local_rank],output_device=[local_rank])
-    #find_unused_parameters=True is needed when single_channel=True since var_embed for each channel not always used
-    model = DDP(model,device_ids=[local_rank],output_device=[local_rank],find_unused_parameters=True)
- 
     optimizer = configure_optimizer(model,lr,beta_1,beta_2,weight_decay)
     scheduler = configure_scheduler(optimizer,warmup_steps,max_steps,warmup_start_lr,eta_min)
 
@@ -296,7 +293,6 @@ def main(device):
         epoch_start = 0
         loss_list = []
         if use_pretrained_mae_model:
-            #state_dict = []
             if single_channel:
                 max_channels = 1
             else:
@@ -414,7 +410,6 @@ def main(device):
                 epoch_start = checkpoint['epoch']
                 loss_list = checkpoint['loss_list']
                 del checkpoint
-            #optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
             else:
                 print("resume from checkpoint was set to True. But the checkpoint path does not exist.",flush=True)
@@ -423,8 +418,64 @@ def main(device):
 
     dist.barrier()
 
+    my_auto_wrap_policy = functools.partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={
+            Block, Sequential   # < ---- Your Transformer layer class
+        },
+    )
+
+    if data_type == "float32":
+        precision_dt = torch.float32
+    elif data_type == "bfloat16":
+        precision_dt = torch.bfloat16
+    else:
+        raise RuntimeError("Data type not supported")
+
+    bfloatPolicy = MixedPrecision(
+        param_dtype=precision_dt,
+        # Gradient communication precision.
+        reduce_dtype=precision_dt,
+        # Buffer precision.
+        buffer_dtype=precision_dt,
+    )
+
+
+    #add hybrid sharded FSDP
+    if fsdp_size > 1 and simple_ddp_size > 1:
+        model = FSDP(model, device_id=local_rank, process_group= (fsdp_group,simple_ddp_group), sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.HYBRID_SHARD, auto_wrap_policy = my_auto_wrap_policy, mixed_precision=bfloatPolicy, forward_prefetch=True, limit_all_gathers = False )
+    #add fully sharded FSDP
+    elif fsdp_size > 1 and simple_ddp_size == 1:
+        model = FSDP(model, device_id=local_rank, process_group= fsdp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.FULL_SHARD, auto_wrap_policy = my_auto_wrap_policy, mixed_precision=bfloatPolicy, forward_prefetch=True, limit_all_gathers = False )
+    #add unsharded DDP
+    else:
+        model = FSDP(model, device_id=local_rank, process_group= simple_ddp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.NO_SHARD, auto_wrap_policy = my_auto_wrap_policy, mixed_precision=bfloatPolicy, forward_prefetch=True, limit_all_gathers = False )
+
+    check_fn = lambda submodule: isinstance(submodule, Block)
+    apply_activation_checkpointing(
+        model, checkpoint_wrapper_fn=checkpoint_wrapper, check_fn=check_fn
+    )
+
+    optimizer = configure_optimizer(model,lr,beta_1,beta_2,weight_decay)
+    scheduler = configure_scheduler(optimizer,warmup_steps,max_steps,warmup_start_lr,eta_min)
+
+    if resume_from_checkpoint:
+
+        print("optimizer resume from checkpoint was set to True",flush=True)
+
+        src_rank = world_rank - tensor_par_size * dist.get_rank(group=data_seq_ort_group)
+
+        #map_location = 'cuda:'+str(device)
+        map_location = 'cpu'
+
+        if tensor_par_size > 1:
+            checkpoint = torch.load(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(src_rank)+".ckpt",map_location=map_location)
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        epoch_start = checkpoint['epoch'] + 1
+        del checkpoint
+
     if use_scaler:
-        #scaler = GradScaler(init_scale=8192, growth_interval=100)
         scaler = ShardedGradScaler(init_scale=8192, growth_interval=100)
         min_scale= 128
 
@@ -582,7 +633,7 @@ def main(device):
         scheduler_states = scheduler.state_dict()
 
 
-        if world_rank == 0 and epoch % 2 == 0:
+        if epoch % 2 == 0:
      
             if world_rank < tensor_par_size:
                 torch.save({
@@ -593,7 +644,7 @@ def main(device):
                     'loss_list' : loss_list,
                     }, checkpoint_path+"/"+checkpoint_filename+"_even_rank_"+str(world_rank)+".ckpt")
 
-        if world_rank == 0 and epoch % 2 == 1:
+        if epoch % 2 == 1:
      
             if world_rank < tensor_par_size:
                 torch.save({
