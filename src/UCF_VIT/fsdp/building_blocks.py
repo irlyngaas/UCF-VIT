@@ -25,9 +25,6 @@ from timm.layers import DropPath, AttentionPoolLatent, PatchDropout, \
 from timm.models.vision_transformer import LayerScale
 from monai.networks.blocks.dynunet_block import get_conv_layer
 
-
-from torch.jit import Final
-
 from UCF_VIT.utils.dist_functions import F_AllReduce_B_Identity
 from UCF_VIT.utils.dist_functions import F_Identity_B_AllReduce
 from UCF_VIT.utils.fused_attn import FusedAttn
@@ -148,8 +145,6 @@ class Mlp(nn.Module):
         return x
 
 class Attention(nn.Module):
-    fused_attn: Final[bool]
-
     def __init__(
             self,
             dim: int,
