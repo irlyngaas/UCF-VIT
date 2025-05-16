@@ -17,7 +17,7 @@ from timm.layers import use_fused_attn
 
 from UCF_VIT.simple.arch import DiffusionVIT
 from UCF_VIT.utils.metrics import masked_mse, adaptive_patching_mse
-from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, patchify, unpatchify
+from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, unpatchify
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.utils.fused_attn import FusedAttn
 from UCF_VIT.ddpm.ddpm import DDPM_Scheduler
