@@ -14,7 +14,7 @@ import torch.nn as nn
 from .building_blocks import Block, PatchEmbed, Mlp, DropPath, AttentionPoolLatent, PatchDropout, \
     trunc_normal_, resample_patch_embed, resample_abs_pos_embed, \
     get_act_layer, get_norm_layer, LayerType, \
-    MyUnetBlock
+    MyUnetBlock, EmbeddingDenseLayer
 
 from timm.models._manipulate import named_apply, checkpoint_seq
 
@@ -22,6 +22,7 @@ from UCF_VIT.utils.pos_embed import (
     get_1d_sincos_pos_embed_from_grid,
     get_2d_sincos_pos_embed,
     get_3d_sincos_pos_embed,
+    SinusoidalEmbeddings,
 )
 import torch.distributed as dist
 

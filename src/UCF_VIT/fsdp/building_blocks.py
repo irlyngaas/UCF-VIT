@@ -314,3 +314,18 @@ class MyUnetBlock(nn.Module):
         # number of channels for skip should equals to out_channels
         out = self.transp_conv(inp)
         return out
+
+class EmbeddingDenseLayer(nn.Module):
+    def __init__(self, 
+            c_in: int, 
+            c_out: int,
+            dropout_prob: float):
+        super().__init__()
+        self.linear1 = nn.Linear(c_in,c_out)
+        self.linear2 = nn.Linear(c_out,c_out)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(p=dropout_prob)
+
+    #input here is gonna be just [B,C]
+    def forward(self, x):
+        return(self.linear2(self.dropout(self.relu(self.linear1(x)))))
