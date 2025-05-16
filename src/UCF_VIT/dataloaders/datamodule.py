@@ -194,15 +194,6 @@ class NativePytorchDataModule(torch.nn.Module):
         data_par_size: int = 1,
         dataset: str = "imagenet",
         ddp_group: Optional[dist.ProcessGroup] = None,
-        nx: Optional[Dict] = None,
-        ny: Optional[Dict] = None,
-        nz: Optional[Dict] = None,
-        nx_skip: Optional[Dict] = None,
-        ny_skip: Optional[Dict] = None,
-        nz_skip: Optional[Dict] = None,
-        num_samples_to_stitch: Optional[Dict] = None,
-        chunk_size: Optional[Dict] = None,
-        dict_out_variables: Optional[Dict] = None,
         num_classes: Optional[int] = None,
     ):
         super().__init__()
@@ -247,6 +238,9 @@ class NativePytorchDataModule(torch.nn.Module):
 
         #Optional Inputs
         self.num_classes = num_classes
+        if self.dataset == "basic_ct":
+            if return_label:
+                assert num_classes != None, "If using segmentation with basic_ct need to pass the number of classes"
 
         in_variables = {}
         for k, list_out in dict_in_variables.items():
