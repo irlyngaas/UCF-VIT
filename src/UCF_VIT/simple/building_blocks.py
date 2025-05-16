@@ -173,6 +173,7 @@ class Attention(nn.Module):
                 q, k, v,
                 dropout_p=self.attn_drop.p if self.training else 0.,
             )
+            x = x.transpose(1,2)
         else: # FusedAttn.NONE
             q = q * self.scale
             attn = q @ k.transpose(-2, -1)
