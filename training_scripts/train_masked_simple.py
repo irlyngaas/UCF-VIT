@@ -295,14 +295,6 @@ def main(device):
         separate_channels = separate_channels,
         data_par_size = dist.get_world_size(),
         dataset = dataset,
-        nx = nx,
-        ny = ny,
-        nz = nz,
-        nx_skip = nx_skip,
-        ny_skip = ny_skip,
-        nz_skip = nz_skip,
-        num_samples_to_stitch = num_samples_to_stitch,
-        chunk_size = chunk_size,
     ).to(device)
 
     data_module.setup()
