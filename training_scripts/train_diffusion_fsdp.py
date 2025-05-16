@@ -83,8 +83,6 @@ def main(device):
 
     data_type = conf['trainer']['data_type']
 
-    assert data_type == "float32", "Only float32 training supported in this training script"
-
     checkpoint_path = conf['trainer']['checkpoint_path']
   
     checkpoint_filename = conf['trainer']['checkpoint_filename']
@@ -367,6 +365,7 @@ def main(device):
         model = FSDP(model, device_id=local_rank, process_group= fsdp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.FULL_SHARD, auto_wrap_policy = my_auto_wrap_policy, mixed_precision=bfloatPolicy, forward_prefetch=True, limit_all_gathers = False )
     #add unsharded DDP
     else:
+        assert data_type == "float32", "Using NO_SHARD with bfloat16 doesn't work. Consider using HYBRID_SHARD or FULL_SHARD"
         model = FSDP(model, device_id=local_rank, process_group= simple_ddp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.NO_SHARD, auto_wrap_policy = my_auto_wrap_policy, mixed_precision=bfloatPolicy, forward_prefetch=True, limit_all_gathers = False )
 
     check_fn = lambda submodule: isinstance(submodule, Block)
@@ -463,6 +462,7 @@ def main(device):
 
                 else:
                     data, variables = batch
+                    data = data.to(precision_dt)
                     data = data.to(device)
                     t = torch.randint(0,num_time_steps,(batch_size,))
                     e = torch.randn_like(data, requires_grad=False)
