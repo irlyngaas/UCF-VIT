@@ -181,6 +181,12 @@ def main(device):
 
     dataset_group_list = conf['load_balancing']['dataset_group_list']
 
+    #Datset specific options
+    if dataset == "imagenet":
+        imagenet_resize = conf['dataset_options']['imagenet_resize']
+    else:
+        imagenet_resize = None
+
     tile_size_x = tile_size[0]
     tile_size_y = tile_size[1]
 
@@ -295,6 +301,7 @@ def main(device):
         separate_channels = separate_channels,
         data_par_size = dist.get_world_size(),
         dataset = dataset,
+        imagenet_resize = imagenet_resize,
     ).to(device)
 
     data_module.setup()

@@ -90,6 +90,13 @@ data:
   tile_overlap: 0.0
   use_all_data: False
 
+# ---------------------------- DATASET SPECIFIC OPTIONS -------------------------------------------
+dataset_options:
+
+  imagenet_resize: {
+      'imagenet': 256,
+    }
+
 # ---------------------------- LOAD BALANCING -------------------------------------------
 load_balancing:
   batches_per_rank_epoch: {

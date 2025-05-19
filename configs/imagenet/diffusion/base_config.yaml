@@ -47,7 +47,7 @@ model:
       mlp_ratio_decoder: 4
       drop_path: 0.0
       drop_rate: 0.0
-      linear_decoder: True
+      linear_decoder: False
       twoD: True
       use_varemb: False
       adaptive_patching: False
@@ -89,6 +89,13 @@ data:
   single_channel: False
   tile_overlap: 0.0
   use_all_data: False
+
+# ---------------------------- DATASET SPECIFIC OPTIONS -------------------------------------------
+dataset_options:
+
+  imagenet_resize: {
+      'imagenet': 256,
+    }
 
 # ---------------------------- LOAD BALANCING -------------------------------------------
 load_balancing:

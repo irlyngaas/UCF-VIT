@@ -1,6 +1,7 @@
 import math
 import os
 import random
+from typing import Dict, Optional
 
 import numpy as np
 import torch
@@ -28,6 +29,7 @@ class FileReader(IterableDataset):
         return_label: bool = False,
         keys_to_add: int = 1,
         dataset: str = "imagenet",
+        imagenet_resize: Optional[int] = 256,
     ) -> None:
         super().__init__()
         self.num_channels_available = num_channels_available
@@ -44,6 +46,7 @@ class FileReader(IterableDataset):
         self.keys_to_add = keys_to_add
         self.ddp_group = ddp_group
         self.dataset = dataset
+        self.imagenet_resize = imagenet_resize
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -96,7 +99,7 @@ class FileReader(IterableDataset):
                 if self.dataset == "imagenet":
                     data = Image.open(path).convert("RGB")
                     data = np.array(data) 
-                    data = cv.resize(data, dsize=[256,256])
+                    data = cv.resize(data, dsize=[self.imagenet_resize,self.imagenet_resize])
                     data = np.moveaxis(data,-1,0)
 
 

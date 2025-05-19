@@ -29,6 +29,8 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                 pos = torch.stack([torch.from_numpy(np.expand_dims(batch[i][3],axis=0)) for i in range(len(batch))])
                 if dataset == "imagenet":
                     label = torch.stack([torch.tensor(batch[i][4]) for i in range(len(batch))])
+                    variables = []
+                    variables.append(batch[0][5])
                 else:
                     if num_labels == 1:
                         label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][4],axis=0)) for i in range(len(batch))])
@@ -45,8 +47,8 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                                 seq_label_list.append([])
                                 seq_label_list[i].append(torch.from_numpy(batch[i][5][j]))
                     seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
-                variables = []
-                variables.append(batch[0][6])
+                    variables = []
+                    variables.append(batch[0][6])
             else:
                 inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
                 seq = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
@@ -61,6 +63,7 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
 
                 if dataset == "imagenet":
                     label = torch.stack([torch.tensor(batch[i][4]) for i in range(len(batch))])
+                    variables = batch[0][5]
                 else:
                     if num_labels == 1:
                         label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][4],axis=0)) for i in range(len(batch))])
@@ -77,7 +80,7 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                                 seq_label_list.append([])
                                 seq_label_list[i].append(torch.from_numpy(batch[i][5][j]))
                     seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
-                variables = batch[0][6]
+                    variables = batch[0][6]
             if dataset == "imagenet":                
                 return (inp, seq, size, pos, label, variables)
             else:
@@ -195,6 +198,7 @@ class NativePytorchDataModule(torch.nn.Module):
         dataset: str = "imagenet",
         ddp_group: Optional[dist.ProcessGroup] = None,
         num_classes: Optional[int] = None,
+        imagenet_resize: Dict = None,
     ):
         super().__init__()
         if num_workers > 1:
@@ -241,6 +245,7 @@ class NativePytorchDataModule(torch.nn.Module):
         if self.dataset == "basic_ct":
             if return_label:
                 assert num_classes != None, "If using segmentation with basic_ct need to pass the number of classes"
+        self.imagenet_resize = imagenet_resize
 
         in_variables = {}
         for k, list_out in dict_in_variables.items():
@@ -318,6 +323,7 @@ class NativePytorchDataModule(torch.nn.Module):
                     variables = self.dict_in_variables["imagenet"]
                     num_channels_available = self.num_channels_available["imagenet"]
                     num_channels_used = self.num_channels_used["imagenet"]
+                    imagenet_resize = self.imagenet_resize["imagenet"]
                 else:
                     start_idx = self.dict_start_idx[k]
                     end_idx = self.dict_end_idx[k]
@@ -339,11 +345,12 @@ class NativePytorchDataModule(torch.nn.Module):
                                         end_idx=end_idx,
                                         variables=variables,
                                         multi_dataset_training=True,
-                                        data_par_size = self.data_par_size,
-                                        return_label = return_label,
-                                        keys_to_add = keys_to_add,
-                                        ddp_group = self.ddp_group,
-                                        dataset=self.dataset
+                                        data_par_size=self.data_par_size,
+                                        return_label=return_label,
+                                        keys_to_add=keys_to_add,
+                                        ddp_group=self.ddp_group,
+                                        dataset=self.dataset,
+                                        imagenet_resize=imagenet_resize,
                                     ),
                                 self.tile_size_x,
                                 self.tile_size_y,

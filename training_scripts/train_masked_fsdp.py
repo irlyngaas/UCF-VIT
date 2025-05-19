@@ -204,6 +204,12 @@ def main(device):
 
     dataset_group_list = conf['load_balancing']['dataset_group_list']
 
+    #Datset specific options
+    if dataset == "imagenet":
+        imagenet_resize = conf['dataset_options']['imagenet_resize']
+    else:
+        imagenet_resize = None
+
     tile_size_x = tile_size[0]
     tile_size_y = tile_size[1]
     if dataset == "imagenet":
@@ -428,6 +434,7 @@ def main(device):
         data_par_size = data_par_size,
         ddp_group = ddp_group,
         dataset = dataset,
+        imagenet_resize = imagenet_resize,
     ).to(device)
 
     data_module.setup()

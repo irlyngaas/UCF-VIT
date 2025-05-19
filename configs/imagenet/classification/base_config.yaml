@@ -84,6 +84,13 @@ data:
   use_all_data: False
   num_classes: 1000
 
+# ---------------------------- DATASET SPECIFIC OPTIONS -------------------------------------------
+dataset_options:
+
+  imagenet_resize: {
+      'imagenet': 256,
+    }
+
 # ---------------------------- LOAD BALANCING -------------------------------------------
 load_balancing:
   batches_per_rank_epoch: {
