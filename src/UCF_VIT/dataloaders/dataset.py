@@ -562,7 +562,7 @@ class ShuffleIterableDataset(IterableDataset):
             yield buf.pop()
 
 class ProcessChannels(IterableDataset):
-    def __init__(self, dataset, num_channels: int, single_channel: bool, batch_size: int, return_label: bool, adaptive_patching: bool, separate_channels: bool, patch_size: int, fixed_length: int, twoD: bool, _dataset: str) -> None:
+    def __init__(self, dataset, num_channels: int, single_channel: bool, batch_size: int, return_label: bool, adaptive_patching: bool, separate_channels: bool, patch_size: int, fixed_length: int, twoD: bool, _dataset: str, return_qdt: bool) -> None:
         super().__init__()
         self.dataset = dataset
         self.num_channels = num_channels
@@ -578,6 +578,7 @@ class ProcessChannels(IterableDataset):
         self.patch_size = patch_size
         self.twoD = twoD
         self._dataset = _dataset
+        self.return_qdt = return_qdt
         if self.adaptive_patching:
             if self.single_channel:
                 if self.twoD:
@@ -713,12 +714,21 @@ class ProcessChannels(IterableDataset):
                                                 seq_label_list.append(seq_label)
 
                                 if self._dataset == "imagenet":
-                                    yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_label_list[i].pop(), yield_var_list[i].pop()
+                                    if self.return_qdt:
+                                        yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_label_list[i].pop(), yield_var_list[i].pop(), qdt
+                                    else:
+                                        yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_label_list[i].pop(), yield_var_list[i].pop()
                                 else:
                                     if self._dataset == "basic_ct":
-                                        yield np_image, seq_image, seq_size, seq_pos, np.asarray(np_label,dtype=np.uint8), seq_label_list, yield_var_list[i].pop()
+                                        if self.return_qdt:
+                                            yield np_image, seq_image, seq_size, seq_pos, np.asarray(np_label,dtype=np.uint8), seq_label_list, yield_var_list[i].pop(), qdt
+                                        else:
+                                            yield np_image, seq_image, seq_size, seq_pos, np.asarray(np_label,dtype=np.uint8), seq_label_list, yield_var_list[i].pop()
                                     else:
-                                        yield np_image, seq_image, seq_size, seq_pos, np_label, seq_label_list, yield_var_list[i].pop()
+                                        if self.return_qdt:
+                                            yield np_image, seq_image, seq_size, seq_pos, np_label, seq_label_list, yield_var_list[i].pop(), qdt
+                                        else:
+                                            yield np_image, seq_image, seq_size, seq_pos, np_label, seq_label_list, yield_var_list[i].pop()
                             else:
                                 if self._dataset == "imagenet":
                                     np_image = yield_x_list[i].pop()
@@ -749,9 +759,15 @@ class ProcessChannels(IterableDataset):
                                     else:
                                         seq_image, seq_size, seq_pos, _ = self.patchify(np.moveaxis(np_image,0,-1))
                                 if self._dataset == "imagenet":
-                                    yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_var_list[i].pop()
+                                    if self.return_qdt:
+                                        yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_var_list[i].pop(), qdt
+                                    else:
+                                        yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_var_list[i].pop()
                                 else:
-                                    yield np_image, seq_image, seq_size, seq_pos, yield_var_list[i].pop()
+                                    if self.return_qdt:
+                                        yield np_image, seq_image, seq_size, seq_pos, yield_var_list[i].pop(), qdt
+                                    else:
+                                        yield np_image, seq_image, seq_size, seq_pos, yield_var_list[i].pop()
                             else:
                                 if self._dataset == "imagenet":
                                     np_image = yield_x_list[i].pop()
