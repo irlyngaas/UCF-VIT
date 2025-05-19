@@ -162,8 +162,9 @@ def main():
     print("DDP RANK RATIO", ddp_rank_ratio)
 
     rank_sum = sum(ddp_rank_ratio)
-    #First Rebalance, if necessary
-    if rank_sum != num_total_ddp_ranks:
+
+    #Rebalance till ranks equal actually amount wanted to use
+    while rank_sum != num_total_ddp_ranks:
         leftover = []
         for i in range(len(num_total_tiles)):
             if ddp_ratio[i] > ddp_rank_ratio[i]:
@@ -179,7 +180,10 @@ def main():
                     if rank_to_decrease == -1:
                         rank_to_decrease = i
                         continue
-                    if leftover[i] > leftover[rank_to_decrease]:
+                    if ddp_rank_ratio[rank_to_decrease] == 1:
+                        rank_to_decrease = i
+                        continue
+                    if leftover[i] > leftover[rank_to_decrease] and ddp_rank_ratio[i] > 1:
                         rank_to_decrease = i
             print("Rank to decrease", rank_to_decrease)
             ddp_rank_ratio[rank_to_decrease] -= 1
@@ -198,46 +202,13 @@ def main():
             print("Rank to increase", rank_to_increase)
             ddp_rank_ratio[rank_to_increase] += 1
 
-    rank_sum = sum(ddp_rank_ratio)
-
-    #Second Rebalance, if necessary, could add more rebalances
-    if rank_sum != num_total_ddp_ranks:
-        leftover = []
-        for i in range(len(num_total_tiles)):
-            if ddp_ratio[i] > ddp_rank_ratio[i]:
-                leftover.append((-1.0)*(ddp_ratio[i]-ddp_rank_ratio[i]))
-            else:
-                leftover.append(ddp_rank_ratio[i]-ddp_ratio[i])
-        if rank_sum > num_total_ddp_ranks:
-            rank_to_decrease = -1
-            for i in range(len(num_total_tiles)):
-                if leftover[i] < 0:
-                    continue
-                else:
-                    if rank_to_decrease == -1:
-                        rank_to_decrease = i
-                        continue
-                    if leftover[i] > leftover[rank_to_decrease]:
-                        rank_to_decrease = i
-            print("Rank to decrease", rank_to_decrease)
-            ddp_rank_ratio[rank_to_decrease] -= 1
-
-        if rank_sum < num_total_ddp_ranks:
-            rank_to_increase = -1
-            for i in range(len(num_total_tiles)):
-                if leftover[i] > 0:
-                    continue
-                else:
-                    if rank_to_increase == -1:
-                        rank_to_increase = i
-                        continue
-                    if leftover[i] < leftover[rank_to_increase]:
-                        rank_to_increase = i
-            print("Rank to increase", rank_to_increase)
-            ddp_rank_ratio[rank_to_increase] += 1
+        rank_sum = sum(ddp_rank_ratio)
 
     print("DDP RANKS:", ddp_rank_ratio)
     assert rank_sum == num_total_ddp_ranks, "All DDP ranks not used"
+
+    for i in range(len(ddp_rank_ratio)):
+        assert ddp_rank_ratio[i] > 0, "All Datasets need at least one GPU. Add more GPUs to the training to resolve this issue, or consider removing datasets with small amounts of data"
 
     num_images_per_rank = []
     for i in range(len(num_total_tiles)):
