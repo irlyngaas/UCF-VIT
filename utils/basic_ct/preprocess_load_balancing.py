@@ -42,9 +42,6 @@ def main():
     patch_size =  conf['model']['net']['init_args']['patch_size']
     max_epochs=conf['trainer']['max_epochs']
 
-    seeds = np.random.randint(2**32-1,size=max_epochs)
-    print("SEEDS", seeds)
-
     tile_size_x = int(tile_size[0])
     tile_size_y = int(tile_size[1])
     tile_size_z = int(tile_size[2])

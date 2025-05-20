@@ -29,7 +29,6 @@ def main():
 
     assert data_par_size * tensor_par_size == num_total_ranks, "Need to use all ranks"
 
-
     dict_root_dirs = conf['data']['dict_root_dirs']
     dict_start_idx = conf['data']['dict_start_idx']
     dict_end_idx = conf['data']['dict_end_idx']
@@ -44,8 +43,6 @@ def main():
     use_all_data = conf['data']['use_all_data']
     patch_size =  conf['model']['net']['init_args']['patch_size']
     max_epochs=conf['trainer']['max_epochs']
-
-    #seeds = np.random.randint(2**32-1,size=max_epochs)
 
     tile_size_x = int(tile_size[0])
     tile_size_y = int(tile_size[1])
