@@ -5,14 +5,20 @@ The purpose of this codebase is to provide a **Uniform Coding Framework (UCF)** 
 ## Architectures
 Currently we provide 5 different architecutres **(VIT, MAE, UNETR, SAP, VIT-DIFFUSION)**, all of which use the same VIT encoder, but a different decoder architecture depending on the task being trained.
 
-### VIT
-### MAE
-### UNETR
-### SAP
-### VIT-DIFFUSION
+### Vision Tranformer (VIT)
+Vision Transformer based on [1]. Code adapted and slimmed down from (https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/vision_transformer.py#L425). Task: Image Classification. Input: Image or Image Tile.
+
+### Mask Autoencoder (MAE)
+Masked Autoencoder pre-training based on [2]. Task: Masked Image Prediction. Input: Image or Image Tile
+### UNet Transformer (UNETR)
+Image segmentation architecture based on [3]. Task: Image Segmentation. Input: Image or Image Tile
+### Symmetric Adaptive Patching (SAP)
+Image segmentation architecture for adaptively patched input based on [4]. Task: Image Segmentation. Input: Adaptively Patching Image or Image Tile
+### Diffusion Vision Transformer (VIT-DIFFUSION)
+Diffusion model training based on [5]. Task: Generate Image via noise that matches distribution of data trained on. Input: Noise
 
 ## Parallelism Modes
-All of these architectures exist in 2 independent sub-folders, simple and fsdp, for which we separate the network architecture code into what we call modes. The choice of mode to be used will depend on the types of advanced parallelism and computing techniques needed for the model being trained.  The first `src/UCF_VIT/simple`, provides a simplified version for training in Distributed Data Parallel (DDP) fashion only. The second `src/UCF_VIT/fsdp`, provides a more complex version with different parallel training techniques. This includes options for training with a combination of Sharded Data Parallelism , DDP, and Tensor Parallelism. These parallelisms are all integrated via the HSTOP method from [cite]. Both modes can be used with the same data loading module and load balancing scripts provided. While the training done within the simple mode can be done with the correct choice of options in the fsdp mode, the purpose of keeping the simple mode is 1) to provide an entry point for new users and developers to add new architectures without the intricacies of the advanced features and 2) to provide a simple reference point to compare with when new innovations are added in order to test how they interact with the more complex parallelism methods.
+All of these architectures exist in 2 independent sub-folders, simple and fsdp, for which we separate the network architecture code into what we call modes. The choice of mode to be used will depend on the types of advanced parallelism and computing techniques needed for the model being trained.  The first `src/UCF_VIT/simple`, provides a simplified version for training in Distributed Data Parallel (DDP) fashion only. The second `src/UCF_VIT/fsdp`, provides a more complex version with different parallel training techniques. This includes options for training with a combination of Sharded Data Parallelism , DDP, and Tensor Parallelism. These parallelisms are all integrated via Hybrid Sharded Tensor-Data Parallelism (Hybrid-STOP) from [6,7]. Both modes can be used with the same data loading module and load balancing scripts provided. While the training done within the simple mode can be done with the correct choice of options in the fsdp mode, the purpose of keeping the simple mode is 1) to provide an entry point for new users and developers to add new architectures without the intricacies of the advanced features and 2) to provide a simple reference point to compare with when new innovations are added in order to test how they interact with the more complex parallelism methods.
 
 ### Building Blocks
 The main building blocks for the VIT based archictectures are in the **Attention** and **Feed-forward** functions, provided in the Attention class and MLP class in `src/UCF_VIT/simple/building_blocks.py` and `src/UCF_VIT/fsdp/building_blocks.py`. We ask that you use these functions as is and do not modify them, as these common building blocks will be used across the different network architectures.
@@ -21,17 +27,17 @@ The main building blocks for the VIT based archictectures are in the **Attention
 We provide several training scripts. These include all of the necessary things for running the main training loop, including utilities such as checkpoint loading and saving. We leave it to the user to implement their own validation and testing routines, based off the existing training examples, in order to more closely fit their needs. Training scripts are provided for each of the training architectures for the simple mode. To convert these scripts to use fsdp mode, look at the code changes made to go from `training_scripts/train_masked_simple.py` to `training_scripts/train_masked_fsdp.py`
 
 ## Data Loader
-The dataloader we provide is a custom native pytorch iterative dataloader. For simplicity, we assume that we are receiving raw data files and we leave it to the user to normalize the data properly within in the dataloader module for training. The purpose of making this assumption of raw data file as input is 1) it removes the need for further data preprocessing scripts to be included in this repo, and 2) we want to provide an end-to-end worfklow from raw data to model prediction. If performing preprocessing during the dataloading phase is to computationally intensive, we recommend doing it offline and properly storing it in a manner that the dataloader module can handle and then removing the data normalization source code.
+The dataloader we provide is a custom native pytorch iterative dataloader. For simplicity, we assume that we are receiving raw data files and we leave it to the user to normalize the data properly within in the dataloader module for training. The purpose of making this assumption of raw data file as input is 1) it removes the need for further data preprocessing scripts to be included in this repo, and 2) we want to provide an end-to-end worfklow from raw data to model prediction. If performing preprocessing during the dataloading phase is too computationally intensive, we recommend doing it offline and properly storing it in a manner that the dataloader module can handle.
 
-The dataloader is built in a fashion such that it can handle multiple different dataset directories at the same time. A dataset directory contains one or more raw data file (with all raw data files having the same dimension or able to be resized so that they have the same dimension). The purpose of being able to handle multiple dataset directories is 1) it provides flexible training where you can easily remove and add different datasets for the purposes of running experiments and 2) it allows for the integration of identifying properties from the different datasets that can potentially used for improved learning. For instance, with data that has multiple channels, e.g. images with (R,G,B), we are able to pass along the information on what variable the channel is from and use that information for more advanced network training. We then could utilize variable aggregration, described in a following section, to tokenize each channel separately.
+The dataloader is built in a fashion such that it can handle multiple different dataset directories at the same time. A dataset directory contains one or more raw data file (with all raw data files having the same dimension or able to be resized so that they have the same dimension). The purpose of being able to handle multiple dataset directories is 1) it provides flexible training where you can easily remove and add different datasets for the purposes of running experiments and 2) it allows for the integration of identifying properties from the different datasets that can potentially used for improved learning via our advanced features. For instance, with data that has multiple channels, e.g. images with (R,G,B) channels, we are able to pass along the information on what variable the channel is from and use that information during network training. We then could utilize variable aggregration, described in a following section, to tokenize each channel separately.
 
-This dataloader provides the flexibility to add a plethora of different options for customizing how the data is broken up for training. Since we are using a VIT, at least 2D data is expected, however, we have capability for both 2D and 3D spatial data. If desired, we have the utilities implemented to break given raw data into smaller tiled chunks. Also, we have a number of different options for how to tile this raw data.
+This dataloader provides the flexibility to add a plethora of different options for customizing how the data is broken up for training. Since we are using a VIT, at least 2D data is expected. However, we have capability for both 2D and 3D spatial data currently. If desired, we have the utilities implemented to break given raw data into smaller tiled chunks. Also, we have a number of different options for how to tile this raw data, e.g. tile overlapping.
 
 ## Load Balancing
 In order for the dataloader to handle multiple datasets at the same time, the data needs to be spread out amongst the GPUs evenly. In the case where different datasets have different amounts and/or different sizes of images, it's very difficult to evenly spread this data amongst the GPUs evenly. We provide example load balancing scripts that for a given setting in a config file determines how the data should be split amongst a given set of N GPUs, in order to evenly balance the resources amongst the compute resources. The output from this script gives the necessary information to the dataloader in order to do this in a proper fashion.
 
 ## Config Arguments
-We store the arguments for each individual run in a yaml file. This config file holds all of the arguments for defining the specific training, dataloading, parallelism, and checkpointing options for a particular architecture
+We store the arguments for each individual run in a yaml file. This config file holds all of the arguments for defining the specific training, dataloading, parallelism, and checkpointing options
 
 ### Required Arguments
 1. Trainer
@@ -92,6 +98,12 @@ We store the arguments for each individual run in a yaml file. This config file 
 
 ### Optional Arguments (Depending on the Network Architecture)
 
+## Advanced Parallelism
+### Hybrid-STOP 
+### Lower Precision Support
+### Layer Wrapping
+### Activation Checkpointing
+
 ## Advanced Features
 ### Adaptive Patching
 ### Variable Aggregation
@@ -99,13 +111,26 @@ We store the arguments for each individual run in a yaml file. This config file 
 
 ## Example Datasets
 ### Imagenet
+Download data at `https://www.image-net.org/challenges/LSVRC/2012/2012-downloads.php`
+
+Directory consists of 1000 sub-folders of 2D JPEG images, each folder corresponding to different classification labels. In order to use data in this format in data distributed fashion across N GPUs, we make individual datasets within the dataloader code, each with 1000/N of these subfolders. Since ImageNet has images of all different sizes, all input images are resized to a standard size, chosen by the imagenet_resize argument in the config file.
 ### Basic_CT
+Download data at 
+
+Directory consists of 3D synthetic CT images of concrete including corresponding labels for segmentation.
 
 ## Integrating a new Dataset with the Dataloader Module
+For Examples, see the XCT-Diffusion and turb branches
 1. Name your dataset and use it in place of the dataset option the yaml config file
 2. Write code to process file keys for the different datasets
-- Add a new else if branch to 
+- Add a new branch to if/else starting at line 291 of `src/UCF_VIT/dataloaders/datamodule.py`, to process datafile paths from each dataset into a corresponding dictionary
+3. Write code that uses appropriate iterative dataloader functions from `src/UCF_VIT/dataloaders/dataset.py`
+- Add a new branch to if/else starting at line 366 of `src/UCF_VIT/dataloaders/datamodule.py`, creating an iterative dataloader using the correct Tile Iterator (ImageBlockDataIter_2D or ImageBlockDataIter_3D) depending on the dimension of your data
+4. Write code to approriately read raw data files
+- Add a new branch to if/else starting at line 99 of `src/UCF_VIT/dataloaders/dataset.py`, that uses an appropriate python function to read the raw data files depending on the type
+
 ### Setting up a new load balancing script
+Use logic from step 1 and 4 above to modify preprocess_load_balancing.py script in the appropriate places
 
 
 # Installation
@@ -113,6 +138,7 @@ Currently installation instructions are limited to Frontier only (the system we 
 
 ## Frontier
 There are two options available for creating software environments. The Apptainer environment creation currently works only when adaptive_patching=True in the config file. Also UNETR won't work. Issues with missing ROCM packages. To be fixed later.
+
 ### Conda
 Create Conda Environment from Scratch. Example below using options from the corresponding Apptainer definition files
 ```
@@ -152,13 +178,35 @@ ln -s $CRAY_MPICH_DIR/lib/libfmpich.so libmpicxx.so
 ```
 
 # Usage
-1. Setup dataset for dataloader
-2. Modify Launch Script
+1. If using a new dataset, modify dataloader module accordingly
+- Follow dataset integration instructions
+
+2. Copy training script of interest from UCF-VIT/training_scripts
+
+3. Modify training script for particular use case. (Adding validation, testing, inferencing, etc. as needed)
+
+4. Create/Modify config file and launch script for your training
+
+5. Modify Launch Script
 - Change project allocation to one you have access to `#SBATCH -A PROJXXX`.
 - Set number of nodes you want to run with `#SBATCH --nodes=N`
 
-3. Run Load Balancing Script
+6. Run Load Balancing Script
+- `python utils/DATASET/preprocess_load_balancing.py CONFIG_FILE NUM_GPUS`
 
-4. Modify Config Script with numbers for load balancing
+7. Modify Config File with numbers from load balancing output
+- dataset_group_list
+- batches_per_rank_epoch
 
-5. Launch job `sbatch launch/DATASET/train_TASK_MODE.sh`
+8. Launch job `sbatch launch/DATASET/train_MODEL_MODE.sh`
+
+# Citations
+
+[1]: Dosovitskiy, Alexey, et al. "An image is worth 16x16 words: Transformers for image recognition at scale." arXiv preprint arXiv:2010.11929 (2020).
+[2]: He, Kaiming, et al. "Masked autoencoders are scalable vision learners." Proceedings of the IEEE/CVF conference on computer vision and pattern recognition. 2022.
+[3]: Hatamizadeh, Ali, et al. "Unetr: Transformers for 3d medical image segmentation." Proceedings of the IEEE/CVF winter conference on applications of computer vision. 2022.
+[4]: Zhang, Enzhi, et al. "Adaptive Patching for High-resolution Image Segmentation with Transformers." SC24: International Conference for High Performance Computing, Networking, Storage and Analysis. IEEE, 2024.
+[5]: Ho, Jonathan, Ajay Jain, and Pieter Abbeel. "Denoising diffusion probabilistic models." Advances in neural information processing systems 33 (2020): 6840-6851.
+[6]: Wang, Xiao, et al. "Orbit: Oak ridge base foundation model for earth system predictability." SC24: International Conference for High Performance Computing, Networking, Storage and Analysis. IEEE, 2024.
+[7]: Wang, Xiao, et al. "ORBIT-2: Scaling Exascale Vision Foundation Models for Weather and Climate Downscaling." arXiv preprint arXiv:2505.04802 (2025).
+
