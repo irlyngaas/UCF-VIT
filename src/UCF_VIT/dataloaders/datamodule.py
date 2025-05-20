@@ -314,6 +314,8 @@ class NativePytorchDataModule(torch.nn.Module):
                     if num_data_roots > data_par_size-1:
                         break
             assert num_data_roots <= data_par_size, "the number of data parallel GPUs (data_par_size) needs to be at least equal to the number of datasets. Try to increase data_par_size"
+        elif self.dataset == "xct":
+            self.dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, ""))) for k, root_dir in dict_root_dirs.items() }
         else:
             self.dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in dict_root_dirs.items() }
            

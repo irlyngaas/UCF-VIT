@@ -141,6 +141,12 @@ class FileReader(IterableDataset):
                         else:
                             yield data, self.variables
 
+                elif self.dataset == "xct":
+                    data = np.load(path)
+                    data = data.astype('float32')
+                    data = (data-data.min())/(data.max()-data.min())
+                    yield data, self.variables
+
 class ImageBlockDataIter_2D(IterableDataset):
     def __init__(
         self, dataset: FileReader, tile_size_x: int = 64, tile_size_y: int = 64, tile_size_z: int = None, return_label: bool = False, tile_overlap: float = 0.0, use_all_data: bool = False, classification: bool = False,

@@ -1,0 +1,96 @@
+# ---------------------------- TRAINER -------------------------------------------
+trainer:
+  max_epochs: 600
+  data_type: "float32"
+  checkpoint_path: "../../checkpoint/xct/diffusion/base"
+  checkpoint_filename: "multi_last"
+  checkpoint_filename_for_loading: "multi_last_odd" #multi_last_odd or multi_last_even
+  inference_path: "../../checkpoint/xct/diffusion/base/inference"
+
+  resume_from_checkpoint: False
+
+# ---------------------------- PARALLELISM -------------------------------------
+parallelism:
+  fsdp_size: 1
+  simple_ddp_size: 8
+  tensor_par_size: 1
+  seq_par_size: 1
+  cpu_offloading: False
+
+# ---------------------------- MODEL -------------------------------------------
+model:
+  lr: 0.0001
+  beta_1: 0.9
+  beta_2: 0.95
+  weight_decay: 1e-5
+  warmup_steps: 1000
+  max_steps: 20000
+  warmup_start_lr: 1e-8
+  eta_min: 1e-8
+  loss_fn: "MSE"
+
+  net:
+    init_args:
+      default_vars: [
+        "xct",
+        "nct",
+      ]
+      tile_size: [128, 128, 128]
+      patch_size: 8
+      embed_dim: 576
+      depth: 8
+      num_heads: 8
+      decoder_embed_dim: 576
+      decoder_depth: 8
+      decoder_num_heads: 16
+      mlp_ratio: 4
+      mlp_ratio_decoder: 4
+      drop_path: 0.0
+      drop_rate: 0.0
+      linear_decoder: True
+      twoD: False
+      use_varemb: False
+      adaptive_patching: False
+      fixed_length: 196
+      separate_channels: False
+      num_time_steps: 1000
+
+# ---------------------------- DATA -------------------------------------------
+data:
+  dataset: "xct"
+  dict_root_dirs: {
+    'xct1': '/lustre/orion/world-shared/mat268/DiffusiveINR_Data/XCT_Concrete',
+  }
+  dict_start_idx: {
+    'xct1': 0,
+  }
+  dict_end_idx: {
+    'xct1': 1,
+  }
+  dict_buffer_sizes: {
+    'xct1': 100,
+  }
+  num_channels_available: {
+    'xct1': 3,
+  }
+  num_channels_used: {
+    'xct1': 3,
+  }
+  dict_in_variables: {
+    'xct1': [
+     "xct", 
+    ],
+  }
+  batch_size: 1
+  num_workers: 1
+  pin_memory: False
+  single_channel: False
+  tile_overlap: 0.0
+  use_all_data: False
+
+# ---------------------------- LOAD BALANCING -------------------------------------------
+load_balancing:
+  batches_per_rank_epoch: {
+    'imagenet': 4935,
+  }
+  dataset_group_list: '1:1:1:1:1:1:1:1'
