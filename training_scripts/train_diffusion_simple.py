@@ -324,7 +324,7 @@ def main(device):
             print("epoch ",epoch,flush=True)
 
         counter = 0
-        with torch.autograd.set_detect_anomaly(True):
+        with torch.autograd.set_detect_anomaly(False):
             for batch_idx, batch in enumerate(train_dataloader):
                 counter = counter + 1
                 if counter > iterations_per_epoch:
