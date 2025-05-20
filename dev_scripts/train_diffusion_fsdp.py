@@ -89,6 +89,8 @@ def main(device):
 
     checkpoint_filename_for_loading = conf['trainer']['checkpoint_filename_for_loading']
 
+    inference_path = conf['trainer']['inference_path']
+
     resume_from_checkpoint = conf['trainer']['resume_from_checkpoint']
 
     fsdp_size = conf['parallelism']['fsdp_size']
@@ -440,6 +442,13 @@ def main(device):
 
 #4. Training Loop
 ##############################################################################################################
+
+    isExist = os.path.exists(inference_path)
+    if not isExist:
+        # Create a new directory because it does not exist
+        os.makedirs(inference_path, exist_ok=True)
+        print("The new inference directory is created!")
+
     #Find max batches
     iterations_per_epoch = 0
     for i,k in enumerate(batches_per_rank_epoch):
