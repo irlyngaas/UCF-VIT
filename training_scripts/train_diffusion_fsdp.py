@@ -493,7 +493,6 @@ def main(device):
                         scaler._scale = torch.tensor(min_scale).to(scaler._scale)
                 else:
                     loss.backward()
-                    loss.backward()
                     optimizer.step()
 
                 scheduler.step()
@@ -506,7 +505,6 @@ def main(device):
         model_states = model.state_dict()
         optimizer_states = optimizer.state_dict()
         scheduler_states = scheduler.state_dict()
-
 
         #Alternating saving in to odd and even checkpoint file to avoid losing progress
         if epoch % 2 == 0:
