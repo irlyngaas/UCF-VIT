@@ -1,5 +1,8 @@
 import torch
 import torch.distributed as dist
+from pathlib import Path
+import re
+
 from UCF_VIT.utils.lr_scheduler import LinearWarmupCosineAnnealingLR
 
 def patchify( data, patch_size, twoD):
@@ -227,3 +230,23 @@ def init_par_groups(world_rank, data_par_size, tensor_par_size, seq_par_size, fs
 
 
     return seq_par_group, ddp_group, tensor_par_group, data_seq_ort_group, fsdp_group, simple_ddp_group
+
+def get_file_prefix(sample_path):
+    '''
+    Function to find base path prefix and timestamp group for a file of type:
+    /lustre/orion/stf006/world-shared/muraligm/CFD135/data_iso/super_res/binary_data/P1F4R32_nx512ny512nz256_6vars/w_29.960000
+    with variable length of var-name and timestamp
+    '''
+    # Regular expression to identify the variable name and timestamp
+    pattern = r'/(.*)/([a-zA-Z0-9_]+)_([0-9]+\.[0-9]+)$'
+    # Extract the base path and timestamp
+    match = re.search(pattern, sample_path)
+    base_path_prefix = match.group(1)
+    timestamp = match.group(3)
+    #   if match:
+    #       base_path_prefix = match.group(1)
+    #       timestamp = match.group(3)
+    #       print(f"Base Path Prefix: {base_path_prefix}; timestamp: {timestamp}")
+    #   else:
+    #       print("No match found")
+    return "/"+base_path_prefix, timestamp

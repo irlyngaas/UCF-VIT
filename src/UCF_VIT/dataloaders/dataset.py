@@ -30,6 +30,10 @@ class FileReader(IterableDataset):
         keys_to_add: int = 1,
         dataset: str = "imagenet",
         imagenet_resize: Optional[int] = 256,
+        nx: Optional[int] = 512,
+        ny: Optional[int] = 512,
+        nz: Optional[int] = 256,
+        variables_out: Optional[list] = None
     ) -> None:
         super().__init__()
         self.num_channels_available = num_channels_available
@@ -46,7 +50,15 @@ class FileReader(IterableDataset):
         self.keys_to_add = keys_to_add
         self.ddp_group = ddp_group
         self.dataset = dataset
-        self.imagenet_resize = imagenet_resize
+
+        #Optional Inputs
+        if self.dataset == "imagenet":
+            self.imagenet_resize = imagenet_resize
+        if self.dataset == "sst":
+           self.nx = nx
+           self.ny = ny
+           self.nz = nz
+           self.variables_out = variables_out
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -140,6 +152,28 @@ class FileReader(IterableDataset):
                             yield data, label, self.variables
                         else:
                             yield data, self.variables
+
+                elif self.dataset == "sst":
+                    root_path = Path(path)
+                    parent = root_path.parent
+                    stem = path.split('/')[-1]
+                    data_list = []
+                    for i in range(len(self.variables)):
+                        channel_path = os.path.join(parent, self.variables[i]+"_"+stem)
+                        data_memmap = np.memmap(channel_path, dtype=np.float32, mode='r', shape=(self.nz, self.ny, self.nx+2))
+                        data_list.append(data_memmap)
+
+                    if self.return_label:
+                        label_list = []
+                        for i in range(len(self.variables_out)):
+                            channel_path = os.path.join(parent, self.variables_out[i]+"_"+stem)
+                            label_memmap = np.memmap(channel_path, dtype=np.float32, mode='r', shape=(self.nz, self.ny, self.nx+2))
+                            label_list.append(label_memmap)
+
+                    if self.return_label:
+                        yield data_list, label_list, self.variables
+                    else:
+                        yield data_list, self.variables
 
 class ImageBlockDataIter_2D(IterableDataset):
     def __init__(
@@ -539,6 +573,470 @@ class ImageBlockDataIter_3D(IterableDataset):
                                         yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, datalen_z-self.tile_size_z:datalen_z], variables
                                     else:
                                         yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
+
+class ImageBlockDataIter_3D_Memmap(IterableDataset):
+    def __init__(
+        self, dataset: FileReader, tile_size_x: int = 64, tile_size_y: int = 64, tile_size_z: int = 64, twoD: bool = True, return_label: bool = False, tile_overlap: float = 0.0, use_all_data: bool = False, nx: int = 512, ny: int = 512, nz: int = 256, nx_skip: int = 1, ny_skip: int = 1, nz_skip: int = 1
+    ) -> None:
+        super().__init__()
+        self.dataset = dataset
+        self.twoD = twoD
+        self.tile_size_x = tile_size_x
+        self.tile_size_y = tile_size_y
+        self.tile_size_z = tile_size_z
+        self.return_label = return_label
+        self.tile_overlap = tile_overlap
+        self.use_all_data = use_all_data
+        self.nx = nx
+        self.ny = ny
+        self.nz = nz
+        self.nx_skip = nx_skip
+        self.ny_skip = ny_skip
+        self.nz_skip = nz_skip
+
+    #TODO: Fix Logic so that it can use nx_skip, ny_skip, and nz_skip > 1 
+    def __iter__(self):
+        tile_overlap_size_x = int(self.tile_size_x*self.tile_overlap)
+        tile_overlap_size_y = int(self.tile_size_y*self.tile_overlap)
+        tile_overlap_size_z = int(self.tile_size_z*self.tile_overlap)
+        if tile_overlap_size_x == 0.0:
+            OTP2_x = 1
+            tile_overlap_size_x = 0
+        else:
+            OTP2_x = int(self.tile_size_x/tile_overlap_size_x)
+        if tile_overlap_size_y == 0.0:
+            OTP2_y = 1
+            tile_overlap_size_y = 0
+        else:
+            OTP2_y = int(self.tile_size_y/tile_overlap_size_y)
+        if tile_overlap_size_z == 0.0:
+            OTP2_z = 1
+            tile_overlap_size_z = 0
+        else:
+            OTP2_z = int(self.tile_size_z/tile_overlap_size_z)
+
+        if self.return_label:
+            for (data,label,variables) in self.dataset:
+                #Total Tiles Evenly Spaced
+                TTE_x = self.nx//self.tile_size_x
+                TTE_y = self.ny//self.tile_size_y
+                num_blocks_x = (TTE_x-1)*OTP2_x + 1
+                num_blocks_y = (TTE_y-1)*OTP2_y + 1
+                if self.use_all_data:
+                    #Total Tiles
+                    TT_x = self.nx/(self.tile_size_x)
+                    TT_y = self.ny/(self.tile_size_y)
+                    # Number of leftover overlap patches for last tile
+                    LTOP_x = np.floor((TT_x-TTE_x)*OTP2_x)
+                    LTOP_y = np.floor((TT_y-TTE_y)*OTP2_y)
+                    if tile_overlap_size_x == 0:
+                        if self.nx % self.tile_size_x != 0:
+                            LTOP_x += 1
+                    else: #>0
+                        if self.nx % tile_overlap_size_x != 0:
+                            LTOP_x += 1
+                    if tile_overlap_size_y == 0:
+                        if self.ny % self.tile_size_y != 0:
+                            LTOP_y += 1
+                    else: #>0
+                        if self.ny % tile_overlap_size_y != 0:
+                            LTOP_y += 1
+                    num_blocks_x = int(num_blocks_x + LTOP_x)
+                    num_blocks_y = int(num_blocks_y + LTOP_y)
+
+                if self.twoD:
+                    if self.use_all_data:
+                        num_blocks_z = np.ceil(self.nz/self.tile_size_z)
+                    else:
+                        num_blocks_z = self.nz//self.tile_size_z
+                else:
+                    TTE_z = self.nz//self.tile_size_z
+                    num_blocks_z = (TTE_z-1)*OTP2_z + 1
+                    if self.use_all_data:
+                        #Total Tiles
+                        TT_z = self.nz/(self.tile_size_z)
+                        # Number of leftover overlap patches for last tile
+                        LTOP_z = np.floor((TT_z-TTE_z)*OTP2_z)
+                        if tile_overlap_size_z == 0:
+                            if self.nz % self.tile_size_z != 0:
+                                LTOP_z += 1
+                        else: #>0
+                            if self.nz % tile_overlap_size_z != 0:
+                                LTOP_z += 1
+                        num_blocks_z = int(num_blocks_z + LTOP_z)
+
+                datalen_x = self.nx
+                datalen_y = self.ny
+                datalen_z = self.nz
+                #channels, datalen_x, datalen_y, datalen_z = data.shape
+
+                x_step_size = self.tile_size_x-tile_overlap_size_x
+                y_step_size = self.tile_size_y-tile_overlap_size_y
+                if not self.twoD:
+                    z_step_size = self.tile_size_z-tile_overlap_size_z
+                for ii in range(num_blocks_x):
+                    for jj in range(num_blocks_y):
+                        for kk in range(num_blocks_z):
+                            if self.twoD:
+                                #TODO: how to use nz_skip on 1D slices
+                                for kkk in range(self.tile_size_z):
+                                    if not self.use_all_data:
+                                        datalist = []
+                                        for cc in range(len(data)):
+                                            data_cube = data[cc][kkk+kk*self.tile_size_z, jj*y_step_size:(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip, ii*x_step_size:(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
+                                            datalist.append(data_cube.copy().transpose(1,0))
+                                        labellist = []
+                                        for cc in range(len(label)):
+                                            label_cube = label[cc][kkk+kk*self.tile_size_z, jj*y_step_size:(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip, ii*x_step_size:(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
+                                            labellist.append(label_cube.copy().transpose(1,0))
+                                        yield np.stack(datalist, axis=0), np.stack(labellist, axis=0), variables
+                                        #yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kkk+kk*self.tile_size_z], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kkk+kk*self.tile_size_z], variables
+                                    else:
+                                        if kkk+kk*self.tile_size_z > (datalen_z-1):
+                                            continue
+                                        elif (self.tile_size_x*self.nx_skip)+ii*x_step_size > (datalen_x-1):
+                                            if (self.tile_size_y*self.ny_skip)+jj*y_step_size > (datalen_y-1):
+                                            #xy
+                                                datalist = []
+                                                for cc in range(len(data)):
+                                                    data_cube = data[cc][kkk+kk*self.tile_size_z, datalen_y-(self.tile_size_y*self.ny_skip):datalen_y:self.ny_skip, datalen_x-(self.tile_size_x*self.nx_skip):datalen_x:self.nx_skip]
+                                                    datalist.append(data_cube.copy().transpose(1,0))
+                                                labellist = []
+                                                for cc in range(len(label)):
+                                                    label_cube = label[cc][kkk+kk*self.tile_size_z, datalen_y-(self.tile_size_y*self.ny_skip):datalen_y:self.ny_skip, datalen_x-(self.tile_size_x*self.nx_skip):datalen_x:self.nx_skip]
+                                                    labellist.append(label_cube.copy().transpose(1,0))
+                                                yield np.stack(datalist, axis=0), np.stack(labellist, axis=0), variables
+                                                #yield data[:, datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y, kkk+kk*self.tile_size_z], label[datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y, kkk+kk*self.tile_size_z], variables
+                                            else:
+                                            #x
+                                                datalist = []
+                                                for cc in range(len(data)):
+                                                    data_cube = data[cc][kkk+kk*self.tile_size_z, jj*y_step_size:(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip, datalen_x-(self.tile_size_x*self.nx_skip):datalen_x:self.nx_skip]
+                                                    datalist.append(data_cube.copy().transpose(1,0))
+                                                labellist = []
+                                                for cc in range(len(label)):
+                                                    label_cube = label[cc][kkk+kk*self.tile_size_z, jj*y_step_size:(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip, datalen_x-(self.tile_size_x*self.nx_skip):datalen_x:self.nx_skip]
+                                                    labellist.append(label_cube.copy().transpose(1,0))
+                                                yield np.stack(datalist, axis=0), np.stack(labellist, axis=0), variables
+                                                #yield data[:, datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size, kkk+kk*self.tile_size_z], label[datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size, kkk+kk*self.tile_size_z], variables
+                                        elif (self.tile_size_y*self.ny_skip)+jj*y_step_size > (datalen_y-1):
+                                        #y
+                                            datalist = []
+                                            for cc in range(len(data)):
+                                                data_cube = data[cc][kkk+kk*self.tile_size_z, datalen_y-(self.tile_size_y*self.ny_skip):datalen_y:self.ny_skip, ii*x_step_size:(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
+                                                datalist.append(data_cube.copy().transpose(1,0))
+                                            labellist = []
+                                            for cc in range(len(label)):
+                                                label_cube = label[cc][kkk+kk*self.tile_size_z, datalen_y-(self.tile_size_y*self.ny_skip):datalen_y:self.ny_skip, ii*x_step_size:(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
+                                                labellist.append(label_cube.copy().transpose(1,0))
+                                            yield np.stack(datalist, axis=0), np.stack(labellist, axis=0), variables
+                                            #yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y, kkk+kk*self.tile_size_z], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y, kkk+kk*self.tile_size_z], variables
+                                        else:
+                                            datalist = []
+                                            for cc in range(len(data)):
+                                                data_cube = data[cc][kkk+kk*self.tile_size_z, jj*y_step_size:(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip, ii*x_step_size:(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
+                                                datalist.append(data_cube.copy().transpose(1,0))
+                                            labellist = []
+                                            for cc in range(len(label)):
+                                                label_cube = label[cc][kkk+kk*self.tile_size_z, jj*y_step_size:(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip, ii*x_step_size:(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
+                                                labellist.append(label_cube.copy().transpose(1,0))
+                                            yield np.stack(datalist, axis=0), np.stack(labellist, axis=0), variables
+                                            #yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kkk+kk*self.tile_size_z], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kkk+kk*self.tile_size_z], variables
+
+                            else:
+                                if not self.use_all_data:
+                                    datalist = []
+                                    for cc in range(len(data)):
+                                        data_cube = data[cc][kk*z_step_size:(self.tile_size_z*self.nz_skip)+kk*z_step_size:self.nz_skip, jj*y_step_size:(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip,ii*x_step_size:(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
+                                        datalist.append(data_cube.copy().transpose(2,1,0))
+                                    labellist = []
+                                    for cc in range(len(label)):
+                                        label_cube = label[cc][kk*z_step_size:(self.tile_size_z*self.nz_skip)+kk*z_step_size:self.nz_skip, jj*y_step_size:(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip,ii*x_step_size:(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
+                                        labellist.append(label_cube.copy().transpose(2,1,0))
+                                    yield np.stack(datalist, axis=0), np.stack(labellist, axis=0), variables
+                                    #yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
+                                else:
+                                    if (self.tile_size_x*self.nx_skip)+ii*x_step_size > (datalen_x-1):
+                                        if (self.tile_size_y*self.ny_skip)+jj*y_step_size > (datalen_y-1):
+                                            if (self.tile_size_z*self.nz_skip)+kk*z_step_size > (datalen_z-1):
+                                            #xyz
+                                                datalist = []
+                                                for cc in range(len(data)):
+                                                    data_cube = data[cc][datalen_z-(self.tile_size_z*self.nz_skip):datalen_z:self.nz_skip, datalen_y-(self.tile_size_y*self.ny_skip):datalen_y:self.ny_skip, datalen_x-(self.tile_size_x*self.nx_skip):datalen_x:self.nx_skip]
+                                                    datalist.append(data_cube.copy().transpose(2,1,0))
+                                                labellist = []
+                                                for cc in range(len(label)):
+                                                    label_cube = label[cc][datalen_z-(self.tile_size_z*self.nz_skip):datalen_z:self.nz_skip, datalen_y-(self.tile_size_y*self.ny_skip):datalen_y:self.ny_skip, datalen_x-(self.tile_size_x*self.nx_skip):datalen_x:self.nx_skip]
+                                                    labellist.append(label_cube.copy().transpose(2,1,0))
+                                                yield np.stack(datalist, axis=0), np.stack(labellist, axis=0), variables
+                                                #yield data[:, datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y, datalen_z-self.tile_size_z:datalen_z], label[datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y, datalen_z-self.tile_size_z:datalen_z], variables
+                                            else:
+                                            #xy
+                                                datalist = []
+                                                for cc in range(len(data)):
+                                                    data_cube = data[cc][kk*z_step_size:(self.tile_size_z*self.nz_skip)+kk*z_step_size:self.nz_skip, datalen_y-(self.tile_size_y*self.ny_skip):datalen_y:self.ny_skip, datalen_x-(self.tile_size_x*self.nx_skip):datalen_x:self.nx_skip]
+                                                    datalist.append(data_cube.copy().transpose(2,1,0))
+                                                labellist = []
+                                                for cc in range(len(label)):
+                                                    label_cube = label[cc][kk*z_step_size:(self.tile_size_z*self.nz_skip)+kk*z_step_size:self.nz_skip, datalen_y-(self.tile_size_y*self.ny_skip):datalen_y:self.ny_skip, datalen_x-(self.tile_size_x*self.nx_skip):datalen_x:self.nx_skip]
+                                                    labellist.append(label_cube.copy().transpose(2,1,0))
+                                                yield np.stack(datalist, axis=0), np.stack(labellist, axis=0), variables
+                                                #yield data[:, datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y, kk*z_step_size:self.tile_size_z+kk*z_step_size], label[datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
+                                        elif self.tile_size_z+kk*z_step_size > (datalen_z-1):
+                                        #xz
+                                            datalist = []
+                                            for cc in range(len(data)):
+                                                data_cube = data[cc][datalen_z-(self.tile_size_z*self.nz_skip):datalen_z:self.nz_skip, jj*y_step_size:(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip, datalen_x-(self.tile_size_x*self.nx_skip):datalen_x:self.nx_skip]
+                                                datalist.append(data_cube.copy().transpose(2,1,0))
+                                            labellist = []
+                                            for cc in range(len(label)):
+                                                label_cube = label[cc][datalen_z-(self.tile_size_z*self.nz_skip):datalen_z:self.nz_skip, jj*y_step_size:(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip, datalen_x-(self.tile_size_x*self.nx_skip):datalen_x:self.nx_skip]
+                                                labellist.append(label_cube.copy().transpose(2,1,0))
+                                            yield np.stack(datalist, axis=0), np.stack(labellist, axis=0), variables
+                                            #yield data[:, datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size, datalen_z-self.tile_size_z:datalen_z], label[datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size, datalen_z-self.tile_size_z:datalen_z], variables
+                                        else:
+                                        #x
+                                            datalist = []
+                                            for cc in range(len(data)):
+                                                data_cube = data[cc][kk*z_step_size:(self.tile_size_z*self.nz_skip)+kk*z_step_size:self.nz_skip, jj*y_step_size:(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip, datalen_x-(self.tile_size_x*self.nx_skip):datalen_x:self.nx_skip]
+                                                datalist.append(data_cube.copy().transpose(2,1,0))
+                                            labellist = []
+                                            for cc in range(len(label)):
+                                                label_cube = label[cc][kk*z_step_size:(self.tile_size_z*self.nz_skip)+kk*z_step_size:self.nz_skip, jj*y_step_size:(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip, datalen_x-(self.tile_size_x*self.nx_skip):datalen_x:self.nx_skip]
+                                                labellist.append(label_cube.copy().transpose(2,1,0))
+                                            yield np.stack(datalist, axis=0), np.stack(labellist, axis=0), variables
+                                            #yield data[:, datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], label[datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
+                                    elif self.tile_size_y+jj*y_step_size > (datalen_y-1):
+                                        if self.tile_size_z+kk*z_step_size > (datalen_z-1):
+                                        #yz
+                                            datalist = []
+                                            for cc in range(len(data)):
+                                                data_cube = data[cc][datalen_z-(self.tile_size_z*self.nz_skip):datalen_z:self.nz_skip, datalen_y-(self.tile_size_y*self.ny_skip):datalen_y:self.ny_skip, ii*x_step_size:(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
+                                                datalist.append(data_cube.copy().transpose(2,1,0))
+                                            labellist = []
+                                            for cc in range(len(label)):
+                                                label_cube = label[cc][datalen_z-(self.tile_size_z*self.nz_skip):datalen_z:self.nz_skip, datalen_y-(self.tile_size_y*self.ny_skip):datalen_y:self.ny_skip, ii*x_step_size:(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
+                                                labellist.append(label_cube.copy().transpose(2,1,0))
+                                            yield np.stack(datalist, axis=0), np.stack(labellist, axis=0), variables
+                                            #yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y, datalen_z-self.tile_size_z:datalen_z], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y, datalen_z-self.tile_size_z:datalen_z], variables
+                                        else:
+                                        #y
+                                            datalist = []
+                                            for cc in range(len(data)):
+                                                data_cube = data[cc][kk*z_step_size:(self.tile_size_z*self.nz_skip)+kk*z_step_size:self.nz_skip, datalen_y-(self.tile_size_y*self.ny_skip):datalen_y:self.ny_skip, ii*x_step_size:(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
+                                                datalist.append(data_cube.copy().transpose(2,1,0))
+                                            labellist = []
+                                            for cc in range(len(label)):
+                                                label_cube = label[cc][kk*z_step_size:(self.tile_size_z*self.nz_skip)+kk*z_step_size:self.nz_skip, datalen_y-(self.tile_size_y*self.ny_skip):datalen_y:self.ny_skip, ii*x_step_size:(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
+                                                labellist.append(label_cube.copy().transpose(2,1,0))
+                                            yield np.stack(datalist, axis=0), np.stack(labellist, axis=0), variables
+                                            #yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y, kk*z_step_size:self.tile_size_z+kk*z_step_size], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
+                                    elif self.tile_size_z+kk*z_step_size > (datalen_z-1):
+                                    #z
+                                        datalist = []
+                                        for cc in range(len(data)):
+                                            data_cube = data[cc][datalen_z-(self.tile_size_z*self.nz_skip):datalen_z:self.nz_skip, jj*y_step_size:(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip, ii*x_step_size:(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
+                                            datalist.append(data_cube.copy().transpose(2,1,0))
+                                        labellist = []
+                                        for cc in range(len(label)):
+                                            label_cube = label[cc][datalen_z-(self.tile_size_z*self.nz_skip):datalen_z:self.nz_skip, jj*y_step_size:(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip, ii*x_step_size:(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
+                                            labellist.append(label_cube.copy().transpose(2,1,0))
+                                        yield np.stack(datalist, axis=0), np.stack(labellist, axis=0), variables
+                                        #yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, datalen_z-self.tile_size_z:datalen_z], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, datalen_z-self.tile_size_z:datalen_z], variables
+                                    else:
+                                        datalist = []
+                                        for cc in range(len(data)):
+                                            data_cube = data[cc][kk*z_step_size:(self.tile_size_z*self.nz_skip)+kk*z_step_size:self.nz_skip, jj*y_step_size:(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip,ii*x_step_size:(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
+                                            datalist.append(data_cube.copy().transpose(2,1,0))
+                                        labellist = []
+                                        for cc in range(len(label)):
+                                            label_cube = label[cc][kk*z_step_size:(self.tile_size_z*self.nz_skip)+kk*z_step_size:self.nz_skip, jj*y_step_size:(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip,ii*x_step_size:(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
+                                            labellist.append(label_cube.copy().transpose(2,1,0))
+                                        yield np.stack(datalist, axis=0), np.stack(labellist, axis=0), variables
+                                        #yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
+
+        else:
+            for (data,variables) in self.dataset:
+                #Total Tiles Evenly Spaced
+                TTE_x = self.nx//self.tile_size_x
+                TTE_y = self.ny//self.tile_size_y
+                num_blocks_x = (TTE_x-1)*OTP2_x + 1
+                num_blocks_y = (TTE_y-1)*OTP2_y + 1
+                if self.use_all_data:
+                    #Total Tiles
+                    TT_x = self.nx/(self.tile_size_x)
+                    TT_y = self.ny/(self.tile_size_y)
+                    # Number of leftover overlap patches for last tile
+                    LTOP_x = np.floor((TT_x-TTE_x)*OTP2_x)
+                    LTOP_y = np.floor((TT_y-TTE_y)*OTP2_y)
+                    if tile_overlap_size_x == 0:
+                        if self.nx % self.tile_size_x != 0:
+                            LTOP_x += 1
+                    else: #>0
+                        if self.nx % tile_overlap_size_x != 0:
+                            LTOP_x += 1
+                    if tile_overlap_size_y == 0:
+                        if self.ny % self.tile_size_y != 0:
+                            LTOP_y += 1
+                    else: #>0
+                        if self.ny % tile_overlap_size_y != 0:
+                            LTOP_y += 1
+                    num_blocks_x = int(num_blocks_x + LTOP_x)
+                    num_blocks_y = int(num_blocks_y + LTOP_y)
+
+                if self.twoD:
+                    if self.use_all_data:
+                        num_blocks_z = np.ceil(self.nz/self.tile_size_z).astype(int)
+                    else:
+                        num_blocks_z = self.nz//self.tile_size_z
+                else:
+                    TTE_z = self.nz//self.tile_size_z
+                    num_blocks_z = (TTE_z-1)*OTP2_z + 1
+                    if self.use_all_data:
+                        #Total Tiles
+                        TT_z = self.nz/(self.tile_size_z)
+                        # Number of leftover overlap patches for last tile
+                        LTOP_z = np.floor((TT_z-TTE_z)*OTP2_z)
+                        if tile_overlap_size_z == 0:
+                            if self.nz % self.tile_size_z != 0:
+                                LTOP_z += 1
+                        else: #>0
+                            if self.nz % tile_overlap_size_z != 0:
+                                LTOP_z += 1
+                        num_blocks_z = int(num_blocks_z + LTOP_z)
+
+                datalen_x = self.nx
+                datalen_y = self.ny
+                datalen_z = self.nz
+                #channels, datalen_x, datalen_y, datalen_z = data.shape
+
+                x_step_size = self.tile_size_x-tile_overlap_size_x
+                y_step_size = self.tile_size_y-tile_overlap_size_y
+                if not self.twoD:
+                    z_step_size = self.tile_size_z-tile_overlap_size_z
+                for ii in range(num_blocks_x):
+                    for jj in range(num_blocks_y):
+                        for kk in range(num_blocks_z):
+                            if self.twoD:
+                                for kkk in range(self.tile_size_z):
+                                    if not self.use_all_data:
+                                        datalist = []
+                                        for cc in range(len(data)):
+                                            data_cube = data[cc][kkk+kk*self.tile_size_z, jj*y_step_size:(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip, ii*x_step_size:(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
+                                            datalist.append(data_cube.copy().transpose(1,0))
+                                        yield np.stack(datalist, axis=0), variables
+                                        #yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kkk+kk*self.tile_size_z], variables
+                                    else:
+                                        if kkk+kk*self.tile_size_z > (datalen_z-1):
+                                            continue
+                                        elif (self.tile_size_x*self.nx_skip)+ii*x_step_size > (datalen_x-1):
+                                            if (self.tile_size_y*self.ny_skip)+jj*y_step_size > (datalen_y-1):
+                                            #xy
+                                                datalist = []
+                                                for cc in range(len(data)):
+                                                    data_cube = data[cc][kkk+kk*self.tile_size_z, datalen_y-(self.tile_size_y*self.ny_skip):datalen_y:self.ny_skip, datalen_x-(self.tile_size_x*self.nx_skip):datalen_x:self.nx_skip]
+                                                    datalist.append(data_cube.copy().transpose(1,0))
+                                                yield np.stack(datalist, axis=0), variables
+                                                #yield data[:, datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y, kkk+kk*self.tile_size_z], variables
+                                            else:
+                                            #x
+                                                datalist = []
+                                                for cc in range(len(data)):
+                                                    data_cube = data[cc][kkk+kk*self.tile_size_z, jj*y_step_size:(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip, datalen_x-(self.tile_size_x*self.nx_skip):datalen_x:self.nx_skip]
+                                                    datalist.append(data_cube.copy().transpose(1,0))
+                                                yield np.stack(datalist, axis=0), variables
+                                                #yield data[:, datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size, kkk+kk*self.tile_size_z], variables
+                                        elif (self.tile_size_y*self.ny_skip)+jj*y_step_size > (datalen_y-1):
+                                        #y
+                                            datalist = []
+                                            for cc in range(len(data)):
+                                                data_cube = data[cc][kkk+kk*self.tile_size_z, datalen_y-(self.tile_size_y*self.ny_skip):datalen_y:self.ny_skip, ii*x_step_size:(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
+                                                datalist.append(data_cube.copy().transpose(1,0))
+                                            yield np.stack(datalist, axis=0), variables
+                                            #yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y, kkk+kk*self.tile_size_z], variables
+                                        else:
+                                            datalist = []
+                                            for cc in range(len(data)):
+                                                data_cube = data[cc][kkk+kk*self.tile_size_z, jj*y_step_size:(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip, ii*x_step_size:(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
+                                                datalist.append(data_cube.copy().transpose(1,0))
+                                            yield np.stack(datalist, axis=0), variables
+                                            #yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kkk+kk*self.tile_size_z], variables
+
+                            else:
+                                if not self.use_all_data:
+                                    datalist = []
+                                    for cc in range(len(data)):
+                                        data_cube = data[cc][kk*z_step_size:(self.tile_size_z*self.nz_skip)+kk*z_step_size:self.nz_skip, jj*y_step_size:(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip,ii*x_step_size:(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
+                                        datalist.append(data_cube.copy().transpose(2,1,0))
+                                    yield np.stack(datalist, axis=0), variables
+                                    #yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
+                                else:
+                                    if (self.tile_size_x*self.nx_skip)+ii*x_step_size > (datalen_x-1):
+                                        if (self.tile_size_y*self.ny_skip)+jj*y_step_size > (datalen_y-1):
+                                            if (self.tile_size_z*self.nz_skip)+kk*z_step_size > (datalen_z-1):
+                                            #xyz
+                                                datalist = []
+                                                for cc in range(len(data)):
+                                                    data_cube = data[cc][datalen_z-(self.tile_size_z*self.nz_skip):datalen_z:self.nz_skip, datalen_y-(self.tile_size_y*self.ny_skip):datalen_y:self.ny_skip, datalen_x-(self.tile_size_x*self.nx_skip):datalen_x:self.nx_skip]
+                                                    datalist.append(data_cube.copy().transpose(2,1,0))
+                                                yield np.stack(datalist, axis=0), variables
+                                                #yield data[:, datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y, datalen_z-self.tile_size_z:datalen_z], variables
+                                            else:
+                                            #xy
+                                                datalist = []
+                                                for cc in range(len(data)):
+                                                    data_cube = data[cc][kk*z_step_size:(self.tile_size_z*self.nz_skip)+kk*z_step_size:self.nz_skip, datalen_y-(self.tile_size_y*self.ny_skip):datalen_y:self.ny_skip, datalen_x-(self.tile_size_x*self.nx_skip):datalen_x:self.nx_skip]
+                                                    datalist.append(data_cube.copy().transpose(2,1,0))
+                                                yield np.stack(datalist, axis=0), variables
+                                                #yield data[:, datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
+                                        elif self.tile_size_z+kk*z_step_size > (datalen_z-1):
+                                        #xz
+                                            datalist = []
+                                            for cc in range(len(data)):
+                                                data_cube = data[cc][datalen_z-(self.tile_size_z*self.nz_skip):datalen_z:self.nz_skip, jj*y_step_size:(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip, datalen_x-(self.tile_size_x*self.nx_skip):datalen_x:self.nx_skip]
+                                                datalist.append(data_cube.copy().transpose(2,1,0))
+                                            yield np.stack(datalist, axis=0), variables
+                                            #yield data[:, datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size, datalen_z-self.tile_size_z:datalen_z], variables
+                                        else:
+                                        #x
+                                            datalist = []
+                                            for cc in range(len(data)):
+                                                data_cube = data[cc][kk*z_step_size:(self.tile_size_z*self.nz_skip)+kk*z_step_size:self.nz_skip, jj*y_step_size:(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip, datalen_x-(self.tile_size_x*self.nx_skip):datalen_x:self.nx_skip]
+                                                datalist.append(data_cube.copy().transpose(2,1,0))
+                                            yield np.stack(datalist, axis=0), variables
+                                            #yield data[:, datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
+                                    elif self.tile_size_y+jj*y_step_size > (datalen_y-1):
+                                        if self.tile_size_z+kk*z_step_size > (datalen_z-1):
+                                        #yz
+                                            datalist = []
+                                            for cc in range(len(data)):
+                                                data_cube = data[cc][datalen_z-(self.tile_size_z*self.nz_skip):datalen_z:self.nz_skip, datalen_y-(self.tile_size_y*self.ny_skip):datalen_y:self.ny_skip, ii*x_step_size:(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
+                                                datalist.append(data_cube.copy().transpose(2,1,0))
+                                            yield np.stack(datalist, axis=0), variables
+                                            #yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y, datalen_z-self.tile_size_z:datalen_z], variables
+                                        else:
+                                        #y
+                                            datalist = []
+                                            for cc in range(len(data)):
+                                                data_cube = data[cc][kk*z_step_size:(self.tile_size_z*self.nz_skip)+kk*z_step_size:self.nz_skip, datalen_y-(self.tile_size_y*self.ny_skip):datalen_y:self.ny_skip, ii*x_step_size:(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
+                                                datalist.append(data_cube.copy().transpose(2,1,0))
+                                            yield np.stack(datalist, axis=0), variables
+                                            #yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
+                                    elif self.tile_size_z+kk*z_step_size > (datalen_z-1):
+                                    #z
+                                        datalist = []
+                                        for cc in range(len(data)):
+                                            data_cube = data[cc][datalen_z-(self.tile_size_z*self.nz_skip):datalen_z:self.nz_skip, jj*y_step_size:(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip, ii*x_step_size:(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
+                                            datalist.append(data_cube.copy().transpose(2,1,0))
+                                        yield np.stack(datalist, axis=0), variables
+                                        #yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, datalen_z-self.tile_size_z:datalen_z], variables
+                                    else:
+                                        datalist = []
+                                        for cc in range(len(data)):
+                                            data_cube = data[cc][kk*z_step_size:(self.tile_size_z*self.nz_skip)+kk*z_step_size:self.nz_skip, jj*y_step_size:(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip,ii*x_step_size:(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
+                                            datalist.append(data_cube.copy().transpose(2,1,0))
+                                        yield np.stack(datalist, axis=0), variables
+                                        #yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
             
 class ShuffleIterableDataset(IterableDataset):
     def __init__(self, dataset, buffer_size: int) -> None:
@@ -637,8 +1135,14 @@ class ProcessChannels(IterableDataset):
                                     seq_image, seq_size, seq_pos, qdt = self.patchify(np.expand_dims(np_image,axis=-1))
                                     if self._dataset != "imagenet":
                                         np_label = yield_label_list[i].pop()
+                                        if self._dataset == "basic_ct"
+                                            np_label = np.expand_dims(np_label,axis=0)
+                                        if self._dataset == "sst":
+                                            num_labels = len(np_label)
+                                        else:
+                                            num_labels = np_label.shape[0]
                                         seq_label_list = []
-                                        for j in range(len(np_label)):
+                                        for j in range(num_labels):
                                             if self.twoD:
                                                 if self._dataset == "basic_ct":
                                                     seq_label, _, _ = qdt.serialize_labels(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,self.num_channels))
@@ -687,13 +1191,19 @@ class ProcessChannels(IterableDataset):
 
                                     if self._dataset != "imagenet":
                                         np_label = yield_label_list[i].pop()
+                                        if self._dataset == "basic_ct"
+                                            np_label = np.expand_dims(np_label,axis=0)
+                                        if self._dataset == "sst":
+                                            num_labels = len(np_label)
+                                        else:
+                                            num_labels = np_label.shape[0]
                                         seq_label_list = []
                                         #TODO: If separate_channel=True, which qdt from qdt_list to use? Default to using the first in the list for now
                                         if self.separate_channels:
                                             qdt_ = qdt[0]
                                         else:
                                             qdt_ = qdt
-                                        for j in range(len(np_label)):
+                                        for j in range(num_labels):
                                             if self.twoD:
                                                 if self._dataset == "basic_ct":
                                                     seq_label, _, _ = qdt_.serialize_labels(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,self.num_channels))

@@ -14,9 +14,12 @@ from .dataset import (
     FileReader,
     ImageBlockDataIter_2D,
     ImageBlockDataIter_3D,
+    ImageBlockDataIter_3D_Memmap,
     ShuffleIterableDataset,
     ProcessChannels,
 )
+
+from UCF_VIT.utils.misc import get_file_prefix
 
 def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_channels, dataset, num_classes, num_labels, return_qdt):
     if adaptive_patching:
@@ -47,8 +50,8 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                             seq_mask = F.one_hot(seq_mask.squeeze(-1), num_classes=num_classes)
                             seq_label_list.append(seq_mask.permute(2, 0, 1).float())
                         else:
+                            seq_label_list.append([])
                             for j in range(num_labels):
-                                seq_label_list.append([])
                                 seq_label_list[i].append(torch.from_numpy(batch[i][5][j]))
                     seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
                     variables = []
@@ -88,8 +91,8 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                             seq_mask = F.one_hot(seq_mask.squeeze(-1), num_classes=num_classes)
                             seq_label_list.append(seq_mask.permute(2, 0, 1).float())
                         else:
+                            seq_label_list.append([])
                             for j in range(num_labels):
-                                seq_label_list.append([])
                                 seq_label_list[i].append(torch.from_numpy(batch[i][5][j]))
                     seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
                     variables = batch[0][6]
@@ -141,10 +144,13 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                 if dataset == "imagenet":
                     label = torch.stack([torch.tensor(batch[i][1]) for i in range(len(batch))])
                 else:
-                    if num_labels == 1:
-                        label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
-                    else:
+                    if dataset == "sst":
                         label = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
+                    else:
+                        if num_labels == 1:
+                            label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
+                        else:
+                            label = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
                 variables = []
                 variables.append(batch[0][2])
             else:
@@ -152,10 +158,13 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                 if dataset == "imagenet":
                     label = torch.stack([torch.tensor(batch[i][1]) for i in range(len(batch))])
                 else:
-                    if num_labels == 1:
-                        label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
-                    else:
+                    if dataset == "sst":
                         label = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
+                    else:
+                        if num_labels == 1:
+                            label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
+                        else:
+                            label = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
                 variables = batch[0][2]
                 
             return (inp, label, variables)
@@ -228,6 +237,13 @@ class NativePytorchDataModule(torch.nn.Module):
         ddp_group: Optional[dist.ProcessGroup] = None,
         num_classes: Optional[int] = None,
         imagenet_resize: Dict = None,
+        nx: Optional[Dict] = None,
+        ny: Optional[Dict] = None,
+        nz: Optional[Dict] = None,
+        nx_skip: Optional[Dict] = None,
+        ny_skip: Optional[Dict] = None,
+        nz_skip: Optional[Dict] = None,
+        dict_out_variables: Optional[Dict] = None,
     ):
         super().__init__()
         if num_workers > 1:
@@ -275,7 +291,26 @@ class NativePytorchDataModule(torch.nn.Module):
         if self.dataset == "basic_ct":
             if return_label:
                 assert num_classes != None, "If using segmentation with basic_ct need to pass the number of classes"
-        self.imagenet_resize = imagenet_resize
+
+        if self.dataset == "imagenet":
+            self.imagenet_resize = imagenet_resize
+
+        if self.dataset == "sst":
+            self.nx = nx
+            self.ny = ny
+            self.nz = nz
+            self.nx_skip = nx_skip
+            self.ny_skip = ny_skip
+            self.nz_skip = nz_skip
+
+            out_variables = {}
+            for k, list_out in dict_out_variables.items():
+                if list_out is not None:
+                    out_variables[k] = list_out
+                #TODO: Add checking and mapping for out_variables
+                #out_variables[k] = [ x for x in out_variables[k] if x in DEFAULT_VARIABLE_LIST ]
+                out_variables[k] = [ x for x in out_variables[k] ]
+            self.dict_out_variables = out_variables
 
         in_variables = {}
         for k, list_out in dict_in_variables.items():
@@ -314,6 +349,22 @@ class NativePytorchDataModule(torch.nn.Module):
                     if num_data_roots > data_par_size-1:
                         break
             assert num_data_roots <= data_par_size, "the number of data parallel GPUs (data_par_size) needs to be at least equal to the number of datasets. Try to increase data_par_size"
+
+        elif self.dataset == "sst":
+           lister = { k: list(dp.iter.FileLister(os.path.join(root_dir, ""))) for k, root_dir in dict_root_dirs.items() }
+           for i,k in enumerate(lister.keys()):
+               list_ = lister[k]
+               main_keys = []
+               for j in range(len(list_)):
+                   base_path_prefix, timestamp = get_file_prefix(list_[j])
+                   key = os.path.join(base_path_prefix, timestamp)
+                   main_keys.append(key)
+               used = set()
+               #Find all unique keys, since different channels are in separate files
+               unique_keys = [x for x in main_keys if x not in used and (used.add(x) or True)]
+               img_dict = {k: unique_keys}
+               self.dict_lister_trains.update(img_dict)
+
         else:
             self.dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in dict_root_dirs.items() }
            
@@ -404,6 +455,56 @@ class NativePytorchDataModule(torch.nn.Module):
                         self.dataset,
                         self.return_qdt,
                     )
+                elif self.dataset == "sst":
+                    dict_data_train[k] = ProcessChannels(
+                        ShuffleIterableDataset(
+                            ImageBlockDataIter_3D_Memmap(
+                                    FileReader(
+                                        lister_train,
+                                        num_channels_available,
+                                        gx = self.gx,
+                                        start_idx=start_idx,
+                                        end_idx=end_idx,
+                                        variables=variables,
+                                        multi_dataset_training=True,
+                                        data_par_size = self.data_par_size,
+                                        return_label = return_label,
+                                        keys_to_add = keys_to_add,
+                                        ddp_group = self.ddp_group,
+                                        dataset=self.dataset,
+                                        variables_out = self.dict_out_variables[k],
+                                        nx = self.nx[k],
+                                        ny = self.ny[k],
+                                        nz = self.nz[k],
+                                    ),
+                                self.tile_size_x*self.nx_skip[k],
+                                self.tile_size_y*self.ny_skip[k],
+                                self.tile_size_z*self.nz_skip[k],
+                                self.twoD,
+                                nx = self.nx[k],
+                                ny = self.ny[k],
+                                nz = self.nz[k],
+                                nx_skip = self.nx_skip[k],
+                                ny_skip = self.ny_skip[k],
+                                nz_skip = self.nz_skip[k],
+                                return_label = return_label,
+                                tile_overlap = self.tile_overlap,
+                                use_all_data = self.use_all_data,
+                            ),
+                            buffer_size
+                        ),
+                        num_channels_used,
+                        single_channel,
+                        self.batch_size,
+                        return_label,
+                        self.adaptive_patching,
+                        self.separate_channels,
+                        self.patch_size,
+                        self.fixed_length,
+                        self.twoD,
+                        self.dataset,
+                        self.return_qdt,
+                    )
                 else:
                     dict_data_train[k] = ProcessChannels(
                         ShuffleIterableDataset(
@@ -467,7 +568,10 @@ class NativePytorchDataModule(torch.nn.Module):
         for idx, k in enumerate(self.dict_data_train.keys()):
             if idx == group_id:
                 data_train = self.dict_data_train[k]
-                num_labels = 1
+                if self.dataset == "sst":
+                    num_labels = len(self.dict_out_variables[k])
+                else:
+                    num_labels = 1
                 break
             
         return DataLoader(
