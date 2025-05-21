@@ -145,7 +145,10 @@ class FileReader(IterableDataset):
                     data = np.load(path)
                     data = data.astype('float32')
                     data = (data-data.min())/(data.max()-data.min())
-                    yield data, self.variables
+                    if self.num_channels_available == 1:
+                        yield np.expand_dims(data,axis=0), self.variables
+                    else:
+                        yield data, self.variables
 
 class ImageBlockDataIter_2D(IterableDataset):
     def __init__(

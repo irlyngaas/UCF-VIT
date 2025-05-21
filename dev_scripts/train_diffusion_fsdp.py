@@ -320,6 +320,7 @@ def main(device):
            map_location = 'cpu'
            #map_location = 'cuda:'+str(device)
            model.load_state_dict(torch.load(checkpoint_path+'/initial_'+str(0)+'.pth',map_location=map_location),strict=False)
+
     else:  
         if world_rank< tensor_par_size:
             if os.path.exists(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(world_rank)+".ckpt"):
@@ -506,7 +507,7 @@ def main(device):
 
                 scheduler.step()
                 optimizer.zero_grad()
-        loss_list.append(epoch_loss)
+        #loss_list.append(epoch_loss)
 
         if world_rank==0:
             print("epoch: ",epoch," epoch_loss ",epoch_loss, flush=True)
@@ -524,7 +525,7 @@ def main(device):
                     'model_state_dict': model_states,
                     'optimizer_state_dict': optimizer_states,
                     'scheduler_state_dict': scheduler_states,
-                    'loss_list' : loss_list,
+                    #'loss_list' : loss_list,
                     }, checkpoint_path+"/"+checkpoint_filename+"_even.ckpt")
 
         if epoch % 2 == 1:
@@ -535,7 +536,7 @@ def main(device):
                     'model_state_dict': model_states,
                     'optimizer_state_dict': optimizer_states,
                     'scheduler_state_dict': scheduler_states,
-                    'loss_list' : loss_list,
+                    #'loss_list' : loss_list,
                     }, checkpoint_path+"/"+checkpoint_filename+"_odd.ckpt")
      
         dist.barrier()
@@ -544,7 +545,7 @@ def main(device):
         del scheduler_states
 
         for var in default_vars:
-            sample_images(model, var, device, tile_size, precision_dt, epoch=epoch, num_samples=2, twoD=twoD, save_path=inference_path, num_time_steps=num_time_steps)
+            sample_images(model, var, device, tile_size, precision_dt, patch_size, epoch=epoch, num_samples=2, twoD=twoD, save_path=inference_path, num_time_steps=num_time_steps)
 
 if __name__ == "__main__":
 

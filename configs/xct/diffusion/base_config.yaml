@@ -1,7 +1,7 @@
 # ---------------------------- TRAINER -------------------------------------------
 trainer:
   max_epochs: 600
-  data_type: "float32"
+  data_type: "bfloat16"
   checkpoint_path: "../../checkpoint/xct/diffusion/base"
   checkpoint_filename: "multi_last"
   checkpoint_filename_for_loading: "multi_last_odd" #multi_last_odd or multi_last_even
@@ -33,7 +33,6 @@ model:
     init_args:
       default_vars: [
         "xct",
-        "nct",
       ]
       tile_size: [128, 128, 128]
       patch_size: 8
@@ -65,16 +64,16 @@ data:
     'xct1': 0,
   }
   dict_end_idx: {
-    'xct1': 1,
+    'xct1': .01,
   }
   dict_buffer_sizes: {
     'xct1': 100,
   }
   num_channels_available: {
-    'xct1': 3,
+    'xct1': 1,
   }
   num_channels_used: {
-    'xct1': 3,
+    'xct1': 1,
   }
   dict_in_variables: {
     'xct1': [
@@ -91,6 +90,6 @@ data:
 # ---------------------------- LOAD BALANCING -------------------------------------------
 load_balancing:
   batches_per_rank_epoch: {
-    'imagenet': 4935,
+    'xct1': 48,
   }
-  dataset_group_list: '1:1:1:1:1:1:1:1'
+  dataset_group_list: '8'

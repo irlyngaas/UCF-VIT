@@ -1,9 +1,12 @@
+import os
 import torch
 import torch.nn as nn
 from einops import rearrange
 import matplotlib.pyplot as plt
-from utils.plotting import plot_3D_array_slices
 import torch.distributed as dist
+
+from UCF_VIT.utils.plotting import plot_3D_array_slices
+from UCF_VIT.utils.misc import unpatchify
 
 class DDPM_Scheduler(nn.Module):
     def __init__(self, num_time_steps: int=1000):
@@ -16,7 +19,7 @@ class DDPM_Scheduler(nn.Module):
     def forward(self, t):
         return self.beta[t], self.alpha[t]
 
-def sample_images(model, var, device, res, precision_dt, epoch=0, num_samples=10, twoD=False, save_path='figures', num_time_steps=1000):
+def sample_images(model, var, device, res, precision_dt, patch_size, epoch=0, num_samples=10, twoD=False, save_path='figures', num_time_steps=1000):
 
     scheduler = DDPM_Scheduler(num_time_steps=num_time_steps)
     times = [0, 15, 50, 100, 200, 300, 400, 550, 700, 999]
@@ -36,14 +39,16 @@ def sample_images(model, var, device, res, precision_dt, epoch=0, num_samples=10
 
             t = [t]
             temp = (scheduler.beta[t]/( (torch.sqrt(1-scheduler.alpha[t]))*(torch.sqrt(1-scheduler.beta[t]))))
-            predicted_noise = model(z.to(precision_dt).to(device), torch.tensor(t).to(precision_dt).to(device), [var]) 
+            predicted_noise = model(z.to(precision_dt).to(device), torch.tensor(t).to(device), [var]) 
+            predicted_noise = unpatchify(predicted_noise, z.to(precision_dt).to(device), patch_size, twoD)
             z = (1/(torch.sqrt(1-scheduler.beta[t])))*z - (temp*predicted_noise.cpu())
             if t[0] in times:
                 images.append(z)
             z = z + (e*torch.sqrt(scheduler.beta[t]))
 
         temp = scheduler.beta[0]/( (torch.sqrt(1-scheduler.alpha[0]))*(torch.sqrt(1-scheduler.beta[0])))
-        predicted_noise = model(z.to(precision_dt).to(device), torch.tensor([0]).to(precision_dt).to(device), [var])
+        predicted_noise = model(z.to(precision_dt).to(device), torch.tensor([0]).to(device), [var])
+        predicted_noise = unpatchify(predicted_noise, z.to(precision_dt).to(device), patch_size, twoD)
         x = (1/(torch.sqrt(1-scheduler.beta[0])))*z - (temp*predicted_noise.cpu())
         images.append(x)
 
