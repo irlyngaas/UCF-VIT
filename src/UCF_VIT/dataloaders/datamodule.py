@@ -40,7 +40,7 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                             qdt_list.append(batch[i][6])
                 else:
                     if dataset == "sst":
-                        label = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
+                        label = torch.stack([torch.from_numpy(batch[i][4]) for i in range(len(batch))])
                     else:
                         if num_labels == 1:
                             label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][4],axis=0)) for i in range(len(batch))])
@@ -84,7 +84,7 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                             qdt_list.append(batch[i][6])
                 else:
                     if dataset == "sst":
-                        label = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
+                        label = torch.stack([torch.from_numpy(batch[i][4]) for i in range(len(batch))])
                     else:
                         if num_labels == 1:
                             label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][4],axis=0)) for i in range(len(batch))])
