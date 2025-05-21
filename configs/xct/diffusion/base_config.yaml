@@ -64,7 +64,7 @@ data:
     'xct1': 0,
   }
   dict_end_idx: {
-    'xct1': .01,
+    'xct1': 1,
   }
   dict_buffer_sizes: {
     'xct1': 100,
@@ -90,6 +90,6 @@ data:
 # ---------------------------- LOAD BALANCING -------------------------------------------
 load_balancing:
   batches_per_rank_epoch: {
-    'xct1': 48,
+    'xct1': 4863,
   }
   dataset_group_list: '8'
