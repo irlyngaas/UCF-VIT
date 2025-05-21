@@ -637,8 +637,11 @@ class ProcessChannels(IterableDataset):
                                     seq_image, seq_size, seq_pos, qdt = self.patchify(np.expand_dims(np_image,axis=-1))
                                     if self._dataset != "imagenet":
                                         np_label = yield_label_list[i].pop()
+                                        if self._dataset == "basic_ct"
+                                            np_label = np.expand_dims(np_label,axis=0)
+                                        num_labels = np_label.shape[0]
                                         seq_label_list = []
-                                        for j in range(len(np_label)):
+                                        for j in range(num_labels):
                                             if self.twoD:
                                                 if self._dataset == "basic_ct":
                                                     seq_label, _, _ = qdt.serialize_labels(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,self.num_channels))
@@ -687,13 +690,18 @@ class ProcessChannels(IterableDataset):
 
                                     if self._dataset != "imagenet":
                                         np_label = yield_label_list[i].pop()
-                                        seq_label_list = []
+                                        if self._dataset == "basic_ct"
+                                            np_label = np.expand_dims(np_label,axis=0)
+                                        num_labels = np_label.shape[0]
+
                                         #TODO: If separate_channel=True, which qdt from qdt_list to use? Default to using the first in the list for now
                                         if self.separate_channels:
                                             qdt_ = qdt[0]
                                         else:
                                             qdt_ = qdt
-                                        for j in range(len(np_label)):
+
+                                        seq_label_list = []
+                                        for j in range(num_labels):
                                             if self.twoD:
                                                 if self._dataset == "basic_ct":
                                                     seq_label, _, _ = qdt_.serialize_labels(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,self.num_channels))
