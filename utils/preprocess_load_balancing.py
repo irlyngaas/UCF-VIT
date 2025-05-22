@@ -54,6 +54,8 @@ def main():
     if dataset != "imagenet":
         tile_size_z = int(tile_size[2])
 
+    #ADD NEW DATASET HERE
+    #Corresponds to the process_root_dirs function of the NativePytorchDataModule in src/UCF_VIT/dataloaders/datamodule.py
     if dataset == "imagenet":
         dict_lister_trains = {}
         for k, root_dir in dict_root_dirs.items():
@@ -103,10 +105,13 @@ def main():
 
         #Assume all channels have the same data size
         data_path = keys[0]
+        
+        #ADD NEW DATASET HERE
+        #Corresponds to the read_process_file function of the FileReader class in src/UCF_VIT/dataloaders/dataset.py
         if dataset == "imagenet":
             data = Image.open(data_path).convert("RGB")
             data = np.array(data) 
-            data = cv.resize(data, dsize=[imagenet_resize["imagenet"],imagenet_resize["imagenet"]])
+            data = cv.resize(data, dsize=[imagenet_resize["imagenet"][0],imagenet_resize["imagenet"][1]])
         else:
             data = nib.load(data_path)
             data = np.array(data.dataobj).astype(np.float32)
@@ -126,6 +131,7 @@ def main():
         else:
             OTP2_y = int(tile_size_y/tile_overlap_size_y)
             
+        #USE THIS IF RAW FILES ARE 2D
         if dataset == "imagenet":
             #Total Tiles Evenly Spaced
             TTE_x = data.shape[0]//tile_size_x
@@ -150,6 +156,7 @@ def main():
 
             tiles_per_image.append(num_blocks_x*num_blocks_y)
             num_channels_per_dataset.append(num_channels_used["imagenet"])
+        #USE THIS IF RAW FILES ARE 3D
         else:
             #Total Tiles Evenly Spaced
             TTE_x = data.shape[0]//tile_size_x
@@ -304,7 +311,7 @@ def main():
 
     grouplist_str = ''
     for i in range(len(ddp_rank_ratio)):
-        grouplist_str += str(ddp_rank_ratio[i])+','
+        grouplist_str += str(ddp_rank_ratio[i])+':'
     print("dataset_group_list: '%s'" % (grouplist_str[:-1]))
 
       
