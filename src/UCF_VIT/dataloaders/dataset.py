@@ -48,6 +48,52 @@ class FileReader(IterableDataset):
         self.dataset = dataset
         self.imagenet_resize = imagenet_resize
 
+    def read_process_file(self, path):
+        if self.dataset == "imagenet":
+            data = Image.open(path).convert("RGB")
+            data = np.array(data) 
+            data = cv.resize(data, dsize=[self.imagenet_resize[0],self.imagenet_resize[1]])
+            data = np.moveaxis(data,-1,0)
+
+
+            if self.return_label:
+                data_path = Path(path)
+                parent = data_path.parent.absolute()
+                parent2 = parent.parent.absolute()
+                stem1 = parent.stem
+                classes = sorted(os.listdir(os.path.join(parent2)))
+                class_to_idx = {cls_name: idx for idx, cls_name in enumerate(classes)}
+                label = class_to_idx[stem1]
+                return data, label
+            else:
+                return data
+
+        elif self.dataset == "basic_ct":
+            data = nib.load(path)
+            data = np.array(data.dataobj).astype(np.float32)
+            data = (data-data.min())/(data.max()-data.min())
+
+            if self.return_label:
+                data_path = Path(path)
+                path2 = data_path.parent.absolute()
+                path3 = path2.parent.absolute()
+                label_stem = data_path.stem.split('image')[-1]
+                path4= os.path.join(path3,'labelsTr', "label"+label_stem+".nii")
+                label = nib.load(path4)
+                label = np.array(label.dataobj).astype(np.int64)
+                label = label - 1 # subtract 1 as original labels are [1,4], new will be [0,3]
+
+            if self.num_channels_available == 1:
+                if self.return_label:
+                    return np.expand_dims(data,axis=0), label
+                else:
+                    return np.expand_dims(data,axis=0)
+            else:
+                if self.return_label:
+                    return data, label
+                else:
+                    return data
+
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is None:
@@ -95,51 +141,12 @@ class FileReader(IterableDataset):
             start_it = iter_start + m*int(len(self.file_list)/self.keys_to_add)
             end_it = iter_end + m*int(len(self.file_list)/self.keys_to_add)
             for idx in range(iter_start, iter_end):
-                path = self.file_list[idx]
-                if self.dataset == "imagenet":
-                    data = Image.open(path).convert("RGB")
-                    data = np.array(data) 
-                    data = cv.resize(data, dsize=[self.imagenet_resize[0],self.imagenet_resize[1]])
-                    data = np.moveaxis(data,-1,0)
-
-
-                    if self.return_label:
-                        data_path = Path(path)
-                        parent = data_path.parent.absolute()
-                        parent2 = parent.parent.absolute()
-                        stem1 = parent.stem
-                        classes = sorted(os.listdir(os.path.join(parent2)))
-                        class_to_idx = {cls_name: idx for idx, cls_name in enumerate(classes)}
-                        label = class_to_idx[stem1]
-                        yield data, label, self.variables
-                    else:
-                        yield data, self.variables
-
-                elif self.dataset == "basic_ct":
-                    data = nib.load(path)
-                    data = np.array(data.dataobj).astype(np.float32)
-                    data = (data-data.min())/(data.max()-data.min())
-
-                    if self.return_label:
-                        data_path = Path(path)
-                        path2 = data_path.parent.absolute()
-                        path3 = path2.parent.absolute()
-                        label_stem = data_path.stem.split('image')[-1]
-                        path4= os.path.join(path3,'labelsTr', "label"+label_stem+".nii")
-                        label = nib.load(path4)
-                        label = np.array(label.dataobj).astype(np.int64)
-                        label = label - 1 # subtract 1 as original labels are [1,4], new will be [0,3]
-
-                    if self.num_channels_available == 1:
-                        if self.return_label:
-                            yield np.expand_dims(data,axis=0), label, self.variables
-                        else:
-                            yield np.expand_dims(data,axis=0), self.variables
-                    else:
-                        if self.return_label:
-                            yield data, label, self.variables
-                        else:
-                            yield data, self.variables
+                if self.return_label:
+                    data, label = self.read_process_file(self.file_list[idx])
+                    yield data, label, self.variables
+                else:
+                    data = self.read_process_file(self.file_list[idx])
+                    yield data, self.variables
 
 class ImageBlockDataIter_2D(IterableDataset):
     def __init__(
