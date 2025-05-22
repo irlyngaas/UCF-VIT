@@ -460,6 +460,27 @@ class NativePytorchDataModule(torch.nn.Module):
 
             self.dict_data_train = dict_data_train
 
+    def reset(self):
+        #Reset data file list to randomize order of files. Needed in order to introduce data that was potentially missed in prior epochs. Some data files are missed when the number of files for each dataset is not divisible by the number of GPUs that's splitting up those files
+        dict_data_train = {}
+        for i, k in enumerate(self.dict_lister_trains.keys()):
+            lister_train = self.dict_lister_trains[k]
+            if self.dataset == "imagenet":
+                keys_to_add = 1
+            else:
+                keys_to_add = int(np.ceil(self.max_balance/self.batches_per_rank_epoch[k]))
+            _lister_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
+            if keys_to_add > 1:
+                for i in range(keys_to_add-1):
+                    _balance_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
+                    _lister_train.extend(_balance_train)
+
+            lister_train = _lister_train
+            
+            dict_data_train = self.set_iterative_dataloader(dict_data_train, k, lister_train, keys_to_add)
+
+        self.dict_data_train = dict_data_train
+
     def train_dataloader(self):
         if not torch.distributed.is_initialized():
             raise NotImplementedError("Only support distributed training")

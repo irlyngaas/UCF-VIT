@@ -140,7 +140,7 @@ class FileReader(IterableDataset):
         for m in range(self.keys_to_add):
             start_it = iter_start + m*int(len(self.file_list)/self.keys_to_add)
             end_it = iter_end + m*int(len(self.file_list)/self.keys_to_add)
-            for idx in range(iter_start, iter_end):
+            for idx in range(start_it, end_it):
                 if self.return_label:
                     data, label = self.read_process_file(self.file_list[idx])
                     yield data, label, self.variables
