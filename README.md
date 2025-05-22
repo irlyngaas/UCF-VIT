@@ -123,11 +123,11 @@ Directory consists of 3D synthetic CT images of concrete including corresponding
 For Examples, see the XCT-Diffusion and turb branches
 1. Name your dataset and use it in place of the dataset option the yaml config file
 2. Write code to process file keys for the different datasets
-- Add a new branch to if/else starting at line 291 of `src/UCF_VIT/dataloaders/datamodule.py`, to process datafile paths from each dataset into a corresponding dictionary
-3. Write code that uses appropriate iterative dataloader functions from `src/UCF_VIT/dataloaders/dataset.py`
-- Add a new branch to if/else starting at line 366 of `src/UCF_VIT/dataloaders/datamodule.py`, creating an iterative dataloader using the correct Tile Iterator (ImageBlockDataIter_2D or ImageBlockDataIter_3D) depending on the dimension of your data
-4. Write code to approriately read raw data files
-- Add a new branch to if/else starting at line 99 of `src/UCF_VIT/dataloaders/dataset.py`, that uses an appropriate python function to read the raw data files depending on the type
+- Add a new branch to if/else in the process_root_dirs function of the NativePytorchDataModule in `src/UCF_VIT/dataloaders/datamodule.py`, to process datafile paths from each dataset into a corresponding dictionary
+3. Write code that uses appropriate iterative dataloader functions from `src/UCF_VIT/dataloaders/dataset.py` to handle the raw data files
+- Add a new branch to if/else in the set_iterative_dataloader function of the NativePytorchDataModule class in `src/UCF_VIT/dataloaders/datamodule.py`, using the correct Tile Iterator (ImageBlockDataIter_2D or ImageBlockDataIter_3D) depending on the dimension of your data
+4. Write code to approriately read and process (including normalization) raw data files
+- Add a new branch to if/else in the read_process_file function of the FileReader class in `src/UCF_VIT/dataloaders/dataset.py`, using an appropriate python function to read the raw data files depending on the type
 
 ### Setting up a new load balancing script
 Use logic from step 1 and 4 above to modify preprocess_load_balancing.py script in the appropriate places
@@ -194,7 +194,7 @@ ln -s $CRAY_MPICH_DIR/lib/libfmpich.so libmpicxx.so
 6. Run Load Balancing Script
 - `python utils/DATASET/preprocess_load_balancing.py CONFIG_FILE NUM_GPUS`
 
-7. Modify Config File with numbers from load balancing output
+7. Modify Config File with the output from load balancing output
 - dataset_group_list
 - batches_per_rank_epoch
 
