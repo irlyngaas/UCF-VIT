@@ -214,8 +214,6 @@ class NativePytorchDataModule(torch.nn.Module):
         tile_size_z: int = None,
         twoD: bool = True,
         single_channel: bool = False,
-        return_label: Optional[bool] = False,
-        return_qdt: Optional[bool] = False,
         dataset_group_list: str = '',
         batches_per_rank_epoch: Dict = None,
         tile_overlap: float = 0.0,
@@ -225,9 +223,11 @@ class NativePytorchDataModule(torch.nn.Module):
         separate_channels: bool = False,
         data_par_size: int = 1,
         dataset: str = "imagenet",
+        return_label: Optional[bool] = False,
+        return_qdt: Optional[bool] = False,
         ddp_group: Optional[dist.ProcessGroup] = None,
         num_classes: Optional[int] = None,
-        imagenet_resize: Dict = None,
+        imagenet_resize: Optional[Dict] = None,
     ):
         super().__init__()
         if num_workers > 1:
@@ -275,7 +275,9 @@ class NativePytorchDataModule(torch.nn.Module):
         if self.dataset == "basic_ct":
             if return_label:
                 assert num_classes != None, "If using segmentation with basic_ct need to pass the number of classes"
-        self.imagenet_resize = imagenet_resize
+
+        if self.dataset == "imagenet":
+            self.imagenet_resize = imagenet_resize
 
         in_variables = {}
         for k, list_out in dict_in_variables.items():
