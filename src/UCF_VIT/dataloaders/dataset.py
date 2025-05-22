@@ -29,7 +29,7 @@ class FileReader(IterableDataset):
         return_label: bool = False,
         keys_to_add: int = 1,
         dataset: str = "imagenet",
-        imagenet_resize: Optional[int] = 256,
+        imagenet_resize: Optional[list] = 256,
     ) -> None:
         super().__init__()
         self.num_channels_available = num_channels_available
@@ -99,7 +99,7 @@ class FileReader(IterableDataset):
                 if self.dataset == "imagenet":
                     data = Image.open(path).convert("RGB")
                     data = np.array(data) 
-                    data = cv.resize(data, dsize=[self.imagenet_resize,self.imagenet_resize])
+                    data = cv.resize(data, dsize=[self.imagenet_resize[0],self.imagenet_resize[1]])
                     data = np.moveaxis(data,-1,0)
 
 
@@ -637,7 +637,7 @@ class ProcessChannels(IterableDataset):
                                     seq_image, seq_size, seq_pos, qdt = self.patchify(np.expand_dims(np_image,axis=-1))
                                     if self._dataset != "imagenet":
                                         np_label = yield_label_list[i].pop()
-                                        if self._dataset == "basic_ct"
+                                        if self._dataset == "basic_ct":
                                             np_label = np.expand_dims(np_label,axis=0)
                                         seq_label_list = []
                                         for j in range(np_label.shape[0]):
@@ -689,7 +689,7 @@ class ProcessChannels(IterableDataset):
 
                                     if self._dataset != "imagenet":
                                         np_label = yield_label_list[i].pop()
-                                        if self._dataset == "basic_ct"
+                                        if self._dataset == "basic_ct":
                                             np_label = np.expand_dims(np_label,axis=0)
 
                                         #TODO: If separate_channel=True, which qdt from qdt_list to use? Default to using the first in the list for now
@@ -781,7 +781,7 @@ class ProcessChannels(IterableDataset):
                                         yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_var_list[i].pop()
                                 else:
                                     if self.return_qdt:
-                                        yield np_image, seq_image, seq_size, seq_pos, yield_var_list[i].pop(), qdt
+                                        yield np_image, seq_image, seq_size, seq_pos, yield_var_list[i].pop(), qdt 
                                     else:
                                         yield np_image, seq_image, seq_size, seq_pos, yield_var_list[i].pop()
                             else:
