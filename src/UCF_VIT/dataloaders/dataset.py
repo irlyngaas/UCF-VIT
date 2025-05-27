@@ -29,7 +29,7 @@ class FileReader(IterableDataset):
         return_label: bool = False,
         keys_to_add: int = 1,
         dataset: str = "imagenet",
-        imagenet_resize: Optional[list] = 256,
+        imagenet_resize: Optional[list] = [256,256],
     ) -> None:
         super().__init__()
         self.num_channels_available = num_channels_available
@@ -46,7 +46,10 @@ class FileReader(IterableDataset):
         self.keys_to_add = keys_to_add
         self.ddp_group = ddp_group
         self.dataset = dataset
-        self.imagenet_resize = imagenet_resize
+
+        #Optional Inputs
+        if self.dataset == "imagenet":
+            self.imagenet_resize = imagenet_resize
 
     def read_process_file(self, path):
         if self.dataset == "imagenet":
