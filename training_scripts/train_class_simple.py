@@ -279,6 +279,11 @@ def main(device):
             iterations_per_epoch = batches_per_rank_epoch[k]
 
     for epoch in range(epoch_start,max_epochs):
+        #Reset dataloader module every epoch to ensure all files get used
+        if epoch != epoch_start:
+            data_module.reset()
+            train_dataloader = data_module.train_dataloader()
+
         #tell the model that we are in train mode. Matters because we have the dropout
         model.train()
         epoch_loss = torch.tensor(0.0 , dtype=torch.float32, device=device)

@@ -229,8 +229,6 @@ class NativePytorchDataModule(torch.nn.Module):
         tile_size_z: int = None,
         twoD: bool = True,
         single_channel: bool = False,
-        return_label: Optional[bool] = False,
-        return_qdt: Optional[bool] = False,
         dataset_group_list: str = '',
         batches_per_rank_epoch: Dict = None,
         tile_overlap: float = 0.0,
@@ -240,9 +238,11 @@ class NativePytorchDataModule(torch.nn.Module):
         separate_channels: bool = False,
         data_par_size: int = 1,
         dataset: str = "imagenet",
+        return_label: Optional[bool] = False,
+        return_qdt: Optional[bool] = False,
         ddp_group: Optional[dist.ProcessGroup] = None,
         num_classes: Optional[int] = None,
-        imagenet_resize: Dict = None,
+        imagenet_resize: Optional[Dict] = None,
         nx: Optional[Dict] = None,
         ny: Optional[Dict] = None,
         nz: Optional[Dict] = None,
@@ -300,7 +300,6 @@ class NativePytorchDataModule(torch.nn.Module):
 
         if self.dataset == "imagenet":
             self.imagenet_resize = imagenet_resize
-
         if self.dataset == "sst":
             self.nx = nx
             self.ny = ny
@@ -327,14 +326,19 @@ class NativePytorchDataModule(torch.nn.Module):
             in_variables[k] = [ x for x in in_variables[k] ]
         self.dict_in_variables = in_variables
 
+        self.dict_lister_trains = self.process_root_dirs()
+           
 
-        self.dict_lister_trains = {}
+        self.dict_data_train: Optional[Dict] = None
+
+    def process_root_dirs(self):
         if self.dataset == "imagenet":
-            for k, root_dir in dict_root_dirs.items():
+            dict_lister_trains = {}
+            for k, root_dir in self.dict_root_dirs.items():
                 #TODO: Add shuffling for data_par_size if it doesn't divide 1000 equally
                 classes = sorted(os.listdir(root_dir))
-                if len(classes) > data_par_size:
-                    classes_to_combine = int(len(classes) // data_par_size)
+                if len(classes) > self.data_par_size:
+                    classes_to_combine = int(len(classes) // self.data_par_size)
                 img_list = []
                 classes_counter = 0
                 num_data_roots = 0
@@ -349,15 +353,15 @@ class NativePytorchDataModule(torch.nn.Module):
                 
                     if classes_counter == classes_to_combine:
                         img_dict = {num_data_roots: img_list}
-                        self.dict_lister_trains.update(img_dict)
+                        dict_lister_trains.update(img_dict)
                         num_data_roots +=1
 
-                    if num_data_roots > data_par_size-1:
+                    if num_data_roots > self.data_par_size-1:
                         break
-            assert num_data_roots <= data_par_size, "the number of data parallel GPUs (data_par_size) needs to be at least equal to the number of datasets. Try to increase data_par_size"
 
         elif self.dataset == "sst":
            lister = { k: list(dp.iter.FileLister(os.path.join(root_dir, ""))) for k, root_dir in dict_root_dirs.items() }
+           dict_lister_trains = {}
            for i,k in enumerate(lister.keys()):
                list_ = lister[k]
                main_keys = []
@@ -369,19 +373,172 @@ class NativePytorchDataModule(torch.nn.Module):
                #Find all unique keys, since different channels are in separate files
                unique_keys = [x for x in main_keys if x not in used and (used.add(x) or True)]
                img_dict = {k: unique_keys}
-               self.dict_lister_trains.update(img_dict)
+               dict_lister_trains.update(img_dict)
 
         else:
-            self.dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in dict_root_dirs.items() }
-           
+            dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in self.dict_root_dirs.items() }
+        return dict_lister_trains
 
-        self.dict_data_train: Optional[Dict] = None
+    def set_iterative_dataloader(self, dict_data_train, k, lister_train, keys_to_add):
+        if self.dataset == "imagenet":
+            start_idx = self.dict_start_idx["imagenet"]
+            end_idx = self.dict_end_idx["imagenet"]
+            buffer_size = self.dict_buffer_sizes["imagenet"]
+            variables = self.dict_in_variables["imagenet"]
+            num_channels_available = self.num_channels_available["imagenet"]
+            num_channels_used = self.num_channels_used["imagenet"]
+            imagenet_resize = self.imagenet_resize["imagenet"]
+        else:
+            start_idx = self.dict_start_idx[k]
+            end_idx = self.dict_end_idx[k]
+            buffer_size = self.dict_buffer_sizes[k]
+            variables = self.dict_in_variables[k]
+            num_channels_available = self.num_channels_available[k]
+            num_channels_used = self.num_channels_used[k]
+        single_channel = self.single_channel
+        return_label = self.return_label
+        if self.dataset == "imagenet":
+            dict_data_train[k] = ProcessChannels(
+                ShuffleIterableDataset(
+                    ImageBlockDataIter_2D(
+                            FileReader(
+                                lister_train,
+                                num_channels_available,
+                                gx = self.gx,
+                                start_idx=start_idx,
+                                end_idx=end_idx,
+                                variables=variables,
+                                multi_dataset_training=True,
+                                data_par_size=self.data_par_size,
+                                return_label=return_label,
+                                keys_to_add=keys_to_add,
+                                ddp_group=self.ddp_group,
+                                dataset=self.dataset,
+                                imagenet_resize=imagenet_resize,
+                            ),
+                        self.tile_size_x,
+                        self.tile_size_y,
+                        self.tile_size_z,
+                        return_label = return_label,
+                        tile_overlap = self.tile_overlap,
+                        use_all_data = self.use_all_data,
+                        classification = True,
+                    ),
+                    buffer_size
+                ),
+                num_channels_used,
+                single_channel,
+                self.batch_size,
+                return_label,
+                self.adaptive_patching,
+                self.separate_channels,
+                self.patch_size,
+                self.fixed_length,
+                self.twoD,
+                self.dataset,
+                self.return_qdt,
+            )
+        elif self.dataset == "sst":
+            dict_data_train[k] = ProcessChannels(
+                ShuffleIterableDataset(
+                    ImageBlockDataIter_3D_Memmap(
+                            FileReader(
+                                lister_train,
+                                num_channels_available,
+                                gx = self.gx,
+                                start_idx=start_idx,
+                                end_idx=end_idx,
+                                variables=variables,
+                                multi_dataset_training=True,
+                                data_par_size = self.data_par_size,
+                                return_label = return_label,
+                                keys_to_add = keys_to_add,
+                                ddp_group = self.ddp_group,
+                                dataset=self.dataset,
+                                variables_out = self.dict_out_variables[k],
+                                nx = self.nx[k],
+                                ny = self.ny[k],
+                                nz = self.nz[k],
+                            ),
+                        self.tile_size_x*self.nx_skip[k],
+                        self.tile_size_y*self.ny_skip[k],
+                        self.tile_size_z*self.nz_skip[k],
+                        self.twoD,
+                        nx = self.nx[k],
+                        ny = self.ny[k],
+                        nz = self.nz[k],
+                        nx_skip = self.nx_skip[k],
+                        ny_skip = self.ny_skip[k],
+                        nz_skip = self.nz_skip[k],
+                        return_label = return_label,
+                        tile_overlap = self.tile_overlap,
+                        use_all_data = self.use_all_data,
+                    ),
+                    buffer_size
+                ),
+                num_channels_used,
+                single_channel,
+                self.batch_size,
+                return_label,
+                self.adaptive_patching,
+                self.separate_channels,
+                self.patch_size,
+                self.fixed_length,
+                self.twoD,
+                self.dataset,
+                self.return_qdt,
+            )
+        else:
+            dict_data_train[k] = ProcessChannels(
+                ShuffleIterableDataset(
+                    ImageBlockDataIter_3D(
+                            FileReader(
+                                lister_train,
+                                num_channels_available,
+                                gx = self.gx,
+                                start_idx=start_idx,
+                                end_idx=end_idx,
+                                variables=variables,
+                                multi_dataset_training=True,
+                                data_par_size = self.data_par_size,
+                                return_label = return_label,
+                                keys_to_add = keys_to_add,
+                                ddp_group = self.ddp_group,
+                                dataset=self.dataset
+                            ),
+                        self.tile_size_x,
+                        self.tile_size_y,
+                        self.tile_size_z,
+                        self.twoD,
+                        return_label = return_label,
+                        tile_overlap = self.tile_overlap,
+                        use_all_data = self.use_all_data,
+                    ),
+                    buffer_size
+                ),
+                num_channels_used,
+                single_channel,
+                self.batch_size,
+                return_label,
+                self.adaptive_patching,
+                self.separate_channels,
+                self.patch_size,
+                self.fixed_length,
+                self.twoD,
+                self.dataset,
+                self.return_qdt,
+            )
+        return dict_data_train
+        
 
     def setup(self):
         # load datasets only if they're not loaded already
         if not self.dict_data_train:
-            self.max_balance = 0
 
+            #Choice to made at this point. Imagenet uses 1) The default option is to use 2)
+            #1) Use the dataset with the smallest amount of data tiles. In this case dataloading stops once all tiles are yielded from the smallest dataset
+            #2) Add more files to each dataset. Allowing dataloading to continue reusing files from the dataset until all tiles are yielded from the largest dataset 
+            self.max_balance = 0
             if self.dataset == "imagenet":
                 self.max_balance = self.batches_per_rank_epoch["imagenet"]
             else:
@@ -403,155 +560,31 @@ class NativePytorchDataModule(torch.nn.Module):
                         _lister_train.extend(_balance_train)
 
                 lister_train = _lister_train
-                if self.dataset == "imagenet":
-                    start_idx = self.dict_start_idx["imagenet"]
-                    end_idx = self.dict_end_idx["imagenet"]
-                    buffer_size = self.dict_buffer_sizes["imagenet"]
-                    variables = self.dict_in_variables["imagenet"]
-                    num_channels_available = self.num_channels_available["imagenet"]
-                    num_channels_used = self.num_channels_used["imagenet"]
-                    imagenet_resize = self.imagenet_resize["imagenet"]
-                else:
-                    start_idx = self.dict_start_idx[k]
-                    end_idx = self.dict_end_idx[k]
-                    buffer_size = self.dict_buffer_sizes[k]
-                    variables = self.dict_in_variables[k]
-                    num_channels_available = self.num_channels_available[k]
-                    num_channels_used = self.num_channels_used[k]
-                single_channel = self.single_channel
-                return_label = self.return_label
-                if self.dataset == "imagenet":
-                    dict_data_train[k] = ProcessChannels(
-                        ShuffleIterableDataset(
-                            ImageBlockDataIter_2D(
-                                    FileReader(
-                                        lister_train,
-                                        num_channels_available,
-                                        gx = self.gx,
-                                        start_idx=start_idx,
-                                        end_idx=end_idx,
-                                        variables=variables,
-                                        multi_dataset_training=True,
-                                        data_par_size=self.data_par_size,
-                                        return_label=return_label,
-                                        keys_to_add=keys_to_add,
-                                        ddp_group=self.ddp_group,
-                                        dataset=self.dataset,
-                                        imagenet_resize=imagenet_resize,
-                                    ),
-                                self.tile_size_x,
-                                self.tile_size_y,
-                                self.tile_size_z,
-                                return_label = return_label,
-                                tile_overlap = self.tile_overlap,
-                                use_all_data = self.use_all_data,
-                                classification = True,
-                            ),
-                            buffer_size
-                        ),
-                        num_channels_used,
-                        single_channel,
-                        self.batch_size,
-                        return_label,
-                        self.adaptive_patching,
-                        self.separate_channels,
-                        self.patch_size,
-                        self.fixed_length,
-                        self.twoD,
-                        self.dataset,
-                        self.return_qdt,
-                    )
-                elif self.dataset == "sst":
-                    dict_data_train[k] = ProcessChannels(
-                        ShuffleIterableDataset(
-                            ImageBlockDataIter_3D_Memmap(
-                                    FileReader(
-                                        lister_train,
-                                        num_channels_available,
-                                        gx = self.gx,
-                                        start_idx=start_idx,
-                                        end_idx=end_idx,
-                                        variables=variables,
-                                        multi_dataset_training=True,
-                                        data_par_size = self.data_par_size,
-                                        return_label = return_label,
-                                        keys_to_add = keys_to_add,
-                                        ddp_group = self.ddp_group,
-                                        dataset=self.dataset,
-                                        variables_out = self.dict_out_variables[k],
-                                        nx = self.nx[k],
-                                        ny = self.ny[k],
-                                        nz = self.nz[k],
-                                    ),
-                                self.tile_size_x*self.nx_skip[k],
-                                self.tile_size_y*self.ny_skip[k],
-                                self.tile_size_z*self.nz_skip[k],
-                                self.twoD,
-                                nx = self.nx[k],
-                                ny = self.ny[k],
-                                nz = self.nz[k],
-                                nx_skip = self.nx_skip[k],
-                                ny_skip = self.ny_skip[k],
-                                nz_skip = self.nz_skip[k],
-                                return_label = return_label,
-                                tile_overlap = self.tile_overlap,
-                                use_all_data = self.use_all_data,
-                            ),
-                            buffer_size
-                        ),
-                        num_channels_used,
-                        single_channel,
-                        self.batch_size,
-                        return_label,
-                        self.adaptive_patching,
-                        self.separate_channels,
-                        self.patch_size,
-                        self.fixed_length,
-                        self.twoD,
-                        self.dataset,
-                        self.return_qdt,
-                    )
-                else:
-                    dict_data_train[k] = ProcessChannels(
-                        ShuffleIterableDataset(
-                            ImageBlockDataIter_3D(
-                                    FileReader(
-                                        lister_train,
-                                        num_channels_available,
-                                        gx = self.gx,
-                                        start_idx=start_idx,
-                                        end_idx=end_idx,
-                                        variables=variables,
-                                        multi_dataset_training=True,
-                                        data_par_size = self.data_par_size,
-                                        return_label = return_label,
-                                        keys_to_add = keys_to_add,
-                                        ddp_group = self.ddp_group,
-                                        dataset=self.dataset
-                                    ),
-                                self.tile_size_x,
-                                self.tile_size_y,
-                                self.tile_size_z,
-                                self.twoD,
-                                return_label = return_label,
-                                tile_overlap = self.tile_overlap,
-                                use_all_data = self.use_all_data,
-                            ),
-                            buffer_size
-                        ),
-                        num_channels_used,
-                        single_channel,
-                        self.batch_size,
-                        return_label,
-                        self.adaptive_patching,
-                        self.separate_channels,
-                        self.patch_size,
-                        self.fixed_length,
-                        self.twoD,
-                        self.dataset,
-                        self.return_qdt,
-                    )
+                
+                dict_data_train = self.set_iterative_dataloader(dict_data_train, k, lister_train, keys_to_add)
+
             self.dict_data_train = dict_data_train
+
+    def reset(self):
+        #Reset data file list to randomize order of files. Needed in order to introduce data that was potentially missed in prior epochs. Some data files are missed when the number of files for each dataset is not divisible by the number of GPUs that's splitting up those files
+        dict_data_train = {}
+        for i, k in enumerate(self.dict_lister_trains.keys()):
+            lister_train = self.dict_lister_trains[k]
+            if self.dataset == "imagenet":
+                keys_to_add = 1
+            else:
+                keys_to_add = int(np.ceil(self.max_balance/self.batches_per_rank_epoch[k]))
+            _lister_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
+            if keys_to_add > 1:
+                for i in range(keys_to_add-1):
+                    _balance_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
+                    _lister_train.extend(_balance_train)
+
+            lister_train = _lister_train
+            
+            dict_data_train = self.set_iterative_dataloader(dict_data_train, k, lister_train, keys_to_add)
+
+        self.dict_data_train = dict_data_train
 
     def train_dataloader(self):
         if not torch.distributed.is_initialized():

@@ -29,6 +29,7 @@ class FileReader(IterableDataset):
         return_label: bool = False,
         keys_to_add: int = 1,
         dataset: str = "imagenet",
+        imagenet_resize: Optional[list] = [256,256],
         imagenet_resize: Optional[int] = 256,
         nx: Optional[int] = 512,
         ny: Optional[int] = 512,
@@ -59,6 +60,53 @@ class FileReader(IterableDataset):
            self.ny = ny
            self.nz = nz
            self.variables_out = variables_out
+
+    def read_process_file(self, path):
+        if self.dataset == "imagenet":
+            data = Image.open(path).convert("RGB")
+            data = np.array(data) 
+            data = cv.resize(data, dsize=[self.imagenet_resize[0],self.imagenet_resize[1]])
+            data = np.moveaxis(data,-1,0)
+
+
+            if self.return_label:
+                data_path = Path(path)
+                parent = data_path.parent.absolute()
+                parent2 = parent.parent.absolute()
+                stem1 = parent.stem
+                classes = sorted(os.listdir(os.path.join(parent2)))
+                class_to_idx = {cls_name: idx for idx, cls_name in enumerate(classes)}
+                label = class_to_idx[stem1]
+                return data, label
+            else:
+                return data
+
+        elif self.dataset == "basic_ct":
+            data = nib.load(path)
+            data = np.array(data.dataobj).astype(np.float32)
+            data = (data-data.min())/(data.max()-data.min())
+
+            if self.return_label:
+                data_path = Path(path)
+                path2 = data_path.parent.absolute()
+                path3 = path2.parent.absolute()
+                label_stem = data_path.stem.split('image')[-1]
+                path4= os.path.join(path3,'labelsTr', "label"+label_stem+".nii")
+                label = nib.load(path4)
+                label = np.array(label.dataobj).astype(np.int64)
+                label = label - 1 # subtract 1 as original labels are [1,4], new will be [0,3]
+
+            if self.num_channels_available == 1:
+                if self.return_label:
+                    return np.expand_dims(data,axis=0), label
+                else:
+                    return np.expand_dims(data,axis=0)
+            else:
+                if self.return_label:
+                    return data, label
+                else:
+                    return data
+>>>>>>> origin
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -106,52 +154,13 @@ class FileReader(IterableDataset):
         for m in range(self.keys_to_add):
             start_it = iter_start + m*int(len(self.file_list)/self.keys_to_add)
             end_it = iter_end + m*int(len(self.file_list)/self.keys_to_add)
-            for idx in range(iter_start, iter_end):
-                path = self.file_list[idx]
-                if self.dataset == "imagenet":
-                    data = Image.open(path).convert("RGB")
-                    data = np.array(data) 
-                    data = cv.resize(data, dsize=[self.imagenet_resize,self.imagenet_resize])
-                    data = np.moveaxis(data,-1,0)
-
-
-                    if self.return_label:
-                        data_path = Path(path)
-                        parent = data_path.parent.absolute()
-                        parent2 = parent.parent.absolute()
-                        stem1 = parent.stem
-                        classes = sorted(os.listdir(os.path.join(parent2)))
-                        class_to_idx = {cls_name: idx for idx, cls_name in enumerate(classes)}
-                        label = class_to_idx[stem1]
-                        yield data, label, self.variables
-                    else:
-                        yield data, self.variables
-
-                elif self.dataset == "basic_ct":
-                    data = nib.load(path)
-                    data = np.array(data.dataobj).astype(np.float32)
-                    data = (data-data.min())/(data.max()-data.min())
-
-                    if self.return_label:
-                        data_path = Path(path)
-                        path2 = data_path.parent.absolute()
-                        path3 = path2.parent.absolute()
-                        label_stem = data_path.stem.split('image')[-1]
-                        path4= os.path.join(path3,'labelsTr', "label"+label_stem+".nii")
-                        label = nib.load(path4)
-                        label = np.array(label.dataobj).astype(np.int64)
-                        label = label - 1 # subtract 1 as original labels are [1,4], new will be [0,3]
-
-                    if self.num_channels_available == 1:
-                        if self.return_label:
-                            yield np.expand_dims(data,axis=0), label, self.variables
-                        else:
-                            yield np.expand_dims(data,axis=0), self.variables
-                    else:
-                        if self.return_label:
-                            yield data, label, self.variables
-                        else:
-                            yield data, self.variables
+            for idx in range(start_it, end_it):
+                if self.return_label:
+                    data, label = self.read_process_file(self.file_list[idx])
+                    yield data, label, self.variables
+                else:
+                    data = self.read_process_file(self.file_list[idx])
+                    yield data, self.variables
 
                 elif self.dataset == "sst":
                     root_path = Path(path)
@@ -1135,7 +1144,7 @@ class ProcessChannels(IterableDataset):
                                     seq_image, seq_size, seq_pos, qdt = self.patchify(np.expand_dims(np_image,axis=-1))
                                     if self._dataset != "imagenet":
                                         np_label = yield_label_list[i].pop()
-                                        if self._dataset == "basic_ct"
+                                        if self._dataset == "basic_ct":
                                             np_label = np.expand_dims(np_label,axis=0)
                                         seq_label_list = []
                                         for j in range(np_label.shape[0]):
@@ -1187,15 +1196,16 @@ class ProcessChannels(IterableDataset):
 
                                     if self._dataset != "imagenet":
                                         np_label = yield_label_list[i].pop()
-                                        if self._dataset == "basic_ct"
+                                        if self._dataset == "basic_ct":
                                             np_label = np.expand_dims(np_label,axis=0)
 
-                                        seq_label_list = []
                                         #TODO: If separate_channel=True, which qdt from qdt_list to use? Default to using the first in the list for now
                                         if self.separate_channels:
                                             qdt_ = qdt[0]
                                         else:
                                             qdt_ = qdt
+
+                                        seq_label_list = []
                                         for j in range(np_label.shape[0]):
                                             if self.twoD:
                                                 if self._dataset == "basic_ct":
@@ -1278,7 +1288,7 @@ class ProcessChannels(IterableDataset):
                                         yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_var_list[i].pop()
                                 else:
                                     if self.return_qdt:
-                                        yield np_image, seq_image, seq_size, seq_pos, yield_var_list[i].pop(), qdt
+                                        yield np_image, seq_image, seq_size, seq_pos, yield_var_list[i].pop(), qdt 
                                     else:
                                         yield np_image, seq_image, seq_size, seq_pos, yield_var_list[i].pop()
                             else:
