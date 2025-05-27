@@ -147,9 +147,9 @@ conda create -n vit python=${PYTHON_VERSION} -y
 conda activate vit
 ROCM_VERSION=6.2.4
 TORCH_URL="https://download.pytorch.org/whl/rocm${ROCM_VERSION}"
-TORCH_VERSION=2.6.0+rocm6.2.4
-TORCHVISION_VERSION=0.21.0
-TORCHAUDIO_VERSION=2.6.0
+TORCH_VERSION=2.7.0+rocm6.2.4
+TORCHVISION_VERSION=0.22.0
+TORCHAUDIO_VERSION=2.7.0
 
 pip install torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} torchaudio==${TORCHAUDIO_VERSION} --index-url ${TORCH_URL}
 pip install xformers --extra-index-url=https://download.pytorch.org/whl/rocm${ROCM_VERSION}
