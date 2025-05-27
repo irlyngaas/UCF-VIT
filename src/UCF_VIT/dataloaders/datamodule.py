@@ -360,7 +360,7 @@ class NativePytorchDataModule(torch.nn.Module):
                         break
 
         elif self.dataset == "sst":
-           lister = { k: list(dp.iter.FileLister(os.path.join(root_dir, ""))) for k, root_dir in dict_root_dirs.items() }
+           lister = { k: list(dp.iter.FileLister(os.path.join(root_dir, ""))) for k, root_dir in self.dict_root_dirs.items() }
            dict_lister_trains = {}
            for i,k in enumerate(lister.keys()):
                list_ = lister[k]

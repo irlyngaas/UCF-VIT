@@ -30,7 +30,6 @@ class FileReader(IterableDataset):
         keys_to_add: int = 1,
         dataset: str = "imagenet",
         imagenet_resize: Optional[list] = [256,256],
-        imagenet_resize: Optional[int] = 256,
         nx: Optional[int] = 512,
         ny: Optional[int] = 512,
         nz: Optional[int] = 256,
@@ -106,7 +105,26 @@ class FileReader(IterableDataset):
                     return data, label
                 else:
                     return data
->>>>>>> origin
+
+        elif self.dataset == "sst":
+            root_path = Path(path)
+            parent = root_path.parent
+            stem = path.split('/')[-1]
+            data_list = []
+            for i in range(len(self.variables)):
+                channel_path = os.path.join(parent, self.variables[i]+"_"+stem)
+                data_memmap = np.memmap(channel_path, dtype=np.float32, mode='r', shape=(self.nz, self.ny, self.nx+2))
+                data_list.append(data_memmap)
+
+            if self.return_label:
+                label_list = []
+                for i in range(len(self.variables_out)):
+                    channel_path = os.path.join(parent, self.variables_out[i]+"_"+stem)
+                    label_memmap = np.memmap(channel_path, dtype=np.float32, mode='r', shape=(self.nz, self.ny, self.nx+2))
+                    label_list.append(label_memmap)
+                return data_list, label_list
+            else:
+                return data_list
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -162,27 +180,6 @@ class FileReader(IterableDataset):
                     data = self.read_process_file(self.file_list[idx])
                     yield data, self.variables
 
-                elif self.dataset == "sst":
-                    root_path = Path(path)
-                    parent = root_path.parent
-                    stem = path.split('/')[-1]
-                    data_list = []
-                    for i in range(len(self.variables)):
-                        channel_path = os.path.join(parent, self.variables[i]+"_"+stem)
-                        data_memmap = np.memmap(channel_path, dtype=np.float32, mode='r', shape=(self.nz, self.ny, self.nx+2))
-                        data_list.append(data_memmap)
-
-                    if self.return_label:
-                        label_list = []
-                        for i in range(len(self.variables_out)):
-                            channel_path = os.path.join(parent, self.variables_out[i]+"_"+stem)
-                            label_memmap = np.memmap(channel_path, dtype=np.float32, mode='r', shape=(self.nz, self.ny, self.nx+2))
-                            label_list.append(label_memmap)
-
-                    if self.return_label:
-                        yield data_list, label_list, self.variables
-                    else:
-                        yield data_list, self.variables
 
 class ImageBlockDataIter_2D(IterableDataset):
     def __init__(
