@@ -11,6 +11,7 @@ from PIL import Image
 import cv2 as cv
 import torchdata.datapipes as dp
 
+from UCF_VIT.utils.misc import get_file_prefix
 
 def main():
     config_path = sys.argv[1]
@@ -49,6 +50,14 @@ def main():
     if dataset == "imagenet":
         imagenet_resize = conf['dataset_options']['imagenet_resize']
 
+    if dataset == "sst":
+        nx = conf['dataset_options']['nx']
+        ny = conf['dataset_options']['ny']
+        nz = conf['dataset_options']['nz']
+        nx_skip = conf['dataset_options']['nx_skip']
+        ny_skip = conf['dataset_options']['ny_skip']
+        nz_skip = conf['dataset_options']['nz_skip']
+
     tile_size_x = int(tile_size[0])
     tile_size_y = int(tile_size[1])
     if dataset != "imagenet":
@@ -82,6 +91,21 @@ def main():
 
                 if num_data_roots > num_total_ddp_ranks-1:
                     break
+    elif dataset == "sst":
+       lister = { k: list(dp.iter.FileLister(os.path.join(root_dir, ""))) for k, root_dir in dict_root_dirs.items() }
+       dict_lister_trains = {}
+       for i,k in enumerate(lister.keys()):
+           list_ = lister[k]
+           main_keys = []
+           for j in range(len(list_)):
+               base_path_prefix, timestamp = get_file_prefix(list_[j])
+               key = os.path.join(base_path_prefix, timestamp)
+               main_keys.append(key)
+           used = set()
+           #Find all unique keys, since different channels are in separate files
+           unique_keys = [x for x in main_keys if x not in used and (used.add(x) or True)]
+           img_dict = {k: unique_keys}
+           dict_lister_trains.update(img_dict)
     else:
         dict_lister_trains = {
             k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in dict_root_dirs.items()
@@ -94,6 +118,11 @@ def main():
     num_channels_per_dataset = []
     for i, k in enumerate(dict_lister_trains.keys()):
         lister_train = dict_lister_trains[k]
+        if dataset == "sst":
+            tile_size_x = int(tile_size[0]*nx_skip[k])
+            tile_size_y = int(tile_size[1]*ny_skip[k])
+            tile_size_z = int(tile_size[2]*nz_skip[k])
+
         if dataset == "imagenet":
             start_idx = int(dict_start_idx["imagenet"] * len(lister_train))
             end_idx = int(dict_end_idx["imagenet"] * len(lister_train))
@@ -112,7 +141,7 @@ def main():
             data = Image.open(data_path).convert("RGB")
             data = np.array(data) 
             data = cv.resize(data, dsize=[imagenet_resize["imagenet"][0],imagenet_resize["imagenet"][1]])
-        else:
+        elif dataset == "basic_ct":
             data = nib.load(data_path)
             data = np.array(data.dataobj).astype(np.float32)
 
@@ -158,44 +187,87 @@ def main():
             num_channels_per_dataset.append(num_channels_used["imagenet"])
         #USE THIS IF RAW FILES ARE 3D
         else:
+            tile_overlap_size_z = int(tile_size_z*tile_overlap)
+            if tile_overlap == 0.0:
+                OTP2_z = 1
+                tile_overlap_size_z = tile_size_z
+            else:
+                OTP2_z = int(tile_size_z/tile_overlap_size_z)
+
             #Total Tiles Evenly Spaced
-            TTE_x = data.shape[0]//tile_size_x
-            TTE_y = data.shape[1]//tile_size_y
+            if dataset == "sst":
+                TTE_x = nx[k]//tile_size_x
+                TTE_y = ny[k]//tile_size_y
+            else:
+                TTE_x = data.shape[0]//tile_size_x
+                TTE_y = data.shape[1]//tile_size_y
             num_blocks_x = (TTE_x-1)*OTP2_x + 1
             num_blocks_y = (TTE_y-1)*OTP2_y + 1
             if use_all_data:
                 #Total Tiles
-                TT_x = data.shape[0]/(tile_size_x)
-                TT_y = data.shape[1]/(tile_size_y)
+                if dataset == "sst":
+                    TT_x = nx[k]/(tile_size_x)
+                    TT_y = ny[k]/(tile_size_y)
+                else:
+                    TT_x = data.shape[0]/(tile_size_x)
+                    TT_y = data.shape[1]/(tile_size_y)
                 # Number of leftover overlap patches for last tile
                 LTOP_x = np.floor((TT_x-TTE_x)*OTP2_x)
                 LTOP_y = np.floor((TT_y-TTE_y)*OTP2_y)
-                if data.shape[0] % tile_overlap_size_x != 0:
-                    LTOP_x += 1
-                if data.shape[1] % tile_overlap_size_y != 0:
-                    LTOP_y += 1
+                if dataset == "sst":
+                    if nx[k] % tile_overlap_size_x != 0:
+                        LTOP_x += 1
+                else:
+                    if data.shape[0] % tile_overlap_size_x != 0:
+                        LTOP_x += 1
+                if dataset == "sst":
+                    if ny[k] % tile_overlap_size_y != 0:
+                        LTOP_y += 1
+                else:
+                    if data.shape[1] % tile_overlap_size_y != 0:
+                        LTOP_y += 1
                 num_blocks_x = int(num_blocks_x + LTOP_x)
                 num_blocks_y = int(num_blocks_y + LTOP_y)
 
             if twoD:
-                if use_all_data:
-                    num_blocks_z = data.shape[2]//tile_size_z
-                    leftover_z_tiles = data.shape[2] % tile_size_z
+                if self.dataset == "sst":
+                    if use_all_data:
+                        num_blocks_z = nz[k]//tile_size_z
+                        leftover_z_tiles = nz[k] % tile_size_z
+                    else:
+                        num_blocks_z = nz[k]//tile_size_z
                 else:
-                    num_blocks_z = data.shape[2]//tile_size_z
+                    if use_all_data:
+                        num_blocks_z = data.shape[2]//tile_size_z
+                        leftover_z_tiles = data.shape[2] % tile_size_z
+                    else:
+                        num_blocks_z = data.shape[2]//tile_size_z
             else:
-                TTE_z = data.shape[2]//tile_size_z
+                if dataset == "sst":
+                    TTE_z = nz[k]//tile_size_z
+                else:
+                    TTE_z = data.shape[2]//tile_size_z
                 num_blocks_z = (TTE_z-1)*OTP2_z + 1
                 if use_all_data:
                     #Total Tiles Rounded Up
-                    TT_z = data.shape[2]/(tile_size_z)
+                    if dataset == "sst":
+                        TT_z = nz[k]/(tile_size_z)
+                    else:
+                        TT_z = data.shape[2]/(tile_size_z)
                     # Number of leftover overlap patches for last tile
                     LTOP_z = np.floor((TT_z-TTE_z)*OTP2_z)
-                    if data.shape[2] % tile_overlap_size_z != 0:
-                        LTOP_z += 1
+                    if dataset == "sst":
+                        if nz[k] % tile_overlap_size_z != 0:
+                            LTOP_z += 1
+                    else:
+                        if data.shape[2] % tile_overlap_size_z != 0:
+                            LTOP_z += 1
                     num_blocks_z = int(num_blocks_z + LTOP_z)
 
-            print("KEY", k, "DATA_SHAPE", data.shape,"NUM_BLOCKS:", num_blocks_x, num_blocks_y, num_blocks_z, flush=True)
+            if dataset == "sst":
+                print("KEY", k, "DATA_SHAPE", nx[k], ny[k], nz[k],"NUM_BLOCKS:", num_blocks_x, num_blocks_y, num_blocks_z, flush=True)
+            else:
+                print("KEY", k, "DATA_SHAPE", data.shape,"NUM_BLOCKS:", num_blocks_x, num_blocks_y, num_blocks_z, flush=True)
 
             if twoD:
                 if use_all_data:
