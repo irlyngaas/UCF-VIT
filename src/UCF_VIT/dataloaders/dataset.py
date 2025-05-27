@@ -30,6 +30,8 @@ class FileReader(IterableDataset):
         keys_to_add: int = 1,
         dataset: str = "imagenet",
         imagenet_resize: Optional[list] = 256,
+        nx: Optional[int] = 512,
+        ny: Optional[int] = 512,
     ) -> None:
         super().__init__()
         self.num_channels_available = num_channels_available
@@ -46,7 +48,13 @@ class FileReader(IterableDataset):
         self.keys_to_add = keys_to_add
         self.ddp_group = ddp_group
         self.dataset = dataset
-        self.imagenet_resize = imagenet_resize
+
+        #Optional Inputs
+        if self.dataset == "imagenet":
+            self.imagenet_resize = imagenet_resize
+        if self.dataset == "s8d_2d":
+            self.nx = nx
+            self.ny = ny
 
     def read_process_file(self, path):
         if self.dataset == "imagenet":
@@ -93,6 +101,11 @@ class FileReader(IterableDataset):
                     return data, label
                 else:
                     return data
+
+        elif self.dataset == "s8d_2d":
+            data = np.fromfile(path, dtype=np.uint16).reshape([self.nx,self.ny])
+            data = (data - np.min(data)) / ((np.max(data) - np.min(data)) + 1e-8).astype(np.float32)
+            return np.expand_dims(data,axis=0)
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()

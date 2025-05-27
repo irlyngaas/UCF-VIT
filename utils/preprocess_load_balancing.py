@@ -49,9 +49,13 @@ def main():
     if dataset == "imagenet":
         imagenet_resize = conf['dataset_options']['imagenet_resize']
 
+    if dataset == "s8d_2d":
+        nx = conf['dataset_options']['nx']
+        ny = conf['dataset_options']['ny']
+
     tile_size_x = int(tile_size[0])
     tile_size_y = int(tile_size[1])
-    if dataset != "imagenet":
+    if dataset != "imagenet" and dataset != "s8d_2d":
         tile_size_z = int(tile_size[2])
 
     #ADD NEW DATASET HERE
@@ -82,6 +86,19 @@ def main():
 
                 if num_data_roots > num_total_ddp_ranks-1:
                     break
+    elif dataset == "s8d_2d":
+        dict_lister_trains = {}
+        for k, root_dir in dict_root_dirs.items():
+            samples = sorted(os.listdir(root_dir))
+            img_list = []
+            for sample in samples: 
+                sample_dir = os.path.join(root_dir, sample)
+                #img_list.extend(list(dp.iter.FileLister(os.path.join(cls_dir))))
+                for img_path in glob.glob(os.path.join(sample_dir,"*.raw")):
+                    img_list.append(img_path)
+            
+            img_dict = {k: img_list}
+            dict_lister_trains.update(img_dict)
     else:
         dict_lister_trains = {
             k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in dict_root_dirs.items()
@@ -112,6 +129,8 @@ def main():
             data = Image.open(data_path).convert("RGB")
             data = np.array(data) 
             data = cv.resize(data, dsize=[imagenet_resize["imagenet"][0],imagenet_resize["imagenet"][1]])
+        elif dataset == "s8d_2d":
+            data = np.fromfile(data_path, dtype=np.uint16).reshape([nx[k],ny[k]])
         else:
             data = nib.load(data_path)
             data = np.array(data.dataobj).astype(np.float32)
@@ -132,7 +151,7 @@ def main():
             OTP2_y = int(tile_size_y/tile_overlap_size_y)
             
         #USE THIS IF RAW FILES ARE 2D
-        if dataset == "imagenet":
+        if dataset == "imagenet" or dataset == "s8d_2d":
             #Total Tiles Evenly Spaced
             TTE_x = data.shape[0]//tile_size_x
             TTE_y = data.shape[1]//tile_size_y
@@ -155,7 +174,10 @@ def main():
             print("KEY", k, "DATA_SHAPE", data.shape,"NUM_BLOCKS:", num_blocks_x, num_blocks_y, flush=True)
 
             tiles_per_image.append(num_blocks_x*num_blocks_y)
-            num_channels_per_dataset.append(num_channels_used["imagenet"])
+            if dataset == "imagenet":
+                num_channels_per_dataset.append(num_channels_used["imagenet"])
+            else:
+                num_channels_per_dataset.append(num_channels_used[k])
         #USE THIS IF RAW FILES ARE 3D
         else:
             #Total Tiles Evenly Spaced
