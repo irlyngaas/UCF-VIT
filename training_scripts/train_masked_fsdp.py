@@ -172,7 +172,7 @@ def main(device):
     use_scaler = True
 
     dataset = conf['data']['dataset']
-    assert dataset in ["mri", "basic_ct", "imagenet"], "This training script only supports basic_ct and imagenet datasets"
+    assert dataset in ["basic_ct", "imagenet"], "This training script only supports basic_ct and imagenet datasets"
 
     dict_root_dirs = conf['data']['dict_root_dirs']
 
