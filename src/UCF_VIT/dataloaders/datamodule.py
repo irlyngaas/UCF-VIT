@@ -321,7 +321,7 @@ class NativePytorchDataModule(torch.nn.Module):
                     if num_data_roots > self.data_par_size-1:
                         break
         elif self.dataset == "xct":
-            self.dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, ""))) for k, root_dir in dict_root_dirs.items() }
+            dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, ""))) for k, root_dir in self.dict_root_dirs.items() }
         else:
             dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in self.dict_root_dirs.items() }
         return dict_lister_trains

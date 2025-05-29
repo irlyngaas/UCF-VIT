@@ -97,6 +97,15 @@ class FileReader(IterableDataset):
                 else:
                     return data
 
+        elif self.dataset == "xct":
+            data = np.load(path)
+            data = data.astype('float32')
+            data = (data-data.min())/(data.max()-data.min())
+            if self.num_channels_available == 1:
+                return np.expand_dims(data,axis=0)
+            else:
+                return data
+
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is None:
@@ -150,15 +159,6 @@ class FileReader(IterableDataset):
                 else:
                     data = self.read_process_file(self.file_list[idx])
                     yield data, self.variables
-
-                elif self.dataset == "xct":
-                    data = np.load(path)
-                    data = data.astype('float32')
-                    data = (data-data.min())/(data.max()-data.min())
-                    if self.num_channels_available == 1:
-                        yield np.expand_dims(data,axis=0), self.variables
-                    else:
-                        yield data, self.variables
 
 class ImageBlockDataIter_2D(IterableDataset):
     def __init__(
