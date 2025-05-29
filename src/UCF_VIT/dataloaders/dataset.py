@@ -29,7 +29,7 @@ class FileReader(IterableDataset):
         return_label: bool = False,
         keys_to_add: int = 1,
         dataset: str = "imagenet",
-        imagenet_resize: Optional[list] = 256,
+        imagenet_resize: Optional[list] = [256,256],
         nx: Optional[int] = 512,
         ny: Optional[int] = 512,
     ) -> None:
