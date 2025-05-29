@@ -82,8 +82,8 @@ def main():
 
                 if num_data_roots > num_total_ddp_ranks-1:
                     break
-    elif self.dataset == "xct":
-        self.dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, ""))) for k, root_dir in dict_root_dirs.items() }
+    elif dataset == "xct":
+        dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, ""))) for k, root_dir in dict_root_dirs.items() }
     else:
         dict_lister_trains = {
             k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in dict_root_dirs.items()
@@ -114,6 +114,9 @@ def main():
             data = Image.open(data_path).convert("RGB")
             data = np.array(data) 
             data = cv.resize(data, dsize=[imagenet_resize["imagenet"][0],imagenet_resize["imagenet"][1]])
+        elif dataset == "xct":
+            data = np.load(data_path)
+            data = data.astype('float32')
         else:
             data = nib.load(data_path)
             data = np.array(data.dataobj).astype(np.float32)
@@ -160,6 +163,13 @@ def main():
             num_channels_per_dataset.append(num_channels_used["imagenet"])
         #USE THIS IF RAW FILES ARE 3D
         else:
+            tile_overlap_size_z = int(tile_size_z*tile_overlap)
+            if tile_overlap == 0.0:
+                OTP2_z = 1
+                tile_overlap_size_z = tile_size_z
+            else:
+                OTP2_z = int(tile_size_z/tile_overlap_size_z)
+
             #Total Tiles Evenly Spaced
             TTE_x = data.shape[0]//tile_size_x
             TTE_y = data.shape[1]//tile_size_y
