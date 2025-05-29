@@ -60,16 +60,15 @@ echo "conda activate vit" >> /.singularity_bashrc
 # Install PyTorch
 ROCM_VERSION=6.2.4
 TORCH_URL="https://download.pytorch.org/whl/rocm${ROCM_VERSION}"
-TORCH_VERSION=2.6.0+rocm6.2.4
-TORCHVISION_VERSION=0.21.0
-TORCHAUDIO_VERSION=2.6.0
+TORCH_VERSION=2.7.0+rocm6.2.4
+TORCHVISION_VERSION=0.22.0
+TORCHAUDIO_VERSION=2.7.0
 PYTHON_VERSION=3.11
 PYTHON_COMPACT_VERSION=${PYTHON_VERSION//./}
 
 export PYTORCH_DIR=/pytorch
 export PYTHONPATH=${PYTORCH_DIR}:${PYTHONPATH}
 ${CONDA_DIR}/bin/pip install torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} torchaudio==${TORCHAUDIO_VERSION} -t ${PYTORCH_DIR} --index-url ${TORCH_URL}
-#pip install torch==.6.0+rocm6.2.4 torchvision==0.21.0 torchaudio===2.6.0+rocm6.2.4 --index-url https://download.pytorch.org/whl/rocm6.2.4
 
 # Install UCF_VIT
 #mkdir -p /source

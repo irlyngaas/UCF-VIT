@@ -94,7 +94,7 @@ data:
 dataset_options:
 
   imagenet_resize: {
-      'imagenet': 256,
+      'imagenet': [256,256],
     }
 
 # ---------------------------- LOAD BALANCING -------------------------------------------
