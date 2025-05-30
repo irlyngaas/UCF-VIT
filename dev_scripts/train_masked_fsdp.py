@@ -172,7 +172,7 @@ def main(device):
     use_scaler = True
 
     dataset = conf['data']['dataset']
-    assert dataset in ["basic_ct", "imagenet", "s8d_2d"], "This training script only supports basic_ct and imagenet datasets"
+    assert dataset in ["basic_ct", "imagenet", "s8d_2d", "s8d_3d"], "This training script only supports basic_ct, imagenet, s8d_2d, and s8d_3d datasets"
 
     dict_root_dirs = conf['data']['dict_root_dirs']
 
@@ -210,10 +210,20 @@ def main(device):
     else:
         imagenet_resize = None
 
-    if dataset == "s8d_2d":
+    if dataset == "s8d_2d" or dataset == "s8d_3d":
         nx = conf['dataset_options']['nx']
 
         ny = conf['dataset_options']['ny']
+    else:
+        nx = None
+        ny = None
+
+    if dataset == "s8d_3d":
+        chunk_size = conf['dataset_options']['chunk_size']
+        num_samples_to_stitch = conf['dataset_options']['num_samples_to_stitch']
+    else:
+        chunk_size = None
+        num_samples_to_stitch = None
 
     tile_size_x = tile_size[0]
     tile_size_y = tile_size[1]
@@ -442,6 +452,8 @@ def main(device):
         imagenet_resize = imagenet_resize,
         nx = nx,
         ny = ny,
+        chunk_size = chunk_size,
+        num_samples_to_stitch = num_samples_to_stitch,
     ).to(device)
 
     data_module.setup()

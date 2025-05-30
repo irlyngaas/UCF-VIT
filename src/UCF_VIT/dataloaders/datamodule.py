@@ -230,6 +230,8 @@ class NativePytorchDataModule(torch.nn.Module):
         imagenet_resize: Optional[Dict] = None,
         nx: Optional[Dict] = None,
         ny: Optional[Dict] = None,
+        chunk_size: Optional[Dict] = None,
+        num_samples_to_stitch: Optional[Dict] = None,
     ):
         super().__init__()
         if num_workers > 1:
@@ -281,9 +283,13 @@ class NativePytorchDataModule(torch.nn.Module):
         if self.dataset == "imagenet":
             self.imagenet_resize = imagenet_resize
 
-        if self.dataset == "s8d_2d":
+        if self.dataset == "s8d_2d" or self.dataset == "s8d_3d":
             self.nx = nx
             self.ny = ny
+
+        if self.dataset == "s8d_3d":
+            self.num_samples_to_stitch = num_samples_to_stitch
+            self.chunk_size = chunk_size
 
         in_variables = {}
         for k, list_out in dict_in_variables.items():
@@ -294,7 +300,7 @@ class NativePytorchDataModule(torch.nn.Module):
             in_variables[k] = [ x for x in in_variables[k] ]
         self.dict_in_variables = in_variables
 
-        self.dict_lister_trains = self.process_root_dirs()
+        self.dict_lister_trains, self.dict_chunk_trains = self.process_root_dirs()
            
 
         self.dict_data_train: Optional[Dict] = None
@@ -339,11 +345,43 @@ class NativePytorchDataModule(torch.nn.Module):
                 
                 img_dict = {k: img_list}
                 dict_lister_trains.update(img_dict)
+        elif self.dataset == "s8d_3d":
+            dict_lister_trains = {}
+            dict_chunk_trains = {}
+            for k, root_dir in self.dict_root_dirs.items():
+                num_chunks = int(self.nx[k]/self.chunk_size[k])
+                samples = sorted(os.listdir(root_dir))
+                #In 3D rather than passing individual files pass list of files with corresponding connected samples
+                img_list = []
+                chunk_list = []
+
+                #Number of samples to stitch
+                num_3d_samples = int(len(samples) / self.num_samples_to_stitch[k])
+
+                for i in range(num_3d_samples):
+                    img_sample_list = []
+                    for sample in samples[i*self.num_samples_to_stitch[k]:i*self.num_samples_to_stitch[k]+self.num_samples_to_stitch[k]]:
+                        sample_dir = os.path.join(root_dir, sample)
+                        for img_path in sorted(glob.glob(os.path.join(sample_dir,"*.raw"))):
+                            img_sample_list.append(img_path)
+
+                    for x_chunk in range(num_chunks):
+                        for y_chunk in range(num_chunks):
+                            img_list.append(img_sample_list)
+                            chunk_list.append([x_chunk,y_chunk])
+                
+                img_dict = {k: img_list}
+                dict_lister_trains.update(img_dict)
+                chunk_dict = {k: chunk_list}
+                dict_chunk_trains.update(chunk_dict)
         else:
             dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in self.dict_root_dirs.items() }
-        return dict_lister_trains
 
-    def set_iterative_dataloader(self, dict_data_train, k, lister_train, keys_to_add):
+        if self.dataset != "s8d_3d":
+            dict_chunk_trains = None
+        return dict_lister_trains, dict_chunk_trains
+
+    def set_iterative_dataloader(self, dict_data_train, k, lister_train, keys_to_add, chunk_train=None):
         if self.dataset == "imagenet":
             start_idx = self.dict_start_idx["imagenet"]
             end_idx = self.dict_end_idx["imagenet"]
@@ -420,7 +458,8 @@ class NativePytorchDataModule(torch.nn.Module):
                                 ddp_group=self.ddp_group,
                                 dataset=self.dataset,
                                 nx = self.nx[k],
-                                ny = self.ny[k]
+                                ny = self.ny[k],
+
                             ),
                         self.tile_size_x,
                         self.tile_size_y,
@@ -429,6 +468,50 @@ class NativePytorchDataModule(torch.nn.Module):
                         tile_overlap = self.tile_overlap,
                         use_all_data = self.use_all_data,
                         classification = False,
+                    ),
+                    buffer_size
+                ),
+                num_channels_used,
+                single_channel,
+                self.batch_size,
+                return_label,
+                self.adaptive_patching,
+                self.separate_channels,
+                self.patch_size,
+                self.fixed_length,
+                self.twoD,
+                self.dataset,
+                self.return_qdt,
+            )
+        elif self.dataset == "s8d_3d":
+            dict_data_train[k] = ProcessChannels(
+                ShuffleIterableDataset(
+                    ImageBlockDataIter_3D(
+                            FileReader(
+                                lister_train,
+                                num_channels_available,
+                                gx = self.gx,
+                                start_idx=start_idx,
+                                end_idx=end_idx,
+                                variables=variables,
+                                multi_dataset_training=True,
+                                data_par_size = self.data_par_size,
+                                return_label = return_label,
+                                keys_to_add = keys_to_add,
+                                ddp_group = self.ddp_group,
+                                dataset=self.dataset,
+                                nx = self.nx[k],
+                                ny = self.ny[k],
+                                chunk_list = chunk_train,
+                                chunk_size = self.chunk_size[k],
+                            ),
+                        self.tile_size_x,
+                        self.tile_size_y,
+                        self.tile_size_z,
+                        self.twoD,
+                        return_label = return_label,
+                        tile_overlap = self.tile_overlap,
+                        use_all_data = self.use_all_data,
                     ),
                     buffer_size
                 ),
@@ -505,19 +588,46 @@ class NativePytorchDataModule(torch.nn.Module):
             dict_data_train = {}
             for i, k in enumerate(self.dict_lister_trains.keys()):
                 lister_train = self.dict_lister_trains[k]
+                if self.dataset == "s8d_3d":
+                    chunk_train = self.dict_chunk_trains[k]
+
                 if self.dataset == "imagenet":
                     keys_to_add = 1
                 else:
                     keys_to_add = int(np.ceil(self.max_balance/self.batches_per_rank_epoch[k]))
-                _lister_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
+
+                if self.dataset == "s8d_3d":
+                    list_indices = np.arange(0,len(lister_train))
+                    indices = np.random.choice(list_indices,len(lister_train), replace=False)
+                    _lister_train = []
+                    _chunk_train = []
+                    for j in range(len(indices)):
+                        _lister_train.append(lister_train[indices[j]])
+                        _chunk_train.append(chunk_train[indices[j]])
+                else:
+                    _lister_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
                 if keys_to_add > 1:
                     for i in range(keys_to_add-1):
-                        _balance_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
-                        _lister_train.extend(_balance_train)
+                        if self.dataset == "s8d_3d":
+                            list_indices = np.arange(0,len(lister_train))
+                            indices = np.random.choice(list_indices, len(lister_train), replace=False)
+                            _balance_train = []
+                            _balance_chunk = []
+                            for j in range(len(indices)):
+                                _balance_train.append(lister_train[indices[j]])
+                                _balance_chunk.append(chunk_train[indices[j]])
+                            _lister_train.extend(_balance_train)
+                            _chunk_train.extend(_balance_chunk)
+                        else:
+                            _balance_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
+                            _lister_train.extend(_balance_train)
 
                 lister_train = _lister_train
-                
-                dict_data_train = self.set_iterative_dataloader(dict_data_train, k, lister_train, keys_to_add)
+                if self.dataset == "s8d_3d":
+                    chunk_train = _chunk_train
+                    dict_data_train = self.set_iterative_dataloader(dict_data_train, k, lister_train, keys_to_add, chunk_train=chunk_train)
+                else: 
+                    dict_data_train = self.set_iterative_dataloader(dict_data_train, k, lister_train, keys_to_add)
 
             self.dict_data_train = dict_data_train
 
@@ -530,15 +640,39 @@ class NativePytorchDataModule(torch.nn.Module):
                 keys_to_add = 1
             else:
                 keys_to_add = int(np.ceil(self.max_balance/self.batches_per_rank_epoch[k]))
-            _lister_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
+            if self.dataset == "s8d_3d":
+                list_indices = np.arange(0,len(lister_train))
+                indices = np.random.choice(list_indices,len(lister_train), replace=False)
+                _lister_train = []
+                _chunk_train = []
+                for j in range(len(indices)):
+                    _lister_train.append(lister_train[indices[j]])
+                    _chunk_train.append(chunk_train[indices[j]])
+            else:
+                _lister_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
             if keys_to_add > 1:
                 for i in range(keys_to_add-1):
-                    _balance_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
-                    _lister_train.extend(_balance_train)
+                    if self.dataset == "s8d_3d":
+                        list_indices = np.arange(0,len(lister_train))
+                        indices = np.random.choice(list_indices, len(lister_train), replace=False)
+                        _balance_train = []
+                        _balance_chunk = []
+                        for j in range(len(indices)):
+                            _balance_train.append(lister_train[indices[j]])
+                            _balance_chunk.append(chunk_train[indices[j]])
+                        _lister_train.extend(_balance_train)
+                        _chunk_train.extend(_balance_chunk)
+                    else:
+                        _balance_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
+                        _lister_train.extend(_balance_train)
 
             lister_train = _lister_train
             
-            dict_data_train = self.set_iterative_dataloader(dict_data_train, k, lister_train, keys_to_add)
+            if self.dataset == "s8d_3d":
+                chunk_train = _chunk_train
+                dict_data_train = self.set_iterative_dataloader(dict_data_train, k, lister_train, keys_to_add, chunk_train=chunk_train)
+            else:
+                dict_data_train = self.set_iterative_dataloader(dict_data_train, k, lister_train, keys_to_add)
 
         self.dict_data_train = dict_data_train
 

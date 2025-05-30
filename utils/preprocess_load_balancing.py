@@ -49,9 +49,12 @@ def main():
     if dataset == "imagenet":
         imagenet_resize = conf['dataset_options']['imagenet_resize']
 
-    if dataset == "s8d_2d":
+    if dataset == "s8d_2d" or dataset == "s8d_3d":
         nx = conf['dataset_options']['nx']
         ny = conf['dataset_options']['ny']
+    if dataset == "s8d_3d":
+        chunk_size = conf['dataset_options']['chunk_size']
+        num_samples_to_stitch = conf['dataset_options']['num_samples_to_stitch']
 
     tile_size_x = int(tile_size[0])
     tile_size_y = int(tile_size[1])
@@ -99,6 +102,37 @@ def main():
             
             img_dict = {k: img_list}
             dict_lister_trains.update(img_dict)
+    elif dataset == "s8d_3d":
+        dict_lister_trains = {}
+        dict_chunk_trains = {}
+        for k, root_dir in dict_root_dirs.items():
+            num_chunks = int(nx[k]/chunk_size[k])
+            samples = sorted(os.listdir(root_dir))
+            #In 3D rather than passing individual files pass list of files with corresponding connected samples
+            img_list = []
+            chunk_list = []
+
+            #Number of samples to stitch
+            num_3d_samples = int(len(samples) / num_samples_to_stitch[k])
+
+            for i in range(num_3d_samples):
+                img_sample_list = []
+                for sample in samples[i*num_samples_to_stitch[k]:i*num_samples_to_stitch[k]+num_samples_to_stitch[k]]:
+                    sample_dir = os.path.join(root_dir, sample)
+                    for img_path in sorted(glob.glob(os.path.join(sample_dir,"*.raw"))):
+                        img_sample_list.append(img_path)
+
+                for x_chunk in range(num_chunks):
+                    for y_chunk in range(num_chunks):
+                        img_list.append(img_sample_list)
+                        chunk_list.append([x_chunk,y_chunk])
+               
+            
+            img_dict = {k: img_list}
+            dict_lister_trains.update(img_dict)
+            chunk_dict = {k: chunk_list}
+            dict_chunk_trains.update(chunk_dict)
+
     else:
         dict_lister_trains = {
             k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in dict_root_dirs.items()
@@ -120,6 +154,10 @@ def main():
         keys = lister_train[start_idx:end_idx]
         num_total_images.append(len(keys))
 
+        if dataset == "s8d_3d":
+            chunk_train = dict_chunk_trains[k]
+            chunks = chunk_train[start_idx:end_idx]
+
         #Assume all channels have the same data size
         data_path = keys[0]
         
@@ -131,6 +169,17 @@ def main():
             data = cv.resize(data, dsize=[imagenet_resize["imagenet"][0],imagenet_resize["imagenet"][1]])
         elif dataset == "s8d_2d":
             data = np.fromfile(data_path, dtype=np.uint16).reshape([nx[k],ny[k]])
+        elif dataset == "s8d_3d":
+            data_list = []
+            for idx in range(len(keys[0])):
+                chunk_idx = chunks[0]
+                
+                data = np.fromfile(keys[0][idx], dtype=np.uint16).reshape(nx[k],ny[k])
+                data = (data[chunk_idx[0]*chunk_size[k]:(chunk_idx[0]+1)*chunk_size[k], chunk_idx[1]*chunk_size[k]:(chunk_idx[1]+1)*chunk_size[k]])
+                data_list.append(data)
+            data = np.stack([data_list[idx] for idx in range(len(data_list))])
+            #z stacked on first dimension, so move to last dimension
+            data = np.moveaxis(data, 0, -1)
         else:
             data = nib.load(data_path)
             data = np.array(data.dataobj).astype(np.float32)

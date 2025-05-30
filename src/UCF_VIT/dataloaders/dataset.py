@@ -32,6 +32,8 @@ class FileReader(IterableDataset):
         imagenet_resize: Optional[list] = [256,256],
         nx: Optional[int] = 512,
         ny: Optional[int] = 512,
+        chunk_size: Optional[int] = 128,
+        chunk_list: Optional[list] = None,
     ) -> None:
         super().__init__()
         self.num_channels_available = num_channels_available
@@ -52,11 +54,16 @@ class FileReader(IterableDataset):
         #Optional Inputs
         if self.dataset == "imagenet":
             self.imagenet_resize = imagenet_resize
-        if self.dataset == "s8d_2d":
+        if self.dataset == "s8d_2d" or self.dataset == "s8d_3d":
             self.nx = nx
             self.ny = ny
+        if self.dataset == "s8d_3d":
+            self.chunk_size = chunk_size
+            chunk_list = chunk_list[start_idx:end_idx]
+            self.chunk_list = chunk_list
 
-    def read_process_file(self, path):
+
+    def read_process_file(self, path, chunk_idx=None):
         if self.dataset == "imagenet":
             data = Image.open(path).convert("RGB")
             data = np.array(data) 
@@ -107,6 +114,19 @@ class FileReader(IterableDataset):
             data = (data - np.min(data)) / ((np.max(data) - np.min(data)) + 1e-8).astype(np.float32)
             return np.expand_dims(data,axis=0)
 
+        elif self.dataset == "s8d_3d":
+            data_list = []
+            for i in range(len(path)):
+                data = np.fromfile(path[i], dtype=np.uint16).reshape(self.nx,self.ny)
+                data = (data[chunk_idx[0]*self.chunk_size:(chunk_idx[0]+1)*self.chunk_size, chunk_idx[1]*self.chunk_size:(chunk_idx[1]+1)*self.chunk_size])
+                #data = (data[:] / 255).astype(np.uint8)
+                data_list.append(data)
+            data = np.stack([data_list[i] for i in range(len(data_list))])
+            data = (data - np.min(data)) / ((np.max(data) - np.min(data)) + 1e-8).astype(np.float32)
+            #z stacked on first dimension, so move to last dimension
+            data = np.moveaxis(data, 0, -1)
+            return np.expand_dims(data,axis=0)
+
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is None:
@@ -154,12 +174,20 @@ class FileReader(IterableDataset):
             start_it = iter_start + m*int(len(self.file_list)/self.keys_to_add)
             end_it = iter_end + m*int(len(self.file_list)/self.keys_to_add)
             for idx in range(start_it, end_it):
-                if self.return_label:
-                    data, label = self.read_process_file(self.file_list[idx])
-                    yield data, label, self.variables
+                if self.dataset == "s8d_3d":
+                    if self.return_label:
+                        data, label = self.read_process_file(self.file_list[idx], chunk_idx=self.chunk_list[idx])
+                        yield data, label, self.variables
+                    else:
+                        data = self.read_process_file(self.file_list[idx], chunk_idx=self.chunk_list[idx])
+                        yield data, self.variables
                 else:
-                    data = self.read_process_file(self.file_list[idx])
-                    yield data, self.variables
+                    if self.return_label:
+                        data, label = self.read_process_file(self.file_list[idx])
+                        yield data, label, self.variables
+                    else:
+                        data = self.read_process_file(self.file_list[idx])
+                        yield data, self.variables
 
 class ImageBlockDataIter_2D(IterableDataset):
     def __init__(
