@@ -42,8 +42,8 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                         label = torch.stack([torch.from_numpy(batch[i][4]) for i in range(len(batch))])
                     seq_label_list = []
                     for i in range(len(batch)):
-                        if dataset == "basic_ct":
-                            seq_mask = torch.from_numpy(batch[i][5]).long()
+                        if dataset == "basic_ct" or dataset == "s8d_2d_label":
+                            seq_mask = torch.from_numpy(batch[i][5][0]).long()
                             seq_mask = F.one_hot(seq_mask.squeeze(-1), num_classes=num_classes)
                             seq_label_list.append(seq_mask.permute(2, 0, 1).float())
                         else:
@@ -83,8 +83,8 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                         label = torch.stack([torch.from_numpy(batch[i][4]) for i in range(len(batch))])
                     seq_label_list = []
                     for i in range(len(batch)):
-                        if dataset == "basic_ct":
-                            seq_mask = torch.from_numpy(batch[i][5]).long()
+                        if dataset == "basic_ct" or dataset == "s8d_2d_label":
+                            seq_mask = torch.from_numpy(batch[i][5][0]).long()
                             seq_mask = F.one_hot(seq_mask.squeeze(-1), num_classes=num_classes)
                             seq_label_list.append(seq_mask.permute(2, 0, 1).float())
                         else:
@@ -276,7 +276,7 @@ class NativePytorchDataModule(torch.nn.Module):
 
         #Optional Inputs
         self.num_classes = num_classes
-        if self.dataset == "basic_ct":
+        if self.dataset == "basic_ct" or self.dataset == "s8d_2d_label":
             if return_label:
                 assert num_classes != None, "If using segmentation with basic_ct need to pass the number of classes"
 
@@ -339,12 +339,22 @@ class NativePytorchDataModule(torch.nn.Module):
                 img_list = []
                 for sample in samples: 
                     sample_dir = os.path.join(root_dir, sample)
-                    #img_list.extend(list(dp.iter.FileLister(os.path.join(cls_dir))))
                     for img_path in glob.glob(os.path.join(sample_dir,"*.raw")):
                         img_list.append(img_path)
                 
                 img_dict = {k: img_list}
                 dict_lister_trains.update(img_dict)
+                
+        elif self.dataset == "s8d_2d_label":
+            dict_lister_trains = {}
+            for k, root_dir in self.dict_root_dirs.items():
+                img_list = []
+                for img_path in glob.glob(os.path.join(root_dir,"*.npy")):
+                    img_list.append(img_path)
+                
+                img_dict = {k: img_list}
+                dict_lister_trains.update(img_dict)
+
         elif self.dataset == "s8d_3d":
             dict_lister_trains = {}
             dict_chunk_trains = {}
@@ -381,7 +391,7 @@ class NativePytorchDataModule(torch.nn.Module):
             dict_chunk_trains = None
         return dict_lister_trains, dict_chunk_trains
 
-    def set_iterative_dataloader(self, dict_data_train, k, lister_train, keys_to_add, chunk_train=None):
+    def set_iterative_dataloader(self, dict_data_train, k, lister_train, keys_to_add, chunk_train):
         if self.dataset == "imagenet":
             start_idx = self.dict_start_idx["imagenet"]
             end_idx = self.dict_end_idx["imagenet"]
@@ -625,9 +635,9 @@ class NativePytorchDataModule(torch.nn.Module):
                 lister_train = _lister_train
                 if self.dataset == "s8d_3d":
                     chunk_train = _chunk_train
-                    dict_data_train = self.set_iterative_dataloader(dict_data_train, k, lister_train, keys_to_add, chunk_train=chunk_train)
                 else: 
-                    dict_data_train = self.set_iterative_dataloader(dict_data_train, k, lister_train, keys_to_add)
+                    chunk_train = None
+                dict_data_train = self.set_iterative_dataloader(dict_data_train, k, lister_train, keys_to_add, chunk_train)
 
             self.dict_data_train = dict_data_train
 

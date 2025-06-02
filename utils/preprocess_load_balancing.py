@@ -102,6 +102,16 @@ def main():
             
             img_dict = {k: img_list}
             dict_lister_trains.update(img_dict)
+    elif dataset == "s8d_2d_label":
+        dict_lister_trains = {}
+        for k, root_dir in dict_root_dirs.items():
+            img_list = []
+            for img_path in glob.glob(os.path.join(root_dir,"*.npy")):
+                img_list.append(img_path)
+                
+            img_dict = {k: img_list}
+            dict_lister_trains.update(img_dict)
+        
     elif dataset == "s8d_3d":
         dict_lister_trains = {}
         dict_chunk_trains = {}
@@ -169,6 +179,9 @@ def main():
             data = cv.resize(data, dsize=[imagenet_resize["imagenet"][0],imagenet_resize["imagenet"][1]])
         elif dataset == "s8d_2d":
             data = np.fromfile(data_path, dtype=np.uint16).reshape([nx[k],ny[k]])
+        elif dataset == "s8d_2d_label":
+            data = np.load(keys[0])
+            data = np.moveaxis(data,0,-1)
         elif dataset == "s8d_3d":
             data_list = []
             for idx in range(len(keys[0])):

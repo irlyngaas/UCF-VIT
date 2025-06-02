@@ -63,7 +63,7 @@ class FileReader(IterableDataset):
             self.chunk_list = chunk_list
 
 
-    def read_process_file(self, path, chunk_idx=None):
+    def read_process_file(self, path, chunk_idx):
         if self.dataset == "imagenet":
             data = Image.open(path).convert("RGB")
             data = np.array(data) 
@@ -114,12 +114,30 @@ class FileReader(IterableDataset):
             data = (data - np.min(data)) / ((np.max(data) - np.min(data)) + 1e-8).astype(np.float32)
             return np.expand_dims(data,axis=0)
 
+        elif self.dataset == "s8d_2d_label":
+                data = np.load(path)
+                data = np.moveaxis(data,0,-1)
+                data = (data / 65535 * 255).astype(np.uint8)
+                
+                if self.return_label:
+                    data_path = Path(path)
+                    parent = data_path.parent.absolute()
+                    stem1 = parent.stem
+                    parent2 = parent.parent.absolute()
+                    parent3 = parent2.parent.absolute()
+                    stem2 = data_path.stem
+                    label_path = os.path.join(parent3,"labels",stem1, stem2[:-23]+"label.npy")
+                    label = np.load(label_path)
+                    label = np.moveaxis(label,0,-1)
+                    return np.expand_dims(data,axis=0), label
+                else:
+                    return np.expand_dims(data,axis=0)
+
         elif self.dataset == "s8d_3d":
             data_list = []
             for i in range(len(path)):
                 data = np.fromfile(path[i], dtype=np.uint16).reshape(self.nx,self.ny)
                 data = (data[chunk_idx[0]*self.chunk_size:(chunk_idx[0]+1)*self.chunk_size, chunk_idx[1]*self.chunk_size:(chunk_idx[1]+1)*self.chunk_size])
-                #data = (data[:] / 255).astype(np.uint8)
                 data_list.append(data)
             data = np.stack([data_list[i] for i in range(len(data_list))])
             data = (data - np.min(data)) / ((np.max(data) - np.min(data)) + 1e-8).astype(np.float32)
@@ -175,19 +193,16 @@ class FileReader(IterableDataset):
             end_it = iter_end + m*int(len(self.file_list)/self.keys_to_add)
             for idx in range(start_it, end_it):
                 if self.dataset == "s8d_3d":
-                    if self.return_label:
-                        data, label = self.read_process_file(self.file_list[idx], chunk_idx=self.chunk_list[idx])
-                        yield data, label, self.variables
-                    else:
-                        data = self.read_process_file(self.file_list[idx], chunk_idx=self.chunk_list[idx])
-                        yield data, self.variables
+                    chunk_idx = self.chunk_list[idx]
                 else:
-                    if self.return_label:
-                        data, label = self.read_process_file(self.file_list[idx])
-                        yield data, label, self.variables
-                    else:
-                        data = self.read_process_file(self.file_list[idx])
-                        yield data, self.variables
+                    chunk_idx = None
+
+                if self.return_label:
+                    data, label = self.read_process_file(self.file_list[idx], chunk_idx)
+                    yield data, label, self.variables
+                else:
+                    data = self.read_process_file(self.file_list[idx], chunk_idx)
+                    yield data, self.variables
 
 class ImageBlockDataIter_2D(IterableDataset):
     def __init__(
@@ -685,12 +700,13 @@ class ProcessChannels(IterableDataset):
                                     seq_image, seq_size, seq_pos, qdt = self.patchify(np.expand_dims(np_image,axis=-1))
                                     if self._dataset != "imagenet":
                                         np_label = yield_label_list[i].pop()
-                                        if self._dataset == "basic_ct":
+                                        if self._dataset == "basic_ct" or self._dataset == "s8d_2d_label":
                                             np_label = np.expand_dims(np_label,axis=0)
                                         seq_label_list = []
                                         for j in range(np_label.shape[0]):
                                             if self.twoD:
-                                                if self._dataset == "basic_ct":
+                                                if self._dataset == "basic_ct" or self._dataset == "s8d_2d_label":
+                                                    #print("NP_LABEL_SHAPE: ", np_label[j].shape, flush=True)
                                                     seq_label, _, _ = qdt.serialize_labels(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,self.num_channels))
                                                     seq_label = np.asarray(seq_label)
                                                     seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size, -1, self.num_channels])
@@ -702,7 +718,7 @@ class ProcessChannels(IterableDataset):
                                                     else:
                                                         seq_label = np.reshape(seq_label, [-1, self.patch_size*self.patch_size])
                                             else:
-                                                if self._dataset == "basic_ct":
+                                                if self._dataset == "basic_ct" or self._dataset == "s8d_2d_label":
                                                     seq_label, _, _ = qdt.serialize_labels(np_label[j], size=(self.patch_size,self.patch_size,self.patch_size))
                                                     seq_label = np.asarray(seq_label)
                                                     seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size*self.patch_size, -1, self.num_channels])
@@ -737,7 +753,7 @@ class ProcessChannels(IterableDataset):
 
                                     if self._dataset != "imagenet":
                                         np_label = yield_label_list[i].pop()
-                                        if self._dataset == "basic_ct":
+                                        if self._dataset == "basic_ct" or self._dataset == "s8d_2d_label":
                                             np_label = np.expand_dims(np_label,axis=0)
 
                                         #TODO: If separate_channel=True, which qdt from qdt_list to use? Default to using the first in the list for now
@@ -749,7 +765,7 @@ class ProcessChannels(IterableDataset):
                                         seq_label_list = []
                                         for j in range(np_label.shape[0]):
                                             if self.twoD:
-                                                if self._dataset == "basic_ct":
+                                                if self._dataset == "basic_ct" or self._dataset == "s8d_2d_label":
                                                     seq_label, _, _ = qdt_.serialize_labels(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,self.num_channels))
                                                     seq_label = np.asarray(seq_label)
                                                     seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size, -1, self.num_channels])
@@ -761,7 +777,7 @@ class ProcessChannels(IterableDataset):
                                                     else:
                                                         seq_label = np.reshape(seq_label, [-1, self.patch_size*self.patch_size])
                                             else:
-                                                if self._dataset == "basic_ct":
+                                                if self._dataset == "basic_ct" or self._dataset == "s8d_2d_label":
                                                     seq_label, _, _ = qdt_.serialize_labels(np_label[j], size=(self.patch_size,self.patch_size,self.patch_size))
                                                     seq_label = np.asarray(seq_label)
                                                     seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size*self.patch_size, -1, self.num_channels])
@@ -781,7 +797,7 @@ class ProcessChannels(IterableDataset):
                                     else:
                                         yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_label_list[i].pop(), yield_var_list[i].pop()
                                 else:
-                                    if self._dataset == "basic_ct":
+                                    if self._dataset == "basic_ct" or self._dataset == "s8d_2d_label":
                                         if self.return_qdt:
                                             yield np_image, seq_image, seq_size, seq_pos, np.asarray(np_label,dtype=np.uint8), seq_label_list, yield_var_list[i].pop(), qdt
                                         else:
