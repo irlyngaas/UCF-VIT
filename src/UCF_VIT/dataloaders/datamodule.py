@@ -43,7 +43,7 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                     seq_label_list = []
                     for i in range(len(batch)):
                         if dataset == "basic_ct":
-                            seq_mask = torch.from_numpy(batch[i][5]).long()
+                            seq_mask = torch.from_numpy(batch[i][5][0]).long()
                             seq_mask = F.one_hot(seq_mask.squeeze(-1), num_classes=num_classes)
                             seq_label_list.append(seq_mask.permute(2, 0, 1).float())
                         else:
@@ -84,7 +84,7 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                     seq_label_list = []
                     for i in range(len(batch)):
                         if dataset == "basic_ct":
-                            seq_mask = torch.from_numpy(batch[i][5]).long()
+                            seq_mask = torch.from_numpy(batch[i][5][0]).long()
                             seq_mask = F.one_hot(seq_mask.squeeze(-1), num_classes=num_classes)
                             seq_label_list.append(seq_mask.permute(2, 0, 1).float())
                         else:
