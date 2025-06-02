@@ -9,7 +9,6 @@ import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
-from torchvision.utils import save_image
 import time
 import yaml
 from einops import rearrange
