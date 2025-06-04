@@ -677,12 +677,13 @@ class NativePytorchDataModule(torch.nn.Module):
                         _lister_train.extend(_balance_train)
 
             lister_train = _lister_train
-            
+
             if self.dataset == "s8d_3d":
                 chunk_train = _chunk_train
-                dict_data_train = self.set_iterative_dataloader(dict_data_train, k, lister_train, keys_to_add, chunk_train=chunk_train)
             else:
-                dict_data_train = self.set_iterative_dataloader(dict_data_train, k, lister_train, keys_to_add)
+                chunk_train = None
+            
+            dict_data_train = self.set_iterative_dataloader(dict_data_train, k, lister_train, keys_to_add, chunk_train)
 
         self.dict_data_train = dict_data_train
 
