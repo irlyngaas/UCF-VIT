@@ -185,6 +185,8 @@ def main(device):
 
     use_all_data = conf['data']['use_all_data']
 
+    assert not use_all_data, "Don't use all_data=True, need to make some changes within the code for this option to work"
+
     batches_per_rank_epoch = conf['load_balancing']['batches_per_rank_epoch']
 
     dataset_group_list = conf['load_balancing']['dataset_group_list']
@@ -218,6 +220,8 @@ def main(device):
         nz_skip = conf['dataset_options']['nz_skip']
         
         dict_out_variables = conf['dataset_options']['dict_out_variables']
+
+        chunk_size = conf['dataset_options']['chunk_size']
 
 
 
@@ -506,6 +510,7 @@ def main(device):
         ny_skip = ny_skip,
         nz_skip = nz_skip,
         dict_out_variables = dict_out_variables,
+        chunk_size = chunk_size,
     ).to(device)
 
     data_module.setup()

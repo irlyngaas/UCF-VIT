@@ -250,6 +250,7 @@ class NativePytorchDataModule(torch.nn.Module):
         ny_skip: Optional[Dict] = None,
         nz_skip: Optional[Dict] = None,
         dict_out_variables: Optional[Dict] = None,
+        chunk_size: Optional[Dict] = None,
     ):
         super().__init__()
         if num_workers > 1:
@@ -307,6 +308,7 @@ class NativePytorchDataModule(torch.nn.Module):
             self.nx_skip = nx_skip
             self.ny_skip = ny_skip
             self.nz_skip = nz_skip
+            self.chunk_size = chunk_size
 
             out_variables = {}
             for k, list_out in dict_out_variables.items():
@@ -326,7 +328,7 @@ class NativePytorchDataModule(torch.nn.Module):
             in_variables[k] = [ x for x in in_variables[k] ]
         self.dict_in_variables = in_variables
 
-        self.dict_lister_trains = self.process_root_dirs()
+        self.dict_lister_trains, self.dict_chunk_trains = self.process_root_dirs()
            
 
         self.dict_data_train: Optional[Dict] = None
@@ -360,26 +362,56 @@ class NativePytorchDataModule(torch.nn.Module):
                         break
 
         elif self.dataset == "sst":
-           lister = { k: list(dp.iter.FileLister(os.path.join(root_dir, ""))) for k, root_dir in self.dict_root_dirs.items() }
-           dict_lister_trains = {}
-           for i,k in enumerate(lister.keys()):
-               list_ = lister[k]
-               main_keys = []
-               for j in range(len(list_)):
-                   base_path_prefix, timestamp = get_file_prefix(list_[j])
-                   key = os.path.join(base_path_prefix, timestamp)
-                   main_keys.append(key)
-               used = set()
-               #Find all unique keys, since different channels are in separate files
-               unique_keys = [x for x in main_keys if x not in used and (used.add(x) or True)]
-               img_dict = {k: unique_keys}
-               dict_lister_trains.update(img_dict)
+            lister = {}
+            for k,root_dirs in self.dict_root_dirs.items():
+                listy = []
+                for i in os.listdir(root_dirs):
+                    listy.append(os.path.join(root_dirs,i))
+                list_dict = {k: listy}
+                lister.update(list_dict)
+            #lister = { k: list(dp.iter.FileLister(os.path.join(root_dir, ""))) for k, root_dir in self.dict_root_dirs.items() }
+            dict_lister_trains = {}
+            dict_chunk_trains = {}
+            for i,k in enumerate(lister.keys()):
+                list_ = lister[k]
+                main_keys = []
+                for j in range(len(list_)):
+                    data_path = Path(list_[j])
+                    if data_path.stem != 'global':
+                        base_path_prefix, timestamp = get_file_prefix(list_[j])
+                        key = os.path.join(base_path_prefix, timestamp)
+                        main_keys.append(key)
+                used = set()
+                #Find all unique keys, since different channels are in separate files
+                unique_keys = [x for x in main_keys if x not in used and (used.add(x) or True)]
+
+                num_chunks_x = self.nx[k] // self.chunk_size[k][0]
+                num_chunks_y = self.ny[k] // self.chunk_size[k][1]
+                num_chunks_z = self.nz[k] // self.chunk_size[k][2]
+
+                img_list = []
+                chunk_list = []
+                for xx in range(num_chunks_x):
+                    for yy in range(num_chunks_y):
+                        for zz in range(num_chunks_z):
+                            img_list.extend(unique_keys)
+                            chunky = []
+                            for cc in range(len(unique_keys)):
+                                chunk_list.append([xx,yy,zz])
+                img_dict = {k: img_list}
+                dict_lister_trains.update(img_dict)
+                chunk_dict = {k: chunk_list}
+                dict_chunk_trains.update(chunk_dict)
 
         else:
             dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in self.dict_root_dirs.items() }
-        return dict_lister_trains
 
-    def set_iterative_dataloader(self, dict_data_train, k, lister_train, keys_to_add):
+        if self.dataset != "sst":
+            dict_chunk_trains = None
+
+        return dict_lister_trains, dict_chunk_trains
+
+    def set_iterative_dataloader(self, dict_data_train, k, lister_train, keys_to_add, chunk_train):
         if self.dataset == "imagenet":
             start_idx = self.dict_start_idx["imagenet"]
             end_idx = self.dict_end_idx["imagenet"]
@@ -459,6 +491,7 @@ class NativePytorchDataModule(torch.nn.Module):
                                 nx = self.nx[k],
                                 ny = self.ny[k],
                                 nz = self.nz[k],
+                                chunk_list = chunk_train,
                             ),
                         self.tile_size_x*self.nx_skip[k],
                         self.tile_size_y*self.ny_skip[k],
@@ -473,6 +506,7 @@ class NativePytorchDataModule(torch.nn.Module):
                         return_label = return_label,
                         tile_overlap = self.tile_overlap,
                         use_all_data = self.use_all_data,
+                        chunk_size = self.chunk_size[k],
                     ),
                     buffer_size
                 ),
@@ -549,19 +583,46 @@ class NativePytorchDataModule(torch.nn.Module):
             dict_data_train = {}
             for i, k in enumerate(self.dict_lister_trains.keys()):
                 lister_train = self.dict_lister_trains[k]
+                if self.dataset == "sst":
+                    chunk_train = self.dict_chunk_trains[k]
+                    
                 if self.dataset == "imagenet":
                     keys_to_add = 1
                 else:
                     keys_to_add = int(np.ceil(self.max_balance/self.batches_per_rank_epoch[k]))
-                _lister_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
+                if self.dataset == "sst":
+                    list_indices = np.arange(0,len(lister_train))
+                    indices = np.random.choice(list_indices,len(lister_train), replace=False)
+                    _lister_train = []
+                    _chunk_train = []
+                    for j in range(len(indices)):
+                        _lister_train.append(lister_train[indices[j]])
+                        _chunk_train.append(chunk_train[indices[j]])
+                else:
+                    _lister_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
                 if keys_to_add > 1:
                     for i in range(keys_to_add-1):
-                        _balance_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
-                        _lister_train.extend(_balance_train)
+                        if self.dataset == "sst":
+                            list_indices = np.arange(0,len(lister_train))
+                            indices = np.random.choice(list_indices, len(lister_train), replace=False)
+                            _balance_train = []
+                            _balance_chunk = []
+                            for j in range(len(indices)):
+                                _balance_train.append(lister_train[indices[j]])
+                                _balance_chunk.append(chunk_train[indices[j]])
+                            _lister_train.extend(_balance_train)
+                            _chunk_train.extend(_balance_chunk)
+                        else:
+                            _balance_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
+                            _lister_train.extend(_balance_train)
 
                 lister_train = _lister_train
+                if self.dataset == "sst":
+                    chunk_train = _chunk_train
+                else:
+                    chunk_train = None
                 
-                dict_data_train = self.set_iterative_dataloader(dict_data_train, k, lister_train, keys_to_add)
+                dict_data_train = self.set_iterative_dataloader(dict_data_train, k, lister_train, keys_to_add, chunk_train)
 
             self.dict_data_train = dict_data_train
 
@@ -574,15 +635,39 @@ class NativePytorchDataModule(torch.nn.Module):
                 keys_to_add = 1
             else:
                 keys_to_add = int(np.ceil(self.max_balance/self.batches_per_rank_epoch[k]))
-            _lister_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
+            if self.dataset == "sst":
+                list_indices = np.arange(0,len(lister_train))
+                indices = np.random.choice(list_indices,len(lister_train), replace=False)
+                _lister_train = []
+                _chunk_train = []
+                for j in range(len(indices)):
+                    _lister_train.append(lister_train[indices[j]])
+                    _chunk_train.append(chunk_train[indices[j]])
+            else:
+                _lister_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
             if keys_to_add > 1:
                 for i in range(keys_to_add-1):
-                    _balance_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
-                    _lister_train.extend(_balance_train)
+                    if self.dataset == "sst":
+                        list_indices = np.arange(0,len(lister_train))
+                        indices = np.random.choice(list_indices, len(lister_train), replace=False)
+                        _balance_train = []
+                        _balance_chunk = []
+                        for j in range(len(indices)):
+                            _balance_train.append(lister_train[indices[j]])
+                            _balance_chunk.append(chunk_train[indices[j]])
+                        _lister_train.extend(_balance_train)
+                        _chunk_train.extend(_balance_chunk)
+                    else:
+                        _balance_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
+                        _lister_train.extend(_balance_train)
 
             lister_train = _lister_train
+            if self.dataset == "sst":
+                chunk_train = _chunk_train
+            else:
+                chunk_train = None
             
-            dict_data_train = self.set_iterative_dataloader(dict_data_train, k, lister_train, keys_to_add)
+            dict_data_train = self.set_iterative_dataloader(dict_data_train, k, lister_train, keys_to_add, chunk_train)
 
         self.dict_data_train = dict_data_train
 

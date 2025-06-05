@@ -57,6 +57,7 @@ def main():
         nx_skip = conf['dataset_options']['nx_skip']
         ny_skip = conf['dataset_options']['ny_skip']
         nz_skip = conf['dataset_options']['nz_skip']
+        chunk_size = conf['dataset_options']['chunk_size']
 
     tile_size_x = int(tile_size[0])
     tile_size_y = int(tile_size[1])
@@ -92,20 +93,43 @@ def main():
                 if num_data_roots > num_total_ddp_ranks-1:
                     break
     elif dataset == "sst":
-       lister = { k: list(dp.iter.FileLister(os.path.join(root_dir, ""))) for k, root_dir in dict_root_dirs.items() }
-       dict_lister_trains = {}
-       for i,k in enumerate(lister.keys()):
-           list_ = lister[k]
-           main_keys = []
-           for j in range(len(list_)):
-               base_path_prefix, timestamp = get_file_prefix(list_[j])
-               key = os.path.join(base_path_prefix, timestamp)
-               main_keys.append(key)
-           used = set()
-           #Find all unique keys, since different channels are in separate files
-           unique_keys = [x for x in main_keys if x not in used and (used.add(x) or True)]
-           img_dict = {k: unique_keys}
-           dict_lister_trains.update(img_dict)
+        lister = {}
+        for k,root_dirs in dict_root_dirs.items():
+            listy = []
+            for i in os.listdir(root_dirs):
+                listy.append(os.path.join(root_dirs,i))
+            list_dict = {k: listy}
+            lister.update(list_dict)
+        dict_lister_trains = {}
+        dict_chunk_trains = {}
+        for i,k in enumerate(lister.keys()):
+            list_ = lister[k]
+            main_keys = []
+            for j in range(len(list_)):
+                data_path = Path(list_[j])
+                base_path_prefix, timestamp = get_file_prefix(list_[j])
+                key = os.path.join(base_path_prefix, timestamp)
+                main_keys.append(key)
+            used = set()
+            #Find all unique keys, since different channels are in separate files
+            unique_keys = [x for x in main_keys if x not in used and (used.add(x) or True)]
+            num_chunks_x = nx[k] // chunk_size[k][0]
+            num_chunks_y = ny[k] // chunk_size[k][1]
+            num_chunks_z = nz[k] // chunk_size[k][2]
+
+            img_list = []
+            chunk_list = []
+            for xx in range(num_chunks_x):
+                for yy in range(num_chunks_y):
+                    for zz in range(num_chunks_z):
+                        img_list.extend(unique_keys)
+                        for cc in range(len(unique_keys)):
+                            chunk_list.append([xx,yy,zz])
+            img_dict = {k: img_list}
+            dict_lister_trains.update(img_dict)
+            chunk_dict = {k: chunk_list}
+            dict_chunk_trains.update(chunk_dict)
+
     else:
         dict_lister_trains = {
             k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in dict_root_dirs.items()
@@ -196,8 +220,8 @@ def main():
 
             #Total Tiles Evenly Spaced
             if dataset == "sst":
-                TTE_x = nx[k]//tile_size_x
-                TTE_y = ny[k]//tile_size_y
+                TTE_x = chunk_size[k][0]//tile_size_x
+                TTE_y = chunk_size[k][1]//tile_size_y
             else:
                 TTE_x = data.shape[0]//tile_size_x
                 TTE_y = data.shape[1]//tile_size_y
@@ -206,8 +230,8 @@ def main():
             if use_all_data:
                 #Total Tiles
                 if dataset == "sst":
-                    TT_x = nx[k]/(tile_size_x)
-                    TT_y = ny[k]/(tile_size_y)
+                    TT_x = chunk_size[k][0]/(tile_size_x)
+                    TT_y = chunk_size[k][1]/(tile_size_y)
                 else:
                     TT_x = data.shape[0]/(tile_size_x)
                     TT_y = data.shape[1]/(tile_size_y)
@@ -215,13 +239,13 @@ def main():
                 LTOP_x = np.floor((TT_x-TTE_x)*OTP2_x)
                 LTOP_y = np.floor((TT_y-TTE_y)*OTP2_y)
                 if dataset == "sst":
-                    if nx[k] % tile_overlap_size_x != 0:
+                    if chunk_size[k][0] % tile_overlap_size_x != 0:
                         LTOP_x += 1
                 else:
                     if data.shape[0] % tile_overlap_size_x != 0:
                         LTOP_x += 1
                 if dataset == "sst":
-                    if ny[k] % tile_overlap_size_y != 0:
+                    if chunk_size[k][1] % tile_overlap_size_y != 0:
                         LTOP_y += 1
                 else:
                     if data.shape[1] % tile_overlap_size_y != 0:
@@ -232,10 +256,10 @@ def main():
             if twoD:
                 if self.dataset == "sst":
                     if use_all_data:
-                        num_blocks_z = nz[k]//tile_size_z
-                        leftover_z_tiles = nz[k] % tile_size_z
+                        num_blocks_z = chunk_size[k][2]//tile_size_z
+                        leftover_z_tiles = chunk_size[k][2] % tile_size_z
                     else:
-                        num_blocks_z = nz[k]//tile_size_z
+                        num_blocks_z = chunk_size[k][2]//tile_size_z
                 else:
                     if use_all_data:
                         num_blocks_z = data.shape[2]//tile_size_z
@@ -244,20 +268,20 @@ def main():
                         num_blocks_z = data.shape[2]//tile_size_z
             else:
                 if dataset == "sst":
-                    TTE_z = nz[k]//tile_size_z
+                    TTE_z = chunk_size[k][2]//tile_size_z
                 else:
                     TTE_z = data.shape[2]//tile_size_z
                 num_blocks_z = (TTE_z-1)*OTP2_z + 1
                 if use_all_data:
                     #Total Tiles Rounded Up
                     if dataset == "sst":
-                        TT_z = nz[k]/(tile_size_z)
+                        TT_z = chunk_size[k][2]/(tile_size_z)
                     else:
                         TT_z = data.shape[2]/(tile_size_z)
                     # Number of leftover overlap patches for last tile
                     LTOP_z = np.floor((TT_z-TTE_z)*OTP2_z)
                     if dataset == "sst":
-                        if nz[k] % tile_overlap_size_z != 0:
+                        if chunk_size[k][2] % tile_overlap_size_z != 0:
                             LTOP_z += 1
                     else:
                         if data.shape[2] % tile_overlap_size_z != 0:
@@ -265,7 +289,7 @@ def main():
                     num_blocks_z = int(num_blocks_z + LTOP_z)
 
             if dataset == "sst":
-                print("KEY", k, "DATA_SHAPE", nx[k], ny[k], nz[k],"NUM_BLOCKS:", num_blocks_x, num_blocks_y, num_blocks_z, flush=True)
+                print("KEY", k, "DATA_SHAPE", chunk_size[k][0], chunk_size[k][1], chunk_size[k][2],"NUM_BLOCKS:", num_blocks_x, num_blocks_y, num_blocks_z, flush=True)
             else:
                 print("KEY", k, "DATA_SHAPE", data.shape,"NUM_BLOCKS:", num_blocks_x, num_blocks_y, num_blocks_z, flush=True)
 
@@ -370,8 +394,6 @@ def main():
             batches_per_rank.append(np.floor(num_images_per_rank[i])*tiles_per_image[i]/batch_size)
         tiles_per_rank.append(np.floor(num_images_per_rank[i])*tiles_per_image[i])
     print("Tiles Per Rank", tiles_per_rank)
-    #print("Batches Per Rank", batches_per_rank)
-    #print("Min Batches Per Rank", min(batches_per_rank))
     print("USE BELOW IN CONFIG FILE")
     print("batches_per_rank_epoch: {")
     if dataset == "imagenet":
