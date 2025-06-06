@@ -570,6 +570,7 @@ def main(device):
         
         counter = 0
         for batch_idx, batch in enumerate(train_dataloader):
+            start_time = time.time()            
             counter = counter + 1 
             if counter > iterations_per_epoch:
                 print("A GPU ran out of data, moving to next epoch", flush=True)
@@ -582,7 +583,7 @@ def main(device):
             loss, output = training_step(data, label, variables, model, patch_size, twoD)
             epoch_loss += loss.detach()
 
-            if world_rank==0:
+            if world_rank == 0:
                 print("epoch: ",epoch,"batch_idx",batch_idx,"world_rank",world_rank,"it_loss ",loss, flush=True)
     
             if use_scaler:
@@ -597,6 +598,10 @@ def main(device):
 
             scheduler.step()
             optimizer.zero_grad()
+
+            if world_rank == 0:
+                print("Tiles/s {:.2f}".format(data_par_size*batch_size/(time.time() - start_time)))
+                
         loss_list.append(epoch_loss)
 
 
