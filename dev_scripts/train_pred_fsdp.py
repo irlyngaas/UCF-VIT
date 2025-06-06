@@ -577,7 +577,9 @@ def main(device):
                 break
 
             data, label, variables = batch
+            data = data.to(precision_dt)
             data = data.to(device)
+            label = label.to(precision_dt)
             label = label.to(device)
 
             loss, output = training_step(data, label, variables, model, patch_size, twoD)
