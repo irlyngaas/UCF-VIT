@@ -1,9 +1,9 @@
 # ---------------------------- TRAINER -------------------------------------------
 trainer:
-  max_epochs: 600
+  max_epochs: 2000
   data_type: "bfloat16"
   checkpoint_path: "../../checkpoint/xct/diffusion/base"
-  checkpoint_filename: "multi_last"
+  checkpoint_filename: "xct_concrete_base"
   checkpoint_filename_for_loading: "multi_last_odd" #multi_last_odd or multi_last_even
   inference_path: "../../checkpoint/xct/diffusion/base/inference"
 
@@ -11,7 +11,7 @@ trainer:
 
 # ---------------------------- PARALLELISM -------------------------------------
 parallelism:
-  fsdp_size: 1
+  fsdp_size: 2
   simple_ddp_size: 8
   tensor_par_size: 1
   seq_par_size: 1
@@ -34,7 +34,7 @@ model:
       default_vars: [
         "xct",
       ]
-      tile_size: [128, 128, 128]
+      tile_size: [256, 256, 256]
       patch_size: 8
       embed_dim: 576
       depth: 8
@@ -47,7 +47,7 @@ model:
       drop_path: 0.0
       drop_rate: 0.0
       linear_decoder: True
-      twoD: False
+      twoD: True
       use_varemb: False
       adaptive_patching: False
       fixed_length: 196
@@ -58,7 +58,8 @@ model:
 data:
   dataset: "xct"
   dict_root_dirs: {
-    'xct1': '/lustre/orion/world-shared/mat268/DiffusiveINR_Data/XCT_Concrete',
+    'xct1': '/lustre/orion/world-shared/mat268/DiffusiveINR_Data/XCT_Concrete_Z00730_650Files',
+    # 'xct1': '/lustre/orion/world-shared/mat268/DiffusiveINR_Data/XCT_Concrete',
   }
   dict_start_idx: {
     'xct1': 0,
@@ -80,7 +81,7 @@ data:
      "xct", 
     ],
   }
-  batch_size: 1
+  batch_size: 16
   num_workers: 1
   pin_memory: False
   single_channel: False
@@ -90,6 +91,6 @@ data:
 # ---------------------------- LOAD BALANCING -------------------------------------------
 load_balancing:
   batches_per_rank_epoch: {
-    'xct1': 4863,
+    'xct1': 592, # 4863
   }
-  dataset_group_list: '8'
+  dataset_group_list: '16'
