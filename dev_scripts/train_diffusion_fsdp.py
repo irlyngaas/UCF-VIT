@@ -280,7 +280,7 @@ def main(device):
     ).to(device)
 
     if not resume_from_checkpoint:
-        epoch_start = 0
+        epoch_start = 1
         #if train from scratch
         if world_rank==0:       
             print("resume from checkpoint was set to False. Pretrain from scratch.",flush=True)
@@ -456,7 +456,7 @@ def main(device):
         if batches_per_rank_epoch[k] > iterations_per_epoch:
             iterations_per_epoch = batches_per_rank_epoch[k]
 
-    for epoch in range(epoch_start,max_epochs):
+    for epoch in range(epoch_start,max_epochs+1):
         #Reset dataloader module every epoch to ensure all files get used
         if epoch != epoch_start:
             data_module.reset()
@@ -467,7 +467,7 @@ def main(device):
         loss = 0.0
         epoch_loss = torch.tensor(0.0 , dtype=torch.float32, device=device)
         if world_rank==0:
-            print("epoch ",epoch,flush=True)
+            print("Starting epoch ",epoch,flush=True)
 
         counter = 0
         with torch.autograd.set_detect_anomaly(False):
@@ -497,8 +497,8 @@ def main(device):
 
                 epoch_loss += loss.detach()
     
-                if world_rank==0:
-                    print("epoch: ",epoch,"batch_idx",batch_idx,"world_rank",world_rank,"it_loss ",loss,flush=True)
+                # if world_rank==0:
+                #     print("epoch: ",epoch,"batch_idx",batch_idx,"world_rank",world_rank,"it_loss ",loss,flush=True)
     
                 if use_scaler:
                     scaler.scale(loss).backward()
@@ -521,9 +521,7 @@ def main(device):
         optimizer_states = optimizer.state_dict()
         scheduler_states = scheduler.state_dict()
 
-        #Alternating saving in to odd and even checkpoint file to avoid losing progress
-        if epoch % 2 == 0:
-     
+        if epoch % 10 == 0 and world_rank == 0:
             if world_rank < tensor_par_size:
                 torch.save({
                     'epoch': epoch,
@@ -531,26 +529,18 @@ def main(device):
                     'optimizer_state_dict': optimizer_states,
                     'scheduler_state_dict': scheduler_states,
                     #'loss_list' : loss_list,
-                    }, checkpoint_path+"/"+checkpoint_filename+"_even.ckpt")
-
-        if epoch % 2 == 1:
-
-            if world_rank < tensor_par_size:
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model_states,
-                    'optimizer_state_dict': optimizer_states,
-                    'scheduler_state_dict': scheduler_states,
-                    #'loss_list' : loss_list,
-                    }, checkpoint_path+"/"+checkpoint_filename+"_odd.ckpt")
+                    }, checkpoint_path+"/"+checkpoint_filename+"_{}.ckpt".format(epoch))
      
         dist.barrier()
         del model_states
         del optimizer_states
         del scheduler_states
 
-        for var in default_vars:
-            sample_images(model, var, device, tile_size, precision_dt, patch_size, epoch=epoch, num_samples=2, twoD=twoD, save_path=inference_path, num_time_steps=num_time_steps)
+        if epoch % 10 == 0:
+            for var in default_vars:
+                sample_images(model, var, device, tile_size, precision_dt, patch_size, epoch=epoch, num_samples=10, twoD=twoD, save_path=inference_path, num_time_steps=num_time_steps)
+                # save_intermediate_data(model, var, device, tile_size, precision_dt, patch_size, epoch=epoch, num_samples=10, twoD=twoD, save_path=inference_path, num_time_steps=num_time_steps)
+
 
 if __name__ == "__main__":
 

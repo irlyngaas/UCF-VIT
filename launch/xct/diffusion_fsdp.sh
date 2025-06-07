@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -A stf006
 #SBATCH -J diffusion_fsdp
-#SBATCH --nodes=1
+#SBATCH --nodes=2
 #SBATCH --gres=gpu:8
 #SBATCH --ntasks-per-node=8
 #SBATCH --cpus-per-task=7
@@ -16,9 +16,8 @@
 
 #ulimit -n 65536
 
-
-source /lustre/orion/proj-shared/stf006/irl1/conda/bin/activate
-conda activate /lustre/orion/stf006/proj-shared/irl1/vit-xformers
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate /lustre/orion/stf006/world-shared/nafi/envs/ucf-vit
 
 module load PrgEnv-gnu
 module load gcc/12.2.0
