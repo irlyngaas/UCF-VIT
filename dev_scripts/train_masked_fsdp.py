@@ -219,6 +219,11 @@ def main(device):
         ny = None
 
     if dataset == "s8d_3d":
+        nz = conf['dataset_options']['nz']
+    else:
+        nz = None
+
+    if dataset == "s8d_3d":
         chunk_size = conf['dataset_options']['chunk_size']
         num_samples_to_stitch = conf['dataset_options']['num_samples_to_stitch']
     else:
@@ -388,7 +393,6 @@ def main(device):
         model = FSDP(model, device_id=local_rank, process_group= fsdp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.FULL_SHARD, auto_wrap_policy = my_auto_wrap_policy, mixed_precision=bfloatPolicy, forward_prefetch=True, limit_all_gathers = False )
     #add unsharded DDP
     else:
-        assert data_type == "float32", "Using NO_SHARD with bfloat16 doesn't work. Consider using HYBRID_SHARD or FULL_SHARD"
         model = FSDP(model, device_id=local_rank, process_group= simple_ddp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.NO_SHARD, auto_wrap_policy = my_auto_wrap_policy, mixed_precision=bfloatPolicy, forward_prefetch=True, limit_all_gathers = False )
 
     check_fn = lambda submodule: isinstance(submodule, Block)
@@ -452,6 +456,7 @@ def main(device):
         imagenet_resize = imagenet_resize,
         nx = nx,
         ny = ny,
+        nz = nz,
         chunk_size = chunk_size,
         num_samples_to_stitch = num_samples_to_stitch,
     ).to(device)
@@ -483,6 +488,7 @@ def main(device):
 
         counter = 0
         for batch_idx, batch in enumerate(train_dataloader):
+            start_time = time.time()            
             counter = counter + 1
             if counter > iterations_per_epoch:
                 print("A GPU ran out of data, moving to next epoch", flush=True)
@@ -518,6 +524,10 @@ def main(device):
             scheduler.step()
 
             optimizer.zero_grad()
+
+            if world_rank == 0:
+                print("Tiles/s {:.2f}".format(data_par_size*batch_size/(time.time() - start_time)))
+
         #loss_list.append(epoch_loss)
 
         if world_rank==0:
