@@ -88,7 +88,7 @@ class Patchify_3D(torch.nn.Module):
         edge_direction_data = np.zeros_like(gradient_direction)
         edge_direction_data[edges_combined] = gradient_direction[edges_combined]
         
-        edge_data_normalized = (edge_direction_data - edge_direction_data.min()) / (edge_direction_data.max() - edge_direction_data.min())
+        edge_data_normalized = (edge_direction_data - edge_direction_data.min()) / ((edge_direction_data.max() - edge_direction_data.min())+1e-8)
         #TODO: Add parameter for this threshold
         threshold = 0.5
         binary_edges = (edge_data_normalized > threshold).astype(np.uint8) * 255
