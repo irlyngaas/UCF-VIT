@@ -1,0 +1,641 @@
+# ---------------------------- TRAINER -------------------------------------------
+trainer:
+  max_epochs: 600
+  data_type: "bfloat16"
+  checkpoint_path: "../../checkpoint/s8d_2d/mae/base"
+  checkpoint_filename: "multi_last"
+  checkpoint_filename_for_loading: "multi_last_odd" #multi_last_odd or multi_last_even
+
+  resume_from_checkpoint: False
+
+# ---------------------------- PARALLELISM -------------------------------------
+parallelism:
+  fsdp_size: 1
+  simple_ddp_size: 48
+  tensor_par_size: 1
+  seq_par_size: 1
+  cpu_offloading: False
+  
+# ---------------------------- MODEL -------------------------------------------
+model:
+  lr: 0.0001
+  beta_1: 0.9
+  beta_2: 0.95
+  weight_decay: 1e-5
+  warmup_steps: 1000
+  max_steps: 20000
+  warmup_start_lr: 1e-8
+  eta_min: 1e-8
+  loss_fn: "MSE"
+
+  net:
+    init_args:
+      default_vars: [
+        "ct_res1",
+      ]
+      tile_size: [8192,8192]
+      patch_size: 8
+      embed_dim: 768
+      depth: 12
+      num_heads: 12
+      decoder_embed_dim: 576
+      decoder_depth: 8
+      decoder_num_heads: 16
+      mlp_ratio: 4
+      mlp_ratio_decoder: 4
+      drop_path: 0.0
+      mask_ratio: 0.75
+      linear_decoder: False
+      twoD: True
+      use_varemb: False
+      adaptive_patching: True
+      fixed_length: 4096
+      separate_channels: False
+
+# ---------------------------- DATA -------------------------------------------
+data:
+  dataset: "s8d_2d"
+  dict_root_dirs: {
+    'No_000': '/lustre/orion/lrn075/world-shared/8192_output_1/No_000',
+    'No_001': '/lustre/orion/lrn075/world-shared/8192_output_1/No_001',
+    'No_002': '/lustre/orion/lrn075/world-shared/8192_output_2/No_002',
+    'No_003': '/lustre/orion/lrn075/world-shared/8192_output_2/No_003',
+    'No_004': '/lustre/orion/lrn075/world-shared/8192_output_2/No_004',
+    'No_005': '/lustre/orion/lrn075/world-shared/8192_output_2/No_005',
+    'No_006': '/lustre/orion/lrn075/world-shared/8192_output_2/No_006',
+    'No_007': '/lustre/orion/lrn075/world-shared/8192_output_2/No_007',
+    'No_008': '/lustre/orion/lrn075/world-shared/8192_output_2/No_008',
+    #'No_009': '/lustre/orion/lrn075/world-shared/8192_output_2/No_009',
+    'No_010': '/lustre/orion/lrn075/world-shared/8192_output_2/No_010',
+    'No_011': '/lustre/orion/lrn075/world-shared/8192_output_2/No_011',
+    'No_012': '/lustre/orion/lrn075/world-shared/8192_output_2/No_012',
+    'No_013': '/lustre/orion/lrn075/world-shared/8192_output_2/No_013',
+    'No_014': '/lustre/orion/lrn075/world-shared/8192_output_2/No_014',
+    'No_015': '/lustre/orion/lrn075/world-shared/8192_output_2/No_015',
+    'No_016': '/lustre/orion/lrn075/world-shared/8192_output_2/No_016',
+    'No_017': '/lustre/orion/lrn075/world-shared/8192_output_2/No_017',
+    'No_018': '/lustre/orion/lrn075/world-shared/8192_output_2/No_018',
+    'No_019': '/lustre/orion/lrn075/world-shared/8192_output_2/No_019',
+    'No_020': '/lustre/orion/lrn075/world-shared/8192_output_2/No_020',
+    'No_021': '/lustre/orion/lrn075/world-shared/8192_output_3/No_021',
+    'No_022': '/lustre/orion/lrn075/world-shared/8192_output_3/No_022',
+    'No_023': '/lustre/orion/lrn075/world-shared/8192_output_3/No_023',
+    'No_024': '/lustre/orion/lrn075/world-shared/8192_output_3/No_024',
+    'No_025': '/lustre/orion/lrn075/world-shared/8192_output_3/No_025',
+    'No_026': '/lustre/orion/lrn075/world-shared/8192_output_3/No_026',
+    'No_027': '/lustre/orion/lrn075/world-shared/8192_output_3/No_027',
+    'No_028': '/lustre/orion/lrn075/world-shared/8192_output_3/No_028',
+    'No_029': '/lustre/orion/lrn075/world-shared/8192_output_3/No_029',
+    'No_030': '/lustre/orion/lrn075/world-shared/8192_output_3/No_030',
+    'No_031': '/lustre/orion/lrn075/world-shared/8192_output_3/No_031',
+    'No_032': '/lustre/orion/lrn075/world-shared/8192_output_3/No_032',
+    'No_033': '/lustre/orion/lrn075/world-shared/8192_output_3/No_033',
+    'No_034': '/lustre/orion/lrn075/world-shared/8192_output_3/No_034',
+    'No_035': '/lustre/orion/lrn075/world-shared/8192_output_3/No_035',
+    'No_036': '/lustre/orion/lrn075/world-shared/8192_output_3/No_036',
+    'No_037': '/lustre/orion/lrn075/world-shared/8192_output_3/No_037',
+    'No_038': '/lustre/orion/lrn075/world-shared/8192_output_3/No_038',
+    'No_039': '/lustre/orion/lrn075/world-shared/8192_output_3/No_039',
+    'No_040': '/lustre/orion/lrn075/world-shared/8192_output_3/No_040',
+    'No_041': '/lustre/orion/lrn075/world-shared/8192_output_3/No_041',
+    'No_042': '/lustre/orion/lrn075/world-shared/8192_output_3/No_042',
+    'No_043': '/lustre/orion/lrn075/world-shared/8192_output_3/No_043',
+    'No_044': '/lustre/orion/lrn075/world-shared/8192_output_3/No_044',
+    'No_045': '/lustre/orion/lrn075/world-shared/8192_output_3/No_045',
+  }
+  dict_start_idx: {
+    'No_000': 0,
+    'No_001': 0,
+    'No_002': 0,
+    'No_003': 0,
+    'No_004': 0,
+    'No_005': 0,
+    'No_006': 0,
+    'No_007': 0,
+    'No_008': 0,
+    #'No_009': 0,
+    'No_010': 0,
+    'No_011': 0,
+    'No_012': 0,
+    'No_013': 0,
+    'No_014': 0,
+    'No_015': 0,
+    'No_016': 0,
+    'No_017': 0,
+    'No_018': 0,
+    'No_019': 0,
+    'No_020': 0,
+    'No_021': 0,
+    'No_022': 0,
+    'No_023': 0,
+    'No_024': 0,
+    'No_025': 0,
+    'No_026': 0,
+    'No_027': 0,
+    'No_028': 0,
+    'No_029': 0,
+    'No_030': 0,
+    'No_031': 0,
+    'No_032': 0,
+    'No_033': 0,
+    'No_034': 0,
+    'No_035': 0,
+    'No_036': 0,
+    'No_037': 0,
+    'No_038': 0,
+    'No_039': 0,
+    'No_040': 0,
+    'No_041': 0,
+    'No_042': 0,
+    'No_043': 0,
+    'No_044': 0,
+    'No_045': 0,
+  }
+  dict_end_idx: {
+    'No_000': 1,
+    'No_001': 1,
+    'No_002': 1,
+    'No_003': 1,
+    'No_004': 1,
+    'No_005': 1,
+    'No_006': 1,
+    'No_007': 1,
+    'No_008': 1,
+    #'No_009': 1,
+    'No_010': 1,
+    'No_011': 1,
+    'No_012': 1,
+    'No_013': 1,
+    'No_014': 1,
+    'No_015': 1,
+    'No_016': 1,
+    'No_017': 1,
+    'No_018': 1,
+    'No_019': 1,
+    'No_020': 1,
+    'No_021': 1,
+    'No_022': 1,
+    'No_023': 1,
+    'No_024': 1,
+    'No_025': 1,
+    'No_026': 1,
+    'No_027': 1,
+    'No_028': 1,
+    'No_029': 1,
+    'No_030': 1,
+    'No_031': 1,
+    'No_032': 1,
+    'No_033': 1,
+    'No_034': 1,
+    'No_035': 1,
+    'No_036': 1,
+    'No_037': 1,
+    'No_038': 1,
+    'No_039': 1,
+    'No_040': 1,
+    'No_041': 1,
+    'No_042': 1,
+    'No_043': 1,
+    'No_044': 1,
+    'No_045': 1,
+  }
+  dict_buffer_sizes: {
+    'No_000': 100,
+    'No_001': 100,
+    'No_002': 100,
+    'No_003': 100,
+    'No_004': 100,
+    'No_005': 100,
+    'No_006': 100,
+    'No_007': 100,
+    'No_008': 100,
+    #'No_009': 100,
+    'No_010': 100,
+    'No_011': 100,
+    'No_012': 100,
+    'No_013': 100,
+    'No_014': 100,
+    'No_015': 100,
+    'No_016': 100,
+    'No_017': 100,
+    'No_018': 100,
+    'No_019': 100,
+    'No_020': 100,
+    'No_021': 100,
+    'No_022': 100,
+    'No_023': 100,
+    'No_024': 100,
+    'No_025': 100,
+    'No_026': 100,
+    'No_027': 100,
+    'No_028': 100,
+    'No_029': 100,
+    'No_030': 100,
+    'No_031': 100,
+    'No_032': 100,
+    'No_033': 100,
+    'No_034': 100,
+    'No_035': 100,
+    'No_036': 100,
+    'No_037': 100,
+    'No_038': 100,
+    'No_039': 100,
+    'No_040': 100,
+    'No_041': 100,
+    'No_042': 100,
+    'No_043': 100,
+    'No_044': 100,
+    'No_045': 100,
+  }
+  num_channels_available: {
+    'No_000': 1,
+    'No_001': 1,
+    'No_002': 1,
+    'No_003': 1,
+    'No_004': 1,
+    'No_005': 1,
+    'No_006': 1,
+    'No_007': 1,
+    'No_008': 1,
+    #'No_009': 1,
+    'No_010': 1,
+    'No_011': 1,
+    'No_012': 1,
+    'No_013': 1,
+    'No_014': 1,
+    'No_015': 1,
+    'No_016': 1,
+    'No_017': 1,
+    'No_018': 1,
+    'No_019': 1,
+    'No_020': 1,
+    'No_021': 1,
+    'No_022': 1,
+    'No_023': 1,
+    'No_024': 1,
+    'No_025': 1,
+    'No_026': 1,
+    'No_027': 1,
+    'No_028': 1,
+    'No_029': 1,
+    'No_030': 1,
+    'No_031': 1,
+    'No_032': 1,
+    'No_033': 1,
+    'No_034': 1,
+    'No_035': 1,
+    'No_036': 1,
+    'No_037': 1,
+    'No_038': 1,
+    'No_039': 1,
+    'No_040': 1,
+    'No_041': 1,
+    'No_042': 1,
+    'No_043': 1,
+    'No_044': 1,
+    'No_045': 1,
+  }
+  num_channels_used: {
+    'No_000': 1,
+    'No_001': 1,
+    'No_002': 1,
+    'No_003': 1,
+    'No_004': 1,
+    'No_005': 1,
+    'No_006': 1,
+    'No_007': 1,
+    'No_008': 1,
+    #'No_009': 1,
+    'No_010': 1,
+    'No_011': 1,
+    'No_012': 1,
+    'No_013': 1,
+    'No_014': 1,
+    'No_015': 1,
+    'No_016': 1,
+    'No_017': 1,
+    'No_018': 1,
+    'No_019': 1,
+    'No_020': 1,
+    'No_021': 1,
+    'No_022': 1,
+    'No_023': 1,
+    'No_024': 1,
+    'No_025': 1,
+    'No_026': 1,
+    'No_027': 1,
+    'No_028': 1,
+    'No_029': 1,
+    'No_030': 1,
+    'No_031': 1,
+    'No_032': 1,
+    'No_033': 1,
+    'No_034': 1,
+    'No_035': 1,
+    'No_036': 1,
+    'No_037': 1,
+    'No_038': 1,
+    'No_039': 1,
+    'No_040': 1,
+    'No_041': 1,
+    'No_042': 1,
+    'No_043': 1,
+    'No_044': 1,
+    'No_045': 1,
+  }
+  dict_in_variables: {
+    'No_000': [
+     "ct_res1", 
+    ],
+    'No_001': [
+     "ct_res1", 
+    ],
+    'No_002': [
+     "ct_res1", 
+    ],
+    'No_003': [
+     "ct_res1", 
+    ],
+    'No_004': [
+     "ct_res1", 
+    ],
+    'No_005': [
+     "ct_res1", 
+    ],
+    'No_006': [
+     "ct_res1", 
+    ],
+    'No_007': [
+     "ct_res1", 
+    ],
+    'No_008': [
+     "ct_res1", 
+    ],
+    #'No_009': [
+    # "ct_res1", 
+    #],
+    'No_010': [
+     "ct_res1", 
+    ],
+    'No_011': [
+     "ct_res1", 
+    ],
+    'No_012': [
+     "ct_res1", 
+    ],
+    'No_013': [
+     "ct_res1", 
+    ],
+    'No_014': [
+     "ct_res1", 
+    ],
+    'No_015': [
+     "ct_res1", 
+    ],
+    'No_016': [
+     "ct_res1", 
+    ],    
+    'No_017': [
+     "ct_res1", 
+    ],
+    'No_018': [
+     "ct_res1", 
+    ],    
+    'No_019': [
+     "ct_res1", 
+    ],
+    'No_020': [
+     "ct_res1", 
+    ],
+    'No_021': [
+     "ct_res1", 
+    ],
+    'No_022': [
+     "ct_res1", 
+    ],
+    'No_023': [
+     "ct_res1", 
+    ],
+    'No_024': [
+     "ct_res1", 
+    ],
+    'No_025': [
+     "ct_res1", 
+    ],
+    'No_026': [
+     "ct_res1", 
+    ],
+    'No_027': [
+     "ct_res1", 
+    ],
+    'No_028': [
+     "ct_res1", 
+    ],
+    'No_029': [
+     "ct_res1", 
+    ],
+    'No_030': [
+     "ct_res1", 
+    ],
+    'No_031': [
+     "ct_res1", 
+    ],
+    'No_032': [
+     "ct_res1", 
+    ],
+    'No_033': [
+     "ct_res1", 
+    ],
+    'No_034': [
+     "ct_res1", 
+    ],
+    'No_035': [
+     "ct_res1", 
+    ],
+    'No_036': [
+     "ct_res1", 
+    ],    
+    'No_037': [
+     "ct_res1", 
+    ],
+    'No_038': [
+     "ct_res1", 
+    ],    
+    'No_039': [
+     "ct_res1", 
+    ],
+    'No_040': [
+     "ct_res1", 
+    ],
+    'No_041': [
+     "ct_res1", 
+    ],
+    'No_042': [
+     "ct_res1", 
+    ],
+    'No_043': [
+     "ct_res1", 
+    ],
+    'No_044': [
+     "ct_res1", 
+    ],
+    'No_045': [
+     "ct_res1", 
+    ],
+  }
+  batch_size: 2
+  num_workers: 1
+  pin_memory: False
+  single_channel: True
+  tile_overlap: 0.0
+  use_all_data: False
+
+# ---------------------------- DATASET SPECIFIC OPTIONS -------------------------------------------
+dataset_options:
+  nx: {
+    'No_000': 8192,
+    'No_001': 8192,
+    'No_002': 8192,
+    'No_003': 8192,
+    'No_004': 8192,
+    'No_005': 8192,
+    'No_006': 8192,
+    'No_007': 8192,
+    'No_008': 8192,
+    #'No_009': 8192,
+    'No_010': 8192,
+    'No_011': 8192,
+    'No_012': 8192,
+    'No_013': 8192,
+    'No_014': 8192,
+    'No_015': 8192,
+    'No_016': 8192,
+    'No_017': 8192,
+    'No_018': 8192,
+    'No_019': 8192,
+    'No_020': 8192,
+    'No_021': 8192,
+    'No_022': 8192,
+    'No_023': 8192,
+    'No_024': 8192,
+    'No_025': 8192,
+    'No_026': 8192,
+    'No_027': 8192,
+    'No_028': 8192,
+    'No_029': 8192,
+    'No_030': 8192,
+    'No_031': 8192,
+    'No_032': 8192,
+    'No_033': 8192,
+    'No_034': 8192,
+    'No_035': 8192,
+    'No_036': 8192,
+    'No_037': 8192,
+    'No_038': 8192,
+    'No_039': 8192,
+    'No_040': 8192,
+    'No_041': 8192,
+    'No_042': 8192,
+    'No_043': 8192,
+    'No_044': 8192,
+    'No_045': 8192,
+  }
+  ny: {
+    'No_000': 8192,
+    'No_001': 8192,
+    'No_002': 8192,
+    'No_003': 8192,
+    'No_004': 8192,
+    'No_005': 8192,
+    'No_006': 8192,
+    'No_007': 8192,
+    'No_008': 8192,
+    #'No_009': 8192,
+    'No_010': 8192,
+    'No_011': 8192,
+    'No_012': 8192,
+    'No_013': 8192,
+    'No_014': 8192,
+    'No_015': 8192,
+    'No_016': 8192,
+    'No_017': 8192,
+    'No_018': 8192,
+    'No_019': 8192,
+    'No_020': 8192,
+    'No_021': 8192,
+    'No_022': 8192,
+    'No_023': 8192,
+    'No_024': 8192,
+    'No_025': 8192,
+    'No_026': 8192,
+    'No_027': 8192,
+    'No_028': 8192,
+    'No_029': 8192,
+    'No_030': 8192,
+    'No_031': 8192,
+    'No_032': 8192,
+    'No_033': 8192,
+    'No_034': 8192,
+    'No_035': 8192,
+    'No_036': 8192,
+    'No_037': 8192,
+    'No_038': 8192,
+    'No_039': 8192,
+    'No_040': 8192,
+    'No_041': 8192,
+    'No_042': 8192,
+    'No_043': 8192,
+    'No_044': 8192,
+    'No_045': 8192,
+  }
+
+# ---------------------------- LOAD BALANCING -------------------------------------------
+load_balancing:
+  batches_per_rank_epoch: {
+  'No_000': 3744,
+  'No_001': 8800,
+  'No_002': 8800,
+  'No_003': 8800,
+  'No_004': 8800,
+  'No_005': 8800,
+  'No_006': 8800,
+  'No_007': 5456,
+  'No_008': 7920,
+  'No_010': 3800,
+  'No_011': 3800,
+  'No_012': 9120,
+  'No_013': 4560,
+  'No_014': 9880,
+  'No_015': 9880,
+  'No_016': 9880,
+  'No_017': 9880,
+  'No_018': 5200,
+  'No_019': 5200,
+  'No_020': 7200,
+  'No_021': 3744,
+  'No_022': 3744,
+  'No_023': 3744,
+  'No_024': 3744,
+  'No_025': 3744,
+  'No_026': 3744,
+  'No_027': 3744,
+  'No_028': 3744,
+  'No_029': 3744,
+  'No_030': 3744,
+  'No_031': 3744,
+  'No_032': 3744,
+  'No_033': 3744,
+  'No_034': 3744,
+  'No_035': 3744,
+  'No_036': 3744,
+  'No_037': 3744,
+  'No_038': 3952,
+  'No_039': 3952,
+  'No_040': 3952,
+  'No_041': 3952,
+  'No_042': 3952,
+  'No_043': 3952,
+  'No_044': 3952,
+  'No_045': 3952,
+  }
+  dataset_group_list: '1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:2:2:2:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1'
