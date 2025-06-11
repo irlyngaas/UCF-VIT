@@ -47,7 +47,7 @@ model:
       drop_path: 0.0
       mask_ratio: 0.75
       linear_decoder: False
-      twoD: True
+      twoD: False
       use_varemb: False
       adaptive_patching: True
       fixed_length: 4096
@@ -105,19 +105,23 @@ dataset_options:
     'No_000': 8192,
     'No_001': 8192,
   }
+  nz: {
+    'No_000': 128,
+    'No_001': 128,
+  }
   num_samples_to_stitch: {
     'No_000': 1,
     'No_001': 1,
   }
   chunk_size: {
-    'No_000': 128,
-    'No_001': 128,
+    'No_000': [128,128,128],
+    'No_001': [128,128,128],
   }
 
 # ---------------------------- LOAD BALANCING -------------------------------------------
 load_balancing:
   batches_per_rank_epoch: {
-  'No_000': 655360,
-  'No_001': 655360,
+  'No_000': 5120,
+  'No_001': 5120,
   }
   dataset_group_list: '4:4'
