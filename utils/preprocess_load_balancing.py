@@ -53,6 +53,7 @@ def main():
         nx = conf['dataset_options']['nx']
         ny = conf['dataset_options']['ny']
     if dataset == "s8d_3d":
+        nz = conf['dataset_options']['nz']
         chunk_size = conf['dataset_options']['chunk_size']
         num_samples_to_stitch = conf['dataset_options']['num_samples_to_stitch']
 
@@ -116,7 +117,9 @@ def main():
         dict_lister_trains = {}
         dict_chunk_trains = {}
         for k, root_dir in dict_root_dirs.items():
-            num_chunks = int(nx[k]/chunk_size[k])
+            num_chunks_x = int(nx[k]/chunk_size[k][0])
+            num_chunks_y = int(ny[k]/chunk_size[k][1])
+            num_chunks_z = int(nz[k]/chunk_size[k][2])
             samples = sorted(os.listdir(root_dir))
             #In 3D rather than passing individual files pass list of files with corresponding connected samples
             img_list = []
@@ -132,10 +135,11 @@ def main():
                     for img_path in sorted(glob.glob(os.path.join(sample_dir,"*.raw"))):
                         img_sample_list.append(img_path)
 
-                for x_chunk in range(num_chunks):
-                    for y_chunk in range(num_chunks):
-                        img_list.append(img_sample_list)
-                        chunk_list.append([x_chunk,y_chunk])
+                for x_chunk in range(num_chunks_x):
+                    for y_chunk in range(num_chunks_y):
+                        for z_chunk in range(num_chunks_z):
+                            img_list.append(img_sample_list)
+                            chunk_list.append([x_chunk,y_chunk,z_chunk])
                
             
             img_dict = {k: img_list}
@@ -183,16 +187,20 @@ def main():
             data = np.load(keys[0])
             data = np.moveaxis(data,0,-1)
         elif dataset == "s8d_3d":
-            data_list = []
-            for idx in range(len(keys[0])):
-                chunk_idx = chunks[0]
-                
-                data = np.fromfile(keys[0][idx], dtype=np.uint16).reshape(nx[k],ny[k])
-                data = (data[chunk_idx[0]*chunk_size[k]:(chunk_idx[0]+1)*chunk_size[k], chunk_idx[1]*chunk_size[k]:(chunk_idx[1]+1)*chunk_size[k]])
-                data_list.append(data)
-            data = np.stack([data_list[idx] for idx in range(len(data_list))])
-            #z stacked on first dimension, so move to last dimension
-            data = np.moveaxis(data, 0, -1)
+            #data_list = []
+            #for idx in range(len(keys[0])):
+            #    chunk_idx = chunks[0]
+            #    
+            #    data = np.fromfile(keys[0][idx], dtype=np.uint16).reshape(nx[k],ny[k])
+            #    data = (data[chunk_idx[0]*chunk_size[k][0]:(chunk_idx[0]+1)*chunk_size[k][0], chunk_idx[1]*chunk_size[k][1]:(chunk_idx[1]+1)*chunk_size[k][1]])
+            #    data_list.append(data)
+            #data = np.stack([data_list[idx] for idx in range(len(data_list))])
+            ##z stacked on first dimension, so move to last dimension
+            #data = np.moveaxis(data, 0, -1)
+
+            #Use this alternative to not need to load from files which is time consuming
+            data = np.zeros(shape=(chunk_size[k][0],chunk_size[k][1],chunk_size[k][2]))
+            
         else:
             data = nib.load(data_path)
             data = np.array(data.dataobj).astype(np.float32)
@@ -242,6 +250,13 @@ def main():
                 num_channels_per_dataset.append(num_channels_used[k])
         #USE THIS IF RAW FILES ARE 3D
         else:
+            tile_overlap_size_z = int(tile_size_z*tile_overlap)
+            if tile_overlap == 0.0:
+                OTP2_z = 1
+                tile_overlap_size_z = tile_size_z
+            else:
+                OTP2_z = int(tile_size_z/tile_overlap_size_z)
+
             #Total Tiles Evenly Spaced
             TTE_x = data.shape[0]//tile_size_x
             TTE_y = data.shape[1]//tile_size_y
