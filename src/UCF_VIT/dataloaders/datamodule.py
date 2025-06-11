@@ -14,6 +14,7 @@ from .dataset import (
     FileReader,
     ImageBlockDataIter_2D,
     ImageBlockDataIter_3D,
+    ImageBlockDataIter_3D_Memmap,
     ShuffleIterableDataset,
     ProcessChannels,
 )
@@ -230,6 +231,7 @@ class NativePytorchDataModule(torch.nn.Module):
         imagenet_resize: Optional[Dict] = None,
         nx: Optional[Dict] = None,
         ny: Optional[Dict] = None,
+        nz: Optional[Dict] = None,
         chunk_size: Optional[Dict] = None,
         num_samples_to_stitch: Optional[Dict] = None,
     ):
@@ -286,6 +288,8 @@ class NativePytorchDataModule(torch.nn.Module):
         if self.dataset == "s8d_2d" or self.dataset == "s8d_3d":
             self.nx = nx
             self.ny = ny
+        if self.dataset == "s8d_3d":
+            self.nz = nz
 
         if self.dataset == "s8d_3d":
             self.num_samples_to_stitch = num_samples_to_stitch
@@ -359,7 +363,9 @@ class NativePytorchDataModule(torch.nn.Module):
             dict_lister_trains = {}
             dict_chunk_trains = {}
             for k, root_dir in self.dict_root_dirs.items():
-                num_chunks = int(self.nx[k]/self.chunk_size[k])
+                num_chunks_x = int(self.nx[k]/self.chunk_size[k][0])
+                num_chunks_y = int(self.ny[k]/self.chunk_size[k][1])
+                num_chunks_z = int(self.nz[k]/self.chunk_size[k][2])
                 samples = sorted(os.listdir(root_dir))
                 #In 3D rather than passing individual files pass list of files with corresponding connected samples
                 img_list = []
@@ -375,10 +381,11 @@ class NativePytorchDataModule(torch.nn.Module):
                         for img_path in sorted(glob.glob(os.path.join(sample_dir,"*.raw"))):
                             img_sample_list.append(img_path)
 
-                    for x_chunk in range(num_chunks):
-                        for y_chunk in range(num_chunks):
-                            img_list.append(img_sample_list)
-                            chunk_list.append([x_chunk,y_chunk])
+                    for x_chunk in range(num_chunks_x):
+                        for y_chunk in range(num_chunks_y):
+                            for z_chunk in range(num_chunks_z):
+                                img_list.append(img_sample_list)
+                                chunk_list.append([x_chunk,y_chunk,z_chunk])
                 
                 img_dict = {k: img_list}
                 dict_lister_trains.update(img_dict)
@@ -494,9 +501,52 @@ class NativePytorchDataModule(torch.nn.Module):
                 self.return_qdt,
             )
         elif self.dataset == "s8d_3d":
+            #dict_data_train[k] = ProcessChannels(
+            #    ShuffleIterableDataset(
+            #        ImageBlockDataIter_3D(
+            #                FileReader(
+            #                    lister_train,
+            #                    num_channels_available,
+            #                    gx = self.gx,
+            #                    start_idx=start_idx,
+            #                    end_idx=end_idx,
+            #                    variables=variables,
+            #                    multi_dataset_training=True,
+            #                    data_par_size = self.data_par_size,
+            #                    return_label = return_label,
+            #                    keys_to_add = keys_to_add,
+            #                    ddp_group = self.ddp_group,
+            #                    dataset=self.dataset,
+            #                    nx = self.nx[k],
+            #                    ny = self.ny[k],
+            #                    chunk_list = chunk_train,
+            #                    chunk_size = self.chunk_size[k],
+            #                ),
+            #            self.tile_size_x,
+            #            self.tile_size_y,
+            #            self.tile_size_z,
+            #            self.twoD,
+            #            return_label = return_label,
+            #            tile_overlap = self.tile_overlap,
+            #            use_all_data = self.use_all_data,
+            #        ),
+            #        buffer_size
+            #    ),
+            #    num_channels_used,
+            #    single_channel,
+            #    self.batch_size,
+            #    return_label,
+            #    self.adaptive_patching,
+            #    self.separate_channels,
+            #    self.patch_size,
+            #    self.fixed_length,
+            #    self.twoD,
+            #    self.dataset,
+            #    self.return_qdt,
+            #)
             dict_data_train[k] = ProcessChannels(
                 ShuffleIterableDataset(
-                    ImageBlockDataIter_3D(
+                    ImageBlockDataIter_3D_Memmap(
                             FileReader(
                                 lister_train,
                                 num_channels_available,
@@ -513,15 +563,17 @@ class NativePytorchDataModule(torch.nn.Module):
                                 nx = self.nx[k],
                                 ny = self.ny[k],
                                 chunk_list = chunk_train,
-                                chunk_size = self.chunk_size[k],
                             ),
                         self.tile_size_x,
                         self.tile_size_y,
                         self.tile_size_z,
                         self.twoD,
+                        nx = self.nx[k],
+                        ny = self.ny[k],
                         return_label = return_label,
                         tile_overlap = self.tile_overlap,
                         use_all_data = self.use_all_data,
+                        chunk_size = self.chunk_size[k],
                     ),
                     buffer_size
                 ),
