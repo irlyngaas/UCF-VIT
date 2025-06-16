@@ -511,7 +511,7 @@ The amount of data parallel training ranks being used
 - `imagenet_resize`: List of Ints.
 -Optional argument specific to the imagenet datset which tells the dataloader what size to resize all images to so that the same input size is used.
 
-## Dataset Integation
+## Dataset Integration
 For Examples, see the XCT-Diffusion, SST, and S8D branches
 1. Name your dataset and use it in place of the dataset option of the config file
 2. Write code to process file keys for the different datasets
@@ -537,7 +537,7 @@ We provide several training scripts. These include all of the necessary things f
 
 ### Usage
 1. If using a new dataset, modify dataloader module accordingly
-- Follow [Dataset Integration Instructions](#Dataset-integration)
+- Follow [Dataset Integration](#dataset-integration)
 
 2. Find training script of interest from training_scripts/
 
