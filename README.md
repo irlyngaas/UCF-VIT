@@ -7,7 +7,7 @@
 2. [Masked Autoencoder](#masked-autoencoder-mae)
 3. [Unet Transformer](#unet-transformer-unetr)
 4. [Symmetric Adaptive Patching](#symmetric-adaptive-patching-sap)
-5. [Diffusion Vision Transformer](#diffusion-vit-diffusionvit)
+5. [Diffusion Vision Transformer](#diffusion-vision-transformer-diffusionvit)
 - [Dataloader](#dataloader)
 - [Dataset Integration](#dataset-integration)
 - [Load Balancing](#load-balancing)
@@ -81,7 +81,7 @@ Various example scripts for launching jobs are in the launch folder. Those ident
 # Supported Model Architectures
 Currently we provide 5 different architecutres **(VIT, MAE, UNETR, SAP, VIT-DIFFUSION)**, all of which use the same VIT encoder, but a different decoder architecture depending on the task being trained. All code for the different architectures inherit the ecnoder from VIT in order to facilitate using the same encoder.
 
-## Vision Transform (VIT)
+## Vision Transformer (VIT)
 Vision Transformer based on [1]. Code adapted and slimmed down from (https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/vision_transformer.py#L425). Task: Image Classification. Input: Image or Image Tile (A tile is a subset portion of a full image).
 
 ### Usage
