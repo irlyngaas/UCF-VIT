@@ -20,10 +20,10 @@ UCF-VIT is a **Uniform Coding Framework (UCF)** for training large scale **Visio
 The intention is to provide the building blocks and utilities for using these different parallelism techniques in fashion that they can be easily integrated to use with various types of scientific data. We provide various different end to end examples for different computer vision tasks using two example datasets. We provide various different options so that the integration of new datasets can be done with a number of different strategies. We also provide various advanced techniques that we have been developed for the specific use case of efficient computing with large scientific datasets.
 
 # Install
-Currently installation instructions are limited to Frontier only (the system we use for development and testing). Installation instructions and launch scripts for other machines will be added as they are implemented.
+Installation instruction are provide for running on Frontier and an NVIDIA DGX Cluster
 
 ## Frontier
-There are two options available for creating software environments Conda Environment installation from scratch or using an apptainer container. The Apptainer container creation currently works only when adaptive_patching=True in the config file (Also UNETR doesn't work) due to issues with missing ROCM packages in the base apptainer image. To be fixed later.
+There are two options available for creating software environments on Frontier 1) creating Conda environment from scratch or 2) using an apptainer container. Creating a Conda environment from scratch is recommended as the Apptainer containers currently only work in limited scenarios due to missing ROCM packages in the base apptainer image.
 
 ### Conda
 Create Conda Environment from Scratch. Example below using options from the corresponding Apptainer definition files
@@ -65,10 +65,14 @@ ln -s $CRAY_MPICH_DIR/lib/libfmpich.so libmpicxx.so
 
 Various example scripts for launching jobs are in the launch folder. Those identified with `_apptainer' in the filename are for running with the Apptainer container
 
+## NVIDIA DGX
+Hybrid Sharded Tensor-Data Orthogonal Parallelism is a novel parallelism algorithm that combines tensor parallelism and Fully Sharded Data Parallelism (FSDP). It avoids the peak memory use probelm in FSDP and leads to better memory reduction capability by keeping parameters sharded throughout training. See [] for more details
+
 # Innovations
 
 ## Advanced Parallelism & Efficient Computing
 ### Hybrid-STOP 
+Hybrid Sharded Tensor-Data Orthogonal Parallelism is a novel parallelism algorithm that combines tensor parallelism and Fully Sharded Data Parallelism (FSDP). It avoids the peak memory use probelm in FSDP and leads to better memory reduction capability by keeping parameters sharded throughout training. See [] for more details
 ### Lower Precision Support
 ### Layer Wrapping
 ### Activation Checkpointing
@@ -594,3 +598,15 @@ Directory consists of 1000 sub-folders of 2D JPEG images, each folder correspond
 Download data at
 
 Directory consists of 3D synthetic CT images of concrete including corresponding labels for segmentation.
+
+## Citations
+[1]: ```bibtex
+@inproceedings{wang2024orbit,
+  title={Orbit: Oak ridge base foundation model for earth system predictability},
+  author={Wang, Xiao and Liu, Siyan and Tsaris, Aristeidis and Choi, Jong-Youl and Aji, Ashwin M and Fan, Ming and Zhang, Wei and Yin, Junqi and Ashfaq, Moetasim and Lu, Dan and others},
+  booktitle={SC24: International Conference for High Performance Computing, Networking, Storage and Analysis},
+  pages={1--11},
+  year={2024},
+  organization={IEEE}
+}
+```
