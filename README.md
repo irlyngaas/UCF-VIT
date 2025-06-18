@@ -72,7 +72,7 @@ Hybrid Sharded Tensor-Data Orthogonal Parallelism is a novel parallelism algorit
 
 ## Advanced Parallelism & Efficient Computing
 ### Hybrid-STOP 
-Hybrid Sharded Tensor-Data Orthogonal Parallelism is a novel parallelism algorithm that combines tensor parallelism and Fully Sharded Data Parallelism (FSDP). It avoids the peak memory use probelm in FSDP and leads to better memory reduction capability by keeping parameters sharded throughout training. See [[1]] for more details
+Hybrid Sharded Tensor-Data Orthogonal Parallelism is a novel parallelism algorithm that combines tensor parallelism and Fully Sharded Data Parallelism (FSDP). It avoids the peak memory use probelm in FSDP and leads to better memory reduction capability by keeping parameters sharded throughout training. See [[1]](#1) for more details
 ### Lower Precision Support
 ### Layer Wrapping
 ### Activation Checkpointing
