@@ -600,7 +600,8 @@ Download data at
 Directory consists of 3D synthetic CT images of concrete including corresponding labels for segmentation.
 
 ## Citations
-[1]: ```bibtex
+[1]: 
+```bibtex
 @inproceedings{wang2024orbit,
   title={Orbit: Oak ridge base foundation model for earth system predictability},
   author={Wang, Xiao and Liu, Siyan and Tsaris, Aristeidis and Choi, Jong-Youl and Aji, Ashwin M and Fan, Ming and Zhang, Wei and Yin, Junqi and Ashfaq, Moetasim and Lu, Dan and others},
