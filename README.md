@@ -2,12 +2,12 @@
 - [UCF-VIT](#ucf-vit)
 - [Install](#install)
 - [Innovations](#Innovations)
-- [Model Architectures](#model-architectures)
-1. [VIT](#vit)
-2. [MAE](#mae)
-3. [UNETR](#unetr)
-4. [SAP](#sap)
-5. [DIFFUSION-VIT](#diffusion-vit)
+- [Supported Model Architectures](#supported-model-architectures)
+1. [Vision Transformer](#vision-transformer-(vit))
+2. [Masked Autoencoder](#masked-autoencoder-(mae))
+3. [Unet Transformer](#unet-transformer-(unetr))
+4. [Symmetric Adaptive Patching](#symmetric-adaptive-patching-(sap))
+5. [Diffusion Vision Transformer](#diffusion-vit-(diffusionvit))
 - [Dataloader](#dataloader)
 - [Dataset Integration](#dataset-integration)
 - [Load Balancing](#load-balancing)
@@ -78,10 +78,10 @@ Various example scripts for launching jobs are in the launch folder. Those ident
 ### Adaptive Patching
 ### Variable Aggregation
 
-# Model Architectures
+# Supported Model Architectures
 Currently we provide 5 different architecutres **(VIT, MAE, UNETR, SAP, VIT-DIFFUSION)**, all of which use the same VIT encoder, but a different decoder architecture depending on the task being trained. All code for the different architectures inherit the ecnoder from VIT in order to facilitate using the same encoder.
 
-## VIT
+## Vision Transform (VIT)
 Vision Transformer based on [1]. Code adapted and slimmed down from (https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/vision_transformer.py#L425). Task: Image Classification. Input: Image or Image Tile (A tile is a subset portion of a full image).
 
 ### Usage
@@ -169,7 +169,7 @@ How many adaptive patches used to tokenize the input image. Only used if **adapt
 - `FusedAttn_option`: [FusedAttn.CK, FusedAttn.DEFAULT, FusedAttn.NONE]
 Which option to use for fused attention. CK - [ComposableKernels](#composable-kernels), DEFAULT - torch implementaion, or None - No fused-attention used
 
-## MAE
+## Masked Autoencoder (MAE)
 Masked Autoencoder pre-training based on [2]. Task: Masked Image Prediction. Input: Image or Image Tile
 
 ### Usage
@@ -241,7 +241,7 @@ Whether to append a class token to the tokenized data. Set to false unless using
 - `weight_init`: ['' or 'skip'].
 Whether to skip the weight_init in the VIT parent class. Set to 'skip' unless using VIT
 
-## UNETR
+## UNet Transformer (UNETR)
 Image segmentation architecture based on [3]. Task: Image Segmentation. Input: Image or Image Tile
 
 ### Usage
@@ -295,7 +295,7 @@ Variable to indicate whether to use skip connection in the convolutional decoder
 - `feature_size`: int.
 Variable to set the how embedding features are expanded through the UNETR convolutional blocks
 
-## SAP
+## Symmetric Adaptive Patching (SAP)
 Image segmentation architecture for adaptively patched input based on [4]. Task: Image Segmentation. Input: Adaptively Patching Image or Image Tile
 
 ### Usage
@@ -332,7 +332,7 @@ variables = ["red", "green", "blue"]
 preds = model.forward(img, variables) # (1, 4, sqrt(4096)*16, sqrt(4096)*16)
 ```
 
-### Diffusion-VIT
+### Diffusion Vision Transformer (DiffusionVIT)
 Diffusion model training based on [5]. Task: Generate Image via noise that matches distribution of data trained on. Input: Noise
 
 ### Usage
@@ -342,7 +342,7 @@ from UCF_VIT.simple.arch import DiffusionVIT
 from UCF_VIT.utils.fused_attn import FusedAttn
  rom UCF_VIT.ddpm.ddpm import DDPM_Scheduler
 
-model = DiffusionVit(
+model = DiffusionVIT(
         img_size=[256,256],
         patch_size=16,
         in_chans=3,
