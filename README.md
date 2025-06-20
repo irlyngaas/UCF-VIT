@@ -74,7 +74,7 @@ Advanced Parallelism & Efficient Computing
 ## Hybrid-STOP 
 Hybrid Sharded Tensor-Data Orthogonal Parallelism (Hybrid-STOP) [[1]](#1) is a novel parallelism algorithm that combines tensor parallelism and Fully Sharded Data Parallelism (FSDP). It avoids the peak memory use probelm in FSDP and leads to better memory reduction capability by keeping parameters sharded throughout training. 
 ### Usage
-The Hybrid-STOP algorithm is available when using our fsdp [parallelism_mode](#parallelism-mode). The following example shows how to initialize and do the forward pass of a [MAE](#masked-autoencoder-mae) model using this algorithm for different number of simple_ddp, fsdp, and tensor parallel ranks. Our custom [dataloader](#dataloader) is used to facilitate proper dataloading which helps facilitate use when tensor parallelism is >1.
+The Hybrid-STOP algorithm is available when using our fsdp [parallelism_mode](#parallelism-modes). The following example shows how to initialize and do the forward pass of a [MAE](#masked-autoencoder-mae) model using this algorithm for different number of simple_ddp, fsdp, and tensor parallel ranks. Our custom [dataloader](#dataloader) with the [Imagenet](#imagenet) dataset is used to facilitate proper dataloading when tensor parallelism is >1.
 
 ```python
 import os
