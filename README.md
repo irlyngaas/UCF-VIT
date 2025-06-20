@@ -69,14 +69,176 @@ Various example scripts for launching jobs are in the launch folder. Those ident
 Hybrid Sharded Tensor-Data Orthogonal Parallelism is a novel parallelism algorithm that combines tensor parallelism and Fully Sharded Data Parallelism (FSDP). It avoids the peak memory use probelm in FSDP and leads to better memory reduction capability by keeping parameters sharded throughout training. See [] for more details
 
 # Innovations
+Advanced Parallelism & Efficient Computing
 
-## Advanced Parallelism & Efficient Computing
-### Hybrid-STOP 
-Hybrid Sharded Tensor-Data Orthogonal Parallelism is a novel parallelism algorithm that combines tensor parallelism and Fully Sharded Data Parallelism (FSDP). It avoids the peak memory use probelm in FSDP and leads to better memory reduction capability by keeping parameters sharded throughout training. See [[1]](#1) for more details
-### Lower Precision Support
-### Layer Wrapping
-### Activation Checkpointing
-### Composable Kernels
+## Hybrid-STOP 
+Hybrid Sharded Tensor-Data Orthogonal Parallelism (Hybrid-STOP) [[1]](#1) is a novel parallelism algorithm that combines tensor parallelism and Fully Sharded Data Parallelism (FSDP). It avoids the peak memory use probelm in FSDP and leads to better memory reduction capability by keeping parameters sharded throughout training. 
+### Usage
+The Hybrid-STOP algorithm is available when using our fsdp [parallelism_mode](#parallelism-mode). The following example shows how to initialize and do the forward pass of a [MAE](#masked-autoencoder-mae) model using this algorithm for different number of simple_ddp, fsdp, and tensor parallel ranks. Our custom [dataloader](#dataloader) is used to facilitate proper dataloading which helps facilitate use when tensor parallelism is >1.
+
+```python
+import os
+import torch.distributed as dist
+from datetime import timedelta
+from UCF_VIT.utils.misc import init_par_groups
+from UCF_VIT.fsdp.arch import MAE
+from UCF_VIT.utils.fused_attn import FusedAttn
+from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
+
+os.environ['MASTER_ADDR'] = str(os.environ['HOSTNAME'])
+os.environ['MASTER_PORT'] = "29500"
+os.environ['WORLD_SIZE'] = os.environ['SLURM_NTASKS']
+os.environ['RANK'] = os.environ['SLURM_PROCID']
+
+world_size = int(os.environ['SLURM_NTASKS'])
+world_rank = int(os.environ['SLURM_PROCID'])
+local_rank = int(os.environ['SLURM_LOCALID'])
+
+torch.cuda.set_device(local_rank)
+device = torch.cuda.current_device()
+
+dist.init_process_group('nccl', timeout=timedelta(seconds=7200000), rank=world_rank, world_size=world_size)
+
+#Assume we have 8 GPUs for training. Change these variables in any way desired such that fsdp_size*simple_ddp_size*tensor_par_size=8
+fsdp_size = 2
+simple_ddp_size = 2
+tensor_par_size = 2
+seq_par_size = 1 
+
+
+data_par_size = fsdp_size * simple_ddp_size
+assert seq_par_size == 1, "Sequence parallelism not implemented"
+assert (data_par_size * seq_par_size * tensor_par_size)==world_size, "DATA_PAR_SIZE * SEQ_PAR_SIZE * TENSOR_PAR_SIZE must equal to world_size"
+num_heads = 12
+assert (num_heads % tensor_par_size) == 0, "model heads % tensor parallel size must be 0"
+decoder_num_heads = 10
+assert (decoder_num_heads % tensor_par_size) == 0, "decoder model heads % tensor parallel size must be 0"
+
+seq_par_group, ddp_group, tensor_par_group, data_seq_ort_group, fsdp_group, simple_ddp_group = init_par_groups(world_rank = world_rank, data_par_size = data_par_size, tensor_par_size = tensor_par_size, seq_par_size = seq_par_size, fsdp_size = fsdp_size, simple_ddp_size = simple_ddp_size)
+
+model = MAE(
+        img_size=[256,256],
+        patch_size=16,
+        in_chans=3,
+        embed_dim=768,
+        depth=12,
+        num_heads=num_heads,
+        linear_decoder=False,
+        decoder_depth=8,
+        decoder_embed_dim=512,
+        decoder_num_heads=decoder_num_heads,
+        mlp_ratio=4,
+        drop_path_rate=0.1,
+        mask_ratio=0.1,
+        twoD=True,
+        mlp_ratio_decoder=4,
+        default_vars=["red", "green", "blue"],
+        single_channel=False,
+        use_varemb=False,
+        adaptive_patching=False,
+        fixed_length=None,
+        FusedAttn_option=FusedAttn.DEFAULT,
+        tensor_par_size=tensor_par_size,
+        tensor_par_group=tensor_par_group,
+        class_token=False,
+        weight_init='skip',
+    )
+
+if world_rank==0:
+    #save initial model weights and distribute to all GPUs in the tensor parallel group to synchronize model weights that do not belong to the training block
+    init_model_dict = {k: v for k, v in model.state_dict().items() if ('attn' not in  k and 'mlp' not in k and 'var_agg' not in k)}
+    torch.save(init_model_dict,
+        checkpoint_path+'/initial_'+str(dist.get_rank())+'.pth')
+    del init_model_dict
+
+dist.barrier()
+
+if world_rank!=0 and world_rank <tensor_par_size:
+   #load initial model weights and synchronize model weights that are not in the training block among sequence parallel GPUs
+   src_rank = dist.get_rank() - dist.get_rank(group=tensor_par_group)
+
+   map_location = 'cpu'
+   model.load_state_dict(torch.load(checkpoint_path+'/initial_'+str(0)+'.pth',map_location=map_location),strict=False)
+
+dist.barrier()
+
+precision_dt = torch.float32
+if fsdp_size > 1 and simple_ddp_size > 1:
+    model = FSDP(model, device_id=local_rank, process_group= (fsdp_group,simple_ddp_group), sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.HYBRID_SHARD, forward_prefetch=True, limit_all_gathers = False )
+elif fsdp_size > 1 and simple_ddp_size == 1:
+    model = FSDP(model, device_id=local_rank, process_group= fsdp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.FULL_SHARD, forward_prefetch=True, limit_all_gathers = False )
+else:
+    model = FSDP(model, device_id=local_rank, process_group= simple_ddp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.NO_SHARD, forward_prefetch=True, limit_all_gathers = False )
+
+
+data_module = NativePytorchDataModule(dict_root_dirs={'imagenet': '~/imagenet/train',},
+        dict_start_idx={'imagenet': 0},
+        dict_end_idx={'imagenet': 1},
+        dict_buffer_sizes={'imagenet': 100},
+        dict_in_variables={'imagenet': ["red", "green", "blue"]},
+        num_channels_available = {'imagenet': 3},
+        num_channels_used = {'imagenet': 3},
+        batch_size=32,
+        num_workers=1,
+        pin_memory=False,
+        patch_size = 16,
+        tile_size_x = 256,
+        tile_size_y = 256,
+        tile_size_z = None,
+        twoD = True,
+        single_channel = False,
+        return_label = False,
+        dataset_group_list = '8',
+        batches_per_rank_epoch = {'imagenet':4935},
+        tile_overlap = 0.0,
+        use_all_data = False,
+        adaptive_patching = False,
+        fixed_length = None,
+        separate_channels = False,
+        data_par_size = data_par_size,
+        ddp_group = ddp_group,
+        dataset = 'imagenet',
+        imagenet_resize = [256,256],
+    ).to(device)
+
+    data_module.setup()
+
+    train_dataloader = data_module.train_dataloader()
+
+for batch_idx, batch in enumerate(train_dataloader):
+    data, variables = batch
+    data.to(precision_dt)
+    model_output = model.forward(data, variables)
+
+```
+
+## Lower Precision Support
+The ability to implement lower precision support is facilitated by using a MixedPrecisionPolicy which is passed as an argument to the FSDP wrapper
+
+### Usage 
+Add the following code and replace the FSDP Wrapper calls in the [full example](#Hybrid-STOP) to add mixed precision support (specifically bfloat16 in this case). 
+```python
+
+    precision_dt = torch.bfloat16
+    mixedPrecisionPolicy = MixedPrecision(
+        param_dtype=precision_dt,
+        reduce_dtype=precision_dt,
+        buffer_dtype=precision_dt,
+    )
+
+    if fsdp_size > 1 and simple_ddp_size > 1:
+        model = FSDP(model, device_id=local_rank, process_group= (fsdp_group,simple_ddp_group), sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.HYBRID_SHARD, auto_wrap_policy = my_auto_wrap_policy, mixed_precision=mixedPrecisionPolicy, forward_prefetch=True, limit_all_gathers = False )
+    elif fsdp_size > 1 and simple_ddp_size == 1:
+        model = FSDP(model, device_id=local_rank, process_group= fsdp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.FULL_SHARD, mixed_precision=mixedPrecisionPolicy, forward_prefetch=True, limit_all_gathers = False )
+    else:
+        assert data_type == "float32", "Using NO_SHARD with bfloat16 doesn't work. Consider using HYBRID_SHARD or FULL_SHARD"
+        model = FSDP(model, device_id=local_rank, process_group= simple_ddp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.NO_SHARD, mixed_precision=mixedPrecisionPolicy, forward_prefetch=True, limit_all_gathers = False )
+
+```
+
+## Layer Wrapping
+## Activation Checkpointing
+## Composable Kernels
 
 ## Advanced Features
 ### Adaptive Patching
@@ -86,7 +248,7 @@ Hybrid Sharded Tensor-Data Orthogonal Parallelism is a novel parallelism algorit
 Currently we provide 5 different architecutres **(VIT, MAE, UNETR, SAP, VIT-DIFFUSION)**, all of which use the same VIT encoder, but a different decoder architecture depending on the task being trained. All code for the different architectures inherit the ecnoder from VIT in order to facilitate using the same encoder.
 
 ## Vision Transformer (VIT)
-Vision Transformer based on [1]. Code adapted and slimmed down from (https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/vision_transformer.py#L425). Task: Image Classification. Input: Image or Image Tile (A tile is a subset portion of a full image).
+VIT based on [1]. Code adapted and slimmed down from (https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/vision_transformer.py#L425) to only contain basic options for VIT Training and options to use some of the [innovations](#innovations). Task: Image Classification. Input: Image or Image Tile (A tile is a subset portion of a full image).
 
 ### Usage
 ```python
@@ -415,7 +577,7 @@ data_module = NativePytorchDataModule(dict_root_dirs={'imagenet': '~/imagenet/tr
         patch_size = 16,
         tile_size_x = 256,
         tile_size_y = 256,
-        tile_size_z = 256,
+        tile_size_z = None,
         twoD = True,
         single_channel = False,
         return_label = False,
