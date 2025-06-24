@@ -18,7 +18,7 @@ from .dataset import (
     ProcessChannels,
 )
 
-def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_channels, dataset, num_classes, num_labels, return_qdt):
+def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_channels, dataset, num_classes, num_labels, return_qdt, dict_key):
     if adaptive_patching:
         if return_label:
             if single_channel:
@@ -99,14 +99,18 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                             qdt_list.append(batch[i][7])
             if dataset == "imagenet":                
                 if return_qdt:
-                    return (inp, seq, size, pos, label, variables, qdt_list)
+                    #return (inp, seq, size, pos, label, variables, qdt_list, dict_key)
+                    return (seq, label, variables, qdt_list, dict_key)
                 else:
-                    return (inp, seq, size, pos, label, variables)
+                    #return (inp, seq, size, pos, label, variables, dict_key)
+                    return (seq, label, variables, dict_key)
             else:
                 if return_qdt:
-                    return (inp, seq, size, pos, label, seq_label, variables, qdt_list)
+                    #return (inp, seq, size, pos, label, seq_label, variables, qdt_list, dict_key)
+                    return (seq, seq_label, variables, qdt_list, dict_key)
                 else:
-                    return (inp, seq, size, pos, label, seq_label, variables)
+                    #return (inp, seq, size, pos, label, seq_label, variables, dict_key)
+                    return (seq, seq_label, variables, dict_key)
         else:
             if single_channel:
                 inp = torch.stack([torch.from_numpy(np.expand_dims(batch[i][0],axis=0)) for i in range(len(batch))])
@@ -131,9 +135,11 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                 qdt_list = []
                 for i in range(len(batch)):
                     qdt_list.append(batch[i][5])
-                return (inp, seq, size, pos, variables, qdt_list)
+                #return (inp, seq, size, pos, variables, qdt_list, dict_key)
+                return (seq, variables, qdt_list, dict_key)
             else:
-                return (inp, seq, size, pos, variables)
+                #return (inp, seq, size, pos, variables, dict_key)
+                return (seq, variables, dict_key)
     else:
         if return_label:
             if single_channel:
@@ -158,7 +164,7 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                         label = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
                 variables = batch[0][2]
                 
-            return (inp, label, variables)
+            return (inp, label, variables, dict_key)
         else:
             if single_channel:
                 inp = torch.stack([torch.from_numpy(np.expand_dims(batch[i][0],axis=0)) for i in range(len(batch))])
@@ -168,7 +174,7 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                 inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
                 variables = batch[0][1]
 
-            return (inp, variables)
+            return (inp, variables, dict_key)
 
 class NativePytorchDataModule(torch.nn.Module):
     """Native pytorch data module for multi-source data.
@@ -511,6 +517,6 @@ class NativePytorchDataModule(torch.nn.Module):
             drop_last=True,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            collate_fn=lambda batch: collate_fn(batch, return_label=self.return_label, single_channel=self.single_channel, adaptive_patching = self.adaptive_patching, separate_channels=self.separate_channels, dataset=self.dataset, num_classes=self.num_classes, num_labels=num_labels, return_qdt=self.return_qdt),
+            collate_fn=lambda batch: collate_fn(batch, return_label=self.return_label, single_channel=self.single_channel, adaptive_patching = self.adaptive_patching, separate_channels=self.separate_channels, dataset=self.dataset, num_classes=self.num_classes, num_labels=num_labels, return_qdt=self.return_qdt, dict_key=k),
         )
 

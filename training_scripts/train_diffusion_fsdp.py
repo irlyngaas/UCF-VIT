@@ -34,21 +34,6 @@ from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.utils.fused_attn import FusedAttn
 from UCF_VIT.ddpm.ddpm import DDPM_Scheduler
 
-def training_step_adaptive(data, seq, size, pos, variables, net: DiffusionVIT, patch_size, twoD, loss_fn):
-
-        
-    output, mask = net.forward(seq, variables)
-    if loss_fn == "realMSE": #Real Loss
-        criterion = adaptive_patching_mse
-        loss = criterion(output, data, size, pos, patch_size, twoD)
-    else: #Compression Loss
-        criterion = nn.MSELoss()
-        target = rearrange(seq, 'b c s p -> b s (p c)')
-        loss = criterion(output, target)
-
-
-    return loss
-
 def training_step(data, variables, t, e, net: DiffusionVIT, patch_size, twoD, loss_fn):
 
 
@@ -276,9 +261,9 @@ def main(device):
         weight_init='skip',
     ).to(device)
 
-    if not resume_from_checkpoint:
+    if not resume_from_checkpoint: #train from scratch
         epoch_start = 0
-        #if train from scratch
+        loss_list = []
         if world_rank==0:       
             print("resume from checkpoint was set to False. Pretrain from scratch.",flush=True)
 
@@ -317,6 +302,7 @@ def main(device):
            map_location = 'cpu'
            #map_location = 'cuda:'+str(device)
            model.load_state_dict(torch.load(checkpoint_path+'/initial_'+str(0)+'.pth',map_location=map_location),strict=False)
+           loss_list = []
     else:  
         if world_rank< tensor_par_size:
             if os.path.exists(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(world_rank)+".ckpt"):
@@ -324,14 +310,14 @@ def main(device):
 
                 print("rank",dist.get_rank(),"src_rank",world_rank,flush=True)
 
-                #map_location = 'cuda:'+str(device)
                 map_location = 'cpu'
+                #map_location = 'cuda:'+str(device)
 
                 checkpoint = torch.load(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(world_rank)+".ckpt",map_location=map_location)
                 model.load_state_dict(checkpoint['model_state_dict'])
                 epoch_start = checkpoint['epoch']
+                loss_list = checkpoint['loss_list']
                 del checkpoint
-            #optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
             else:
                 print("resume from checkpoint was set to True. But the checkpoint path does not exist.",flush=True)
@@ -370,7 +356,6 @@ def main(device):
         model = FSDP(model, device_id=local_rank, process_group= fsdp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.FULL_SHARD, auto_wrap_policy = my_auto_wrap_policy, mixed_precision=bfloatPolicy, forward_prefetch=True, limit_all_gathers = False )
     #add unsharded DDP
     else:
-        assert data_type == "float32", "Using NO_SHARD with bfloat16 doesn't work. Consider using HYBRID_SHARD or FULL_SHARD"
         model = FSDP(model, device_id=local_rank, process_group= simple_ddp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.NO_SHARD, auto_wrap_policy = my_auto_wrap_policy, mixed_precision=bfloatPolicy, forward_prefetch=True, limit_all_gathers = False )
 
     check_fn = lambda submodule: isinstance(submodule, Block)
@@ -387,8 +372,8 @@ def main(device):
 
         src_rank = world_rank - tensor_par_size * dist.get_rank(group=data_seq_ort_group)
 
-        #map_location = 'cuda:'+str(device)
         map_location = 'cpu'
+        #map_location = 'cuda:'+str(device)
 
         if tensor_par_size > 1:
             checkpoint = torch.load(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(src_rank)+".ckpt",map_location=map_location)
@@ -403,39 +388,40 @@ def main(device):
 
 #3. Initialize Dataloader
 ##############################################################################################################
-    data_module = NativePytorchDataModule(dict_root_dirs=dict_root_dirs,
-        dict_start_idx=dict_start_idx,
-        dict_end_idx=dict_end_idx,
-        dict_buffer_sizes=dict_buffer_sizes,
-        dict_in_variables=dict_in_variables,
-        num_channels_available = num_channels_available,
-        num_channels_used = num_channels_used,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        patch_size = patch_size,
-        tile_size_x = tile_size_x,
-        tile_size_y = tile_size_y,
-        tile_size_z = tile_size_z,
-        twoD = twoD,
-        single_channel = single_channel,
-        return_label = False,
-        dataset_group_list = dataset_group_list,
-        batches_per_rank_epoch = batches_per_rank_epoch,
-        tile_overlap = tile_overlap,
-        use_all_data = use_all_data,
-        adaptive_patching = adaptive_patching,
-        fixed_length = fixed_length,
-        separate_channels = separate_channels,
-        data_par_size = data_par_size,
-        ddp_group = ddp_group,
-        dataset = dataset,
-        imagenet_resize = imagenet_resize,
-    ).to(device)
+    if dist.get_rank(tensor_par_group) == 0:
+        data_module = NativePytorchDataModule(dict_root_dirs=dict_root_dirs,
+            dict_start_idx=dict_start_idx,
+            dict_end_idx=dict_end_idx,
+            dict_buffer_sizes=dict_buffer_sizes,
+            dict_in_variables=dict_in_variables,
+            num_channels_available = num_channels_available,
+            num_channels_used = num_channels_used,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            patch_size = patch_size,
+            tile_size_x = tile_size_x,
+            tile_size_y = tile_size_y,
+            tile_size_z = tile_size_z,
+            twoD = twoD,
+            single_channel = single_channel,
+            return_label = False,
+            dataset_group_list = dataset_group_list,
+            batches_per_rank_epoch = batches_per_rank_epoch,
+            tile_overlap = tile_overlap,
+            use_all_data = use_all_data,
+            adaptive_patching = adaptive_patching,
+            fixed_length = fixed_length,
+            separate_channels = separate_channels,
+            data_par_size = data_par_size,
+            ddp_group = ddp_group,
+            dataset = dataset,
+            imagenet_resize = imagenet_resize,
+        ).to(device)
 
-    data_module.setup()
+        data_module.setup()
 
-    train_dataloader = data_module.train_dataloader()
+        train_dataloader = data_module.train_dataloader()
 
 #4. Training Loop
 ##############################################################################################################
@@ -448,8 +434,9 @@ def main(device):
     for epoch in range(epoch_start,max_epochs):
         #Reset dataloader module every epoch to ensure all files get used
         if epoch != epoch_start:
-            data_module.reset()
-            train_dataloader = data_module.train_dataloader()
+            if dist.get_rank(tensor_par_group) == 0:
+                data_module.reset()
+                train_dataloader = data_module.train_dataloader()
 
         #tell the model that we are in train mode. Matters because we have the dropout
         model.train()
@@ -458,21 +445,61 @@ def main(device):
         if world_rank==0:
             print("epoch ",epoch,flush=True)
 
+        if dist.get_rank(tensor_par_group) == 0:
+            it_loader = iter(train_dataloader)
+
         counter = 0
         with torch.autograd.set_detect_anomaly(False):
-            for batch_idx, batch in enumerate(train_dataloader):
+            while counter < iterations_per_epoch:
                 counter = counter + 1
-                if counter > iterations_per_epoch:
-                    print("A GPU ran out of data, moving to next epoch", flush=True)
-                    break
+                if tensor_par_size > 1:
+                    if dist.get_rank(tensor_par_group) == 0:
+                        data, variables, dict_key = next(it_loader)
+                        data = data.to(precision_dt)
+                        data = data.to(device)
+                        if dataset != "imagenet":
+                            dict_key_len = torch.tensor(len(dict_key)).to(device)
+                        else:
+                            dict_key = "imagenet"
+                        t = torch.randint(0,num_time_steps,(batch_size,))
+                        e = torch.randn_like(data, requires_grad=False)
+                        if twoD:
+                            a = ddpm_scheduler.alpha[t].view(batch_size,1,1,1).to(precision_dt).to(device)
+                        else:
+                            a = ddpm_scheduler.alpha[t].view(batch_size,1,1,1,1).to(precision_dt).to(device)
+                        t = t.to(device)
+                        data = (torch.sqrt(a)*data) + (torch.sqrt(1-a)*e)
+                    else:
+                        if dataset != "imagenet":
+                            dict_key_len = torch.tensor(0).to(device)
+                        else: 
+                            dict_key = "imagenet"
 
-                if adaptive_patching:
-                    data, seq, size, pos, variables = batch
-                    seq = seq.to(device)
-                    loss = training_step_adaptive(data, seq, size, pos, variables, model, patch_size, twoD, loss_fn)
+                    if dataset != "imagenet":
+                        dist.broadcast(dict_key_len, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group = tensor_par_group)
+                        if dist.get_rank(tensor_par_group) != 0:
+                            dict_key = [None] * dict_key_len.item()
+                        dist.broadcast_object_list(dict_key, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
 
-                else:
-                    data, variables = batch
+                        if dist.get_rank(tensor_par_group) != 0:
+                            dict_key = ''.join(dict_key)
+
+                    if dist.get_rank(tensor_par_group) != 0:
+                        if twoD:
+                            data = torch.zeros(batch_size, num_channels_used[dict_key], tile_size_x, tile_size_y, dtype=precision_dt).to(device)
+                        else:
+                            data = torch.zeros(batch_size, num_channels_used[dict_key], tile_size_x, tile_size_y, tile_size_z, dtype=precision_dt).to(device)
+                        variables = [None] * num_channels_used[dict_key]
+                        t = torch.zeros(batch_size, dtype=torch.int).to(device)
+                        e = torch.zeros_like(data, requires_grad=False)
+                    dist.broadcast(data, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+                    dist.broadcast_object_list(variables, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+                    dist.broadcast(t, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+                    t = t.to('cpu')
+                    dist.broadcast(e, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+
+                else: #Avoid unnecesary broadcasts if not using tensor parallelism
+                    data, variables, _ = next(it_loader)
                     data = data.to(precision_dt)
                     data = data.to(device)
                     t = torch.randint(0,num_time_steps,(batch_size,))
@@ -482,12 +509,13 @@ def main(device):
                     else:
                         a = ddpm_scheduler.alpha[t].view(batch_size,1,1,1,1).to(precision_dt).to(device)
                     data = (torch.sqrt(a)*data) + (torch.sqrt(1-a)*e)
-                    loss = training_step(data, variables, t, e, model, patch_size, twoD, loss_fn)
+
+                loss = training_step(data, variables, t, e, model, patch_size, twoD, loss_fn)
 
                 epoch_loss += loss.detach()
     
                 if world_rank==0:
-                    print("epoch: ",epoch,"batch_idx",batch_idx,"world_rank",world_rank,"it_loss ",loss,flush=True)
+                    print("epoch: ",epoch,"batch_idx",counter,"world_rank",world_rank,"it_loss ",loss,flush=True)
     
                 if use_scaler:
                     scaler.scale(loss).backward()
