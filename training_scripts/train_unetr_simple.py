@@ -359,7 +359,7 @@ def main(device):
                 print("A GPU ran out of data, moving to next epoch", flush=True)
                 break
 
-            data, label, variables = batch
+            data, label, variables, _ = batch
             data = data.to(device)
             label = label.to(device)
 
