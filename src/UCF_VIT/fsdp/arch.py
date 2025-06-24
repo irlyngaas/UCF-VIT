@@ -639,8 +639,16 @@ class MAE(VIT):
         len_keep = int(seq_length * (1-self.mask_ratio))
 
         if noise is None:
-            noise = torch.rand(batch_size, seq_length, device=sequence.device)
+            if self.tensor_par_size > 1: #Synchronize noise to have the same masks across all data in a tensor parallel group
+                if dist.get_rank(self.tensor_par_group) == 0:
+                    noise = torch.rand(batch_size, seq_length, device=sequence.device)
+                else:
+                    noise = torch.rand(batch_size, seq_length, device=sequence.device)
+                dist.broadcast(noise, src=(dist.get_rank()//self.tensor_par_size*self.tensor_par_size), group=self.tensor_par_group)
+            else:
+                noise = torch.rand(batch_size, seq_length, device=sequence.device)
         ids_shuffle = torch.argsort(noise, dim=1).to(sequence.device)
+
         ids_restore = torch.argsort(ids_shuffle,dim=1).to(sequence.device)
         ids_keep = ids_shuffle[:,:len_keep]
         sequence_unmasked = torch.gather(sequence, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, dim))
@@ -1263,7 +1271,7 @@ class DiffusionVIT(VIT):
 
         if self.tensor_par_size > 1:
             src_rank = dist.get_rank() - dist.get_rank(group=self.tensor_par_group)
-            dist.broadcast(x, src_rank, group=self.tensor_par_group)
+            dist.broadcast(x.contiguous(), src_rank, group=self.tensor_par_group)
 
         x = self.blocks(x)
         x = self.norm(x)
