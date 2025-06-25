@@ -4,15 +4,15 @@ trainer:
   data_type: "bfloat16"
   checkpoint_path: "../../checkpoint/xct/diffusion/base"
   checkpoint_filename: "xct_concrete_base"
-  checkpoint_filename_for_loading: "multi_last_odd" #multi_last_odd or multi_last_even
+  checkpoint_filename_for_loading: "xct_concrete_base_0" #xct_concrete_base_[EPOCH]
   inference_path: "../../checkpoint/xct/diffusion/base/inference"
 
   resume_from_checkpoint: False
 
 # ---------------------------- PARALLELISM -------------------------------------
 parallelism:
-  fsdp_size: 2
-  simple_ddp_size: 8
+  fsdp_size: 1
+  simple_ddp_size: 16
   tensor_par_size: 1
   seq_par_size: 1
   cpu_offloading: False
@@ -90,7 +90,8 @@ data:
 
 # ---------------------------- LOAD BALANCING -------------------------------------------
 load_balancing:
+  load_balancing:
   batches_per_rank_epoch: {
-    'xct1': 592, # 4863
+  'xct1': 592,
   }
   dataset_group_list: '16'
