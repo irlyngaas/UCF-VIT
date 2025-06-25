@@ -308,7 +308,6 @@ def main(device):
            map_location = 'cpu'
            #map_location = 'cuda:'+str(device)
            model.load_state_dict(torch.load(checkpoint_path+'/initial_'+str(0)+'.pth',map_location=map_location),strict=False)
-           loss_list = []
     else:  
         if world_rank < tensor_par_size:
             if os.path.exists(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(world_rank)+".ckpt"):
@@ -322,7 +321,6 @@ def main(device):
                 checkpoint = torch.load(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(world_rank)+".ckpt",map_location=map_location)
                 model.load_state_dict(checkpoint['model_state_dict'])
                 epoch_start = checkpoint['epoch']
-                loss_list = checkpoint['loss_list']
                 del checkpoint
 
             else:
@@ -382,10 +380,10 @@ def main(device):
         map_location = 'cpu'
         #map_location = 'cuda:'+str(device)
 
-        if tensor_par_size > 1:
-            checkpoint = torch.load(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(src_rank)+".ckpt",map_location=map_location)
+        checkpoint = torch.load(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(src_rank)+".ckpt",map_location=map_location)
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        loss_list = checkpoint['loss_list']
         epoch_start = checkpoint['epoch'] + 1
         del checkpoint
 
