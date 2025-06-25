@@ -9,7 +9,6 @@ import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
-from torchvision.utils import save_image
 import time
 import yaml
 from einops import rearrange
@@ -220,8 +219,8 @@ def main(device):
         loss_list = []
     else:
         dist.barrier()
-        #map_location = 'cuda:'+str(device)
         map_location = 'cpu'
+        #map_location = 'cuda:'+str(device)
         checkpoint = torch.load(checkpoint_path+"/"+checkpoint_filename_for_loading+".ckpt",map_location=map_location)
         model.load_state_dict(checkpoint['model_state_dict'])
         epoch_start = checkpoint['epoch']
@@ -299,13 +298,13 @@ def main(device):
                 break
 
             if adaptive_patching:
-                data, seq, size, pos, label, variables = batch
+                seq, label, variables, _ = batch
                 seq = seq.to(device)
                 label = label.to(device)
                 loss, output = training_step(seq, variables, label, model)
 
             else:
-                data, label, variables = batch
+                data, label, variables, _ = batch
                 data = data.to(device)
                 label = label.to(device)
                 loss, output = training_step(data, variables, label, model)

@@ -9,29 +9,24 @@ import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
-from torchvision.utils import save_image
 import time
 import yaml
 from einops import rearrange
 from timm.layers import use_fused_attn
 
 from UCF_VIT.simple.arch import MAE
-from UCF_VIT.utils.metrics import masked_mse, adaptive_patching_mse
+from UCF_VIT.utils.metrics import masked_mse
 from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, patchify, unpatchify
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.utils.fused_attn import FusedAttn
 
-def training_step_adaptive(data, seq, size, pos, variables, net: MAE, patch_size, twoD, loss_fn):
+def training_step_adaptive(seq, variables, net: MAE, patch_size, twoD, loss_fn):
 
         
     output, mask = net.forward(seq, variables)
-    if loss_fn == "realMSE": #Real Loss
-        criterion = adaptive_patching_mse
-        loss = criterion(output, data, size, pos, patch_size, twoD)
-    else: #Compression Loss
-        criterion = nn.MSELoss()
-        target = rearrange(seq, 'b c s p -> b s (p c)')
-        loss = criterion(output, target)
+    criterion = nn.MSELoss()
+    target = rearrange(seq, 'b c s p -> b s (p c)')
+    loss = criterion(output, target)
 
 
     return loss
@@ -259,8 +254,8 @@ def main(device):
         loss_list = []
     else:
         dist.barrier()
-        #map_location = 'cuda:'+str(device)
         map_location = 'cpu'
+        #map_location = 'cuda:'+str(device)
         checkpoint = torch.load(checkpoint_path+"/"+checkpoint_filename_for_loading+".ckpt",map_location=map_location)
         model.load_state_dict(checkpoint['model_state_dict'])
         epoch_start = checkpoint['epoch']
@@ -337,12 +332,12 @@ def main(device):
                 break
 
             if adaptive_patching:
-                data, seq, size, pos, variables = batch
+                seq, variables, _ = batch
                 seq = seq.to(device)
-                loss = training_step_adaptive(data, seq, size, pos, variables, model, patch_size, twoD, loss_fn)
+                loss = training_step_adaptive(seq, variables, model, patch_size, twoD, loss_fn)
 
             else:
-                data, variables = batch
+                data, variables, _ = batch
                 data = data.to(device)
                 loss = training_step(data, variables, model, patch_size, twoD, loss_fn)
 

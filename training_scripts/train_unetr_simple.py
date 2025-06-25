@@ -9,7 +9,6 @@ import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
-from torchvision.utils import save_image
 import time
 from collections import OrderedDict
 import yaml
@@ -360,7 +359,7 @@ def main(device):
                 print("A GPU ran out of data, moving to next epoch", flush=True)
                 break
 
-            data, label, variables = batch
+            data, label, variables, _ = batch
             data = data.to(device)
             label = label.to(device)
 

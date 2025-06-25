@@ -9,7 +9,6 @@ import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
-from torchvision.utils import save_image
 import time
 import yaml
 from einops import rearrange
@@ -24,7 +23,7 @@ from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.utils.fused_attn import FusedAttn
 
 #TODO: Add qdt_list back for visualization
-def training_step_adaptive(data, seq, label, seq_label, size, pos, variables, net: SAP, patch_size, twoD, num_classes, sqrt_len):
+def training_step_adaptive(seq, seq_label, variables, net: SAP, patch_size, twoD, num_classes, sqrt_len):
 
     #seq = torch.reshape(seq, shape=(-1,1,patch_size*sqrt_len, patch_size*sqrt_len))
     if twoD:
@@ -388,10 +387,10 @@ def main(device):
 
             #TODO: Add qdt_list back for visualization
             #data, seq, size, pos, label, seq_label, variables, qdt_list = batch
-            data, seq, size, pos, label, seq_label, variables = batch
+            seq, seq_label, variables, _ = batch
             seq = seq.to(device)
             seq_label = seq_label.to(device)
-            loss = training_step_adaptive(data, seq, label, seq_label, size, pos, variables, model, patch_size, twoD, num_classes, sqrt_len)
+            loss = training_step_adaptive(seq, seq_label, variables, model, patch_size, twoD, num_classes, sqrt_len)
 
             epoch_loss += loss.detach()
     
