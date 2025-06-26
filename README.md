@@ -19,6 +19,8 @@ UCF-VIT is a **Uniform Coding Framework (UCF)** for training large scale **Visio
 
 The intention is to provide the building blocks and utilities for using these different parallelism techniques in fashion that they can be easily integrated to use with various types of scientific data. We provide various different end to end examples for different computer vision tasks using two example datasets. We provide various different options so that the integration of new datasets can be done with a number of different strategies. We also provide various advanced techniques that we have been developed for the specific use case of efficient computing with large scientific datasets.
 
+## Why use UCF-VIT?
+
 # Install
 Installation instruction are provide for running on Frontier and an NVIDIA DGX Cluster
 
@@ -74,11 +76,13 @@ Advanced Parallelism & Efficient Computing
 ## Hybrid-STOP 
 Hybrid Sharded Tensor-Data Orthogonal Parallelism (Hybrid-STOP) [[1]](#1) is a novel parallelism algorithm that combines tensor parallelism and Fully Sharded Data Parallelism (FSDP). It avoids the peak memory use probelm in FSDP and leads to better memory reduction capability by keeping parameters sharded throughout training. 
 ### Usage
-The Hybrid-STOP algorithm is available when using our fsdp [parallelism_mode](#parallelism-modes). The following example shows how to initialize and do the forward pass of a [MAE](#masked-autoencoder-mae) model using this algorithm for different number of simple_ddp, fsdp, and tensor parallel ranks. Our custom [dataloader](#dataloader) with the [Imagenet](#imagenet) dataset is used to facilitate proper dataloading when tensor parallelism is >1.
+The Hybrid-STOP algorithm is available when using our fsdp [parallelism mode](#parallelism-modes). The following example shows how to initialize and do the forward pass of a [MAE](#masked-autoencoder-mae) model using this algorithm for different number of simple_ddp, fsdp, and tensor parallel ranks. Our custom [dataloader](#dataloader) with the [Imagenet](#imagenet) dataset is used to facilitate proper dataloading when tensor parallelism is > 1 (In this case each tensor parallel rank needs the same batch of input data).
 
 ```python
 import os
+import torch
 import torch.distributed as dist
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from datetime import timedelta
 from UCF_VIT.utils.misc import init_par_groups
 from UCF_VIT.fsdp.arch import MAE
@@ -111,7 +115,7 @@ assert seq_par_size == 1, "Sequence parallelism not implemented"
 assert (data_par_size * seq_par_size * tensor_par_size)==world_size, "DATA_PAR_SIZE * SEQ_PAR_SIZE * TENSOR_PAR_SIZE must equal to world_size"
 num_heads = 12
 assert (num_heads % tensor_par_size) == 0, "model heads % tensor parallel size must be 0"
-decoder_num_heads = 10
+decoder_num_heads = 8
 assert (decoder_num_heads % tensor_par_size) == 0, "decoder model heads % tensor parallel size must be 0"
 
 seq_par_group, ddp_group, tensor_par_group, data_seq_ort_group, fsdp_group, simple_ddp_group = init_par_groups(world_rank = world_rank, data_par_size = data_par_size, tensor_par_size = tensor_par_size, seq_par_size = seq_par_size, fsdp_size = fsdp_size, simple_ddp_size = simple_ddp_size)
@@ -148,17 +152,17 @@ if world_rank==0:
     #save initial model weights and distribute to all GPUs in the tensor parallel group to synchronize model weights that do not belong to the training block
     init_model_dict = {k: v for k, v in model.state_dict().items() if ('attn' not in  k and 'mlp' not in k and 'var_agg' not in k)}
     torch.save(init_model_dict,
-        checkpoint_path+'/initial_'+str(dist.get_rank())+'.pth')
+        'initial_'+str(dist.get_rank())+'.pth')
     del init_model_dict
 
 dist.barrier()
 
 if world_rank!=0 and world_rank <tensor_par_size:
-   #load initial model weights and synchronize model weights that are not in the training block among sequence parallel GPUs
+   #load initial model weights and synchronize model weights that are not in the training block among tensor parallel GPUs
    src_rank = dist.get_rank() - dist.get_rank(group=tensor_par_group)
 
    map_location = 'cpu'
-   model.load_state_dict(torch.load(checkpoint_path+'/initial_'+str(0)+'.pth',map_location=map_location),strict=False)
+   model.load_state_dict(torch.load('initial_'+str(0)+'.pth',map_location=map_location),strict=False)
 
 dist.barrier()
 
@@ -171,73 +175,141 @@ else:
     model = FSDP(model, device_id=local_rank, process_group= simple_ddp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.NO_SHARD, forward_prefetch=True, limit_all_gathers = False )
 
 
-data_module = NativePytorchDataModule(dict_root_dirs={'imagenet': '~/imagenet/train',},
-        dict_start_idx={'imagenet': 0},
-        dict_end_idx={'imagenet': 1},
-        dict_buffer_sizes={'imagenet': 100},
-        dict_in_variables={'imagenet': ["red", "green", "blue"]},
-        num_channels_available = {'imagenet': 3},
-        num_channels_used = {'imagenet': 3},
-        batch_size=32,
-        num_workers=1,
-        pin_memory=False,
-        patch_size = 16,
-        tile_size_x = 256,
-        tile_size_y = 256,
-        tile_size_z = None,
-        twoD = True,
-        single_channel = False,
-        return_label = False,
-        dataset_group_list = '8',
-        batches_per_rank_epoch = {'imagenet':4935},
-        tile_overlap = 0.0,
-        use_all_data = False,
-        adaptive_patching = False,
-        fixed_length = None,
-        separate_channels = False,
-        data_par_size = data_par_size,
-        ddp_group = ddp_group,
-        dataset = 'imagenet',
-        imagenet_resize = [256,256],
-    ).to(device)
+if dist.get_rank(tensor_par_group) == 0:
+    data_module = NativePytorchDataModule(dict_root_dirs={'imagenet': '~/imagenet/train',},
+            dict_start_idx={'imagenet': 0},
+            dict_end_idx={'imagenet': 1},
+            dict_buffer_sizes={'imagenet': 100},
+            dict_in_variables={'imagenet': ["red", "green", "blue"]},
+            num_channels_available = {'imagenet': 3},
+            num_channels_used = {'imagenet': 3},
+            batch_size=32,
+            num_workers=1,
+            pin_memory=False,
+            patch_size = 16,
+            tile_size_x = 256,
+            tile_size_y = 256,
+            tile_size_z = None,
+            twoD = True,
+            single_channel = False,
+            return_label = False,
+            dataset_group_list = '1:1:1:1', #Calculate from running utils/preprocess_load_balancing.py
+            batches_per_rank_epoch = {'imagenet':9945}, #Calculated from running utils/preprocess_load_balancing.py
+            tile_overlap = 0.0,
+            use_all_data = False,
+            adaptive_patching = False,
+            fixed_length = None,
+            separate_channels = False,
+            data_par_size = data_par_size,
+            ddp_group = ddp_group,
+            dataset = 'imagenet',
+            imagenet_resize = {'imagenet':[256,256]},
+        ).to(device)
 
     data_module.setup()
 
     train_dataloader = data_module.train_dataloader()
 
-for batch_idx, batch in enumerate(train_dataloader):
-    data, variables = batch
-    data.to(precision_dt)
+    it_loader = iter(train_dataloader)
+
+counter = 0
+while counter < 9945:
+    if tensor_par_size > 1:
+        if dist.get_rank(tensor_par_group) == 0:
+            data, variables, _ = next(it_loader)
+            data = data.to(precision_dt)
+            data = data.to(device)
+        else:
+            data = torch.zeros(32, 3, 256, 256, dtype=precision_dt).to(device)
+            variables = [None] * 3
+        dist.broadcast(data, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+        dist.broadcast_object_list(variables, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+
+    else: #Avoid unnecesary broadcasts if not using tensor parallelism
+        data, variables, _ = next(it_loader)
+        data = data.to(precision_dt)
+        data = data.to(device)
     model_output = model.forward(data, variables)
 
 ```
 
-## Lower Precision Support
-The ability to implement lower precision support is facilitated by using a MixedPrecisionPolicy which is passed as an argument to the FSDP wrapper
+### Implementation Details 
+In order to properly implement the H-STOP algorithm, specifically the tensor parallelism aspects, the architecture code requires modifications to correctly split up and communicate the tensor calculations amongst the tensor parallel ranks. Currently tensor parallelism is only enacted over the attention and mlp calculations, which are the costliest components. The below code snippet shows how the tensor parallel implementation is implemented in the FSDP parallelism mode, corresponding modifications are built into the attention mechanism in building_blocks.py. Tensor parallelism is not implemented in simple parallelism mode, so the tensor_par_group communicator group is not required to be passed to the neural network architecture for that case.  
 
-### Usage 
-Add the following code and replace the FSDP Wrapper calls in the [full example](#Hybrid-STOP) to add mixed precision support (specifically bfloat16 in this case). 
 ```python
+if self.tensor_par_size > 1:
+    src_rank = dist.get_rank() - dist.get_rank(group=self.tensor_par_group)
+    dist.broadcast(x, src_rank, group=self.tensor_par_group)
 
-    precision_dt = torch.bfloat16
-    mixedPrecisionPolicy = MixedPrecision(
-        param_dtype=precision_dt,
-        reduce_dtype=precision_dt,
-        buffer_dtype=precision_dt,
-    )
+x = self.blocks(x)
+x = self.norm(x)
 
-    if fsdp_size > 1 and simple_ddp_size > 1:
-        model = FSDP(model, device_id=local_rank, process_group= (fsdp_group,simple_ddp_group), sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.HYBRID_SHARD, auto_wrap_policy = my_auto_wrap_policy, mixed_precision=mixedPrecisionPolicy, forward_prefetch=True, limit_all_gathers = False )
-    elif fsdp_size > 1 and simple_ddp_size == 1:
-        model = FSDP(model, device_id=local_rank, process_group= fsdp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.FULL_SHARD, mixed_precision=mixedPrecisionPolicy, forward_prefetch=True, limit_all_gathers = False )
-    else:
-        assert data_type == "float32", "Using NO_SHARD with bfloat16 doesn't work. Consider using HYBRID_SHARD or FULL_SHARD"
-        model = FSDP(model, device_id=local_rank, process_group= simple_ddp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.NO_SHARD, mixed_precision=mixedPrecisionPolicy, forward_prefetch=True, limit_all_gathers = False )
+if self.tensor_par_size > 1:
+    x = F_Identity_B_Broadcast(x, src_rank, group=self.tensor_par_group)
 
 ```
 
+## Lower Precision Support
+The ability to implement lower precision support is facilitated by using a MixedPrecision Policy which is passed as an argument to the FSDP wrapper
+
+### Usage 
+Add the following code and replace the FSDP Wrapper calls in the [full example](#Hybrid-STOP) to apply mixed precision training (specifically bfloat16 in this case). 
+```python
+precision_dt = torch.bfloat16
+mixedPrecisionPolicy = MixedPrecision(
+    param_dtype=precision_dt,
+    reduce_dtype=precision_dt,
+    buffer_dtype=precision_dt,
+)
+
+if fsdp_size > 1 and simple_ddp_size > 1:
+    model = FSDP(model, device_id=local_rank, process_group= (fsdp_group,simple_ddp_group), sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.HYBRID_SHARD mixed_precision=mixedPrecisionPolicy, forward_prefetch=True, limit_all_gathers = False )
+elif fsdp_size > 1 and simple_ddp_size == 1:
+    model = FSDP(model, device_id=local_rank, process_group= fsdp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.FULL_SHARD, mixed_precision=mixedPrecisionPolicy, forward_prefetch=True, limit_all_gathers = False )
+else:
+    model = FSDP(model, device_id=local_rank, process_group= simple_ddp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.NO_SHARD, mixed_precision=mixedPrecisionPolicy, forward_prefetch=True, limit_all_gathers = False )
+```
+
 ## Layer Wrapping
+TEXT TO DESCRIBE
+### Usage 
+Add the following code and replace the FSDP Wrapper calls in the [full example](#Hybrid-STOP) to apply layer wrapping
+```python
+from UCF_VIT.fsdp.building_blocks import Block
+from torch.nn import Sequential
+import functools
+
+my_auto_wrap_policy = functools.partial(
+    transformer_auto_wrap_policy,
+    transformer_layer_cls={
+        Block, Sequential   # < ---- Your Transformer layer class
+    },
+
+if fsdp_size > 1 and simple_ddp_size > 1:
+    model = FSDP(model, device_id=local_rank, process_group= (fsdp_group,simple_ddp_group), sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.HYBRID_SHARD, auto_wrap_policy = my_auto_wrap_policy, forward_prefetch=True, limit_all_gathers = False )
+elif fsdp_size > 1 and simple_ddp_size == 1:
+    model = FSDP(model, device_id=local_rank, process_group= fsdp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.FULL_SHARD, auto_wrap_policy = my_auto_wrap_policy, forward_prefetch=True, limit_all_gathers = False )
+else:
+    model = FSDP(model, device_id=local_rank, process_group= simple_ddp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.NO_SHARD, auto_wrap_policy = my_auto_wrap_policy, forward_prefetch=True, limit_all_gathers = False )
+)
+```
 ## Activation Checkpointing
+TEXT TO DESCRIBE
+### Usage
+Add the following code after the FSDP Wrapper
+```python
+from UCF_VIT.fsdp.building_blocks import Block
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+   checkpoint_wrapper,
+   apply_activation_checkpointing,
+)
+
+check_fn = lambda submodule: isinstance(submodule, Block)
+apply_activation_checkpointing(
+    model, checkpoint_wrapper_fn=checkpoint_wrapper, check_fn=check_fn
+)
+
+```
 ## Composable Kernels
 
 ## Advanced Features
