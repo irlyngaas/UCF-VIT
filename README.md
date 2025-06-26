@@ -313,8 +313,8 @@ apply_activation_checkpointing(
 ## Composable Kernels
 
 ## Advanced Features
-### Adaptive Patching
-### Variable Aggregation
+## Adaptive Patching
+## Variable Aggregation
 
 # Supported Model Architectures
 Currently we provide 5 different architecutres **(VIT, MAE, UNETR, SAP, VIT-DIFFUSION)**, all of which use the same VIT encoder, but a different decoder architecture depending on the task being trained. All code for the different architectures inherit the ecnoder from VIT in order to facilitate using the same encoder.
@@ -578,7 +578,7 @@ Diffusion model training based on [5]. Task: Generate Image via noise that match
 import torch
 from UCF_VIT.simple.arch import DiffusionVIT
 from UCF_VIT.utils.fused_attn import FusedAttn
- rom UCF_VIT.ddpm.ddpm import DDPM_Scheduler
+from UCF_VIT.ddpm.ddpm import DDPM_Scheduler
 
 model = DiffusionVIT(
         img_size=[256,256],
@@ -625,9 +625,9 @@ output = unpatchify(output, data, patch_size, twoD) #(1, 3, 256, 256)
 Number of time steps in the diffusion process
 
 ## Dataloader
-The dataloader we provide is a custom native pytorch iterative dataloader. For simplicity, we assume that we are receiving raw data files and we leave it to the user to normalize the data properly within in the dataloader module for training. The purpose of making this assumption of raw data file as input is 1) it removes the need for further data preprocessing scripts to be included in this repo, and 2) we want to provide an end-to-end worfklow from raw data to model prediction. If performing preprocessing during the dataloading phase is too computationally intensive, we recommend doing it offline and properly storing it in a manner that the dataloader module can handle. 
+The dataloader we provide is a custom native pytorch iterative dataloader. For simplicity, we assume that we are receiving raw data files and we leave it to the user to normalize the data properly within in the dataloader module for training. The reasons for making this assumption of raw data file as input is 1) we intend this repo to be used on very large datasets, thus preprocessing and storing all of the data before training can quickly take up a massive amount of storage, and 2) it removes the need for further data preprocessing scripts to be included in this repo. If performing preprocessing during the dataloading phase is too computationally intensive, we recommend doing it offline and properly storing it in a manner that the dataloader module can handle. 
 
-The dataloader is built in a fashion such that it can handle multiple different dataset directories at the same time. A dataset directory contains one or more raw data file (with all raw data files having the same dimension or able to be resized so that they have the same dimension). The purpose of being able to handle multiple dataset directories is 1) it provides flexible training where you can easily remove and add different datasets for the purposes of running experiments and 2) it allows for the integration of identifying properties from the different datasets that can potentially used for improved learning via our advanced features. For instance, with data that has multiple channels, e.g. images with (R,G,B) channels, we are able to pass along the information on what variable the channel is from and use that information during network training. We then could utilize variable aggregration, described in a following section, to tokenize each channel separately.
+The dataloader is built in a fashion such that it can handle multiple different dataset directories at the same time. A dataset directory contains one or more raw data file (with all raw data files having the same dimension or able to be resized so that they have the same dimension). The purpose of being able to handle multiple dataset directories is 1) it provides flexible training where you can easily remove and add different datasets for the purposes of running experiments and 2) it allows for the integration of identifying properties from the different datasets that can potentially used for improved learning via our advanced features. For instance, with data that has multiple channels, e.g. images with (R,G,B) channels, we are able to pass along the information on what variable the channel is from and use that information during network training. We then could utilize [variable aggregration](#variable-aggregation) to tokenize each channel separately.
 
 This dataloader provides the flexibility to add a plethora of different options for customizing how the data is broken up for training. Since we are using a VIT, at least 2D data is expected. However, we have capability for both 2D and 3D spatial data currently. If desired, we have the utilities implemented to break given raw data into smaller tiled chunks. Also, we have a number of different options for how to tile this raw data, e.g. tile overlapping.
 
