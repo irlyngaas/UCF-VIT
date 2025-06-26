@@ -65,10 +65,18 @@ cd lib/8.1.31
 ln -s $CRAY_MPICH_DIR/lib/libfmpich.so libmpicxx.so
 ```
 
-Various example scripts for launching jobs are in the launch folder. Those identified with `_apptainer' in the filename are for running with the Apptainer container
+Various example scripts for launching jobs are in the launch folder. Those identified with `_apptainer` in the filename are for running with the Apptainer container
 
 ## NVIDIA DGX
-Hybrid Sharded Tensor-Data Orthogonal Parallelism is a novel parallelism algorithm that combines tensor parallelism and Fully Sharded Data Parallelism (FSDP). It avoids the peak memory use probelm in FSDP and leads to better memory reduction capability by keeping parameters sharded throughout training. See [] for more details
+To run on NVIDIA DGX systems we rely on Pytorch Docker containers maintained by NVIDIA. The following instructions give commands to build a docker container with our codebase.
+
+```
+cd Docker
+docker build -t ucf-vit:25.05 .
+docker tag ucf-vit:25.05 [DOCKER_USERNAME]/[DOCKER_REPO]/ucf-vit:25.05
+docker push [DOCKER_USERNAME]/[DOCKER_REPO]/ucf-vit:25.05
+```
+Various example scripts for launching jobs are in the launch folder. Those identified with `_dgx` in the filename are for running with the Docker container
 
 # Innovations
 Advanced Parallelism & Efficient Computing
