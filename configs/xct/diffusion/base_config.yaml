@@ -90,7 +90,7 @@ data:
 
 # ---------------------------- LOAD BALANCING -------------------------------------------
 load_balancing:
-  load_balancing:
+  auto_load_balancing: True
   batches_per_rank_epoch: {
   'xct1': 592,
   }
