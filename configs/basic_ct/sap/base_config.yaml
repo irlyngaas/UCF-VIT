@@ -17,7 +17,6 @@ parallelism:
   simple_ddp_size: 8
   tensor_par_size: 1
   seq_par_size: 1
-  cpu_offloading: False
 # ---------------------------- MODEL -------------------------------------------
 model:
   lr: 0.0001
@@ -69,9 +68,6 @@ data:
   dict_buffer_sizes: {
     'ct1': 100,
   }
-  num_channels_available: {
-    'ct1': 1,
-  }
   num_channels_used: {
     'ct1': 1,
   }
@@ -90,6 +86,7 @@ data:
 
 # ---------------------------- LOAD BALANCING -------------------------------------------
 load_balancing:
+  auto_load_balancing: True
   batches_per_rank_epoch: {
     'ct1': 13568,
   }
