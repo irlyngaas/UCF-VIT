@@ -201,8 +201,8 @@ if dist.get_rank(tensor_par_group) == 0:
             twoD = True,
             single_channel = False,
             return_label = False,
-            dataset_group_list = '1:1:1:1', #Calculate from running utils/preprocess_load_balancing.py
-            batches_per_rank_epoch = {'imagenet':9945}, #Calculated from running utils/preprocess_load_balancing.py
+            dataset_group_list = '1:1:1:1', #Calculated from running utils/load_balance.py
+            batches_per_rank_epoch = {'imagenet':9945}, #Calculated from running utils/load_balance.py
             tile_overlap = 0.0,
             use_all_data = False,
             adaptive_patching = False,
@@ -801,8 +801,8 @@ We provide several training scripts. These include all of the necessary things f
 - Change project allocation to one you have access to `#SBATCH -A PROJXXX`.
 - Set number of nodes you want to run with `#SBATCH --nodes=N`
 
-6. Run Load Balancing Script
-- `python utils/preprocess_load_balancing.py [CONFIG_FILE] [NUM_GPUS]`
+6. Run Load Balancing Script (or set `auto_load_balancing` to True in config file and skip to step 8)
+- `python utils/load_balance.py [CONFIG_FILE] [NUM_GPUS]`
 
 7. Modify Config File with the output from load balancing output
 - dataset_group_list
