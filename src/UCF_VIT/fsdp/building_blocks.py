@@ -184,7 +184,13 @@ class Attention(nn.Module):
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
 
-        if self.fused_attn == FusedAttn.CK:
+        if self.fused_attn == FusedAttn.FLASH:
+            x = xformers.ops.memory_efficient_attention(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), 
+                p=self.attn_drop.p,
+                op=xformers.ops.MemoryEfficientAttentionFlashAttentionOp
+            )
+        elif self.fused_attn == FusedAttn.CK:
             x = xformers.ops.memory_efficient_attention(
                 q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
                 p=self.attn_drop.p,

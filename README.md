@@ -302,7 +302,7 @@ else:
 )
 ```
 ## Activation Checkpointing
-The ability to invoke activation checkpointing to the model is provided through FSDP's `apply_activation_checkpointing`. In our cases we again apply activation checkpointing to the `Block` submodule containing the transformer computational layers to reduce the memory storage required by that component of the model training. With activation checkpointing, the gradients are no longer stored for that component to be used during the backward pass of optimatization. Rather the gradients are recomputed from previously stored states when necessary during the backwards pass, significantly reducing the amount of GPU memory used during runtime.
+The ability to invoke activation checkpointing to the model is provided through FSDP's `apply_activation_checkpointing` function. In our cases we apply activation checkpointing only to the `Block` submodule containing the transformer computational layers to reduce the memory storage required by that component of the model training. With activation checkpointing, the gradients are no longer stored for that component to be used during the backward pass of optimatization. Rather the gradients are recomputed from previously stored states when necessary during the backwards pass, significantly reducing the amount of GPU memory used during runtime.
 ### Usage
 Add the following code after the FSDP Wrapper
 ```python
@@ -318,10 +318,44 @@ apply_activation_checkpointing(
 )
 
 ```
-## Composable Kernels
+## XFormers
+In order to integrate computationally efficient kernels across different GPU accelerated hardware, we rely on the XFormers libary. The XFormers library provides an interface to memory efficient implementations of fused multi-head attention (FMHA) for various different hardwares. On AMD GPUs we use the ComposableKernel (CK) implementation of FMHA and on NVIDIA GPUs we use the FlashAttention implementation of FMHA. These two implementations only have compatibility with bfloat16 operations, thus with float32 data types we use the default torch FMHA kernel implementation.
 
-## Advanced Features
+### Usage 
+We provide an enumerated class with which to choose the FMHA implementation to use in the architecture class.
+```python
+from UCF_VIT.utils.fused_attn import FusedAttn
+
+#Choose from these options
+FusedAttn_option = FusedAttn.DEFAULT #Default torch implementation of FMHA compatible with float32 datatype
+#FusedAttn_option = FusedAttn.FLASH #Flash Attention implementation of FMHA comatible with bloat16 datatype and NVIDIA GPUs
+#FusedAttn_option = FusedAttn.CK #Flash Attention implementation of FMHA comatible with bloat16 datatype and AMD GPUs
+#FusedAttn_option = FusedAttn.None #Basic Python implementation of FMHA
+
+model = VIT(
+    img_size = [256,256],
+    patch_size = 16,
+    num_classes = 1000,
+    in_chans = 3,
+    embed_dim = 768,
+    depth = 12,
+    num_heads = 12,
+    mlp_ratio = 4,
+    drop_path_rate = 0.1,
+    drop_rate = 0.1,
+    twoD = True, # set False if 3D
+    use_varemb = False,
+    default_vars = ["red", "green", "blue"]
+    single_channel = False,
+    adaptive_patching = False,
+    fixed_length = None,
+    FusedAttn_option = FusedAttn_option,
+)
+
+```
+
 ## Adaptive Patching
+
 ## Variable Aggregation
 
 # Supported Model Architectures

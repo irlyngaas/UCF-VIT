@@ -67,6 +67,8 @@ def main(device):
 
     data_type = conf['trainer']['data_type']
 
+    gpu_type = conf['trainer']['gpu_type']
+
     checkpoint_path = conf['trainer']['checkpoint_path']
   
     checkpoint_filename = conf['trainer']['checkpoint_filename']
@@ -214,7 +216,13 @@ def main(device):
 #2. Initialize model, optimizer, and scheduler
 ##############################################################################################################
     if data_type == "bfloat16":
-        FusedAttn_option = FusedAttn.CK
+        if gpu_type == "amd":
+            FusedAttn_option = FusedAttn.CK
+        elif gpu_type == "nvidia":
+            FusedAttn_option = FusedAttn.FLASH
+        else:
+            print("Invalid gpu_type used, reverting to using default FMHA")
+            FusedAttn_option = FusedAttn.DEFAULT
     else:
         if use_fused_attn():
             FusedAttn_option = FusedAttn.DEFAULT
