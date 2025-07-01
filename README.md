@@ -279,7 +279,7 @@ else:
 ```
 
 ## Layer Wrapping
-TEXT TO DESCRIBE
+The ability to use layer wrapping is facilitated through by using a custom autowrap policy which is passed as an argument to the FSDP wrapper. The purpose of this wrapping is to control how and when the parameters of each layer are sharded and gathered during the forward and backward passes. By wrapping layers in the Block submodule (which contains the transformer computational layers) peak GPU memory usage is reduced, and communication and computations have improved overlapping.
 ### Usage 
 Add the following code and replace the FSDP Wrapper calls in the [full example](#Hybrid-STOP) to apply layer wrapping
 ```python
@@ -290,7 +290,7 @@ import functools
 my_auto_wrap_policy = functools.partial(
     transformer_auto_wrap_policy,
     transformer_layer_cls={
-        Block, Sequential   # < ---- Your Transformer layer class
+        Block, Sequential
     },
 
 if fsdp_size > 1 and simple_ddp_size > 1:
@@ -302,7 +302,7 @@ else:
 )
 ```
 ## Activation Checkpointing
-TEXT TO DESCRIBE
+The ability to invoke activation checkpointing to the model is provided through FSDP's `apply_activation_checkpointing`. In our cases we again apply activation checkpointing to the `Block` submodule containing the transformer computational layers to reduce the memory storage required by that component of the model training. With activation checkpointing, the gradients are no longer stored for that component to be used during the backward pass of optimatization. Rather the gradients are recomputed from previously stored states when necessary during the backwards pass, significantly reducing the amount of GPU memory used during runtime.
 ### Usage
 Add the following code after the FSDP Wrapper
 ```python
