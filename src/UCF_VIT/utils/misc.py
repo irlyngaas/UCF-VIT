@@ -237,42 +237,14 @@ def init_par_groups(world_rank, data_par_size, tensor_par_size, seq_par_size, fs
 
     return seq_par_group, ddp_group, tensor_par_group, data_seq_ort_group, fsdp_group, simple_ddp_group
 
-def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VERBOSE=False):
-    conf = yaml.load(open(yaml_file,'r'),Loader=yaml.FullLoader)
-    num_total_ddp_ranks = data_par_size
-
-    dict_root_dirs = conf['data']['dict_root_dirs']
-    dict_start_idx = conf['data']['dict_start_idx']
-    dict_end_idx = conf['data']['dict_end_idx']
-    dict_in_variables = conf['data']['dict_in_variables']
-    tile_size =  conf['model']['net']['init_args']['tile_size']
-    twoD = conf['model']['net']['init_args']['twoD']
-    num_channels_used = conf['data']['num_channels_used']
-    single_channel = conf['data']['single_channel']
-    batch_size = conf['data']['batch_size']
-    tile_overlap = conf['data']['tile_overlap']
-    use_all_data = conf['data']['use_all_data']
-    patch_size =  conf['model']['net']['init_args']['patch_size']
-    max_epochs=conf['trainer']['max_epochs']
-    dataset = conf['data']['dataset']
-
-    if dataset == "imagenet":
-        imagenet_resize = conf['dataset_options']['imagenet_resize']
-
-    tile_size_x = int(tile_size[0])
-    tile_size_y = int(tile_size[1])
-    if dataset != "imagenet":
-        tile_size_z = int(tile_size[2])
-
-    #ADD NEW DATASET HERE
-    #Corresponds to the process_root_dirs function of the NativePytorchDataModule in src/UCF_VIT/dataloaders/datamodule.py
+def process_root_dirs(dataset, dict_root_dirs, data_par_size):
     if dataset == "imagenet":
         dict_lister_trains = {}
         for k, root_dir in dict_root_dirs.items():
+            #TODO: Add shuffling for data_par_size if it doesn't divide 1000 equally
             classes = sorted(os.listdir(root_dir))
-            class_to_idx = {cls_name: idx for idx, cls_name in enumerate(classes)}
-            if len(classes) > num_total_ddp_ranks:
-                classes_to_combine = int(len(classes) // num_total_ddp_ranks)
+            if len(classes) > data_par_size:
+                classes_to_combine = int(len(classes) // data_par_size)
             img_list = []
             classes_counter = 0
             num_data_roots = 0
@@ -284,18 +256,56 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
                 for img_path in glob.glob(os.path.join(cls_dir,"*.JPEG")):
                     img_list.append(img_path)
                 classes_counter += 1
+            
                 if classes_counter == classes_to_combine:
                     img_dict = {num_data_roots: img_list}
                     dict_lister_trains.update(img_dict)
                     num_data_roots +=1
 
-                if num_data_roots > num_total_ddp_ranks-1:
+                if num_data_roots > data_par_size-1:
                     break
     else:
-        dict_lister_trains = {
-            k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in dict_root_dirs.items()
-        }
-        
+        dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in dict_root_dirs.items() }
+    return dict_lister_trains
+
+def read_process_file(dataset, path, imagenet_resize):
+    if dataset == "imagenet":
+        data = Image.open(path).convert("RGB")
+        data = np.array(data) 
+        data = cv.resize(data, dsize=[imagenet_resize["imagenet"][0],imagenet_resize["imagenet"][1]])
+    else:
+        data = nib.load(path)
+        data = np.array(data.dataobj).astype(np.float32)
+    return data
+
+def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VERBOSE=False):
+    conf = yaml.load(open(yaml_file,'r'),Loader=yaml.FullLoader)
+    num_total_ddp_ranks = data_par_size
+
+    dict_root_dirs = conf['data']['dict_root_dirs']
+    dict_start_idx = conf['data']['dict_start_idx']
+    dict_end_idx = conf['data']['dict_end_idx']
+    tile_size =  conf['model']['net']['init_args']['tile_size']
+    twoD = conf['model']['net']['init_args']['twoD']
+    num_channels_used = conf['data']['num_channels_used']
+    single_channel = conf['data']['single_channel']
+    batch_size = conf['data']['batch_size']
+    tile_overlap = conf['data']['tile_overlap']
+    use_all_data = conf['data']['use_all_data']
+    patch_size =  conf['model']['net']['init_args']['patch_size']
+    dataset = conf['data']['dataset']
+
+    if dataset == "imagenet":
+        imagenet_resize = conf['dataset_options']['imagenet_resize']
+    else:
+        imagenet_resize = None
+
+    tile_size_x = int(tile_size[0])
+    tile_size_y = int(tile_size[1])
+    if dataset != "imagenet":
+        tile_size_z = int(tile_size[2])
+
+    dict_lister_trains = process_root_dirs(dataset, dict_root_dirs, num_total_ddp_ranks)
 
     num_total_tiles = []
     num_total_images = []
@@ -314,16 +324,7 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
 
         #Assume all channels have the same data size
         data_path = keys[0]
-        
-        #ADD NEW DATASET HERE
-        #Corresponds to the read_process_file function of the FileReader class in src/UCF_VIT/dataloaders/dataset.py
-        if dataset == "imagenet":
-            data = Image.open(data_path).convert("RGB")
-            data = np.array(data) 
-            data = cv.resize(data, dsize=[imagenet_resize["imagenet"][0],imagenet_resize["imagenet"][1]])
-        else:
-            data = nib.load(data_path)
-            data = np.array(data.dataobj).astype(np.float32)
+        data = read_process_file(dataset, data_path, imagenet_resize)
 
         tile_overlap_size_x = int(tile_size_x*tile_overlap)
         tile_overlap_size_y = int(tile_size_y*tile_overlap)

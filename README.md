@@ -730,11 +730,11 @@ Whether to return back a corresponding label to each tile when loading data
 - `auto_load_balancing`: Bool
 Whether to allow [Load Balancing](#load-balancing) to be done automatically in the training script. If True, then both both dataset_group_list and batches_per_rank_epoch do not need to specified in the config file.
 
-- `dataset_group_list`: str of colon separated ints.
-How to split available GPUs amongst the available datasets. Run "python utils/preprocess_load_balancing.py [CONFIG_FILE] [NUM_GPUS]" to obtain. See [Load Balancing](#load-balancing) for more details
+- `dataset_group_list`: Str of colon separated ints.
+How to split available GPUs amongst the available datasets. Run "python utils/load_balance.py [CONFIG_FILE] [NUM_GPUS]" to obtain. See [Load Balancing](#load-balancing) for more details
 
 - `batches_per_rank_epoch`: Dictionary of Ints.
-How many batches per rank per epoch for a given dataset. Used to get a full epoch from the Dataset with largest value. If a dataset has less than the maximum. Reuse data to obtain enough data to run until the largest data has been fully trained on. Run "python utils/preprocess_load_balancing.py [CONFIG_FILE] [NUM_GPUS]" to obtain. See [Load Balancing](#load-balancing) for more details
+How many batches per rank per epoch for a given dataset. Used to get a full epoch from the Dataset with largest value. If a dataset has less than the maximum. Reuse data to obtain enough data to run until the largest data has been fully trained on. Run "python utils/load_balance.py [CONFIG_FILE] [NUM_GPUS]" to obtain. See [Load Balancing](#load-balancing) for more details
 
 - `tile_overlap`: Float (0,1).
 Amount of tile overlapping to use, multiplies tile_size by tile_overlap to determine step size. Use 0.0 for no overlapping
@@ -742,10 +742,10 @@ Amount of tile overlapping to use, multiplies tile_size by tile_overlap to deter
 - `use_all_data`: Bool. 
 Whether or not to use all data in dataloading. Including if tile size doesn't evenly split images. If tile size splits an image unevenly on last tile of a dimension go from last pixel backwards to get a full tile
 
-- `adaptive_patching`: bool.
+- `adaptive_patching`: Bool.
 Variable for indicating whether to use adaptive patching. If set to True, Adaptive Patching is done within the dataloader before being fed into a model. See [Adaptive Patching](#adaptive-patching)
 
-- `fixed_length`: int.
+- `fixed_length`: Int.
 How many adaptive patches used to tokenize the input image. Only used if **adaptive_patching** is set to true
 
 - `separate_channels`: Bool.
@@ -767,11 +767,14 @@ For Examples, see the XCT-Diffusion, SST, and S8D branches
 - Add a new branch to if/else in the process_root_dirs function of the NativePytorchDataModule in `src/UCF_VIT/dataloaders/datamodule.py`, to process datafile paths from each dataset into a corresponding dictionary
 3. Write code that uses appropriate iterative dataloader functions from `src/UCF_VIT/dataloaders/dataset.py` to handle the raw data files
 - Add a new branch to if/else in the set_iterative_dataloader function of the NativePytorchDataModule class in `src/UCF_VIT/dataloaders/datamodule.py`, using the correct Tile Iterator (ImageBlockDataIter_2D or ImageBlockDataIter_3D) depending on the dimension of your data
-4. Write code to approriately read and process (including normalization) raw data files
+4. Write code to appropriately read and process (including normalization) raw data files
 - Add a new branch to if/else in the read_process_file function of the FileReader class in `src/UCF_VIT/dataloaders/dataset.py`, using an appropriate python function to read the raw data files depending on the type
+5. Write code to appropriately load balance data files across the computing hardware
+- Add a new branch to if/else in the process_root_dirs function of `src/UCF_VIT/utils/misc.py` (similar to step 2)
+- Add a new bracnh to if/else in the read_process_file function of `src/UCF_VIT/utils/misc.py` (similar to step 4)
 
 ## Load Balancing
-In order for the dataloader to handle multiple datasets at the same time, the data needs to be spread out amongst the GPUs evenly. In the case where different datasets have different amounts and/or different sizes of images, it's difficult to evenly spread this data amongst the GPUs evenly. We provide example load balancing scripts that for a given setting in a config file determines how the data should be split amongst a given set of N GPUs, in order to evenly balance the data amongst the compute resources. The output from this script gives the necessary information to the dataloader in order to do this in a proper fashion.
+In order for the dataloader to handle multiple datasets at the same time, the data needs to be spread out amongst the GPUs evenly. In the case where different datasets have different amounts and/or different sizes of images, it's difficult to evenly spread this data amongst the GPUs evenly. We provide example load balancing scripts that for a given setting in a config file determines how the data should be split amongst a given set of N GPUs, in order to evenly balance the data amongst the compute resources. The output from this script gives the necessary information to the dataloader in order to do this in a proper fashion. If you want this load_balancing to be done automatically set `auto_load_balancing` to True in your config file. If you want to do the load balancing manually to check for correct implementation run `python utils/load_balance.py [CONFIG_FILE] [NUM_GPUS]` and use the output from this script to add to the load balancing portion of the config file.
 
 ## Parallelism Modes
 All of these architectures exist in 2 independent sub-folders, simple and fsdp, for which we separate the network architecture code into what we call modes. The choice of mode to be used will depend on the types of advanced parallelism and computing techniques needed for the model being trained.  The first `src/UCF_VIT/simple`, provides a simplified version for training in Distributed Data Parallel (DDP) fashion only. The second `src/UCF_VIT/fsdp`, provides a more complex version with different parallel training techniques. This includes options for training with a combination of Sharded Data Parallelism , DDP, and Tensor Parallelism. These parallelisms are all integrated via Hybrid Sharded Tensor-Data Parallelism (Hybrid-STOP) from [6,7]. Both modes can be used with the same data loading module and load balancing scripts provided. While the training done within the simple mode can be done with the correct choice of options in the fsdp mode, the purpose of keeping the simple mode is 1) to provide an entry point for new users and developers to add new architectures without the intricacies of the advanced features and 2) to provide a simple reference point to compare with when new innovations are added in order to test how they interact with the more complex parallelism methods.
