@@ -329,7 +329,7 @@ from UCF_VIT.utils.fused_attn import FusedAttn
 #Choose from these options
 FusedAttn_option = FusedAttn.DEFAULT #Default torch implementation of FMHA compatible with float32 datatype
 #FusedAttn_option = FusedAttn.FLASH #Flash Attention implementation of FMHA comatible with bloat16 datatype and NVIDIA GPUs
-#FusedAttn_option = FusedAttn.CK #Flash Attention implementation of FMHA comatible with bloat16 datatype and AMD GPUs
+#FusedAttn_option = FusedAttn.CK #Composable Kernel implementation of FMHA comatible with bloat16 datatype and AMD GPUs
 #FusedAttn_option = FusedAttn.None #Basic Python implementation of FMHA
 
 model = VIT(
@@ -355,8 +355,16 @@ model = VIT(
 ```
 
 ## Adaptive Patching
+A recent innovation for efficient computing with VITs that we have implemented within this codebase is adaptive patching. Traditionally in VITs, input images (or data) are separated in to individual nonoverlapping pixels (or individual datapoints) called tokens of size patch_size x patch_size in 2D (or patch_size x patch_size x patch_size in 3D), these tokens are then flattened to be used as input to the ViT. When input image sizes become too large, the sequence length of the tokens being fed into the network can become intractably large except for at very large patch sizes which can then hinder the ability to do more accurate predictions. Often it is the case there is there is large portions of inputs that are largely homogenous and thus it is wasteful to consider all of the input tokens equally. Adaptive patching is an approach inspired by Adaptive Mesh Refinement (AMR) techniques in which a tree is used to break down the input into adaptively sized regions based on some quantity of interest such as the magnitude of the gradient. In our case we use a Canny Edge detection method is used to break down the images with a quadtree (2D) or octtree (3D) into a smaller regions adaptively depending on the amount of edges in certain regions of the image. To control the amount of regions the image is broken into we use the integer variable `fixed_length`, to tell the adaptive patching to stop splitting the image into more subcomponents. Each adaptively sized region is resized into a token of patch_size x patch_size to be fed in a form suitable for feeding into a VIT. This approach can drastrically reduce the sequence length of tokens and consequently significantly reduced the amount of compute time required to feed through the network.
+
+### Usage
+In our implementation, adaptive patching is currently handled during dataloading time. Therefore if `adaptive_patching` is set to True rather than the dataloader passing back a batch of input images, instead a batch of adaptively patched input images are passed through the dataloader. If adaptive patching is being used, an integer fixed length needs to be defined and it must be chosen such that 3n+1 = fixed_length where n is some integer if the input is 2D or such that 7n+1 = fixed_length where n is some integer if the input is 3D. Also it is a requirement that the input images must be of a size that is a power of 2, e.g (32x32), (64x64) etc. or (32x32x32), (64x64x64) etc. 
 
 ## Variable Aggregation
+Another advanced technique that we have introduced into this codebase particularly for foundational model training is the capability to do variable aggregation. Variable aggregation is a technique where instead of tokenizing multi-channel inputs all at once, each individual channel is tokenize individually, given some direction via the `variables` argument in the forward pass, when being transformed into the latent embedding dimension space. Each of these individually tokenized embedded vectors are then fed through an additional attention mechanism to compress all of the input into a single dimension. The reason it is important that these input channels be tokenized individually for each input channel is because it allows the flexibility to use a pre-trained foundational model in all different types of context. For instance variable aggregation allows for the ability to use any number of the different channels when training on a downstream task with dataset that is missing one of the initial channels from the original pre-trained model. 
+
+### Usage 
+In order to use variable aggregation set the `use_varemb` to True. In the case where `use_varemb=False` multi-channel tokenization over the entire data will be performed and thus any fruther finetuning will require data that matches the specific number of channels as the original pre-trained model.
 
 # Supported Model Architectures
 Currently we provide 5 different architecutres **(VIT, MAE, UNETR, SAP, VIT-DIFFUSION)**, all of which use the same VIT encoder, but a different decoder architecture depending on the task being trained. All code for the different architectures inherit the ecnoder from VIT in order to facilitate using the same encoder.
