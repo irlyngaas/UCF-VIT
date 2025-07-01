@@ -727,6 +727,9 @@ Variable for indicating that multiple modalities will be used, but the model wil
 - `return_label`: Bool.
 Whether to return back a corresponding label to each tile when loading data
 
+- `auto_load_balancing`: Bool
+Whether to allow [Load Balancing](#load-balancing) to be done automatically in the training script. If True, then both both dataset_group_list and batches_per_rank_epoch do not need to specified in the config file.
+
 - `dataset_group_list`: str of colon separated ints.
 How to split available GPUs amongst the available datasets. Run "python utils/preprocess_load_balancing.py [CONFIG_FILE] [NUM_GPUS]" to obtain. See [Load Balancing](#load-balancing) for more details
 
