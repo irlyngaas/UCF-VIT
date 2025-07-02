@@ -2,7 +2,7 @@
 - [UCF-VIT](#ucf-vit)
 - [Install](#install)
 - [Innovations](#Innovations)
-- [Supported Model Architectures](#supported-model-architectures)
+- [Model Architectures](#model-architectures)
 1. [Vision Transformer](#vision-transformer-vit)
 2. [Masked Autoencoder](#masked-autoencoder-mae)
 3. [Unet Transformer](#unet-transformer-unetr)
@@ -369,8 +369,8 @@ Another advanced technique that we have introduced into this codebase particular
 ### Usage 
 In order to use variable aggregation set the `use_varemb` to True. In the case where `use_varemb=False` multi-channel tokenization will be performed and thus any further training or finetuning with that model will require data to match the specific number of channels as the original data used with that model. Variable aggregation is controlled by sending a list of variables identifiers to the forward pass of the model architecture, i.e. `["red","green","blue"]` for the case of RGB images. This list of variables must correspond correctly with the order that the raw data is formatted in and this process is facilitated through our [dataloader](#dataloader) via passing in the identifier list to the `dict_in_variables` argument of the config file. `default_vars` controls the type of types of input channels that the model will allow for ingestion. Thus every variable in `dict_in_variables` must be in `default_vars`, however not every input channel is necessary when passing through the model. 
 
-# Supported Model Architectures
-Currently we provide 5 different architecutres **(VIT, MAE, UNETR, SAP, VIT-DIFFUSION)**, all of which use the same VIT encoder, but a different decoder architecture depending on the task being trained. All code for the different architectures inherit the encoder from the VIT architecture class in order to facilitate using the same encoder. In the following sections we provide working examples for exectuing a forward pass with each of these architectures that can be ran on a single CPU. For more complex full training runs on multiple GPUs look to the example scripts in the `training_scripts/` directory.
+# Model Architectures
+Currently we provide 5 different model architecutres **(VIT, MAE, UNETR, SAP, VIT-DIFFUSION)**, all of which use the same VIT encoder, but a different decoder architecture depending on the task being trained. All code for the different architectures inherit the encoder from the VIT architecture class in order to facilitate using the same encoder. In the following sections we provide working examples for exectuing a forward pass with each of these architectures that can be ran on a single CPU. For more complex full training runs on multiple GPUs look to the example scripts in the `training_scripts/` directory.
 
 ## Vision Transformer (VIT)
 VIT based on [[7]](#7). Code slimmed down from (https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/vision_transformer.py#L425) to only contain basic options for VIT Training and adapted to integrate our [innovations](#innovations). Task: Image Classification. Input: Image or Image Tile (A tile is a subset portion of a full image).
@@ -844,7 +844,7 @@ The main building blocks for the VIT based archictectures are in the **Attention
 We provide several example training scripts. These include all of the necessary things for running the main training loop, including utilities such as checkpoint loading and saving. We leave it to the user to implement their own validation and testing routines in order to more closely fit their needs. Training scripts are provided for each of the training architectures for the simple mode. To convert these scripts to use fsdp mode, look at the code changes made to go from `training_scripts/train_masked_simple.py` to `training_scripts/train_masked_fsdp.py`
 
 ## Config Files
-We store the arguments for each individual run in a yaml file. This config file holds all of the arguments for defining the specific training, dataloading, parallelism, and checkpointing options. Below are a number of arguments used in these config files that weren't listed in the example files in the [Supported Model Architectures](#supported-model-architectures) sections. In addition to these arguments, the config files also are store information for running the architectures through stored variables.
+We store the arguments for each individual run in a yaml file. This config file holds all of the arguments for defining the specific training, dataloading, parallelism, and checkpointing options. Below are a number of arguments used in these config files that weren't listed in the example files in the [Model Architectures](#model-architectures) section. In addition to these arguments, the config files also are store information for running the architectures through stored variables.
 
 1. Trainer
 - max_epochs: Max number of epochs to train
