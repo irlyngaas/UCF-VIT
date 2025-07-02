@@ -79,12 +79,12 @@ docker push [DOCKER_USERNAME]/[DOCKER_REPO]/ucf-vit:25.05
 Various example scripts for launching jobs are in the launch folder. Those identified with `_dgx` in the filename are for running with the Docker container
 
 # Innovations
-Advanced Parallelism & Efficient Computing
+In this codebase, we provide various Advanced Parallelism & Efficient Computing techniques that we have used to explore larger model and input sizes with VITs than has been previously possible. These techniques range from novel methods to the utilization of several techniques provided by external libraries that are integrated with these novel techniques.
 
 ## Hybrid-STOP 
 Hybrid Sharded Tensor-Data Orthogonal Parallelism (Hybrid-STOP) [[1]](#1) is a novel parallelism algorithm that combines tensor parallelism and Fully Sharded Data Parallelism (FSDP). It avoids the peak memory use probelm in FSDP and leads to better memory reduction capability by keeping parameters sharded throughout training. 
 ### Usage
-The Hybrid-STOP algorithm is available when using our fsdp [parallelism mode](#parallelism-modes). The following example shows how to initialize and do the forward pass of a [MAE](#masked-autoencoder-mae) model using this algorithm for different number of simple_ddp, fsdp, and tensor parallel ranks. Our custom [dataloader](#dataloader) with the [Imagenet](#imagenet) dataset is used to facilitate proper dataloading when tensor parallelism is > 1 (In this case each tensor parallel rank needs the same batch of input data).
+The Hybrid-STOP algorithm is available when using our fsdp [parallelism mode](#parallelism-modes). The following example shows how to initialize and do the forward pass of a [MAE](#masked-autoencoder-mae) model using this algorithm for different number of simple_ddp, fsdp, and tensor parallel ranks (see scripts in the training_script folder full end-to-end training examples). Our custom [dataloader](#dataloader) with the [Imagenet](#imagenet) dataset is used to facilitate proper dataloading when tensor parallelism is > 1 (In this case each tensor parallel rank needs the same batch of input data). This example is meant to be run on a system that uses a slurm resource scheduler, e.g. with a single node via the following `srun -n 8 -c 7 --gpus 8 python test-hstop.py`.
 
 ```python
 import os
@@ -201,8 +201,8 @@ if dist.get_rank(tensor_par_group) == 0:
             twoD = True,
             single_channel = False,
             return_label = False,
-            dataset_group_list = '1:1:1:1', #Calculated from running utils/load_balance.py
-            batches_per_rank_epoch = {'imagenet':9945}, #Calculated from running utils/load_balance.py
+            dataset_group_list = '1:1:1:1', #Calculated from running utils/load_balance.py with a corresponding config file, these values will change if data_par_size changes
+            batches_per_rank_epoch = {'imagenet':9945}, #Calculated from running utils/load_balance.py with a corresponding config file, these values will change if data_par_size changes
             tile_overlap = 0.0,
             use_all_data = False,
             adaptive_patching = False,
@@ -242,7 +242,7 @@ while counter < 9945:
 ```
 
 ### Implementation Details 
-In order to properly implement the H-STOP algorithm, specifically the tensor parallelism aspects, the architecture code requires modifications to correctly split up and communicate the tensor calculations amongst the tensor parallel ranks. Currently tensor parallelism is only enacted over the attention and mlp calculations, which are the costliest components. The below code snippet shows how the tensor parallel implementation is implemented in the FSDP parallelism mode, corresponding modifications are built into the attention mechanism in building_blocks.py. Tensor parallelism is not implemented in simple parallelism mode, so the tensor_par_group communicator group is not required to be passed to the neural network architecture for that case.  
+In order to properly implement the H-STOP algorithm, specifically the tensor parallelism aspects, the architecture code requires modifications (from that of the code for the ([simple architecture mode](#parallelism-modes)) to correctly split up and communicate the tensor calculations amongst the tensor parallel ranks. Currently tensor parallelism is only enacted over the attention and mlp calculations, which are the costliest components. The below code snippet shows how the tensor parallel implementation is implemented in the FSDP parallelism mode, corresponding modifications are built into the attention mechanism in `src/UCF-VIT/fsdp/building_blocks.py`. Tensor parallelism is not implemented in simple parallelism mode, so the tensor_par_group communicator group is not required to be passed to the neural network architecture for that case. Here `self.blocks` corresponds to the attention and multi-layer perceptron (mlp) layers that consist of the bulk of the computing in each of the VIT architectures.  
 
 ```python
 if self.tensor_par_size > 1:
@@ -258,7 +258,7 @@ if self.tensor_par_size > 1:
 ```
 
 ## Lower Precision Support
-The ability to implement lower precision support is facilitated by using a MixedPrecision Policy which is passed as an argument to the FSDP wrapper
+The ability to implement lower precision support is facilitated by using a MixedPrecision Policy which is passed as an argument to the FSDP wrapper. Using lower precision data types such as bfloat16 reduces storage size to allow for large model sizes and increased throughput due to the faster computing that is possible with lower precision.
 
 ### Usage 
 Add the following code and replace the FSDP Wrapper calls in the [full example](#Hybrid-STOP) to apply mixed precision training (specifically bfloat16 in this case). 
@@ -279,7 +279,7 @@ else:
 ```
 
 ## Layer Wrapping
-The ability to use layer wrapping is facilitated through by using a custom autowrap policy which is passed as an argument to the FSDP wrapper. The purpose of this wrapping is to control how and when the parameters of each layer are sharded and gathered during the forward and backward passes. By wrapping layers in the Block submodule (which contains the transformer computational layers) peak GPU memory usage is reduced, and communication and computations have improved overlapping.
+The ability to use layer wrapping is facilitated by using a custom autowrap policy which is passed as an argument to the FSDP wrapper. The purpose of this wrapping is to control how and when the parameters of each layer are sharded and gathered during the forward and backward passes. By wrapping layers in the Block submodule (which contains the transformer computational layers) peak GPU memory usage is reduced, and communication and computations have improved overlapping.
 ### Usage 
 Add the following code and replace the FSDP Wrapper calls in the [full example](#Hybrid-STOP) to apply layer wrapping
 ```python
@@ -318,8 +318,8 @@ apply_activation_checkpointing(
 )
 
 ```
-## XFormers
-In order to integrate computationally efficient kernels across different GPU accelerated hardware, we rely on the XFormers libary. The XFormers library provides an interface to memory efficient implementations of fused multi-head attention (FMHA) for various different hardwares. On AMD GPUs we use the ComposableKernel (CK) implementation of FMHA and on NVIDIA GPUs we use the FlashAttention implementation of FMHA. These two implementations only have compatibility with bfloat16 operations, thus with float32 data types we use the default torch FMHA kernel implementation.
+## Fused Attention via XFormers
+In order to integrate computationally efficient kernels across different GPU accelerated hardware, we rely on the XFormers [[2]](#2) libary. The XFormers library provides an interface to memory efficient implementations of fused multi-head attention (FMHA) for various different hardwares. On AMD GPUs we use the ComposableKernel (CK)[[3]](#3) implementation of FMHA and on NVIDIA GPUs we use the FlashAttention [[4]](#4),[[5]](#5) implementation of FMHA. These two implementations only have compatibility with bfloat16 operations, thus with float32 data types we use the default torch FMHA kernel implementation.
 
 ### Usage 
 We provide an enumerated class with which to choose the FMHA implementation to use in the architecture class.
@@ -355,22 +355,22 @@ model = VIT(
 ```
 
 ## Adaptive Patching
-A recent innovation for efficient computing with VITs that we have implemented within this codebase is adaptive patching. Traditionally in VITs, input images (or data) are separated in to individual nonoverlapping pixels (or individual datapoints) called tokens of size patch_size x patch_size in 2D (or patch_size x patch_size x patch_size in 3D), these tokens are then flattened to be used as input to the ViT. When input image sizes become too large, the sequence length of the tokens being fed into the network can become intractably large except for at very large patch sizes which can then hinder the ability to do more accurate predictions. Often it is the case there is there is large portions of inputs that are largely homogenous and thus it is wasteful to consider all of the input tokens equally. Adaptive patching is an approach inspired by Adaptive Mesh Refinement (AMR) techniques in which a tree is used to break down the input into adaptively sized regions based on some quantity of interest such as the magnitude of the gradient. In our case we use a Canny Edge detection method is used to break down the images with a quadtree (2D) or octtree (3D) into a smaller regions adaptively depending on the amount of edges in certain regions of the image. To control the amount of regions the image is broken into we use the integer variable `fixed_length`, to tell the adaptive patching to stop splitting the image into more subcomponents. Each adaptively sized region is resized into a token of patch_size x patch_size to be fed in a form suitable for feeding into a VIT. This approach can drastrically reduce the sequence length of tokens and consequently significantly reduced the amount of compute time required to feed through the network.
+A recent innovation for efficient computing with VITs that we have implemented within this codebase is adaptive patching [[6]](#6). Traditionally in VITs, input images (or data) are separated in to groups of individual nonoverlapping pixels (or individual datapoints) called tokens of size patch_size x patch_size in 2D (or patch_size x patch_size x patch_size in 3D), these tokens are then flattened to be used as input to the ViT. When input image sizes become too large, the sequence length of tokens being fed into the network can become intractably large except for at very large patch sizes which can hinder the ability to train more accurate models. Often it is the case that there are large portions of regions of input that are largely homogenous, thus it is wasteful to consider all of the input tokens equally. Adaptive patching is an approach inspired by Adaptive Mesh Refinement (AMR) techniques in which a tree is used to break down input data into adaptively sized regions based on some quantity such as the magnitude of the gradient to indicate how much variation is in each spatial region. In our case we use a Canny Edge detection method to break down the images with a quadtree (2D) or octtree (3D) into a smaller regions adaptively depending on the amount of edges in certain regions of the image. To control the amount of regions the image is broken into we use the integer variable `fixed_length`, to tell adaptive patching to stop splitting the image. Each adaptively sized region is then resized into tokens of size patch_size x patch_size or (patch_size x patch_size x patch_size in 3D) to be in a form suitable for being input into a VIT. This approach can drastrically reduce the sequence length of tokens and consequently significantly reduced the amount of compute time required to feed through the network.
 
 ### Usage
-In our implementation, adaptive patching is currently handled during dataloading time. Therefore if `adaptive_patching` is set to True rather than the dataloader passing back a batch of input images, instead a batch of adaptively patched input images are passed through the dataloader. If adaptive patching is being used, an integer fixed length needs to be defined and it must be chosen such that 3n+1 = fixed_length where n is some integer if the input is 2D or such that 7n+1 = fixed_length where n is some integer if the input is 3D. Also it is a requirement that the input images must be of a size that is a power of 2, e.g (32x32), (64x64) etc. or (32x32x32), (64x64x64) etc. 
+In our implementation, adaptive patching is currently handled during dataloading time. Therefore if `adaptive_patching` is set to True rather then the dataloader passing back a batch of input images, instead a batch of adaptively patched input images are passed through the dataloader. If adaptive patching is being used, an integer fixed length needs to be defined and it must be chosen such that 3n+1 = fixed_length where n is some integer if the input is 2D or such that 7n+1 = fixed_length where n is some integer if the input is 3D, to satisify the requirements for the underlying quadtree/octtree. Also it is a requirement that the each dimension of the input images be of a size that is a power of 2, i.e. 32, 64, ..., in order to properly split the data. 
 
 ## Variable Aggregation
-Another advanced technique that we have introduced into this codebase particularly for foundational model training is the capability to do variable aggregation. Variable aggregation is a technique where instead of tokenizing multi-channel inputs all at once, each individual channel is tokenize individually, given some direction via the `variables` argument in the forward pass, when being transformed into the latent embedding dimension space. Each of these individually tokenized embedded vectors are then fed through an additional attention mechanism to compress all of the input into a single dimension. The reason it is important that these input channels be tokenized individually for each input channel is because it allows the flexibility to use a pre-trained foundational model in all different types of context. For instance variable aggregation allows for the ability to use any number of the different channels when training on a downstream task with dataset that is missing one of the initial channels from the original pre-trained model. 
+Another advanced technique that we have introduced into this codebase particularly for the purpose of foundational model training is the capability to incorporate variable aggregation. Variable aggregation is a technique where instead of tokenizing multi-channel inputs all at once and transforming them into the latent embedding dimension space, each individual channel is tokenize individually  and transformed into the latent embedding dimensions space based on the type of channel data, given some direction via the `variables` argument in the forward pass. Each of these channel embedding vectors are then fed through an additional attention mechanism to compress all of the input into a single dimension, a process we call variable aggregation. The reason it is important that these input channels be tokenized and embedded separately is because it allows the flexibility to use a pre-trained foundational model in a flexible manner. Variable aggregation allows for the ability to use different types of data during training, e.g. data that does not contain all of the input channels contained in other datasets that the model is being trained with.
 
 ### Usage 
-In order to use variable aggregation set the `use_varemb` to True. In the case where `use_varemb=False` multi-channel tokenization over the entire data will be performed and thus any fruther finetuning will require data that matches the specific number of channels as the original pre-trained model.
+In order to use variable aggregation set the `use_varemb` to True. In the case where `use_varemb=False` multi-channel tokenization will be performed and thus any further training or finetuning with that model will require data to match the specific number of channels as the original data used with that model. Variable aggregation is controlled by sending a list of variables identifiers to the forward pass of the model architecture, i.e. `["red","green","blue"]` for the case of RGB images. This list of variables must correspond correctly with the order that the raw data is formatted in and this process is facilitated through our [dataloader](#dataloader) via passing in the identifier list to the `dict_in_variables` argument of the config file. `default_vars` controls the type of types of input channels that the model will allow for ingestion. Thus every variable in `dict_in_variables` must be in `default_vars`, however not every input channel is necessary when passing through the model. 
 
 # Supported Model Architectures
-Currently we provide 5 different architecutres **(VIT, MAE, UNETR, SAP, VIT-DIFFUSION)**, all of which use the same VIT encoder, but a different decoder architecture depending on the task being trained. All code for the different architectures inherit the ecnoder from VIT in order to facilitate using the same encoder.
+Currently we provide 5 different architecutres **(VIT, MAE, UNETR, SAP, VIT-DIFFUSION)**, all of which use the same VIT encoder, but a different decoder architecture depending on the task being trained. All code for the different architectures inherit the encoder from the VIT architecture class in order to facilitate using the same encoder. In the following sections we provide working examples for exectuing a forward pass with each of these architectures that can be ran on a single CPU. For more complex full training runs on multiple GPUs look to the example scripts in the `training_scripts/` directory.
 
 ## Vision Transformer (VIT)
-VIT based on [1]. Code adapted and slimmed down from (https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/vision_transformer.py#L425) to only contain basic options for VIT Training and options to use some of the [innovations](#innovations). Task: Image Classification. Input: Image or Image Tile (A tile is a subset portion of a full image).
+VIT based on [[7]](#7). Code slimmed down from (https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/vision_transformer.py#L425) to only contain basic options for VIT Training and adapted to integrate our [innovations](#innovations). Task: Image Classification. Input: Image or Image Tile (A tile is a subset portion of a full image).
 
 ### Usage
 ```python
@@ -391,14 +391,14 @@ model = VIT(
     drop_rate = 0.1,
     twoD = True, # set False if 3D
     use_varemb = False,
-    default_vars = ["red", "green", "blue"]
+    default_vars = ["red", "green", "blue"],
     single_channel = False,
     adaptive_patching = False,
     fixed_length = None,
     FusedAttn_option = FusedAttn.DEFAULT,
 )
 
-img = torch.randn(1, 3, 256, 256)
+img = torch.randn(1, 3, 256, 256) # (batch_size, num_channels, tile_size_x, tile_size_y)
 variables = ["red", "green", "blue"]
 
 preds = model.forward(img, variables) # (1, 1000)
@@ -406,59 +406,59 @@ preds = model.forward(img, variables) # (1, 1000)
 
 ### Parameters
 
-- `img_size`: int, Tuple[int,int], or Tuple[int,int,int].  
+- `img_size`: Int, Tuple[int,int], or Tuple[int,int,int].  
 Image size. If a single int is given the input image is assumed to be the same in each dimension and the dimension of the image is set via the **twoD** variable. If **adaptive_patching** is set to True this variable is ignored, since input has already been patched in an adaptive fashion in the dataloader.
 
-- `patch_size`: int.  
+- `patch_size`: Int.  
 Size of patches. `image_size` must be divisible by `patch_size` if **adaptive_patching** is set to True.
 
-- `num_classes`: int.  
+- `num_classes`: Int.  
 Number of classes to classify.
 
-- `in_chans`: int.  
+- `in_chans`: Int.  
 Number of input channels contained in each input image. E.g, a JPEG image has 3 color channels [R,G,B] at each pixel
 
-- `embed_dim`: int.  
+- `embed_dim`: Int.  
 Embedding dimension for Transformer Inputs
 
-- `depth`: int.
+- `depth`: Int.
 Number of Transformer blocks.
 
-- `num_heads`: int.  
+- `num_heads`: Int.  
 Number of heads in Multi-head Attention layer.
 
-- `mlp_ratio`: int.
+- `mlp_ratio`: Int.
 Ratio of MLP hidden dimension to embedding dimension, used to set the dimension of the MLP (FeedForward) layer.
 
-- `drop_path_rate`: float (0,1).
+- `drop_path_rate`: Float (0,1).
 Stochastic depth dropout rate for dropping random layers during training
 
-- `drop_rate`: float (0,1).
+- `drop_rate`: Float (0,1).
 Dropout rate for classification head
 
-- `twoD`: bool.
-Variable for indicating two or three dimensionsal input, if False, three dimensional input. Needed to do correct patching. Used in coordination with the [dataloader module](#dataloader) to correctly set up the data for the given architecture
+- `twoD`: Bool.
+Variable for indicating two or three dimensionsal input, if False, three dimensional input. Needed to do correct tokenizing. Used in coordination with the [dataloader module](#dataloader) to correctly set up the data for the given architecture
 
-- `use_varemb`: bool.
+- `use_varemb`: Bool.
 Variable for indicating whether to use variable embedding tokens. When using variable embedding tokens each input channel is tokenized separately. In order to feed these tokens into the model, the separate variable tokens are fed through [variable aggregation](#variable-aggregation) to compress multiple input into a single aggregated input channel via an attention mechanism
 
-- `default_vars`: list[str].
-List of different potential modalities to be used as input. When **use_varemb** is set to true, this list contains the possible variable tokenizations available.
+- `default_vars`: List[str].
+List of different potential modalities to be used as input. When **use_varemb** is set to true, this list contains the available input channels.
 
-- `single_channel`: bool.
+- `single_channel`: Bool.
 Variable for indicating that multiple modalities will be used, but the model will be fed with modalities separated into batches only containing a single modality
 
-- `adaptive_patching`: bool.
-Variable for indicating whether to use adaptive patching. See [Adaptive Patching](#adaptive-patching)
+- `adaptive_patching`: Bool.
+Variable for indicating whether to use adaptive patching. See [Adaptive Patching](#adaptive-patching) for more details. 
 
-- `fixed_length`: int.
+- `fixed_length`: Int.
 How many adaptive patches used to tokenize the input image. Only used if **adaptive_patching** is set to true
 
-- `FusedAttn_option`: [FusedAttn.CK, FusedAttn.DEFAULT, FusedAttn.NONE]
-Which option to use for fused attention. CK - [ComposableKernels](#composable-kernels), DEFAULT - torch implementaion, or None - No fused-attention used
+- `FusedAttn_option`: [FusedAttn.FLASH, FusedAttn.CK, FusedAttn.DEFAULT, FusedAttn.NONE]
+Which option to use for fused attention See [Fused Attention](#Fused-Attention-via-XFormers) for more details.
 
 ## Masked Autoencoder (MAE)
-Masked Autoencoder pre-training based on [2]. Task: Masked Image Prediction. Input: Image or Image Tile
+Masked Autoencoder pre-training based on [[8]](#8). Task: Masked Image Prediction. Input: Image or Image Tile
 
 ### Usage
 ```python
@@ -494,43 +494,43 @@ model = MAE(
     )
 
 
-img = torch.randn(1, 3, 256, 256)
+img = torch.randn(1, 3, 256, 256) # (batch_size, num_channels, tile_size_x, tile_size_y)
 variables = ["red", "green", "blue"]
 
-preds = model.forward(img, variables) # (1, 16*16, 16*16*3)
+preds, _ = model.forward(img, variables) # (1, 16*16, 16*16*3) -> (batch_size, num_tokens_x * num_tokens_y, patch_size * patch_size * num_channels)
 
 #Move masked image prediction from patched space back to original image space
 pred_img = unpatchify(preds, img, 16, True) # (1, 3, 256, 256) 
 ```
 
-### Parameters
+### Parameters (if not listed here see descriptions in the architectures above)
 
-- `linear_decoder`: bool.
+- `linear_decoder`: Bool.
 Variable to indicate whether to use a linear decoder. If False, a Transformer decoder is used to predict the mask prediction output
 
-- `decoder_depth`: int.
+- `decoder_depth`: Int.
 Number of Transformer blocks to use in the decoder. Not used if **linear_decoder** is set to True
 
-- `decoder_embed_dim`: int.  
+- `decoder_embed_dim`: Int.  
 Embedding dimension for Inputs to the Transformer decoder. Not used if **linear_decoder** is set to True
 
-- `decoder_num_heads`: int.  
+- `decoder_num_heads`: Int.  
 Number of heads in Multi-head Attention layer for the Transformer decoder. Not used if **linear_decoder** is set to True
 
-- `mlp_ratio_decoder`: int.
+- `mlp_ratio_decoder`: Int.
 Ratio of MLP hidden dimension to embedding dimension, used to set the dimension of the MLP (FeedForward) layer in the Transfomer decoder. Not used if **linear_decoder** is set to True
 
-- `mask_ratio`: float (0, 1).
+- `mask_ratio`: Float in (0, 1).
 Amount of tokens to mask out in the Transformer encoder
 
-- `class_token`: bool.
+- `class_token`: Bool.
 Whether to append a class token to the tokenized data. Set to false unless using VIT
 
-- `weight_init`: ['' or 'skip'].
+- `weight_init`: Str from ['' or 'skip'].
 Whether to skip the weight_init in the VIT parent class. Set to 'skip' unless using VIT
 
 ## UNet Transformer (UNETR)
-Image segmentation architecture based on [3]. Task: Image Segmentation. Input: Image or Image Tile
+Image segmentation architecture based on [[9]](#9). Task: Image Segmentation. Input: Image or Image Tile
 
 ### Usage
 ```python
@@ -563,13 +563,13 @@ model = UNETR(
     )
 
 
-img = torch.randn(1, 3, 256, 256)
+img = torch.randn(1, 3, 256, 256) # (batch_size, num_channels, tile_size_x, tile_size_y)
 variables = ["red", "green", "blue"]
 
-preds = model.forward(img, variables) # (1, 4, 256, 256)
+preds = model.forward(img, variables) # (1, 4, 256, 256) # (batch_size, num_classes, tile_size_x, tile_size_y)
 ```
 
-### Parameters
+### Parameters (if not listed here see descriptions in the architectures above)
 
 - `num_classes`: int.  
 Number of classes to predict from at each image pixel.
@@ -581,16 +581,18 @@ Variable to indicate whether to use a linear decoder. If False, a convolutional 
 Variable to indicate whether to use skip connection in the convolutional decoder. The skip connection uses intermediate output from the Trasnformer encoder blocks
 
 - `feature_size`: int.
-Variable to set the how embedding features are expanded through the UNETR convolutional blocks
+Variable to set how the embedding features are expanded through the UNETR convolutional blocks
 
 ## Symmetric Adaptive Patching (SAP)
-Image segmentation architecture for adaptively patched input based on [4]. Task: Image Segmentation. Input: Adaptively Patching Image or Image Tile
+Image segmentation architecture for adaptively patched input based on [[6]](#6). Task: Image Segmentation. Input: Adaptively Patching Image or Image Tile
 
 ### Usage
 ```python
 import torch
+import numpy as np
 from UCF_VIT.simple.arch import SAP
 from UCF_VIT.utils.fused_attn import FusedAttn
+from UCF_VIT.dataloaders.transform import Patchify
 
 model = SAP(
         img_size=[256,256],
@@ -607,21 +609,28 @@ model = SAP(
         single_channel=False,
         use_varemb=False,
         adaptive_patching=True,
-        fixed_length=4096,
+        fixed_length=64,
+        sqrt_len=int(np.sqrt(64)),
         FusedAttn_option=FusedAttn.DEFAULT,
         class_token=False,
         weight_init='skip',
     )
 
 
-img = torch.randn(1, 3, 256, 256)
+img = np.random.randn(1, 3, 256, 256).astype(np.uint8) # (batch_size, num_channels, tile_size_x, tile_size_y)
+patchify = Patchify(fixed_length=64, patch_size=16, num_channels=3)
+adaptive_patch_img, _, _, _ = patchify(np.moveaxis(np.squeeze(img),0,-1)) # -> (num_channels, fixed_length, patch_size*patch_size)
+adaptive_patch_img = np.expand_dims(adaptive_patch_img,axis=0).astype(np.float32) # Add back batch dimension
+adaptive_patch_img = torch.from_numpy(adaptive_patch_img)
+
+
 variables = ["red", "green", "blue"]
 
-preds = model.forward(img, variables) # (1, 4, sqrt(4096)*16, sqrt(4096)*16)
+preds = model.forward(adaptive_patch_img, variables) # (1, 4, sqrt(64)*16, sqrt(64)*16)
 ```
 
 ### Diffusion Vision Transformer (DiffusionVIT)
-Diffusion model training based on [5]. Task: Generate Image via noise that matches distribution of data trained on. Input: Noise
+Diffusion model training based on [[10]](#10). Task: Generate Image via noise that matches distribution of data trained on. Input: Noise
 
 ### Usage
 ```python
@@ -629,7 +638,9 @@ import torch
 from UCF_VIT.simple.arch import DiffusionVIT
 from UCF_VIT.utils.fused_attn import FusedAttn
 from UCF_VIT.ddpm.ddpm import DDPM_Scheduler
+from UCF_VIT.utils.misc import unpatchify
 
+num_time_steps = 1000
 model = DiffusionVIT(
         img_size=[256,256],
         patch_size=16,
@@ -643,13 +654,15 @@ model = DiffusionVIT(
         decoder_num_heads=16,
         mlp_ratio=4,
         drop_path_rate=0.1,
+        linear_decoder=True,
         twoD=True,
+        mlp_ratio_decoder=4,
         default_vars=["red", "green", "blue"],
         single_channel=False,
         use_varemb=False,
         adaptive_patching=False,
         fixed_length=None,
-        time_steps=1000,
+        time_steps=num_time_steps,
         FusedAttn_option=FusedAttn.DEFAULT,
         class_token=False,
         weight_init='skip',
@@ -660,16 +673,16 @@ img = torch.randn(1, 3, 256, 256)
 variables = ["red", "green", "blue"]
 
 t = torch.randint(0,num_time_steps,(1,))
-e = torch.randn_like(data, requires_grad=False)
+e = torch.randn_like(img, requires_grad=False)
 ddpm_scheduler = DDPM_Scheduler(num_time_steps=num_time_steps)
-a = ddpm_scheduler.alpha[t].view(batch_size,1,1,1)
-data = (torch.sqrt(a)*data) + (torch.sqrt(1-a)*e)
-output = net.forward(data, t, variables) # (1, 16*16, 16*16*3)
+a = ddpm_scheduler.alpha[t].view(1,1,1,1)
+data = (torch.sqrt(a)*img) + (torch.sqrt(1-a)*e)
+output = model.forward(data, t, variables) # (1, 16*16, 16*16*3) -> (batch_size, num_tokens_x * num_tokens_y, patch_size * patch_size * num_channels)
 
 #Move generated image from patched space back to original image space
-output = unpatchify(output, data, patch_size, twoD) #(1, 3, 256, 256)
+output = unpatchify(output, data, 16, True) #(1, 3, 256, 256)
 ```
-### Parameters
+### Parameters (if not listed here see descriptions in the architectures above)
 
 - `time_steps`: int.
 Number of time steps in the diffusion process
@@ -899,5 +912,102 @@ Directory consists of 3D synthetic CT images of concrete including corresponding
   pages={1--11},
   year={2024},
   organization={IEEE}
+}
+```
+### [2]
+```bibtex
+@Misc{xFormers2022,
+  author =       {Benjamin Lefaudeux and Francisco Massa and Diana Liskovich and Wenhan Xiong and Vittorio Caggiano and Sean Naren and Min Xu and Jieru Hu and Marta Tintore and Susan Zhang and Patrick Labatut and Daniel Haziza and Luca Wehrstedt and Jeremy Reizenstein and Grigory Sizov},
+  title =        {xFormers: A modular and hackable Transformer modelling library},
+  howpublished = {\url{https://github.com/facebookresearch/xformers}},
+  year =         {2022}
+}
+```
+
+### [3]
+```bibtex
+@software{Liu_Composable_Kernel,
+author = {Liu, Chao and Zhang, Jing and Qin, Letao and Zhang, Qianfeng and Huang, Liang and Wang, Shaojie and Chang, Anthony and Lai, Chunyu and Silin, Illia and Osewski, Adam and Chen, Poyen and Geyyer, Rosty and Chen, Hanwen and Shah, Tejash and Zhou, Xiaoyan and Yan, Jianfeng},
+license = {MIT},
+title = {{Composable Kernel}},
+url = {https://github.com/ROCm/composable_kernel}
+}
+
+```
+
+### [4]
+```bibtex
+@inproceedings{dao2022flashattention,
+  title={Flash{A}ttention: Fast and Memory-Efficient Exact Attention with {IO}-Awareness},
+  author={Dao, Tri and Fu, Daniel Y. and Ermon, Stefano and Rudra, Atri and R{\'e}, Christopher},
+  booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
+  year={2022}
+}
+```
+
+### [5]
+```bibtex
+@inproceedings{dao2023flashattention2,
+  title={Flash{A}ttention-2: Faster Attention with Better Parallelism and Work Partitioning},
+  author={Dao, Tri},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2024}
+}
+```
+
+### [6]
+```bibtex
+@inproceedings{zhang2024adaptive,
+  title={Adaptive Patching for High-resolution Image Segmentation with Transformers},
+  author={Zhang, Enzhi and Lyngaas, Isaac and Chen, Peng and Wang, Xiao and Igarashi, Jun and Huo, Yuankai and Munetomo, Masaharu and Wahib, Mohamed},
+  booktitle={SC24: International Conference for High Performance Computing, Networking, Storage and Analysis},
+  pages={1--16},
+  year={2024},
+  organization={IEEE}
+}
+```
+
+### [7]
+```bibtex
+@article{dosovitskiy2020image,
+  title={An image is worth 16x16 words: Transformers for image recognition at scale},
+  author={Dosovitskiy, Alexey and Beyer, Lucas and Kolesnikov, Alexander and Weissenborn, Dirk and Zhai, Xiaohua and Unterthiner, Thomas and Dehghani, Mostafa and Minderer, Matthias and Heigold, Georg and Gelly, Sylvain and others},
+  journal={arXiv preprint arXiv:2010.11929},
+  year={2020}
+}
+```
+
+### [8]
+```bibtex
+@inproceedings{he2022masked,
+  title={Masked autoencoders are scalable vision learners},
+  author={He, Kaiming and Chen, Xinlei and Xie, Saining and Li, Yanghao and Doll{\'a}r, Piotr and Girshick, Ross},
+  booktitle={Proceedings of the IEEE/CVF conference on computer vision and pattern recognition},
+  pages={16000--16009},
+  year={2022}
+}
+```
+
+### [9]
+```bibtex
+@inproceedings{hatamizadeh2022unetr,
+  title={Unetr: Transformers for 3d medical image segmentation},
+  author={Hatamizadeh, Ali and Tang, Yucheng and Nath, Vishwesh and Yang, Dong and Myronenko, Andriy and Landman, Bennett and Roth, Holger R and Xu, Daguang},
+  booktitle={Proceedings of the IEEE/CVF winter conference on applications of computer vision},
+  pages={574--584},
+  year={2022}
+}
+
+```
+
+### [10]
+```bibtex
+@article{ho2020denoising,
+  title={Denoising diffusion probabilistic models},
+  author={Ho, Jonathan and Jain, Ajay and Abbeel, Pieter},
+  journal={Advances in neural information processing systems},
+  volume={33},
+  pages={6840--6851},
+  year={2020}
 }
 ```
