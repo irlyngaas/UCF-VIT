@@ -11,7 +11,10 @@
 - [Dataloader](#dataloader)
 - [Dataset Integration](#dataset-integration)
 - [Load Balancing](#load-balancing)
+- [Parallelism Modes](#parallelism-modes)
 - [Training Scripts](#training-scripts)
+- [Config Files](#config-files)
+- [Datasets](#datasets)
 
 ## UCF-VIT
 UCF-VIT is a **Uniform Coding Framework (UCF)** for training large scale **Vision Transformer (VIT)** based models. The framework brings together a host of functionalities for the purpose of training large models with large input data in a scalable and efficient manner. It consists of advanced parallelism schemes, State of the Art techniques for efficient computing, and custom dataloader utilities that are integrated with the aforementioned schemes and techniques to allow for training on a multitude of different datasets.
@@ -629,7 +632,7 @@ variables = ["red", "green", "blue"]
 preds = model.forward(adaptive_patch_img, variables) # (1, 4, sqrt(64)*16, sqrt(64)*16)
 ```
 
-### Diffusion Vision Transformer (DiffusionVIT)
+## Diffusion Vision Transformer (DiffusionVIT)
 Diffusion model training based on [[10]](#10). Task: Generate Image via noise that matches distribution of data trained on. Input: Noise
 
 ### Usage
@@ -772,7 +775,7 @@ Variable whether to use pinned memory on GPU for dataloading
 Patch Size to use when creating patch Embeddings Sequences for the network input
 
 - `tile_size_[x,y,z]`: Int.
-Desired tile size to generate from raw input. If tile_size smaller than raw input files, multiple tiles will be created from each raw data file
+Desired tile size to generate from raw input. If tile_size is smaller than raw input files, multiple tiles will be created from each raw data file
 
 - `twoD`: Bool. Variable for indicating two or three dimensionsal input, if False, three-dimensional data will be created from the dataloader. If the raw dataloader is three-dimensional and twoD is set to True, two-dimensional slices will be created from the three-dimensional data by iterating over the final spatial dimension of the data
 
@@ -832,44 +835,16 @@ For Examples, see the XCT-Diffusion, SST, and S8D branches
 In order for the dataloader to handle multiple datasets at the same time, the data needs to be spread out amongst the GPUs evenly. In the case where different datasets have different amounts and/or different sizes of images, it's difficult to evenly spread this data amongst the GPUs evenly. We provide example load balancing scripts that for a given setting in a config file determines how the data should be split amongst a given set of N GPUs, in order to evenly balance the data amongst the compute resources. The output from this script gives the necessary information to the dataloader in order to do this in a proper fashion. If you want this load_balancing to be done automatically set `auto_load_balancing` to True in your config file. If you want to do the load balancing manually to check for correct implementation run `python utils/load_balance.py [CONFIG_FILE] [NUM_GPUS]` and use the output from this script to add to the load balancing portion of the config file.
 
 ## Parallelism Modes
-All of these architectures exist in 2 independent sub-folders, simple and fsdp, for which we separate the network architecture code into what we call modes. The choice of mode to be used will depend on the types of advanced parallelism and computing techniques needed for the model being trained.  The first `src/UCF_VIT/simple`, provides a simplified version for training in Distributed Data Parallel (DDP) fashion only. The second `src/UCF_VIT/fsdp`, provides a more complex version with different parallel training techniques. This includes options for training with a combination of Sharded Data Parallelism , DDP, and Tensor Parallelism. These parallelisms are all integrated via Hybrid Sharded Tensor-Data Parallelism (Hybrid-STOP) from [6,7]. Both modes can be used with the same data loading module and load balancing scripts provided. While the training done within the simple mode can be done with the correct choice of options in the fsdp mode, the purpose of keeping the simple mode is 1) to provide an entry point for new users and developers to add new architectures without the intricacies of the advanced features and 2) to provide a simple reference point to compare with when new innovations are added in order to test how they interact with the more complex parallelism methods.
-
-Thus far the examples we have given have only used the **simple** DDP mode. Minimal changes are needed to run with the FSDP mode
+All of the currently existing architectures exist in 2 independent sub-folders, simple and fsdp, for which we separate the network architecture code into what we call modes. The choice of mode to be used will depend on the types of advanced parallelism and computing techniques needed for the model being trained.  The first `src/UCF_VIT/simple`, provides a simplified version for training in Distributed Data Parallel (DDP) fashion only. The second `src/UCF_VIT/fsdp`, provides a more complex version with different parallel and efficient computing training techniques. This includes options for training with a combination of Sharded Data Parallelism , DDP, and Tensor Parallelism. These parallelisms are all integrated via the [Hybrid-Stop](#hybrid-stop) algorithm. Both modes can be used with the same data loading module and load balancing scripts provided. While the training done within the simple mode can be done with the correct choice of options in the fsdp mode, the purpose of keeping the simple mode is 1) to provide an entry point for new users and developers to add new architectures without the intricacies of the advanced features and 2) to provide a simple reference point to compare with when new innovations are added in order to test how they interact with the more complex parallelism methods.
 
 ### Building Blocks
 The main building blocks for the VIT based archictectures are in the **Attention** and **Feed-forward** functions, provided in the Attention class and MLP class in `src/UCF_VIT/simple/building_blocks.py` and `src/UCF_VIT/fsdp/building_blocks.py`. We ask that you use these functions as is and do not modify them, as these common building blocks will be used across the different network architectures.
 
 ## Training Scripts
-We provide several training scripts. These include all of the necessary things for running the main training loop, including utilities such as checkpoint loading and saving. We leave it to the user to implement their own validation and testing routines, based off the existing training examples, in order to more closely fit their needs. Training scripts are provided for each of the training architectures for the simple mode. To convert these scripts to use fsdp mode, look at the code changes made to go from `training_scripts/train_masked_simple.py` to `training_scripts/train_masked_fsdp.py`
+We provide several example training scripts. These include all of the necessary things for running the main training loop, including utilities such as checkpoint loading and saving. We leave it to the user to implement their own validation and testing routines in order to more closely fit their needs. Training scripts are provided for each of the training architectures for the simple mode. To convert these scripts to use fsdp mode, look at the code changes made to go from `training_scripts/train_masked_simple.py` to `training_scripts/train_masked_fsdp.py`
 
-### Usage
-1. If using a new dataset, modify dataloader module accordingly
-- Follow [Dataset Integration](#dataset-integration)
-
-2. Find training script of interest from training_scripts/
-
-3. Modify training script for particular use case. (Adding validation, testing, inferencing, etc. as needed)
-
-4. Create/Modify config file for your training
-
-5. Modify Launch Script
-- Change project allocation to one you have access to `#SBATCH -A PROJXXX`.
-- Set number of nodes you want to run with `#SBATCH --nodes=N`
-
-6. Run Load Balancing Script (or set `auto_load_balancing` to True in config file and skip to step 8)
-- `python utils/load_balance.py [CONFIG_FILE] [NUM_GPUS]`
-
-7. Modify Config File with the output from load balancing output
-- dataset_group_list
-- batches_per_rank_epoch
-
-8. Launch job `sbatch launch/[DATASET]/train_[MODEL]_[MODE].sh`
-- [DATASET] is the particular dataset you want to use. The examples use (imagenet or basic_ct)
-- [MODEL] is the type of model you want to use chose from those in [Model Architectures](#Model-Architectures)
-- [MODE] is the training mode you want to use. There are two options (simple and fsdp). See [Parallelism Modes](#Parallelism-Modes) for a more detailed description
-
-### Config Arguments
-We store the arguments for each individual run in a yaml file. This config file holds all of the arguments for defining the specific training, dataloading, parallelism, and checkpointing options
+## Config Files
+We store the arguments for each individual run in a yaml file. This config file holds all of the arguments for defining the specific training, dataloading, parallelism, and checkpointing options. Below are a number of arguments used in these config files that weren't listed in the example files in the [Supported Model Architectures](#supported-model-architectures) sections. In addition to these arguments, the config files also are store information for running the architectures through stored variables.
 
 1. Trainer
 - max_epochs: Max number of epochs to train
@@ -892,7 +867,39 @@ We store the arguments for each individual run in a yaml file. This config file 
 - max_steps: Maximum number of warmup steps for learning rate scheduler
 - warmup_start_lr: Learning rate to use for warm up steps
 
-## Example Datasets
+### Usage
+1. If using a new dataset, modify dataloader module accordingly
+- If using a new dataset, follow [Dataset Integration](#dataset-integration) intstructions
+- If using our example datasets, see [datasets](#datasets) for downloading the data and properly set your root_dir paths based on the location you download the data to.
+
+2. Find training script of interest from the `training_scripts/` directory
+
+3. Modify training script for the particular use case. (Adding validation, testing, inferencing, etc. as needed)
+
+4. Create/Modify config file for your training
+
+5. Create/Modify Launch Script
+- Find/Create a proper launch script for the run you want to do
+- If on Frontier Change project allocation to one you have access to `#SBATCH -A PROJXXX`.
+- Set number of nodes you want to run with `#SBATCH --nodes=N`
+
+6. Run Load Balancing Script (or set `auto_load_balancing` to True in config file and skip to step 8)
+- `python utils/load_balance.py [CONFIG_FILE] [NUM_GPUS]`
+
+7. Modify Config File with the output from load balancing output
+- dataset_group_list
+- batches_per_rank_epoch
+
+8. Launch job `sbatch launch/[DATASET]/train_[MODEL]_[MODE]_[OPTIONAL].sh`
+- Existing launch scripts follow the following naming conventions
+- [DATASET] is the particular dataset you want to use. The examples use (imagenet or basic_ct)
+- [MODEL] is the type of model you want to use chose from those in [Model Architectures](#Model-Architectures)
+- [MODE] is the training mode you want to use. There are two options (simple and fsdp). See [Parallelism Modes](#Parallelism-Modes) for a more detailed description
+- [OPTIONAL] is an optional keyword for launch scripts using the apptainer method for installing containers on Frontier or the docker method for installing containers for running on DGX machines
+
+
+## Datasets
+We use two example datasets to test functionality of our code, their descriptions and instructions for downloading are below.
 ### Imagenet
 Download data at `https://www.image-net.org/challenges/LSVRC/2012/2012-downloads.php`
 
