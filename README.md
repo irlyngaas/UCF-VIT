@@ -43,7 +43,7 @@ TORCHVISION_VERSION=0.22.0
 TORCHAUDIO_VERSION=2.7.0
 
 pip install torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} torchaudio==${TORCHAUDIO_VERSION} --index-url ${TORCH_URL}
-pip install xformers --extra-index-url=https://download.pytorch.org/whl/rocm${ROCM_VERSION}
+pip install xformers==0.0.30 --extra-index-url=https://download.pytorch.org/whl/rocm${ROCM_VERSION}
 pip install timm \
  monai \
  nibabel \
