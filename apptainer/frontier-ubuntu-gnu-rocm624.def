@@ -70,6 +70,9 @@ export PYTORCH_DIR=/pytorch
 export PYTHONPATH=${PYTORCH_DIR}:${PYTHONPATH}
 ${CONDA_DIR}/bin/pip install torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} torchaudio==${TORCHAUDIO_VERSION} -t ${PYTORCH_DIR} --index-url ${TORCH_URL}
 
+# Install XFormers
+${CONDA_DIR}/bin/pip install xformers==0.0.30 --extra-index-url=${TORCH_URL}
+
 # Install UCF_VIT
 #mkdir -p /source
 #cd /source

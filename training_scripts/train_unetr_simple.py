@@ -22,7 +22,7 @@ from functools import partial
 from timm.layers import use_fused_attn
 
 from UCF_VIT.simple.arch import UNETR, MAE
-from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler
+from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, calculate_load_balancing_on_the_fly
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.utils.fused_attn import FusedAttn
 
@@ -128,8 +128,6 @@ def main(device):
 
     dict_buffer_sizes = conf['data']['dict_buffer_sizes']
 
-    num_channels_available = conf['data']['num_channels_available']
-
     num_channels_used = conf['data']['num_channels_used']
 
     dict_in_variables = conf['data']['dict_in_variables']
@@ -147,10 +145,6 @@ def main(device):
     tile_overlap = conf['data']['tile_overlap']
 
     use_all_data = conf['data']['use_all_data']
-
-    batches_per_rank_epoch = conf['load_balancing']['batches_per_rank_epoch']
-
-    dataset_group_list = conf['load_balancing']['dataset_group_list']
 
     #These configs need only for finetuning with pre-trained MAE model
     decoder_embed_dim = conf['model']['net']['init_args']['decoder_embed_dim']
@@ -172,6 +166,13 @@ def main(device):
     assert (tile_size_x%patch_size)==0, "tile_size_x % patch_size must be 0"
     assert (tile_size_y%patch_size)==0, "tile_size_y % patch_size must be 0"
     assert (tile_size_z%patch_size)==0, "tile_size_z % patch_size must be 0"
+
+    auto_load_balancing = conf['load_balancing']['auto_load_balancing']
+    if auto_load_balancing:
+        batches_per_rank_epoch, dataset_group_list = calculate_load_balancing_on_the_fly(config_path, world_size, batch_size)
+    else:
+        batches_per_rank_epoch = conf['load_balancing']['batches_per_rank_epoch']
+        dataset_group_list = conf['load_balancing']['dataset_group_list']
 
 #2. Initialize model, optimizer, and scheduler
 ##############################################################################################################
@@ -305,7 +306,6 @@ def main(device):
         dict_end_idx=dict_end_idx,
         dict_buffer_sizes=dict_buffer_sizes,
         dict_in_variables=dict_in_variables,
-        num_channels_available = num_channels_available,
         num_channels_used = num_channels_used,
         batch_size=batch_size,
         num_workers=num_workers,

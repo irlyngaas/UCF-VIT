@@ -185,7 +185,6 @@ class NativePytorchDataModule(torch.nn.Module):
         dict_end_idx (Dict): Dictionary of end indices ratio (between 0.0 and 1.0) for each source.
         dict_in_variables (Dict): Dictionary of input modality variables for each source
         dict_buffer_sizes (Dict): Dictionary of buffer sizes for each source.
-        num_channels_available (Dict): Dictionary of number of channels available for each source.
         num_channels_used (Dict): Dictionary of number of channels used from each source.
         batch_size (int, optional): Batch size.
         num_workers (int, optional): Number of workers.
@@ -209,7 +208,6 @@ class NativePytorchDataModule(torch.nn.Module):
         dict_end_idx: Dict = None,
         dict_buffer_sizes: Dict = None,
         dict_in_variables: Dict = None,
-        num_channels_available: Dict = None, 
         num_channels_used: Dict = None,
         batch_size: int = 64,
         num_workers: int = 0,
@@ -253,7 +251,6 @@ class NativePytorchDataModule(torch.nn.Module):
         self.dict_start_idx = dict_start_idx
         self.dict_end_idx = dict_end_idx
         self.dict_buffer_sizes = dict_buffer_sizes 
-        self.num_channels_available = num_channels_available
         self.num_channels_used = num_channels_used
         self.batch_size = batch_size
         self.num_workers = num_workers
@@ -338,7 +335,6 @@ class NativePytorchDataModule(torch.nn.Module):
             end_idx = self.dict_end_idx["imagenet"]
             buffer_size = self.dict_buffer_sizes["imagenet"]
             variables = self.dict_in_variables["imagenet"]
-            num_channels_available = self.num_channels_available["imagenet"]
             num_channels_used = self.num_channels_used["imagenet"]
             imagenet_resize = self.imagenet_resize["imagenet"]
         else:
@@ -346,7 +342,6 @@ class NativePytorchDataModule(torch.nn.Module):
             end_idx = self.dict_end_idx[k]
             buffer_size = self.dict_buffer_sizes[k]
             variables = self.dict_in_variables[k]
-            num_channels_available = self.num_channels_available[k]
             num_channels_used = self.num_channels_used[k]
         single_channel = self.single_channel
         return_label = self.return_label
@@ -356,7 +351,6 @@ class NativePytorchDataModule(torch.nn.Module):
                     ImageBlockDataIter_2D(
                             FileReader(
                                 lister_train,
-                                num_channels_available,
                                 gx = self.gx,
                                 start_idx=start_idx,
                                 end_idx=end_idx,
@@ -397,7 +391,6 @@ class NativePytorchDataModule(torch.nn.Module):
                     ImageBlockDataIter_3D(
                             FileReader(
                                 lister_train,
-                                num_channels_available,
                                 gx = self.gx,
                                 start_idx=start_idx,
                                 end_idx=end_idx,

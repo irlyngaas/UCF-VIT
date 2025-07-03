@@ -237,6 +237,7 @@ def init_par_groups(world_rank, data_par_size, tensor_par_size, seq_par_size, fs
 
     return seq_par_group, ddp_group, tensor_par_group, data_seq_ort_group, fsdp_group, simple_ddp_group
 
+<<<<<<< HEAD
 def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size):
     conf = yaml.load(open(yaml_file,'r'),Loader=yaml.FullLoader)
     num_total_ddp_ranks = data_par_size
@@ -274,6 +275,15 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size):
             class_to_idx = {cls_name: idx for idx, cls_name in enumerate(classes)}
             if len(classes) > num_total_ddp_ranks:
                 classes_to_combine = int(len(classes) // num_total_ddp_ranks)
+=======
+def process_root_dirs(dataset, dict_root_dirs, data_par_size):
+    if dataset == "imagenet":
+        dict_lister_trains = {}
+        for k, root_dir in dict_root_dirs.items():
+            #TODO: Add shuffling for data_par_size if it doesn't divide 1000 equally
+            classes = sorted(os.listdir(root_dir))
+            if len(classes) > data_par_size:
+                classes_to_combine = int(len(classes) // data_par_size)
             img_list = []
             classes_counter = 0
             num_data_roots = 0
@@ -285,8 +295,8 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size):
                 for img_path in glob.glob(os.path.join(cls_dir,"*.JPEG")):
                     img_list.append(img_path)
                 classes_counter += 1
+            
                 if classes_counter == classes_to_combine:
-                    #print("LEN_IMG_LIST",len(img_list))
                     img_dict = {num_data_roots: img_list}
                     dict_lister_trains.update(img_dict)
                     num_data_roots +=1
@@ -296,10 +306,50 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size):
     elif dataset == "xct":
         dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, ""))) for k, root_dir in dict_root_dirs.items() }
     else:
-        dict_lister_trains = {
-            k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in dict_root_dirs.items()
-        }
-        
+        dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in dict_root_dirs.items() }
+    return dict_lister_trains
+
+def read_process_file(dataset, path, imagenet_resize):
+    if dataset == "imagenet":
+        data = Image.open(path).convert("RGB")
+        data = np.array(data) 
+        data = cv.resize(data, dsize=[imagenet_resize["imagenet"][0],imagenet_resize["imagenet"][1]])
+    elif dataset == "xct":
+        data = np.load(path)
+        data = data.astype('float32')
+    else:
+        data = nib.load(path)
+        data = np.array(data.dataobj).astype(np.float32)
+    return data
+
+def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VERBOSE=False):
+    conf = yaml.load(open(yaml_file,'r'),Loader=yaml.FullLoader)
+    num_total_ddp_ranks = data_par_size
+
+    dict_root_dirs = conf['data']['dict_root_dirs']
+    dict_start_idx = conf['data']['dict_start_idx']
+    dict_end_idx = conf['data']['dict_end_idx']
+    tile_size =  conf['model']['net']['init_args']['tile_size']
+    twoD = conf['model']['net']['init_args']['twoD']
+    num_channels_used = conf['data']['num_channels_used']
+    single_channel = conf['data']['single_channel']
+    batch_size = conf['data']['batch_size']
+    tile_overlap = conf['data']['tile_overlap']
+    use_all_data = conf['data']['use_all_data']
+    patch_size =  conf['model']['net']['init_args']['patch_size']
+    dataset = conf['data']['dataset']
+
+    if dataset == "imagenet":
+        imagenet_resize = conf['dataset_options']['imagenet_resize']
+    else:
+        imagenet_resize = None
+
+    tile_size_x = int(tile_size[0])
+    tile_size_y = int(tile_size[1])
+    if dataset != "imagenet":
+        tile_size_z = int(tile_size[2])
+
+    dict_lister_trains = process_root_dirs(dataset, dict_root_dirs, num_total_ddp_ranks)
 
     num_total_tiles = []
     num_total_images = []
@@ -318,19 +368,7 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size):
 
         #Assume all channels have the same data size
         data_path = keys[0]
-        
-        #ADD NEW DATASET HERE
-        #Corresponds to the read_process_file function of the FileReader class in src/UCF_VIT/dataloaders/dataset.py
-        if dataset == "imagenet":
-            data = Image.open(data_path).convert("RGB")
-            data = np.array(data) 
-            data = cv.resize(data, dsize=[imagenet_resize["imagenet"][0],imagenet_resize["imagenet"][1]])
-        elif dataset == "xct":
-            data = np.load(data_path)
-            data = data.astype('float32')
-        else:
-            data = nib.load(data_path)
-            data = np.array(data.dataobj).astype(np.float32)
+        data = read_process_file(dataset, data_path, imagenet_resize)
 
         tile_overlap_size_x = int(tile_size_x*tile_overlap)
         tile_overlap_size_y = int(tile_size_y*tile_overlap)
@@ -368,7 +406,8 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size):
                 num_blocks_x = int(num_blocks_x + LTOP_x)
                 num_blocks_y = int(num_blocks_y + LTOP_y)
 
-            #print("KEY", k, "DATA_SHAPE", data.shape,"NUM_BLOCKS:", num_blocks_x, num_blocks_y, flush=True)
+            if VERBOSE:
+                print("KEY", k, "DATA_SHAPE", data.shape,"NUM_BLOCKS:", num_blocks_x, num_blocks_y, flush=True)
 
             tiles_per_image.append(num_blocks_x*num_blocks_y)
             num_channels_per_dataset.append(num_channels_used["imagenet"])
@@ -380,7 +419,6 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size):
                 tile_overlap_size_z = tile_size_z
             else:
                 OTP2_z = int(tile_size_z/tile_overlap_size_z)
-
             #Total Tiles Evenly Spaced
             TTE_x = data.shape[0]//tile_size_x
             TTE_y = data.shape[1]//tile_size_y
@@ -418,7 +456,8 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size):
                         LTOP_z += 1
                     num_blocks_z = int(num_blocks_z + LTOP_z)
 
-            #print("KEY", k, "DATA_SHAPE", data.shape,"NUM_BLOCKS:", num_blocks_x, num_blocks_y, num_blocks_z, flush=True)
+            if VERBOSE:
+                print("KEY", k, "DATA_SHAPE", data.shape,"NUM_BLOCKS:", num_blocks_x, num_blocks_y, num_blocks_z, flush=True)
 
             if twoD:
                 if use_all_data:
@@ -435,14 +474,15 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size):
         else:
             num_total_tiles.append(tiles_per_image[i] * num_total_images[i])
 
-    #print("Total Images", num_total_images)
-    #print("Tiles Per Image", tiles_per_image)
-    #print("Total Tiles per Dataset", num_total_tiles)
-    #print("Total Tiles", sum(num_total_tiles))
-    #if twoD:
-    #    print("Total Tokens", sum(num_total_tiles)*(tile_size_x/patch_size)*(tile_size_y/patch_size))
-    #else:
-    #    print("Total Tokens", sum(num_total_tiles)*(tile_size_x/patch_size)*(tile_size_y/patch_size)*(tile_size_z/patch_size))
+    if VERBOSE:
+        print("Total Images", num_total_images)
+        print("Tiles Per Image", tiles_per_image)
+        print("Total Tiles per Dataset", num_total_tiles)
+        print("Total Tiles", sum(num_total_tiles))
+        if twoD:
+            print("Total Tokens", sum(num_total_tiles)*(tile_size_x/patch_size)*(tile_size_y/patch_size))
+        else:
+            print("Total Tokens", sum(num_total_tiles)*(tile_size_x/patch_size)*(tile_size_y/patch_size)*(tile_size_z/patch_size))
         
     total_tiles_all_data = sum(num_total_tiles)
         
@@ -454,8 +494,9 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size):
         ddp_ratio.append(ratio*num_total_ddp_ranks)
         ddp_rank_ratio.append(int(np.rint(ddp_ratio[i])))
         ratio_diff.append(ddp_rank_ratio[i] - ddp_ratio[i])
-    #print("DDP RATIO", ddp_ratio)
-    #print("DDP RANK RATIO", ddp_rank_ratio)
+    if VERBOSE:
+        print("DDP RATIO", ddp_ratio)
+        print("DDP RANK RATIO", ddp_rank_ratio)
 
     rank_sum = sum(ddp_rank_ratio)
 
@@ -481,7 +522,8 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size):
                         continue
                     if leftover[i] > leftover[rank_to_decrease] and ddp_rank_ratio[i] > 1:
                         rank_to_decrease = i
-            #print("Rank to decrease", rank_to_decrease)
+            if VERBOSE:
+                print("Rank to decrease", rank_to_decrease)
             ddp_rank_ratio[rank_to_decrease] -= 1
 
         if rank_sum < num_total_ddp_ranks:
@@ -495,12 +537,14 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size):
                         continue
                     if leftover[i] < leftover[rank_to_increase]:
                         rank_to_increase = i
-            #print("Rank to increase", rank_to_increase)
+            if VERBOSE:
+                print("Rank to increase", rank_to_increase)
             ddp_rank_ratio[rank_to_increase] += 1
 
         rank_sum = sum(ddp_rank_ratio)
 
-    #print("DDP RANKS:", ddp_rank_ratio)
+    if VERBOSE:
+        print("DDP RANKS:", ddp_rank_ratio)
     assert rank_sum == num_total_ddp_ranks, "All DDP ranks not used"
 
     for i in range(len(ddp_rank_ratio)):
@@ -520,34 +564,38 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size):
         else:
             batches_per_rank.append(np.floor(num_images_per_rank[i])*tiles_per_image[i]/batch_size)
         tiles_per_rank.append(np.floor(num_images_per_rank[i])*tiles_per_image[i])
-    #print("Tiles Per Rank", tiles_per_rank)
-    ##print("Batches Per Rank", batches_per_rank)
-    ##print("Min Batches Per Rank", min(batches_per_rank))
-    #print("USE BELOW IN CONFIG FILE")
-    #print("batches_per_rank_epoch: {")
-
+    if VERBOSE:
+        print("Tiles Per Rank", tiles_per_rank)
+        print("USE BELOW IN CONFIG FILE")
+        print("batches_per_rank_epoch: {")
     batches_per_rank_epoch = {}
-    for i,k in enumerate(dict_lister_trains.keys()):
-        new_data = [(k, int(batches_per_rank[i]))]
+    if dataset == "imagenet":
+        new_data = [("imagenet", int(min(batches_per_rank)))]
         batches_per_rank_epoch.update(new_data)
+    else:
+        for i,k in enumerate(dict_lister_trains.keys()):
+            new_data = [(k, int(batches_per_rank[i]))]
+            batches_per_rank_epoch.update(new_data)
 
-    #if dataset == "imagenet":
-    #    print("'%s': %i," % ("imagenet", int(min(batches_per_rank))))
-    #else:
-    #    for i, k in enumerate(dict_lister_trains.keys()):
-    #        print("'%s': %i," % (k, int(batches_per_rank[i])))
-    #print('}')
+    if VERBOSE:
+        if dataset == "imagenet":
+            print("'%s': %i," % ("imagenet", int(min(batches_per_rank))))
+        else:
+            for i, k in enumerate(dict_lister_trains.keys()):
+                print("'%s': %i," % (k, int(batches_per_rank[i])))
+        print('}')
 
     grouplist_str = ''
     for i in range(len(ddp_rank_ratio)):
         grouplist_str += str(ddp_rank_ratio[i])+':'
-    #print("dataset_group_list: '%s'" % (grouplist_str[:-1]))
+    if VERBOSE:
+        print("dataset_group_list: '%s'" % (grouplist_str[:-1]))
     grouplist_str = grouplist_str[:-1]
 
     return batches_per_rank_epoch, grouplist_str
 
-
-
+def is_power_of_two(n):
+    return (n != 0) and (n & (n-1) == 0)
 
 
 

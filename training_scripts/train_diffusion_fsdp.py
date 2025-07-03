@@ -29,7 +29,7 @@ from timm.layers import use_fused_attn
 
 from UCF_VIT.fsdp.arch import DiffusionVIT
 from UCF_VIT.fsdp.building_blocks import Block
-from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, unpatchify, init_par_groups
+from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, unpatchify, init_par_groups, calculate_load_balancing_on_the_fly
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.utils.fused_attn import FusedAttn
 from UCF_VIT.ddpm.ddpm import DDPM_Scheduler
@@ -67,6 +67,8 @@ def main(device):
 
     data_type = conf['trainer']['data_type']
 
+    gpu_type = conf['trainer']['gpu_type']
+
     checkpoint_path = conf['trainer']['checkpoint_path']
   
     checkpoint_filename = conf['trainer']['checkpoint_filename']
@@ -83,8 +85,6 @@ def main(device):
 
     seq_par_size = conf['parallelism']['seq_par_size']
 
-    cpu_offload_flag = conf['parallelism']['cpu_offloading']
- 
     lr = float(conf['model']['lr'])
 
     beta_1 = float(conf['model']['beta_1'])
@@ -147,14 +147,15 @@ def main(device):
         fixed_length = None
         separate_channels = None
 
-    #use_scaler = conf['model']['net']['init_args']['use_scaler']
-    use_scaler = True
+    use_grad_scaler = conf['model']['use_grad_scaler']
 
     num_time_steps = conf['model']['net']['init_args']['num_time_steps']
 
     dataset = conf['data']['dataset']
     assert dataset in ["basic_ct", "imagenet"], "This training script only supports basic_ct, imagenet datasets"
 
+    if dataset == "imagenet":
+        assert twoD, "twoD must be True if using imagenet"
 
     dict_root_dirs = conf['data']['dict_root_dirs']
 
@@ -163,8 +164,6 @@ def main(device):
     dict_end_idx = conf['data']['dict_end_idx']
 
     dict_buffer_sizes = conf['data']['dict_buffer_sizes']
-
-    num_channels_available = conf['data']['num_channels_available']
 
     num_channels_used = conf['data']['num_channels_used']
 
@@ -181,10 +180,6 @@ def main(device):
     tile_overlap = conf['data']['tile_overlap']
 
     use_all_data = conf['data']['use_all_data']
-
-    batches_per_rank_epoch = conf['load_balancing']['batches_per_rank_epoch']
-
-    dataset_group_list = conf['load_balancing']['dataset_group_list']
 
     #Datset specific options
     if dataset == "imagenet":
@@ -211,10 +206,23 @@ def main(device):
     assert (num_heads % tensor_par_size) == 0, "model heads % tensor parallel size must be 0"
     assert (decoder_num_heads % tensor_par_size) == 0, "decoder model heads % tensor parallel size must be 0"
 
+    auto_load_balancing = conf['load_balancing']['auto_load_balancing']
+    if auto_load_balancing:
+        batches_per_rank_epoch, dataset_group_list = calculate_load_balancing_on_the_fly(config_path, data_par_size, batch_size)
+    else:
+        batches_per_rank_epoch = conf['load_balancing']['batches_per_rank_epoch']
+        dataset_group_list = conf['load_balancing']['dataset_group_list']
+
 #2. Initialize model, optimizer, and scheduler
 ##############################################################################################################
     if data_type == "bfloat16":
-        FusedAttn_option = FusedAttn.CK
+        if gpu_type == "amd":
+            FusedAttn_option = FusedAttn.CK
+        elif gpu_type == "nvidia":
+            FusedAttn_option = FusedAttn.FLASH
+        else:
+            print("Invalid gpu_type used, reverting to using default FMHA")
+            FusedAttn_option = FusedAttn.DEFAULT
     else:
         if use_fused_attn():
             FusedAttn_option = FusedAttn.DEFAULT
@@ -302,7 +310,6 @@ def main(device):
            map_location = 'cpu'
            #map_location = 'cuda:'+str(device)
            model.load_state_dict(torch.load(checkpoint_path+'/initial_'+str(0)+'.pth',map_location=map_location),strict=False)
-           loss_list = []
     else:  
         if world_rank< tensor_par_size:
             if os.path.exists(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(world_rank)+".ckpt"):
@@ -316,7 +323,6 @@ def main(device):
                 checkpoint = torch.load(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(world_rank)+".ckpt",map_location=map_location)
                 model.load_state_dict(checkpoint['model_state_dict'])
                 epoch_start = checkpoint['epoch']
-                loss_list = checkpoint['loss_list']
                 del checkpoint
 
             else:
@@ -375,14 +381,14 @@ def main(device):
         map_location = 'cpu'
         #map_location = 'cuda:'+str(device)
 
-        if tensor_par_size > 1:
-            checkpoint = torch.load(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(src_rank)+".ckpt",map_location=map_location)
+        checkpoint = torch.load(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(src_rank)+".ckpt",map_location=map_location)
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        loss_list = checkpoint['loss_list']
         epoch_start = checkpoint['epoch'] + 1
         del checkpoint
 
-    if use_scaler:
+    if use_grad_scaler:
         scaler = ShardedGradScaler(init_scale=8192, growth_interval=100)
         min_scale= 128
 
@@ -394,7 +400,6 @@ def main(device):
             dict_end_idx=dict_end_idx,
             dict_buffer_sizes=dict_buffer_sizes,
             dict_in_variables=dict_in_variables,
-            num_channels_available = num_channels_available,
             num_channels_used = num_channels_used,
             batch_size=batch_size,
             num_workers=num_workers,
@@ -517,7 +522,7 @@ def main(device):
                 if world_rank==0:
                     print("epoch: ",epoch,"batch_idx",counter,"world_rank",world_rank,"it_loss ",loss,flush=True)
     
-                if use_scaler:
+                if use_grad_scaler:
                     scaler.scale(loss).backward()
                     scaler.step(optimizer)
                     scaler.update()
@@ -548,7 +553,7 @@ def main(device):
                     'optimizer_state_dict': optimizer_states,
                     'scheduler_state_dict': scheduler_states,
                     'loss_list' : loss_list,
-                    }, checkpoint_path+"/"+checkpoint_filename+"_even.ckpt")
+                    }, checkpoint_path+"/"+checkpoint_filename+"_even_rank_"+str(world_rank)+".ckpt")
 
         if epoch % 2 == 1:
 
@@ -559,7 +564,7 @@ def main(device):
                     'optimizer_state_dict': optimizer_states,
                     'scheduler_state_dict': scheduler_states,
                     'loss_list' : loss_list,
-                    }, checkpoint_path+"/"+checkpoint_filename+"_odd.ckpt")
+                    }, checkpoint_path+"/"+checkpoint_filename+"_odd_rank_"+str(world_rank)+".ckpt")
      
         dist.barrier()
         del model_states

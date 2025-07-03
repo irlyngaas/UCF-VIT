@@ -10,6 +10,7 @@ Classes:
 """
 
 class FusedAttn(Enum):
+    FLASH = "FLASH"
     CK = "CK"
     DEFAULT = "DEFAULT"
     NONE = "NONE"
