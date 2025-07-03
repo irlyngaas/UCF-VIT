@@ -237,7 +237,6 @@ def init_par_groups(world_rank, data_par_size, tensor_par_size, seq_par_size, fs
 
     return seq_par_group, ddp_group, tensor_par_group, data_seq_ort_group, fsdp_group, simple_ddp_group
 
-<<<<<<< HEAD
 def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size):
     conf = yaml.load(open(yaml_file,'r'),Loader=yaml.FullLoader)
     num_total_ddp_ranks = data_par_size
@@ -275,7 +274,7 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size):
             class_to_idx = {cls_name: idx for idx, cls_name in enumerate(classes)}
             if len(classes) > num_total_ddp_ranks:
                 classes_to_combine = int(len(classes) // num_total_ddp_ranks)
-=======
+
 def process_root_dirs(dataset, dict_root_dirs, data_par_size):
     if dataset == "imagenet":
         dict_lister_trains = {}
