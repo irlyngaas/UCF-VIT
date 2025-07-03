@@ -76,10 +76,17 @@ To run on NVIDIA DGX systems we rely on Pytorch Docker containers maintained by 
 ```
 cd Docker
 docker build -t ucf-vit:25.05 .
-docker tag ucf-vit:25.05 [DOCKER_USERNAME]/[DOCKER_REPO]/ucf-vit:25.05
-docker push [DOCKER_USERNAME]/[DOCKER_REPO]/ucf-vit:25.05
+docker tag ucf-vit:25.05 [DOCKER_USERNAME]/ucf-vit:25.05
+docker push [DOCKER_USERNAME]/ucf-vit:25.05
 ```
-Various example scripts for launching jobs are in the launch folder. Those identified with `_dgx` in the filename are for running with the Docker container
+
+or alternatively pull an already created image from the public dockerhub repo with
+
+```
+docker pull irlyngaas/ucf-vit:25.05
+```
+
+Various example scripts for launching jobs are in the launch folder. Those identified with `_dgx` in the filename are for running with a Docker container
 
 # Innovations
 In this codebase, we provide various Advanced Parallelism & Efficient Computing techniques that we have used to explore larger model and input sizes with VITs than has been previously possible. These techniques range from novel methods to the utilization of several techniques provided by external libraries that are integrated with these novel techniques.
@@ -87,9 +94,11 @@ In this codebase, we provide various Advanced Parallelism & Efficient Computing 
 ## Hybrid-STOP 
 Hybrid Sharded Tensor-Data Orthogonal Parallelism (Hybrid-STOP) [[1]](#1) is a novel parallelism algorithm that combines tensor parallelism and Fully Sharded Data Parallelism (FSDP). It avoids the peak memory use probelm in FSDP and leads to better memory reduction capability by keeping parameters sharded throughout training. 
 ### Usage
-The Hybrid-STOP algorithm is available when using our fsdp [parallelism mode](#parallelism-modes). The following example shows how to initialize and do the forward pass of a [MAE](#masked-autoencoder-mae) model using this algorithm for different number of simple_ddp, fsdp, and tensor parallel ranks (see scripts in the training_script folder full end-to-end training examples). Our custom [dataloader](#dataloader) with the [Imagenet](#imagenet) dataset is used to facilitate proper dataloading when tensor parallelism is > 1 (In this case each tensor parallel rank needs the same batch of input data). This example is meant to be run on a system that uses a slurm resource scheduler, e.g. with a single node via the following `srun -n 8 -c 7 --gpus 8 python test-hstop.py`.
+The Hybrid-STOP algorithm is available when using our fsdp [parallelism mode](#parallelism-modes). The following example shows how to initialize and do the forward pass of a [MAE](#masked-autoencoder-mae) model using this algorithm for different number of simple_ddp, fsdp, and tensor parallel ranks (see scripts in the training_script folder full end-to-end training examples). Our custom [dataloader](#dataloader) with the [Imagenet](#imagenet) dataset is used to facilitate proper dataloading when tensor parallelism is > 1 (In this case each tensor parallel rank needs the same batch of input data). This example is meant to be run on a system that uses a slurm resource scheduler. To run with a single node use the following command `srun -n 8 -c 7 --gpus 8 python test-hstop.py`.
 
 ```python
+#test-hstop.py
+
 import os
 import torch
 import torch.distributed as dist
