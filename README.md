@@ -83,7 +83,7 @@ docker push [DOCKER_USERNAME]/ucf-vit:25.05
 or alternatively pull an already created image from the public dockerhub repo with
 
 ```
-docker pull irlyngaas/ucf-vit:25.05
+docker pull irlyngaas/ucf-vit:25.05-upd2
 ```
 
 Various example scripts for launching jobs are in the launch folder. Those identified with `_dgx` in the filename are for running with a Docker container
@@ -201,7 +201,6 @@ if dist.get_rank(tensor_par_group) == 0:
             dict_end_idx={'imagenet': 1},
             dict_buffer_sizes={'imagenet': 100},
             dict_in_variables={'imagenet': ["red", "green", "blue"]},
-            num_channels_available = {'imagenet': 3},
             num_channels_used = {'imagenet': 3},
             batch_size=32,
             num_workers=1,
@@ -707,16 +706,31 @@ The dataloader is built in a fashion such that it can handle multiple different 
 This dataloader provides the flexibility to add a plethora of different options for customizing how the data is broken up for training. Since we are using a VIT, at least 2D data is expected. However, we have capability for both 2D and 3D spatial data currently. If desired, we have the utilities implemented to break given raw data into smaller tiled chunks. Also, we have a number of different options for how to tile this raw data, e.g. tile overlapping.
 
 ### Usage
+This example is meant to be run on a system that uses a slurm resource scheduler. To run with a single node use the following command `srun -n 8 -c 7 --gpus 8 python test_dataloader.py`.
 ```python
+#test_dataloader.py
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 import torch.distributed as dist
+
+os.environ['MASTER_ADDR'] = str(os.environ['HOSTNAME'])
+os.environ['MASTER_PORT'] = "29500"
+os.environ['WORLD_SIZE'] = os.environ['SLURM_NTASKS']
+os.environ['RANK'] = os.environ['SLURM_PROCID']
+
+world_size = int(os.environ['SLURM_NTASKS'])
+world_rank = int(os.environ['SLURM_PROCID'])
+local_rank = int(os.environ['SLURM_LOCALID'])
+
+torch.cuda.set_device(local_rank)
+device = torch.cuda.current_device()
+
+dist.init_process_group('nccl', timeout=timedelta(seconds=7200000), rank=world_rank, world_size=world_size)
 
 data_module = NativePytorchDataModule(dict_root_dirs={'imagenet': '~/imagenet/train',},
         dict_start_idx={'imagenet': 0},
         dict_end_idx={'imagenet': 1},
         dict_buffer_sizes={'imagenet': 100},
         dict_in_variables={'imagenet': ["red", "green", "blue"]},
-        num_channels_available = {'imagenet': 3},
         num_channels_used = {'imagenet': 3},
         batch_size=32,
         num_workers=1,
@@ -728,24 +742,24 @@ data_module = NativePytorchDataModule(dict_root_dirs={'imagenet': '~/imagenet/tr
         twoD = True,
         single_channel = False,
         return_label = False,
-        dataset_group_list = '8',
+        dataset_group_list = '1:1:1:1:1:1:1:1',
         batches_per_rank_epoch = {'imagenet':4935},
         tile_overlap = 0.0,
         use_all_data = False,
         adaptive_patching = False,
         fixed_length = None,
         separate_channels = False,
-        data_par_size = dist.get_world_size(),
+        data_par_size = 1,
         dataset = 'imagenet',
-        imagenet_resize = [256,256],
+        imagenet_resize = {'imagenet':[256,256]},
     ).to(device)
 
-    data_module.setup()
+data_module.setup()
 
-    train_dataloader = data_module.train_dataloader()
+train_dataloader = data_module.train_dataloader()
 
-    for batch_idx, batch in enumerate(train_dataloader):
-        data, variables = batch
+for batch_idx, batch in enumerate(train_dataloader):
+    data, variables = batch
 ```
 
 ### Parameters
@@ -761,9 +775,6 @@ Ending indices ratio (between 0.0 and 1.0) to determine amount of files in direc
 
 - `dict_buffer_sizes`: Dictionary of ints.
 Buffer Size to use when filling iterative dataloader with prospective tiles for creation of batches
-
-- `num_channels_available`: Dictionary of ints.
-Number of Channels each dataset consists of
 
 - `num_channels_used`: Dictionary of ints.
 Number of Channels to use during training, currently no control of choosing modalities, but will cycle through the channels in order
