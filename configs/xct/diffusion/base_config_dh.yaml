@@ -2,6 +2,7 @@
 trainer:
   max_epochs: 1
   data_type: "bfloat16"
+  gpu_type: "nvidia"
   checkpoint_path: "../../checkpoint/xct/diffusion/base"
   checkpoint_filename: "xct_concrete_base"
   checkpoint_filename_for_loading: "xct_concrete_base_0" #xct_concrete_base_[EPOCH]
@@ -28,6 +29,7 @@ model:
   warmup_start_lr: 1e-8
   eta_min: 1e-8
   loss_fn: "MSE"
+  use_grad_scaler: True
 
   net:
     init_args:

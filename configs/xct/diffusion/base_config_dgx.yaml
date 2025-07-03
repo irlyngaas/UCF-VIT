@@ -1,7 +1,8 @@
 # ---------------------------- TRAINER -------------------------------------------
 trainer:
   max_epochs: 2000
-  data_type: "float32"
+  data_type: "bfloat16"
+  gpu_type: "nvidia"
   checkpoint_path: "/lustre/fs0/scratch/lyngaasir/checkpoint/xct/diffusion/base"
   checkpoint_filename: "xct_concrete_base"
   checkpoint_filename_for_loading: "xct_concrete_base_0" #xct_concrete_base_[EPOCH]
@@ -28,6 +29,7 @@ model:
   warmup_start_lr: 1e-8
   eta_min: 1e-8
   loss_fn: "MSE"
+  use_grad_scaler: True
 
   net:
     init_args:
@@ -59,7 +61,6 @@ data:
   dataset: "xct"
   dict_root_dirs: {
     'xct1': '/lustre/fs0/scratch/lyngaasir/DiffusiveINR_Data/XCT_Concrete_Z00730_650Files',
-    # 'xct1': '/lustre/orion/world-shared/mat268/DiffusiveINR_Data/XCT_Concrete',
   }
   dict_start_idx: {
     'xct1': 0,

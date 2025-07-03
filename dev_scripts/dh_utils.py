@@ -2,9 +2,14 @@ import os
 import subprocess
 
 def master_from_host(host):
-    get_master = "ssh " + host + " hostname -I"
-    master_addr = subprocess.check_output(get_master, shell=True)
-    master_addr = master_addr.decode().split()[0]
+    MACHINE = os.environ["MACHINE"]
+    if MACHINE == "FRONTIER":
+        get_master = "ssh " + host + " hostname -I"
+        master_addr = subprocess.check_output(get_master, shell=True)
+        master_addr = master_addr.decode().split()[0]
+    else: # MACHINE == "DGX"
+        get_master = "getent hosts " + host
+        master_addr = subprocess.check_output(get_master, shell=True)
     print("master address =", master_addr)
     return master_addr
 
@@ -24,15 +29,25 @@ def read_node_list():
             else:
                 nodes.append(f"frontier{subset}")
         nodes_string = ",".join(nodes)
-    #elif MACHINE == "DGX":
-    #    #TODO: ADD IMPLEMENTAION FOR DGX MACHINE
-    #    x = 0
+    elif MACHINE == "DGX":
+        node_subsets = node_list[4:-1].split(",")
+        for subset in node_subsets:
+            if "-" in subset:
+                start, end = subset.split("-")
+                start, end = int(start), int(end)
+                for i in range(start, end + 1):
+                    leading_zeros = "".join(["0"] * (3 - len(str(i))))
+                    nodes.append(f"gpu{leading_zeros}{i}")
+            else:
+                nodes.append(f"gpu{subset}")
+        nodes_string = ",".join(nodes)
     return nodes, nodes_string
 
 
 def read_job_node_list(job_id, job_nodes=None):
     if job_nodes is None:
         nodes, nodes_string = read_node_list()
+        print(nodes, nodes_string)
         total_nodes = len(nodes)
         start = (job_id * 4) % total_nodes
         end = start + 4
@@ -71,6 +86,7 @@ def create_launch_command(prefix, params, job_id, job_nodes=None, DEEPHYPER_LOG_
 
     python_exe = "python"
     python_script = os.environ["TRAINING_SCRIPT"]
+    MACHINE = os.environ["MACHINE"]
     walltime = os.environ["WALLTIME"]
 
     print("job_id =", job_id)

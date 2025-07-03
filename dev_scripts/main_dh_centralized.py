@@ -22,11 +22,22 @@ def run_distributed_training(job, dequed=None):
     #python_script = os.path.join(os.path.dirname(__file__), "train.py")
 
     params = job.parameters
+
+    MACHINE = os.environ["MACHINE"]
     
-    prefix = "".join([f"HOME=/tmp srun",
-                      f" -u -N {NGPUS_PER_TRAINING//8} -n {NGPUS_PER_TRAINING}" ,
-                      f" --ntasks-per-node=8",                      
-                      ])
+    if MACHINE == "FRONTIER":
+        prefix = "".join([f"HOME=/tmp srun",
+                          f" -u -N {NGPUS_PER_TRAINING//8} -n {NGPUS_PER_TRAINING}" ,
+                          f" --ntasks-per-node=8",                      
+                          ])
+    else: #MACHINE == "DGX"
+        #prefix = "".join([f"HOME=/tmp srun",
+        prefix = "".join([f"srun",
+                          f" -u -N {NGPUS_PER_TRAINING//8} -n {NGPUS_PER_TRAINING}" ,
+                          f" --ntasks-per-node=8",                      
+                          f" --mpi=pmix --container-mounts /lustre/fs0 --container-mount-home --container-image /lustre/fs0/scratch/lyngaasir/sqsh-files/0698614322576143+ucf-vit+25.05-upd2.sqsh ",
+                          ])
+#srun --mpi=pmix --container-mounts /lustre/fs0 --container-mount-home --container-image /lustre/fs0/scratch/lyngaasir/sqsh-files/0698614322576143+ucf-vit+25.05-upd2.sqsh python $HOME/UCF-VIT/dev_scripts/train_diffusion_fsdp.py $HOME/UCF-VIT/configs/xct/diffusion/base_config_dgx.yaml
     command = dh_utils.create_launch_command(prefix, params, job.id, dequed,DEEPHYPER_LOG_DIR) 
     print("Command = ", command, flush=True)
 

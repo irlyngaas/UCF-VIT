@@ -71,6 +71,8 @@ def main(args, device):
 
     data_type = conf['trainer']['data_type']
 
+    gpu_type = conf['trainer']['gpu_type']
+
     checkpoint_path = conf['trainer']['checkpoint_path']
   
     checkpoint_filename = conf['trainer']['checkpoint_filename']
@@ -153,10 +155,9 @@ def main(args, device):
         fixed_length = None
         separate_channels = None
 
-    #use_scaler = conf['model']['net']['init_args']['use_scaler']
-    use_scaler = True
-
     num_time_steps = conf['model']['net']['init_args']['num_time_steps']
+
+    use_grad_scaler = conf['model']['use_grad_scaler']
 
     dataset = conf['data']['dataset']
     assert dataset in ["basic_ct", "imagenet", "xct"], "This training script only supports basic_ct, imagenet, or xct datasets"
@@ -239,7 +240,13 @@ def main(args, device):
 #2. Initialize model, optimizer, and scheduler
 ##############################################################################################################
     if data_type == "bfloat16":
-        FusedAttn_option = FusedAttn.CK
+        if gpu_type == "amd":
+            FusedAttn_option = FusedAttn.CK
+        elif gpu_type == "nvidia":
+            FusedAttn_option = FusedAttn.FLASH
+        else:
+            print("Invalid gpu_type used, reverting to using default FMHA")
+            FusedAttn_option = FusedAttn.DEFAULT
     else:
         if use_fused_attn():
             FusedAttn_option = FusedAttn.DEFAULT
@@ -406,7 +413,7 @@ def main(args, device):
         epoch_start = checkpoint['epoch'] + 1
         del checkpoint
 
-    if use_scaler:
+    if use_grad_scaler:
         scaler = ShardedGradScaler(init_scale=8192, growth_interval=100)
         min_scale= 128
 
@@ -546,7 +553,7 @@ def main(args, device):
                 if world_rank==0:
                     print("epoch: ",epoch,"batch_idx",counter,"world_rank",world_rank,"it_loss ",loss,flush=True)
     
-                if use_scaler:
+                if use_grad_scaler:
                     scaler.scale(loss).backward()
                     scaler.step(optimizer)
                     scaler.update()
