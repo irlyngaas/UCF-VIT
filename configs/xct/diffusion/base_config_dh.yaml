@@ -70,9 +70,6 @@ data:
   dict_buffer_sizes: {
     'xct1': 100,
   }
-  num_channels_available: {
-    'xct1': 1,
-  }
   num_channels_used: {
     'xct1': 1,
   }

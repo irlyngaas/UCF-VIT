@@ -167,8 +167,6 @@ def main(device):
 
     dict_buffer_sizes = conf['data']['dict_buffer_sizes']
 
-    num_channels_available = conf['data']['num_channels_available']
-
     num_channels_used = conf['data']['num_channels_used']
 
     dict_in_variables = conf['data']['dict_in_variables']
@@ -399,7 +397,6 @@ def main(device):
             dict_end_idx=dict_end_idx,
             dict_buffer_sizes=dict_buffer_sizes,
             dict_in_variables=dict_in_variables,
-            num_channels_available = num_channels_available,
             num_channels_used = num_channels_used,
             batch_size=batch_size,
             num_workers=num_workers,
