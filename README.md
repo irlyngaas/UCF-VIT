@@ -17,12 +17,14 @@
 - [Datasets](#datasets)
 
 ## UCF-VIT
-UCF-VIT is a **Uniform Coding Framework (UCF)** for training large scale **Vision Transformer (VIT)** based models. The framework brings together a host of functionalities for the purpose of training large models with large input data in a scalable and efficient manner. It consists of advanced parallelism schemes, State of the Art techniques for efficient computing, and custom dataloader utilities that are integrated with the aforementioned schemes and techniques to allow for training on a multitude of different datasets.
+This repository provides a unified coding framework for scalable Vision Transformer (ViT) models, designed to support both extreme-scale model training on leadership-class supercomputers and efficient deployment on smaller systems such as DGX nodes. The framework integrates several cutting-edge innovations in efficient computing, including optimized attention mechanisms, advanced parallelism strategies (data, tensor, sequence, and pipeline parallelism), and mixed-precision acceleration, enabling the training of vision models with hundreds of billions of parameters and achieving sustained ExaFLOP-scale performance on systems like the Frontier supercomputer.
 
+At the same time, the codebase is modular and flexible, allowing researchers and practitioners to run the same models on smaller compute environments without sacrificing performance or usability. This unified approach lowers the barrier to entry for next-generation large-scale vision model research while ensuring reproducibility and scalability across diverse computing platforms.
 
-The intention is to provide the building blocks and utilities for using these different parallelism techniques in fashion that they can be easily integrated to use with various types of scientific data. We provide various different end to end examples for different computer vision tasks using two example datasets. We provide various different options so that the integration of new datasets can be done with a number of different strategies. We also provide various advanced techniques that we have been developed for the specific use case of efficient computing with large scientific datasets.
+The repository is open-source and maintained on GitLab to foster collaboration and accelerate innovation in vision transformer research at scale.
 
 ## Why use UCF-VIT?
+Training large Vision Transformer (ViT) models at scale remains a major technical challenge in both AI research and deployment, with most existing codebases narrowly optimized for either small-scale experiments or vendor-specific hardware, creating barriers to portability, scalability, and reproducibility. A unified coding framework is essential to streamline development, maximize resource efficiency, and enable seamless scaling from small machines to the world’s largest supercomputers. This repository provides such a unified solution—offering robust support for both NVIDIA and AMD GPUs, across systems ranging from single-node DGX machines to leadership-class clusters like the Frontier supercomputer. The framework incorporates our in-house hybrid-stop extreme-scale parallel computing technique, which won the HPCWire Supercomputing Achievement Award, to unlock scalable and efficient ViT model training. It also introduces our adaptive patching method to reduce the computational complexity of ViT attention, alongside variable aggregation for handling large-channel ViTs. Additionally, it integrates widely used techniques such as lower-precision training, layer wrapping, fused attention, and FlashAttention for further efficiency gains. The framework is compatible with a variety of ViT architectural variants, making it a powerful, flexible tool for researchers and practitioners aiming to push the frontier of scalable vision model development and deployment.
 
 # Install
 Installation instruction are provide for running on Frontier and an NVIDIA DGX Cluster
@@ -92,7 +94,7 @@ Various example scripts for launching jobs are in the launch folder. Those ident
 In this codebase, we provide various Advanced Parallelism & Efficient Computing techniques that we have used to explore larger model and input sizes with VITs than has been previously possible. These techniques range from novel methods to the utilization of several techniques provided by external libraries that are integrated with these novel techniques.
 
 ## Hybrid-STOP 
-Hybrid Sharded Tensor-Data Orthogonal Parallelism (Hybrid-STOP) [[1]](#1) is a novel parallelism algorithm that combines tensor parallelism and Fully Sharded Data Parallelism (FSDP). It avoids the peak memory use probelm in FSDP and leads to better memory reduction capability by keeping parameters sharded throughout training. 
+Hybrid Sharded Tensor-Data Orthogonal Parallelism (Hybrid-STOP) [[1]](#1),[[11]](#11) is a novel parallelism algorithm that combines tensor parallelism and Fully Sharded Data Parallelism (FSDP). It avoids the peak memory use probelm in FSDP and leads to better memory reduction capability by keeping parameters sharded throughout training. 
 ### Usage
 The Hybrid-STOP algorithm is available when using our fsdp [parallelism mode](#parallelism-modes). The following example shows how to initialize and do the forward pass of a [MAE](#masked-autoencoder-mae) model using this algorithm for different number of simple_ddp, fsdp, and tensor parallel ranks (see scripts in the training_script folder full end-to-end training examples). Our custom [dataloader](#dataloader) with the [Imagenet](#imagenet) dataset is used to facilitate proper dataloading when tensor parallelism is > 1 (In this case each tensor parallel rank needs the same batch of input data). This example is meant to be run on a system that uses a slurm resource scheduler. To run with a single node use the following command `srun -n 8 -c 7 --gpus 8 python test-hstop.py`.
 
@@ -372,7 +374,7 @@ A recent innovation for efficient computing with VITs that we have implemented w
 In our implementation, adaptive patching is currently handled during dataloading time. Therefore if `adaptive_patching` is set to True rather then the dataloader passing back a batch of input images, instead a batch of adaptively patched input images are passed through the dataloader. If adaptive patching is being used, an integer fixed length needs to be defined and it must be chosen such that 3n+1 = fixed_length where n is some integer if the input is 2D or such that 7n+1 = fixed_length where n is some integer if the input is 3D, to satisify the requirements for the underlying quadtree/octtree. Also it is a requirement that the each dimension of the input images be of a size that is a power of 2, i.e. 32, 64, ..., in order to properly split the data. 
 
 ## Variable Aggregation
-Another advanced technique that we have introduced into this codebase particularly for the purpose of foundational model training is the capability to incorporate variable aggregation. Variable aggregation is a technique where instead of tokenizing multi-channel inputs all at once and transforming them into the latent embedding dimension space, each individual channel is tokenize individually  and transformed into the latent embedding dimensions space based on the type of channel data, given some direction via the `variables` argument in the forward pass. Each of these channel embedding vectors are then fed through an additional attention mechanism to compress all of the input into a single dimension, a process we call variable aggregation. The reason it is important that these input channels be tokenized and embedded separately is because it allows the flexibility to use a pre-trained foundational model in a flexible manner. Variable aggregation allows for the ability to use different types of data during training, e.g. data that does not contain all of the input channels contained in other datasets that the model is being trained with.
+Another advanced technique that we have introduced into this codebase particularly for the purpose of foundational model training is the capability to incorporate variable aggregation [[12]](#12). Variable aggregation is a technique where instead of tokenizing multi-channel inputs all at once and transforming them into the latent embedding dimension space, each individual channel is tokenize individually  and transformed into the latent embedding dimensions space based on the type of channel data, given some direction via the `variables` argument in the forward pass. Each of these channel embedding vectors are then fed through an additional attention mechanism to compress all of the input into a single dimension, a process we call variable aggregation. The reason it is important that these input channels be tokenized and embedded separately is because it allows the flexibility to use a pre-trained foundational model in a flexible manner. Variable aggregation allows for the ability to use different types of data during training, e.g. data that does not contain all of the input channels contained in other datasets that the model is being trained with.
 
 ### Usage 
 In order to use variable aggregation set the `use_varemb` to True. In the case where `use_varemb=False` multi-channel tokenization will be performed and thus any further training or finetuning with that model will require data to match the specific number of channels as the original data used with that model. Variable aggregation is controlled by sending a list of variables identifiers to the forward pass of the model architecture, i.e. `["red","green","blue"]` for the case of RGB images. This list of variables must correspond correctly with the order that the raw data is formatted in and this process is facilitated through our [dataloader](#dataloader) via passing in the identifier list to the `dict_in_variables` argument of the config file. `default_vars` controls the type of types of input channels that the model will allow for ingestion. Thus every variable in `dict_in_variables` must be in `default_vars`, however not every input channel is necessary when passing through the model. 
@@ -1036,5 +1038,25 @@ url = {https://github.com/ROCm/composable_kernel}
   volume={33},
   pages={6840--6851},
   year={2020}
+}
+```
+
+### [11]
+```bibtex
+@article{wang2025orbit,
+  title={ORBIT-2: Scaling Exascale Vision Foundation Models for Weather and Climate Downscaling},
+  author={Wang, Xiao and Choi, Jong-Youl and Kurihaya, Takuya and Lyngaas, Isaac and Yoon, Hong-Jun and Fan, Ming and Nafi, Nasik Muhammad and Tsaris, Aristeidis and Aji, Ashwin M and Hossain, Maliha and others},
+  journal={arXiv preprint arXiv:2505.04802},
+  year={2025}
+}
+```
+
+### [12]
+```bibtex
+@article{tsaris2025distributed,
+  title={Distributed Cross-Channel Hierarchical Aggregation for Foundation Models},
+  author={Tsaris, Aristeidis and Lyngaas, Isaac and Lagregren, John and Wahib, Mohamed and York, Larry and Balaprakash, Prasanna and Lu, Dan and Wang, Feiyi and Wang, Xiao},
+  journal={arXiv preprint arXiv:2506.21411},
+  year={2025}
 }
 ```
