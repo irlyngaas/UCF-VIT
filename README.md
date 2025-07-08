@@ -72,8 +72,35 @@ ln -s $CRAY_MPICH_DIR/lib/libfmpich.so libmpicxx.so
 
 Various example scripts for launching jobs are in the launch folder. Those identified with `_apptainer` in the filename are for running with the Apptainer container
 
-## NVIDIA DGX
-To run on NVIDIA DGX systems we rely on Pytorch Docker containers maintained by NVIDIA. The following instructions give commands to build a docker container with our codebase.
+## Local DGX System
+To run on a local NVIDIA system we provide instructions for creating a Conda environment from scratch
+
+```
+conda create -n vit python=3.11 -y
+conda activate vit
+CUDA_DRIVER=cu128
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/${CUDA_DRIVER}
+pip install xformers \
+timm \
+monai==1.4.0 \
+nibabel \
+torchdata==0.9.0 \
+einops \
+opencv-python-headless==4.11.0.86 \
+matplotlib \
+scipy 
+
+MPI_DIST=mpich
+conda install -c conda-forge mpi4py ${MPI_DIST}
+
+cd UCF-VIT
+pip install -e .
+```
+
+To run on a local DGX system using one of our training scripts invoke the following command `mpirun -n [NUM_GPUS] python -u [TRAINING_SCRIPT] [CONFIG_FILE] MPI`. If you are running on a shared resource machine and you want to use a subset of the available GPUS be sure to set the visible devices before running, e.g. `os.environ["CUDA_VISIBLE_DEVICES"] = '0,1,2,3'`.
+
+## DGX Cluster System
+To run on NVIDIA DGX cluster systems we rely on Pytorch Docker containers maintained by NVIDIA. The following instructions give commands to build a docker container with our codebase.
 
 ```
 cd Docker
@@ -96,12 +123,15 @@ In this codebase, we provide various Advanced Parallelism & Efficient Computing 
 ## Hybrid-STOP 
 Hybrid Sharded Tensor-Data Orthogonal Parallelism (Hybrid-STOP) [[1]](#1),[[11]](#11) is a novel parallelism algorithm that combines tensor parallelism and Fully Sharded Data Parallelism (FSDP). It avoids the peak memory use probelm in FSDP and leads to better memory reduction capability by keeping parameters sharded throughout training. 
 ### Usage
-The Hybrid-STOP algorithm is available when using our fsdp [parallelism mode](#parallelism-modes). The following example shows how to initialize and do the forward pass of a [MAE](#masked-autoencoder-mae) model using this algorithm for different number of simple_ddp, fsdp, and tensor parallel ranks (see scripts in the training_script folder full end-to-end training examples). Our custom [dataloader](#dataloader) with the [Imagenet](#imagenet) dataset is used to facilitate proper dataloading when tensor parallelism is > 1 (In this case each tensor parallel rank needs the same batch of input data). This example is meant to be run on a system that uses a slurm resource scheduler. To run with a single node use the following command `srun -n 8 -c 7 --gpus 8 python test-hstop.py`.
+The Hybrid-STOP algorithm is available when using our fsdp [parallelism mode](#parallelism-modes). The following example shows how to initialize and do the forward pass of a [MAE](#masked-autoencoder-mae) model using this algorithm for different number of simple_ddp, fsdp, and tensor parallel ranks (see scripts in the training_script folder full end-to-end training examples). Our custom [dataloader](#dataloader) with the [Imagenet](#imagenet) dataset is used to facilitate proper dataloading when tensor parallelism is > 1 (In this case each tensor parallel rank needs the same batch of input data). 
+
+This example is meant to be run on a system that uses a slurm resource scheduler or an installed MPI library. To run with a single node on a system with a slurm scheduler use the following command `srun -n [NUM_TASKS] -c [NUM_CPUS_PER_TASK] --gpus [NUM_GPUS] python test-hstop.py SLURM`. To run on a local system via MPI use the following command `mpirun -n [NUM_GPUS] python -u test-hstop.py MPI`
 
 ```python
 #test-hstop.py
 
 import os
+import sys
 import torch
 import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -111,17 +141,44 @@ from UCF_VIT.fsdp.arch import MAE
 from UCF_VIT.utils.fused_attn import FusedAttn
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 
-os.environ['MASTER_ADDR'] = str(os.environ['HOSTNAME'])
-os.environ['MASTER_PORT'] = "29500"
-os.environ['WORLD_SIZE'] = os.environ['SLURM_NTASKS']
-os.environ['RANK'] = os.environ['SLURM_PROCID']
+LAUNCHER = sys.argv[1]
 
-world_size = int(os.environ['SLURM_NTASKS'])
-world_rank = int(os.environ['SLURM_PROCID'])
-local_rank = int(os.environ['SLURM_LOCALID'])
+if LAUNCHER == "SLURM":
 
-torch.cuda.set_device(local_rank)
-device = torch.cuda.current_device()
+    os.environ['MASTER_ADDR'] = str(os.environ['HOSTNAME'])
+    os.environ['WORLD_SIZE'] = os.environ['SLURM_NTASKS']
+    os.environ['RANK'] = os.environ['SLURM_PROCID']
+
+    world_size = int(os.environ['SLURM_NTASKS'])
+    world_rank = int(os.environ['SLURM_PROCID'])
+    local_rank = int(os.environ['SLURM_LOCALID'])
+
+    torch.cuda.set_device(local_rank)
+    device = torch.cuda.current_device()
+
+elif LAUNCHER == "MPI":
+    from mpi4py import MPI
+    import socket 
+
+    num_gpus_per_node = torch.cuda.device_count()
+    comm = MPI.COMM_WORLD
+    world_size = comm.Get_size()
+    world_rank = rank = comm.Get_rank()
+    local_rank = int(rank) % int(num_gpus_per_node) if num_gpus_per_node>0 else 0 # local_rank and device are 0 when using 1 GPU per task
+    os.environ['WORLD_SIZE'] = str(world_size)
+    os.environ['RANK'] = str(world_rank)
+    os.environ['LOCAL_RANK'] = str(local_rank)
+
+    master_addr = None
+    if rank == 0:
+        hostname = socket.gethostname()
+        ip_address = socket.gethostbyname(hostname)
+        master_addr = ip_address
+    master_addr = comm.bcast(master_addr, root=0)
+    os.environ['MASTER_ADDR'] = master_addr
+
+    torch.cuda.set_device(local_rank)
+    device = torch.device(local_rank) if torch.cuda.is_available() else torch.device("cpu")
 
 dist.init_process_group('nccl', timeout=timedelta(seconds=7200000), rank=world_rank, world_size=world_size)
 
@@ -708,23 +765,51 @@ The dataloader is built in a fashion such that it can handle multiple different 
 This dataloader provides the flexibility to add a plethora of different options for customizing how the data is broken up for training. Since we are using a VIT, at least 2D data is expected. However, we have capability for both 2D and 3D spatial data currently. If desired, we have the utilities implemented to break given data into smaller tiled chunks. Also, we have a number of different options for how to tile this data, e.g. tile overlapping.
 
 ### Usage
-This example is meant to be run on a system that uses a slurm resource scheduler. To run with a single node use the following command `srun -n 8 -c 7 --gpus 8 python test_dataloader.py`.
+This example is meant to be run on a system that uses a slurm resource scheduler or an installed MPI library. To run with a single node on a system with a slurm scheduler use the following command `srun -n [NUM_TASKS] -c [NUM_CPUS_PER_TASK] --gpus [NUM_GPUS] python test-hstop.py SLURM`. To run on a local system via MPI use the following command `mpirun -n [NUM_GPUS] python -u test-hstop.py MPI`
 ```python
 #test_dataloader.py
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 import torch.distributed as dist
+import sys
 
-os.environ['MASTER_ADDR'] = str(os.environ['HOSTNAME'])
-os.environ['MASTER_PORT'] = "29500"
-os.environ['WORLD_SIZE'] = os.environ['SLURM_NTASKS']
-os.environ['RANK'] = os.environ['SLURM_PROCID']
+LAUNCHER = sys.argv[1]
 
-world_size = int(os.environ['SLURM_NTASKS'])
-world_rank = int(os.environ['SLURM_PROCID'])
-local_rank = int(os.environ['SLURM_LOCALID'])
+if LAUNCHER == "SLURM":
 
-torch.cuda.set_device(local_rank)
-device = torch.cuda.current_device()
+    os.environ['MASTER_ADDR'] = str(os.environ['HOSTNAME'])
+    os.environ['WORLD_SIZE'] = os.environ['SLURM_NTASKS']
+    os.environ['RANK'] = os.environ['SLURM_PROCID']
+
+    world_size = int(os.environ['SLURM_NTASKS'])
+    world_rank = int(os.environ['SLURM_PROCID'])
+    local_rank = int(os.environ['SLURM_LOCALID'])
+
+    torch.cuda.set_device(local_rank)
+    device = torch.cuda.current_device()
+
+elif LAUNCHER == "MPI":
+    from mpi4py import MPI
+    import socket 
+
+    num_gpus_per_node = torch.cuda.device_count()
+    comm = MPI.COMM_WORLD
+    world_size = comm.Get_size()
+    world_rank = rank = comm.Get_rank()
+    local_rank = int(rank) % int(num_gpus_per_node) if num_gpus_per_node>0 else 0 # local_rank and device are 0 when using 1 GPU per task
+    os.environ['WORLD_SIZE'] = str(world_size)
+    os.environ['RANK'] = str(world_rank)
+    os.environ['LOCAL_RANK'] = str(local_rank)
+
+    master_addr = None
+    if rank == 0:
+        hostname = socket.gethostname()
+        ip_address = socket.gethostbyname(hostname)
+        master_addr = ip_address
+    master_addr = comm.bcast(master_addr, root=0)
+    os.environ['MASTER_ADDR'] = master_addr
+
+    torch.cuda.set_device(local_rank)
+    device = torch.device(local_rank) if torch.cuda.is_available() else torch.device("cpu")
 
 dist.init_process_group('nccl', timeout=timedelta(seconds=7200000), rank=world_rank, world_size=world_size)
 
@@ -744,14 +829,14 @@ data_module = NativePytorchDataModule(dict_root_dirs={'imagenet': '~/imagenet/tr
         twoD = True,
         single_channel = False,
         return_label = False,
-        dataset_group_list = '1:1:1:1:1:1:1:1',
-        batches_per_rank_epoch = {'imagenet':4935},
+        dataset_group_list = '1:1:1:1:1:1:1:1', #Calculated from running utils/load_balance.py with a corresponding config file, these values will change if data_par_size changes
+        batches_per_rank_epoch = {'imagenet':4935}, #Calculated from running utils/load_balance.py with a corresponding config file, these values will change if data_par_size changes
         tile_overlap = 0.0,
         use_all_data = False,
         adaptive_patching = False,
         fixed_length = None,
         separate_channels = False,
-        data_par_size = 1,
+        data_par_size = dist.get_world_size(),
         dataset = 'imagenet',
         imagenet_resize = {'imagenet':[256,256]},
     ).to(device)
