@@ -1,7 +1,7 @@
 ## Table of Contents
 - [UCF-VIT](#ucf-vit)
 - [Install](#install)
-- [Innovations](#Innovations)
+- [Features](#features)
 - [Model Architectures](#model-architectures)
 1. [Vision Transformer](#vision-transformer-vit)
 2. [Masked Autoencoder](#masked-autoencoder-mae)
@@ -90,7 +90,7 @@ docker pull irlyngaas/ucf-vit:25.05-upd2
 
 Various example scripts for launching jobs are in the launch folder. Those identified with `_dgx` in the filename are for running with a Docker container
 
-# Innovations
+# Features
 In this codebase, we provide various Advanced Parallelism & Efficient Computing techniques that we have used to explore larger model and input sizes with VITs than has been previously possible. These techniques range from novel methods to the utilization of several techniques provided by external libraries that are integrated with these novel techniques.
 
 ## Hybrid-STOP 
@@ -377,7 +377,7 @@ In our implementation, adaptive patching is currently handled during dataloading
 Another advanced technique that we have introduced into this codebase particularly for the purpose of foundational model training is the capability to incorporate variable aggregation [[12]](#12). Variable aggregation is a technique where instead of tokenizing multi-channel inputs all at once and transforming them into the latent embedding dimension space, each individual channel is tokenize individually  and transformed into the latent embedding dimensions space based on the type of channel data, given some direction via the `variables` argument in the forward pass. Each of these channel embedding vectors are then fed through an additional attention mechanism to compress all of the input into a single dimension, a process we call variable aggregation. The reason it is important that these input channels be tokenized and embedded separately is because it allows the flexibility to use a pre-trained foundational model in a flexible manner. Variable aggregation allows for the ability to use different types of data during training, e.g. data that does not contain all of the input channels contained in other datasets that the model is being trained with.
 
 ### Usage 
-In order to use variable aggregation set the `use_varemb` to True. In the case where `use_varemb=False` multi-channel tokenization will be performed and thus any further training or finetuning with that model will require data to match the specific number of channels as the original data used with that model. Variable aggregation is controlled by sending a list of variables identifiers to the forward pass of the model architecture, i.e. `["red","green","blue"]` for the case of RGB images. This list of variables must correspond correctly with the order that the raw data is formatted in and this process is facilitated through our [dataloader](#dataloader) via passing in the identifier list to the `dict_in_variables` argument of the config file. `default_vars` controls the type of types of input channels that the model will allow for ingestion. Thus every variable in `dict_in_variables` must be in `default_vars`, however not every input channel is necessary when passing through the model. 
+In order to use variable aggregation set the `use_varemb` to True. In the case where `use_varemb=False` multi-channel tokenization will be performed and thus any further training or finetuning with that model will require data to match the specific number of channels as the original data used with that model. Variable aggregation is controlled by sending a list of variables identifiers to the forward pass of the model architecture, i.e. `["red","green","blue"]` for the case of RGB images. This list of variables must correspond correctly with the order that the data is formatted in and this process is facilitated through our [dataloader](#dataloader) via passing in the identifier list to the `dict_in_variables` argument of the config file. `default_vars` controls the type of types of input channels that the model will allow for ingestion. Thus every variable in `dict_in_variables` must be in `default_vars`, however not every input channel is necessary when passing through the model. 
 
 # Model Architectures
 Currently we provide 5 different model architecutres **(VIT, MAE, UNETR, SAP, VIT-DIFFUSION)**, all of which use the same VIT encoder, but a different decoder architecture depending on the task being trained. All code for the different architectures inherit the encoder from the VIT architecture class in order to facilitate using the same encoder. In the following sections we provide working examples for exectuing a forward pass with each of these architectures that can be ran on a single CPU. For more complex full training runs on multiple GPUs look to the example scripts in the `training_scripts/` directory.
@@ -701,11 +701,11 @@ output = unpatchify(output, data, 16, True) #(1, 3, 256, 256)
 Number of time steps in the diffusion process
 
 ## Dataloader
-The dataloader we provide is a custom native pytorch iterative dataloader. For simplicity, we assume that we are receiving raw data files and we leave it to the user to normalize the data properly within in the dataloader module for training. The reasons for making this assumption of raw data file as input is 1) we intend this repo to be used on very large datasets, thus preprocessing and storing all of the data before training can quickly take up a massive amount of storage, and 2) it removes the need for further data preprocessing scripts to be included in this repo. If performing preprocessing during the dataloading phase is too computationally intensive, we recommend doing it offline and properly storing it in a manner that the dataloader module can handle. 
+The dataloader we provide is a custom native pytorch iterative dataloader. For simplicity, we assume that we are receiving unprocessed data files and we leave it to the user to normalize the data properly within in the dataloader module for training. The reasons for making this assumption of unprocessed data files as input is 1) we intend this repo to be used on very large datasets, thus preprocessing and storing all of the data before training can quickly take up a massive amount of storage, and 2) it removes the need for further data preprocessing scripts to be included in this repo. If performing preprocessing during the dataloading phase is too computationally intensive, we recommend doing it offline and properly storing it in a manner that the dataloader module can handle. 
 
-The dataloader is built in a fashion such that it can handle multiple different dataset directories at the same time. A dataset directory contains one or more raw data file (with all raw data files having the same dimension or able to be resized so that they have the same dimension). The purpose of being able to handle multiple dataset directories is 1) it provides flexible training where you can easily remove and add different datasets for the purposes of running experiments and 2) it allows for the integration of identifying properties from the different datasets that can potentially used for improved learning via our advanced features. For instance, with data that has multiple channels, e.g. images with (R,G,B) channels, we are able to pass along the information on what variable the channel is from and use that information during network training. We then could utilize [variable aggregration](#variable-aggregation) to tokenize each channel separately.
+The dataloader is built in a fashion such that it can handle multiple different dataset directories at the same time. A dataset directory contains one or more data file (with all data files having the same dimension or able to be resized so that they have the same dimension). The purpose of being able to handle multiple dataset directories is 1) it provides flexible training where you can easily remove and add different datasets for the purposes of running experiments and 2) it allows for the integration of identifying properties from the different datasets that can potentially used for improved learning via our advanced features. For instance, with data that has multiple channels, e.g. images with (R,G,B) channels, we are able to pass along the information on what variable the channel is from and use that information during network training. We then could utilize [variable aggregration](#variable-aggregation) to tokenize each channel separately.
 
-This dataloader provides the flexibility to add a plethora of different options for customizing how the data is broken up for training. Since we are using a VIT, at least 2D data is expected. However, we have capability for both 2D and 3D spatial data currently. If desired, we have the utilities implemented to break given raw data into smaller tiled chunks. Also, we have a number of different options for how to tile this raw data, e.g. tile overlapping.
+This dataloader provides the flexibility to add a plethora of different options for customizing how the data is broken up for training. Since we are using a VIT, at least 2D data is expected. However, we have capability for both 2D and 3D spatial data currently. If desired, we have the utilities implemented to break given data into smaller tiled chunks. Also, we have a number of different options for how to tile this data, e.g. tile overlapping.
 
 ### Usage
 This example is meant to be run on a system that uses a slurm resource scheduler. To run with a single node use the following command `srun -n 8 -c 7 --gpus 8 python test_dataloader.py`.
@@ -767,7 +767,7 @@ for batch_idx, batch in enumerate(train_dataloader):
 ### Parameters
 
 - `dict_root_dirs`: Dictionary of paths.
-Paths to directories with raw input data
+Paths to directories with input data files
 
 - `dict_start_idx`: Dictionary of floats (0,1).
 Starting indices ratio (between 0.0 and 1.0) to determine amount of files in directory to use
@@ -782,7 +782,7 @@ Buffer Size to use when filling iterative dataloader with prospective tiles for 
 Number of Channels to use during training, currently no control of choosing modalities, but will cycle through the channels in order
 
 - `dict_in_variables`: Diction of Lists of strings.
-Variables corresponding to the different channels in the dataset, used in the dataloader to find corresponding correct values in the default_var_list. Needs to be in the correct order of the raw data files
+Variables corresponding to the different channels in the dataset, used in the dataloader to find corresponding correct values in the default_var_list. Needs to be in the correct order of the data files
 
 - `batch_size`: Int.
 Per GPU batch size
@@ -797,9 +797,9 @@ Variable whether to use pinned memory on GPU for dataloading
 Patch Size to use when creating patch Embeddings Sequences for the network input
 
 - `tile_size_[x,y,z]`: Int.
-Desired tile size to generate from raw input. If tile_size is smaller than raw input files, multiple tiles will be created from each raw data file
+Desired tile size to generate from the input data files. If tile_size is smaller than the size of the input files, multiple tiles will be created from each data file
 
-- `twoD`: Bool. Variable for indicating two or three dimensionsal input, if False, three-dimensional data will be created from the dataloader. If the raw dataloader is three-dimensional and twoD is set to True, two-dimensional slices will be created from the three-dimensional data by iterating over the final spatial dimension of the data
+- `twoD`: Bool. Variable for indicating two or three dimensionsal input, if False, three-dimensional data will be created from the dataloader. If the dataloader is three-dimensional and twoD is set to True, two-dimensional slices will be created from the three-dimensional data by iterating over the final spatial dimension of the data
 
 - `single_channel`: Bool.
 Variable for indicating that multiple modalities will be used, but the model will be fed with modalities separated into batches only containing a single modality
@@ -835,7 +835,7 @@ Whether or not to separate channels and adaptively patch with different quadtree
 The amount of data parallel training ranks being used
 
 - `dataset`: String. 
--Variable for telling dataloader how to handle raw data and how to break up root directories into files within source code (Each dataset potentially needs it's own code to do this depending on the data type and layout of files). See [Datset Integration](#dataset-integration)
+-Variable for telling dataloader how to handle data and how to break up root directories into files within source code (Each dataset potentially needs it's own code to do this depending on the data type and layout of files). See [Datset Integration](#dataset-integration)
 
 - `imagenet_resize`: List of Ints.
 -Optional argument specific to the imagenet datset which tells the dataloader what size to resize all images to so that the same input size is used.
@@ -845,10 +845,10 @@ For Examples, see the XCT-Diffusion, SST, and S8D branches
 1. Name your dataset and use it in place of the dataset option of the config file
 2. Write code to process file keys for the different datasets
 - Add a new branch to if/else in the process_root_dirs function of the NativePytorchDataModule in `src/UCF_VIT/dataloaders/datamodule.py`, to process datafile paths from each dataset into a corresponding dictionary
-3. Write code that uses appropriate iterative dataloader functions from `src/UCF_VIT/dataloaders/dataset.py` to handle the raw data files
+3. Write code that uses appropriate iterative dataloader functions from `src/UCF_VIT/dataloaders/dataset.py` to handle the data files
 - Add a new branch to if/else in the set_iterative_dataloader function of the NativePytorchDataModule class in `src/UCF_VIT/dataloaders/datamodule.py`, using the correct Tile Iterator (ImageBlockDataIter_2D or ImageBlockDataIter_3D) depending on the dimension of your data
-4. Write code to appropriately read and process (including normalization) raw data files
-- Add a new branch to if/else in the read_process_file function of the FileReader class in `src/UCF_VIT/dataloaders/dataset.py`, using an appropriate python function to read the raw data files depending on the type
+4. Write code to appropriately read and process (including normalization) data files
+- Add a new branch to if/else in the read_process_file function of the FileReader class in `src/UCF_VIT/dataloaders/dataset.py`, using an appropriate python function to read the data files depending on the type
 5. Write code to appropriately load balance data files across the computing hardware
 - Add a new branch to if/else in the process_root_dirs function of `src/UCF_VIT/utils/misc.py` (similar to step 2)
 - Add a new bracnh to if/else in the read_process_file function of `src/UCF_VIT/utils/misc.py` (similar to step 4)
