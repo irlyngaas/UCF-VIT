@@ -27,13 +27,13 @@ The repository is open-source and maintained on GitLab to foster collaboration a
 Training large Vision Transformer (ViT) models at scale remains a major technical challenge in both AI research and deployment, with most existing codebases narrowly optimized for either small-scale experiments or vendor-specific hardware, creating barriers to portability, scalability, and reproducibility. A unified coding framework is essential to streamline development, maximize resource efficiency, and enable seamless scaling from small machines to the world’s largest supercomputers. This repository provides such a unified solution—offering robust support for both NVIDIA and AMD GPUs, across systems ranging from single-node DGX machines to leadership-class clusters like the Frontier supercomputer. The framework incorporates our in-house hybrid-stop extreme-scale parallel computing technique, which won the HPCWire Supercomputing Achievement Award, to unlock scalable and efficient ViT model training. It also introduces our adaptive patching method to reduce the computational complexity of ViT attention, alongside variable aggregation for handling large-channel ViTs. Additionally, it integrates widely used techniques such as lower-precision training, layer wrapping, fused attention, and FlashAttention for further efficiency gains. The framework is compatible with a variety of ViT architectural variants, making it a powerful, flexible tool for researchers and practitioners aiming to push the frontier of scalable vision model development and deployment.
 
 # Install
-Installation instruction are provide for running on Frontier and an NVIDIA DGX Cluster
+Installation instruction are provide for running on systems with both AMD and NVIDIA GPU hardware. Instructions are included for systems ranging from a local DGX cluster to the Frontier Supercomputer.
 
-## Frontier
-There are two options available for creating software environments on Frontier 1) creating Conda environment from scratch or 2) using an apptainer container. Creating a Conda environment from scratch is recommended as the Apptainer containers currently only work in limited scenarios due to missing ROCM packages in the base apptainer image.
+## Systems with AMD GPUs
+There are two options available for creating software environments for systems with AMD GPUs 1) creating Conda environment from scratch or 2) using an apptainer container (the installation instructions for this are currently limited to use on the Frontier supercomputer). Creating a Conda environment from scratch is recommended as the Apptainer containers currently only work in limited scenarios due to missing ROCM packages in the base apptainer image.
 
 ### Conda
-Create Conda Environment from Scratch. Example below using options from the corresponding Apptainer definition files
+Create Conda Environment from Scratch. Example below uses similar options from the corresponding Apptainer definition files
 ```
 PYTHON_VERSION=3.11
 conda create -n vit python=${PYTHON_VERSION} -y
@@ -55,12 +55,19 @@ pip install timm \
  matplotlib \
  scipy
 
+#If your system has an existing MPI installed use the proper mpi4py installation for your sytsem
+#Default install mpi4py 
+MPI_DIST=mpich
+conda install -c conda-forge mpi4py ${MPI_DIST}
+#mpi4py install on Frontier
+MPICC="cc -shared" pip install --no-cache-dir --no-binary=mpi4py mpi4py
+
 cd UCF-VIT
 pip install -e .
 ```
 
-### Apptainer
-Use Apptainer container definition files
+### Apptainer (on Frontier)
+Use Apptainer container definition files (Only use this on Frontier)
 ```
 cd apptainter
 apptainer build frontier-ubuntu-gnu-rocm624.sif frontier-ubuntu-gnu-rocm624.def
@@ -90,6 +97,8 @@ opencv-python-headless==4.11.0.86 \
 matplotlib \
 scipy 
 
+#If your system has an existing MPI installed use the proper mpi4py installation for your sytsem
+#Default install mpi4py 
 MPI_DIST=mpich
 conda install -c conda-forge mpi4py ${MPI_DIST}
 
@@ -97,7 +106,7 @@ cd UCF-VIT
 pip install -e .
 ```
 
-To run on a local DGX system using one of our training scripts invoke the following command `mpirun -n [NUM_GPUS] python -u [TRAINING_SCRIPT] [CONFIG_FILE] MPI`. If you are running on a shared resource machine and you want to use a subset of the available GPUS be sure to set the visible devices before running, e.g. `os.environ["CUDA_VISIBLE_DEVICES"] = '0,1,2,3'`.
+To run on a local DGX system using one of our training scripts invoke the following command `mpirun -n [NUM_GPUS] python -u [TRAINING_SCRIPT] [CONFIG_FILE] MPI` or `python [TRAINING_SCRIPT] [CONFIG_FILE] MPI` to run on a single GPU. If you are running on a shared resource machine and you want to use a subset of the available GPUS be sure to set the visible devices before running, e.g. `os.environ["CUDA_VISIBLE_DEVICES"] = '0,1,2,3'`.
 
 ## DGX Cluster System
 To run on NVIDIA DGX cluster systems we rely on Pytorch Docker containers maintained by NVIDIA. The following instructions give commands to build a docker container with our codebase.
@@ -125,7 +134,7 @@ Hybrid Sharded Tensor-Data Orthogonal Parallelism (Hybrid-STOP) [[1]](#1),[[11]]
 ### Usage
 The Hybrid-STOP algorithm is available when using our fsdp [parallelism mode](#parallelism-modes). The following example shows how to initialize and do the forward pass of a [MAE](#masked-autoencoder-mae) model using this algorithm for different number of simple_ddp, fsdp, and tensor parallel ranks (see scripts in the training_script folder full end-to-end training examples). Our custom [dataloader](#dataloader) with the [Imagenet](#imagenet) dataset is used to facilitate proper dataloading when tensor parallelism is > 1 (In this case each tensor parallel rank needs the same batch of input data). 
 
-This example is meant to be run on a system that uses a slurm resource scheduler or an installed MPI library. To run with a single node on a system with a slurm scheduler use the following command `srun -n [NUM_TASKS] -c [NUM_CPUS_PER_TASK] --gpus [NUM_GPUS] python test-hstop.py SLURM`. To run on a local system via MPI use the following command `mpirun -n [NUM_GPUS] python -u test-hstop.py MPI`
+This example is meant to be run on a system that uses a slurm resource scheduler or with an installed MPI library. To run with a single node on a system with a slurm scheduler use the following command `srun -n [NUM_TASKS] -c [NUM_CPUS_PER_TASK] --gpus [NUM_GPUS] python test-hstop.py SLURM`. To run on a local system via MPI use the following command `mpirun -n [NUM_GPUS] python -u test-hstop.py MPI`
 
 ```python
 #test-hstop.py
@@ -225,7 +234,7 @@ model = MAE(
         tensor_par_group=tensor_par_group,
         class_token=False,
         weight_init='skip',
-    )
+    ).to(device)
 
 if world_rank==0:
     #save initial model weights and distribute to all GPUs in the tensor parallel group to synchronize model weights that do not belong to the training block
@@ -765,7 +774,7 @@ The dataloader is built in a fashion such that it can handle multiple different 
 This dataloader provides the flexibility to add a plethora of different options for customizing how the data is broken up for training. Since we are using a VIT, at least 2D data is expected. However, we have capability for both 2D and 3D spatial data currently. If desired, we have the utilities implemented to break given data into smaller tiled chunks. Also, we have a number of different options for how to tile this data, e.g. tile overlapping.
 
 ### Usage
-This example is meant to be run on a system that uses a slurm resource scheduler or an installed MPI library. To run with a single node on a system with a slurm scheduler use the following command `srun -n [NUM_TASKS] -c [NUM_CPUS_PER_TASK] --gpus [NUM_GPUS] python test-hstop.py SLURM`. To run on a local system via MPI use the following command `mpirun -n [NUM_GPUS] python -u test-hstop.py MPI`
+This example is meant to be run on a system that uses a slurm resource scheduler or with an installed MPI library. To run with a single node on a system with a slurm scheduler use the following command `srun -n [NUM_TASKS] -c [NUM_CPUS_PER_TASK] --gpus [NUM_GPUS] python test-hstop.py SLURM`. To run on a local system via MPI use the following command `mpirun -n [NUM_GPUS] python -u test-hstop.py MPI`
 ```python
 #test_dataloader.py
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
@@ -948,9 +957,14 @@ All of the currently existing architectures exist in 2 independent sub-folders, 
 The main building blocks for the VIT based archictectures are in the **Attention** and **Feed-forward** functions, provided in the Attention class and MLP class in `src/UCF_VIT/simple/building_blocks.py` and `src/UCF_VIT/fsdp/building_blocks.py`. We ask that you use these functions as is and do not modify them, as these common building blocks will be used across the different network architectures.
 
 ## Training Scripts
-We provide several example training scripts. These include all of the necessary things for running the main training loop, including utilities such as checkpoint loading and saving. We leave it to the user to implement their own validation and testing routines in order to more closely fit their needs. Training scripts are provided for each of the training architectures for the simple mode. To convert these scripts to use fsdp mode, look at the code changes made to go from `training_scripts/train_masked_simple.py` to `training_scripts/train_masked_fsdp.py`. 
+We provide several example training scripts. These include all of the necessary things for running the main training loop, including utilities such as checkpoint loading and saving and mechanisms for launching across hardware for different systems. We leave it to the user to implement their own validation and testing routines in order to more closely fit their needs. Training scripts are provided for each of the training architectures for the simple mode. We also have several scripts to train architectures in the fdsp mode. To convert the simple scripts to use fsdp mode, implement the code changes that were done for, e.g. `training_scripts/train_masked_simple.py` to `training_scripts/train_masked_fsdp.py`. 
 
-The training scripts have the capability to launch in different modes for compatibility with different systems. Each training script takes two arguments the first is the config file containing all the different parameters for the particular run and an argument for specifying the specific launching mechanism used to work across the hardware on the system. Currently we provide two launch modes: MPI and SLURM.
+The training scripts have the capability to launch in different modes for compatibility with different systems. Each training script takes two arguments the first is the config file containing all the different parameters for the particular run and an argument for specifying the specific launching mechanism used to work across the hardware on the system. Currently we provide two launch modes: MPI and SLURM. 
+
+For a local DGX system specify `MPI` as the LAUNCHER, then we use the `mpi4py` library to instantiate an MPI communicator and launch jobs via `mpirun -n [NUM_GPUS] -u python [TRAINING_SCRIPT] [CONFIG_FILE] MPI' spawning enough tasks to correspond to the number of GPUs to be used. In this case each task will have it's own GPU for computing. In the case where a single GPU was to be used for training the mpirun can be omitted and a simple invocation of `python [TRAINING_SCRIPT] [CONFIG_FILE] MPI` can be used (be aware to set the device to be used via `CUDA_VISIBLE_DEVICES` environment variable).
+
+For systems that use resource schedulers to use multiple nodes acrossed a system, such as DGX Clusters or Frontier, specify `SLURM` as the launcher. In this case, SLURM environment variables are used to set up the distributed training across the resources. See some of the various examples in the `launch/` folder to see how this is done. Again in this case we assume that there this is one task per every GPU utilized for computing.
+
 
 ## Config Files
 We store the arguments for each individual run in a yaml file. This config file holds all of the arguments for defining the specific training, dataloading, parallelism, and checkpointing options. Below are a number of arguments used in these config files that weren't listed in the example files in the [Model Architectures](#model-architectures) section. In addition to these arguments, the config files also are store information for running the architectures through stored variables.
