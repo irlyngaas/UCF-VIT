@@ -61,7 +61,7 @@ def training_step(data, variables, net: MAE, patch_size, twoD, loss_fn):
     return loss
 
 
-def main(device):
+def main(device, local_rank):
 #1. Load arguments from config file and setup parallelization
 ##############################################################################################################
 
@@ -665,6 +665,6 @@ if __name__ == "__main__":
 
     print("Using dist.init_process_group. world_size ",world_size,flush=True)
     
-    main(device)
+    main(device, local_rank)
 
     dist.destroy_process_group()

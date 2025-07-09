@@ -30,7 +30,7 @@ def training_step(data, variables, label, net: VIT):
     return loss, output
 
 
-def main(device):
+def main(device, local_rank):
 #1. Load arguments from config file and setup parallelization
 ##############################################################################################################
 
@@ -220,7 +220,6 @@ def main(device):
         FusedAttn_option=FusedAttn_option,
     ).to(device)
 
-    local_rank = int(os.environ['SLURM_LOCALID'])
     #model = DDP(model,device_ids=[local_rank],output_device=[local_rank])
     #find_unused_parameters=True is needed under these circumstances
     model = DDP(model,device_ids=[local_rank],output_device=[local_rank],find_unused_parameters=True)
@@ -425,6 +424,6 @@ if __name__ == "__main__":
 
     print("Using dist.init_process_group. world_size ",world_size,flush=True)
     
-    main(device)
+    main(device, local_rank)
 
     dist.destroy_process_group()
