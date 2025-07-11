@@ -10,6 +10,7 @@ def master_from_host(host):
     else: # MACHINE == "DGX"
         get_master = "getent hosts " + host
         master_addr = subprocess.check_output(get_master, shell=True)
+        master_addr = master_addr.decode().split()[0]
     print("master address =", master_addr)
     return master_addr
 
