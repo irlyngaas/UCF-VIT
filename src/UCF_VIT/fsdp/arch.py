@@ -14,7 +14,8 @@ import torch.nn as nn
 from .building_blocks import Block, PatchEmbed, Mlp, DropPath, AttentionPoolLatent, PatchDropout, \
     trunc_normal_, resample_patch_embed, resample_abs_pos_embed, \
     get_act_layer, get_norm_layer, LayerType, \
-    MyUnetBlock, EmbeddingDenseLayer
+    MyUnetBlock, EmbeddingDenseLayer, \
+    VariableMapping_Attention
 
 from timm.models._manipulate import named_apply, checkpoint_seq
 
@@ -305,7 +306,8 @@ class VIT(nn.Module):
             else:
                 self.var_query = nn.Parameter(torch.zeros(1, self.aggregated_variables, self.embed_dim), requires_grad=True)
                 #TODO: Different parameter for specifying num_heads in var_agg rather than encoder num_heads
-                self.var_agg = nn.MultiheadAttention(self.embed_dim, self.num_heads, batch_first=True)
+                #self.var_agg = nn.MultiheadAttention(self.embed_dim, self.num_heads, batch_first=True)
+                self.var_agg = VariableMapping_Attention(self.embed_dim, fused_attn=self.FusedAttn_option, num_heads=self.num_heads, qkv_bias=False, tensor_par_size = self.tensor_par_size, tensor_par_group = self.tensor_par_group)
 
         if weight_init != 'skip':
             self.init_weights('')
@@ -395,8 +397,10 @@ class VIT(nn.Module):
         x = torch.einsum("bvld->blvd", x)
         x = x.flatten(0, 1)  # BxL, V, D
 
-        var_query = self.var_query.repeat_interleave(x.shape[0], dim=0)
-        x , _ = self.var_agg(var_query, x, x)  # BxL, V~ , D, where V~ is the aggregated variables
+        #var_query = self.var_query.repeat_interleave(x.shape[0], dim=0)
+        #x , _ = self.var_agg(var_query, x, x)  # BxL, V~ , D, where V~ is the aggregated variables
+        var_query = self.var_query.expand(x.shape[0], -1, -1).contiguous()
+        x = self.var_agg(var_query, x)  # BxL, V~ , D, where V~ is the aggregated variables
         x = x.squeeze()
 
         if self.tensor_par_size > 1:
