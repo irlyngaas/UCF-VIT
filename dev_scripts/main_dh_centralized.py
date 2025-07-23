@@ -5,6 +5,7 @@ import sys
 import dh_utils
 #import parse
 from deephyper.evaluator import profile
+from ConfigSpace import CategoricalHyperparameter
 
 NNODES = int(os.environ["NNODES"])
 NTOTGPUS = int(os.environ["NTOTGPUS"])
@@ -79,8 +80,12 @@ if __name__ == "__main__":
     problem.add_hyperparameter((0.1, 1., "log-uniform"), "beta_2", default_value=0.9999)
     problem.add_hyperparameter((1e-5, 10, "log-uniform"), "weight_decay", default_value=1e-5)    
     problem.add_hyperparameter((1e-12, 1e-1, "log-uniform"), "eta_min", default_value=1e-9)
-    problem.add_hyperparameter((1, 8, "log-uniform"), "batch_size", default_value=8)    
-
+    problem.add_hyperparameter(CategoricalHyperparameter("batch_size", [2, 4, 8, 16], default_value=8))
+    #problem.add_hyperparameter(CategoricalHyperparameter("patch_size", [8, 16], default_value=8))
+    #problem.add_hyperparameter((2,4,8,16,32,64), "batch_size", default_value=8)
+    #problem.add_hyperparameter((1, 16, "log-uniform"), "batch_size", default_value=8)
+    #problem.add_hyperparameter((2, 4, 8, 16, 32), "patch_size",default_value=8)
+    #problem.add_hyperparameter((2, 16, "log-uniform"), "patch_size", default_value=8)
     # Create the node queue
     queue, _ = read_node_list()
     print("The queue:", queue, len(queue))
@@ -103,4 +108,4 @@ if __name__ == "__main__":
         initial_points=[problem.default_configuration],
     )
 
-    results = search.search(max_evals=1000, timeout=14400)
+    results = search.search(max_evals=1000, timeout=1440000)

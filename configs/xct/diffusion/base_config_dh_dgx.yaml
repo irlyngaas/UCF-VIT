@@ -1,12 +1,12 @@
 # ---------------------------- TRAINER -------------------------------------------
 trainer:
-  max_epochs: 1
+  max_epochs: 100
   data_type: "bfloat16"
   gpu_type: "nvidia"
-  checkpoint_path: "../../checkpoint/xct/diffusion/base"
+  checkpoint_path:  "/lustre/fs0/scratch/lyngaasir/checkpoint/xct/diffusion/32Node/base_DH_isaac"
   checkpoint_filename: "xct_concrete_base"
   checkpoint_filename_for_loading: "xct_concrete_base_0" #xct_concrete_base_[EPOCH]
-  inference_path: "../../checkpoint/xct/diffusion/base/inference"
+  inference_path: "/lustre/fs0/scratch/lyngaasir/checkpoint/xct/diffusion/32Node/base_DH_isaac/inference_DH/best"
 
   resume_from_checkpoint: False
 
@@ -66,7 +66,7 @@ data:
     'xct1': 0,
   }
   dict_end_idx: {
-    'xct1': .1,
+    'xct1': 1,
   }
   dict_buffer_sizes: {
     'xct1': 100,

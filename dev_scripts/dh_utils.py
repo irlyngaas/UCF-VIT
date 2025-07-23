@@ -92,7 +92,8 @@ def create_launch_command(prefix, params, job_id, job_nodes=None, DEEPHYPER_LOG_
 
     print("job_id =", job_id)
     job_nodes, job_master = read_job_node_list(job_id, job_nodes)
-    SLURM_ARGS = f"--nodelist {job_nodes} -t {walltime} --error {DEEPHYPER_LOG_DIR}/error_{job_id}.txt"
+    #SLURM_ARGS = f"--nodelist {job_nodes} -t {walltime} --error {DEEPHYPER_LOG_DIR}/error_{job_id}.txt"
+    SLURM_ARGS = f"--nodelist {job_nodes} --error {DEEPHYPER_LOG_DIR}/error_{job_id}.txt"
     ORBIT_ARGS = YAML_FILE + " " + ARGS + f" --master_addr {job_master} --job_id {job_id}"
     
     command = f"{prefix} {SLURM_ARGS} {python_exe} {python_script} {ORBIT_ARGS}"

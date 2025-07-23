@@ -1,4 +1,3 @@
-
 import glob
 import os
 import sys
@@ -447,6 +446,21 @@ def main(device):
         if batches_per_rank_epoch[k] > iterations_per_epoch:
             iterations_per_epoch = batches_per_rank_epoch[k]
 
+    ### to get the best loss saved
+    best_loss = float("inf")
+    best_epoch = -1
+    epochs_without_improvement = 0
+    max_patience = 20
+    patience = 4
+    lr_decay_count = 0
+    save_period = 15
+    decay_factor = 0.5
+    patience_inc_rate = 1.25 
+        
+    best_model_state = None
+    best_optimizer_state = None
+    best_scheduler_state = None
+
     for epoch in range(epoch_start,max_epochs+1):
         #Reset dataloader module every epoch to ensure all files get used
         if epoch != epoch_start:
@@ -546,32 +560,86 @@ def main(device):
                 optimizer.zero_grad()
         loss_list.append(epoch_loss)
 
-        if world_rank==0:
-            print("epoch: ",epoch," epoch_loss ",epoch_loss, flush=True)
+        # Check for improvement
+        if epoch_loss.item() < best_loss:
+            best_loss = epoch_loss.item()
+            best_epoch = epoch
+            epochs_without_improvement = 0
 
-        model_states = model.state_dict()
-        optimizer_states = optimizer.state_dict()
-        scheduler_states = scheduler.state_dict()
+            best_model_state = copy.deepcopy(model.state_dict())
+            best_optimizer_state = copy.deepcopy(optimizer.state_dict())
+            best_scheduler_state = copy.deepcopy(scheduler.state_dict())
 
-        if epoch % 10 == 0:
-            if world_rank < tensor_par_size:
+            # Save intermediate best model every 15 epochs
+            if epoch>0 and epoch % save_period == 0 and world_rank < tensor_par_size:
                 torch.save({
                     'epoch': epoch,
-                    'model_state_dict': model_states,
-                    'optimizer_state_dict': optimizer_states,
-                    'scheduler_state_dict': scheduler_states,
-                    'loss_list' : loss_list,
-                    }, checkpoint_path+"/"+checkpoint_filename+"_"+str(epoch)+"_rank_"+str(world_rank)+".ckpt".format(epoch))
-     
-        dist.barrier()
-        del model_states
-        del optimizer_states
-        del scheduler_states
+                    'model_state_dict': best_model_state,
+                    'optimizer_state_dict': best_optimizer_state,
+                    'scheduler_state_dict': best_scheduler_state,
+                    'loss_list': loss_list,
+                }, checkpoint_path+"/"+checkpoint_filename+"_BEST_"+str(epoch)+"_rank_"+str(world_rank)+".ckpt".format(epoch))
+                
+                model.load_state_dict(best_model_state)
 
-        if epoch % 10 == 0:
-            for var in default_vars:
-                sample_images(model, var, device, tile_size, precision_dt, patch_size, epoch=epoch, num_samples=10, twoD=twoD, save_path=inference_path, num_time_steps=num_time_steps)
-                # save_intermediate_data(model, var, device, tile_size, precision_dt, patch_size, epoch=epoch, num_samples=10, twoD=twoD, save_path=inference_path, num_time_steps=num_time_steps)
+                for var in default_vars:
+                    # sample_images(model, var, device, tile_size, precision_dt, patch_size,
+                    #                     epoch=epoch, num_samples=10, twoD=twoD, save_path=inference_path,
+                    #                     num_time_steps=num_time_steps)
+                    save_intermediate_data(model, var, device, tile_size, precision_dt, patch_size,
+                                        epoch=epoch, num_samples=10, twoD=twoD, save_path=inference_path,
+                                        num_time_steps=num_time_steps)
+        else:
+            epochs_without_improvement += 1
+
+            # Reduce LR if no improvement for `patience` epochs
+            if epochs_without_improvement >= patience:
+
+                lr_decay_count += 1
+
+                # Apply LR decay on all ranks
+                for i, param_group in enumerate(optimizer.param_groups):
+                    if world_rank == 0:
+                        print(f"LR for param group {i} was: {param_group['lr']:.2e}")
+                    param_group['lr'] *= decay_factor
+                    if world_rank == 0:
+                        print(f"LR for param group {i} updated to: {param_group['lr']:.2e}")
+
+                # Log patience change (optional)
+                if world_rank == 0:
+                    print(f"Increasing patience: old={patience}", flush=True)
+
+                # Update patience
+                patience = min(int(patience * patience_inc_rate), max_patience)
+
+                # Reset counter
+                epochs_without_improvement = 0
+
+        dist.barrier()
+
+    # Final save of best model
+    if world_rank == 0:
+        print(f"Training completed. Best loss: {best_loss:.6f} at epoch {best_epoch}")
+
+    if best_model_state is not None and world_rank < tensor_par_size:
+        torch.save({
+            'epoch': best_epoch,
+            'model_state_dict': best_model_state,
+            'optimizer_state_dict': best_optimizer_state,
+            'scheduler_state_dict': best_scheduler_state,
+            'loss_list': loss_list,
+        }, checkpoint_path+"/"+checkpoint_filename+"_FINALBEST_"+str(best_epoch)+"_rank_"+str(world_rank)+".ckpt".format(best_epoch)) 
+
+        model.load_state_dict(best_model_state)
+
+        for var in default_vars:
+            # sample_images(model, var, device, tile_size, precision_dt, patch_size,
+            #                     epoch=best_epoch, num_samples=10, twoD=twoD, save_path=inference_path,
+            #                     num_time_steps=num_time_steps)
+            save_intermediate_data(model, var, device, tile_size, precision_dt, patch_size,
+                                epoch=best_epoch, num_samples=10, twoD=twoD, save_path=inference_path,
+                                num_time_steps=num_time_steps)
+
 
 
 if __name__ == "__main__":
@@ -601,3 +669,5 @@ if __name__ == "__main__":
     main(device)
 
     dist.destroy_process_group()
+
+

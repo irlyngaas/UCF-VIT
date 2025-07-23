@@ -5,7 +5,7 @@ from einops import rearrange
 import matplotlib.pyplot as plt
 import torch.distributed as dist
 
-from UCF_VIT.utils.plotting import plot_3D_array_slices
+from UCF_VIT.utils.plotting import plot_3D_array_slices, plot_3D_array_center_slices
 from UCF_VIT.utils.misc import unpatchify
 
 class DDPM_Scheduler(nn.Module):
@@ -113,6 +113,8 @@ def save_intermediate_data(model, var, device, res, precision_dt, patch_size, ep
     images = images.astype('float32')
 
     if not twoD:
+        plot_3D_array_center_slices(images, filename=os.path.join(save_path, '3D_gen_centerSlice_%s_%i_%i_%i_%irank%i.png' %(var, epoch, res[0], res[1], res[2], dist.get_rank())))
         np.savez(os.path.join(save_path,'Output_gen_%s_%i_%i_%i_rank%i.npz' %(var, epoch, res[1], res[2], dist.get_rank())),images)
     else:
+        plot_2D_array_slices(images, filename=os.path.join(save_path, '2D_gen_%s_%i_%i_%i_%irank%i.png' %(var, epoch, res[1], res[2], dist.get_rank())))
         np.savez(os.path.join(save_path,'Output_gen_%s_%i_%i_%i_%i_rank%i.npz' %(var, epoch, res[0], res[1], res[2], dist.get_rank())),images)

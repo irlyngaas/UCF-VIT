@@ -111,3 +111,44 @@ def plot_3D_array_slices(arrays,filename='3Dslices.png'):
     plt.subplots_adjust(left=0.01,right=0.99,hspace=-0.05,wspace=-0.05,top=0.99,bottom=0.01)
     fig.savefig(filename,format='png',dpi=300)
     plt.close(fig)
+
+
+def plot_3D_array_center_slices(arrays,filename='3D_center_slices.png'):
+    # arrays is a list with N entries (corresponding to N reverse diffusion time steps)
+    # array[j] is a [B,C,H,W,D] array corresponding to the generated modality at time step t 
+
+    colormap = "gray"#plt.cm.jet
+    fig,ax = plt.subplots(arrays[0].shape[0],len(arrays),figsize=(10,10),facecolor='w',subplot_kw={'projection':'3d'})
+
+    for i in range(ax.shape[0]):
+        for j in range(ax.shape[1]):
+            x_slice = arrays[j][i,...,0][arrays[j][i,...,0].shape[0]//2, :, :]
+            # y_slice = arrays[j][i,...,0][:, arrays[j][i,...,0].shape[1]//2, :]
+            # z_slice = arrays[j][i,...,0][:, :, arrays[j][i,...,0].shape[2]//2]
+            ax[i][j].imshow(x_slice,cmap=colormap)
+            # plot_quadrants(ax[i][j], x_slice, 'x', arrays[j][i,...,0].shape[0]//2, colormap, arrays[j][i,...,0].shape, -2, 2)
+            # plot_quadrants(ax[i][j], y_slice, 'y', arrays[j][i,...,0].shape[1]//2, colormap, arrays[j][i,...,0].shape, -2, 2)
+            # plot_quadrants(ax[i][j], z_slice, 'z', arrays[j][i,...,0].shape[2]//2, colormap, arrays[j][i,...,0].shape, -2, 2)
+            ax[i][j].set_axis_off()
+
+    plt.subplots_adjust(left=0.01,right=0.99,hspace=-0.05,wspace=-0.05,top=0.99,bottom=0.01)
+    fig.savefig(filename,format='png',dpi=300)
+    plt.close(fig)
+
+
+
+def plot_2D_array_slices(arrays,filename='2D_slices.png'):
+    # arrays is a list with N entries (corresponding to N reverse diffusion time steps)
+    # array[j] is a [B,C,H,W,D] array corresponding to the generated modality at time step t 
+
+    colormap = "gray"#plt.cm.jet
+    fig,ax = plt.subplots(arrays[0].shape[0],len(arrays),figsize=(10,10),facecolor='w',subplot_kw={'projection':'3d'})
+
+    for i in range(ax.shape[0]):
+        for j in range(ax.shape[1]):
+            ax[i][j].imshow(arrays[j][i,:,:,0],cmap=colormap)
+            ax[i][j].set_axis_off()
+
+    plt.subplots_adjust(left=0.01,right=0.99,hspace=-0.05,wspace=-0.05,top=0.99,bottom=0.01)
+    fig.savefig(filename,format='png',dpi=300)
+    plt.close(fig)

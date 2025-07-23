@@ -1,9 +1,6 @@
-
 import glob
 import os
-import argparse
 import sys
-import copy
 import random
 from datetime import timedelta
 import numpy as np
@@ -48,17 +45,15 @@ def training_step(data, variables, t, e, net: DiffusionVIT, patch_size, twoD, lo
     return loss
 
 
-def main(args, device):
+def main(device):
 #1. Load arguments from config file and setup parallelization
 ##############################################################################################################
-
-    
 
     print("in main()","sys.argv[1] ",sys.argv[1],flush=True) 
     world_size = int(os.environ['SLURM_NTASKS'])
     world_rank = dist.get_rank()
 
-    config_path = args.yaml_config #sys.argv[1]
+    config_path = sys.argv[1]
 
     if world_rank==0:
         print("config_path ",config_path,flush=True)
@@ -188,24 +183,6 @@ def main(args, device):
 
     use_all_data = conf['data']['use_all_data']
 
-
-    fsdp_size = args.fsdp_size if args.fsdp_size is not None else fsdp_size
-    simple_ddp_size = args.simple_ddp_size if args.simple_ddp_size is not None else simple_ddp_size
-    tensor_par_size = args.tensor_par_size if args.tensor_par_size is not None else tensor_par_size    
-    emb_dim = args.emb_dim if args.emb_dim is not None else emb_dim
-    depth = args.depth if args.depth is not None else depth
-    decoder_depth = args.decoder_depth if args.decoder_depth is not None else decoder_depth
-    num_heads = args.num_heads if args.num_heads is not None else num_heads
-    mlp_ratio = args.mlp_ratio if args.mlp_ratio is not None else mlp_ratio
-    batch_size = args.batch_size if args.batch_size is not None else batch_size
-    lr = args.lr if args.lr is not None else lr
-    weight_decay = args.weight_decay if args.weight_decay is not None else weight_decay
-    beta_1 = args.beta_1 if args.beta_1 is not None else beta_1
-    beta_2 = args.beta_2 if args.beta_2 is not None else beta_2    
-    eta_min = args.eta_min if args.eta_min is not None else eta_min
-
-    data_par_size = fsdp_size * simple_ddp_size    
-
     #Datset specific options
     if dataset == "imagenet":
         imagenet_resize = conf['dataset_options']['imagenet_resize']
@@ -316,7 +293,7 @@ def main(args, device):
             print("rank",dist.get_rank(),"init_model_dict.keys()",init_model_dict.keys(),flush=True)
 
             torch.save(init_model_dict,
-                    checkpoint_path+'/initial_'+str(dist.get_rank())+"_"+str(args.job_id)+'.pth')
+                    checkpoint_path+'/initial_'+str(dist.get_rank())+'.pth')
 
             print("rank", dist.get_rank(),"after torch.save for initial",flush=True)
 
@@ -334,9 +311,9 @@ def main(args, device):
 
            map_location = 'cpu'
            #map_location = 'cuda:'+str(device)
-           model.load_state_dict(torch.load(checkpoint_path+'/initial_'+str(0)+"_"+str(args.job_id)+'.pth',map_location=map_location),strict=False)
+           model.load_state_dict(torch.load(checkpoint_path+'/initial_'+str(0)+'.pth',map_location=map_location),strict=False)
 
-    else: #This should never be used during Deephyper runs 
+    else:  
         if world_rank< tensor_par_size:
             if os.path.exists(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(world_rank)+".ckpt"):
                 print("resume from checkpoint was set to True. Checkpoint path found.",flush=True)
@@ -469,16 +446,6 @@ def main(args, device):
         if batches_per_rank_epoch[k] > iterations_per_epoch:
             iterations_per_epoch = batches_per_rank_epoch[k]
 
-    ### to get the best loss saved
-    best_loss = float("inf")
-    best_epoch = -1
-    epochs_without_improvement = 0
-    patience = 10
-
-    best_model_state = None
-    best_optimizer_state = None
-    best_scheduler_state = None
-
     for epoch in range(epoch_start,max_epochs+1):
         #Reset dataloader module every epoch to ensure all files get used
         if epoch != epoch_start:
@@ -578,108 +545,37 @@ def main(args, device):
                 optimizer.zero_grad()
         loss_list.append(epoch_loss)
 
-        # Track best loss and save corresponding state
-        if epoch_loss.item() < best_loss:
-            best_loss = epoch_loss.item()
-            best_epoch = epoch
-            epochs_without_improvement = 0
-            
-            best_model_state = copy.deepcopy(model.state_dict())
-            best_optimizer_state = copy.deepcopy(optimizer.state_dict())
-            best_scheduler_state = copy.deepcopy(scheduler.state_dict())
+        if world_rank==0:
+            print("epoch: ",epoch," epoch_loss ",epoch_loss, flush=True)
 
-        else:
-            epochs_without_improvement += 1
+        model_states = model.state_dict()
+        optimizer_states = optimizer.state_dict()
+        scheduler_states = scheduler.state_dict()
 
-        # Report current loss
-        if world_rank == 0:
-            print("epoch:", epoch, "epoch_loss", epoch_loss, flush=True)
-
-
-        # Early stopping or normal final epoch
-        if epochs_without_improvement >= patience or epoch == max_epochs:
-            if world_rank == 0:
-                # print(f"MUST-{world_rank} {best_loss:.6f} (from epoch {best_epoch})", flush=True)
-                print(" MUST-"+str(world_rank), best_loss, end=' ', flush=True)
-            # Save best checkpoint
-            if best_model_state is not None and world_rank < tensor_par_size:
+        if epoch % 10 == 0:
+            if world_rank < tensor_par_size:
                 torch.save({
-                    'epoch': best_epoch,
-                    'model_state_dict': best_model_state,
-                    'optimizer_state_dict': best_optimizer_state,
-                    'scheduler_state_dict': best_scheduler_state,
-                    'loss_list': loss_list,
-                }, checkpoint_path + "/" + checkpoint_filename + f"_BEST_{best_epoch}_{args.job_id}.ckpt")
-
-            
-            # Sample images from best model
-            model.load_state_dict(best_model_state)
-            for var in default_vars:
-                sample_images(model, var, device, tile_size, precision_dt, patch_size, epoch=best_epoch, num_samples=10, twoD=twoD, save_path=f"{inference_path}", num_time_steps=num_time_steps)
-                # sample_images(model, var, device, tile_size, precision_dt, patch_size, epoch=epoch, num_samples=10, twoD=twoD, save_path=inference_path, num_time_steps=num_time_steps)
-            
-            break  # stop training early
-        
-        # if world_rank==0:
-        #     print("epoch: ",epoch," epoch_loss ",epoch_loss, flush=True)
-        # if epoch==max_epochs:
-        #     # this line should be the best epoch. if the accuracy doesn't improve for so many epochs, save the best loss/epoch values.
-        #     # model can learn epochs as a ahyperparameter later
-        #     print(" MUST-"+str(world_rank), epoch_loss.item(), end=' ', flush=True)
-
-        # model_states = model.state_dict()
-        # optimizer_states = optimizer.state_dict()
-        # scheduler_states = scheduler.state_dict()
-
-        # if epoch % 5 == 0:
-        #     if world_rank < tensor_par_size:
-        #         torch.save({
-        #             'epoch': epoch,
-        #             'model_state_dict': model_states,
-        #             'optimizer_state_dict': optimizer_states,
-        #             'scheduler_state_dict': scheduler_states,
-        #             'loss_list' : loss_list,
-        #             }, checkpoint_path+"/"+checkpoint_filename+"_"+str(epoch)+"_"+str(args.job_id)+".ckpt")
+                    'epoch': epoch,
+                    'model_state_dict': model_states,
+                    'optimizer_state_dict': optimizer_states,
+                    'scheduler_state_dict': scheduler_states,
+                    'loss_list' : loss_list,
+                    }, checkpoint_path+"/"+checkpoint_filename+"_"+str(epoch)+"_rank_"+str(world_rank)+".ckpt".format(epoch))
      
         dist.barrier()
-        # del model_states
-        # del optimizer_states
-        # del scheduler_states
+        del model_states
+        del optimizer_states
+        del scheduler_states
 
-        # if epoch % 5 == 0:
-        #     for var in default_vars:
-        #         sample_images(model, var, device, tile_size, precision_dt, patch_size, epoch=epoch, num_samples=10, twoD=twoD, save_path=inference_path, num_time_steps=num_time_steps)
-        #         # save_intermediate_data(model, var, device, tile_size, precision_dt, patch_size, epoch=epoch, num_samples=10, twoD=twoD, save_path=inference_path, num_time_steps=num_time_steps)
+        if epoch % 10 == 0:
+            for var in default_vars:
+                # sample_images(model, var, device, tile_size, precision_dt, patch_size, epoch=epoch, num_samples=10, twoD=twoD, save_path=inference_path, num_time_steps=num_time_steps)
+                save_intermediate_data(model, var, device, tile_size, precision_dt, patch_size, epoch=epoch, num_samples=10, twoD=twoD, save_path=inference_path, num_time_steps=num_time_steps)
 
 
 if __name__ == "__main__":
 
-
-    parser = argparse.ArgumentParser(description='Vision Transformer in PyTorch')
-    parser.add_argument("yaml_config", default='./config/ViT.yaml', type=str, help='path')
-
-    parser.add_argument('--fsdp_size', type=int)
-    parser.add_argument('--simple_ddp_size', type=int)
-    parser.add_argument('--tensor_par_size', type=int)
-    parser.add_argument('--emb_dim', type=int)
-    parser.add_argument('--depth', type=int)
-    parser.add_argument('--decoder_depth', type=int)
-    parser.add_argument('--num_heads', type=int)
-    parser.add_argument('--mlp_ratio', type=int)
-
-    parser.add_argument('--batch_size', type=int)
-    parser.add_argument('--lr', type=float)
-    parser.add_argument('--weight_decay', type=float)
-    parser.add_argument('--beta_1', type=float)
-    parser.add_argument('--beta_2', type=float)
-    parser.add_argument('--eta_min', type=float)
-
-    parser.add_argument('--master_addr',)
-    parser.add_argument('--job_id', type=int)
-    
-    args = parser.parse_args()
-
-    os.environ['MASTER_ADDR'] = str(args.master_addr)    
+    os.environ['MASTER_ADDR'] = str(os.environ['HOSTNAME'])
     os.environ['MASTER_PORT'] = "29500"
     os.environ['WORLD_SIZE'] = os.environ['SLURM_NTASKS']
     os.environ['RANK'] = os.environ['SLURM_PROCID']
@@ -692,15 +588,15 @@ if __name__ == "__main__":
     device = torch.cuda.current_device()
 
 
+
     #torch.backends.cudnn.benchmark = True
 
-    dist.init_process_group('nccl', timeout=timedelta(seconds=720000000), rank=world_rank, world_size=world_size)
-    
+    dist.init_process_group('nccl', timeout=timedelta(seconds=7200000), rank=world_rank, world_size=world_size)
 
 #    initialize_process()
 
     print("Using dist.init_process_group. world_size ",world_size,flush=True)
     
-    main(args, device)
+    main(device)
 
     dist.destroy_process_group()
