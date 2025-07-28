@@ -113,13 +113,47 @@ def plot_3D_array_slices(arrays,filename='3Dslices.png'):
     plt.close(fig)
 
 
+def plot_3D_array_center_slices_up(arrays, filename='3D_center_slices.png'):
+    """
+    Plot center X-slices (axis 0) for each sample and timestep.
+
+    arrays: list of arrays, each with shape [B, H, W, D, C] for a diffusion step.
+    """
+    colormap = "gray"
+    B = arrays[0].shape[0]         # number of samples
+    T = len(arrays)                # number of time steps
+
+    fig, ax = plt.subplots(B, T, figsize=(T * 2, B * 2))
+
+    for i in range(B):
+        for j in range(T):
+            vol = arrays[j][i, ..., 0]  # shape: (H, W, D)
+
+            # Take center slice along the first axis (X direction)
+            center_slice = vol[vol.shape[0] // 2, :, :]  # (W, D)
+
+            if B > 1 and T > 1:
+                ax_ij = ax[i, j]
+            elif B == 1:
+                ax_ij = ax[j]        # Single row
+            else:
+                ax_ij = ax[i]        # Single column
+
+            ax_ij.imshow(center_slice, cmap=colormap)
+            ax_ij.axis('off')
+
+    plt.subplots_adjust(left=0.01, right=0.99, hspace=0.05, wspace=0.05, top=0.99, bottom=0.01)
+    fig.savefig(filename, format='png', dpi=300)
+    plt.close(fig)
+
+
 def plot_3D_array_center_slices(arrays,filename='3D_center_slices.png'):
     # arrays is a list with N entries (corresponding to N reverse diffusion time steps)
     # array[j] is a [B,C,H,W,D] array corresponding to the generated modality at time step t 
 
     colormap = "gray"#plt.cm.jet
-    fig,ax = plt.subplots(arrays[0].shape[0],len(arrays),figsize=(10,10),facecolor='w',subplot_kw={'projection':'3d'})
-
+    fig,ax = plt.subplots(arrays[0].shape[0],len(arrays),figsize=(10,10))#,facecolor='w',subplot_kw={'projection':'3d'})
+    
     for i in range(ax.shape[0]):
         for j in range(ax.shape[1]):
             x_slice = arrays[j][i,...,0][arrays[j][i,...,0].shape[0]//2, :, :]

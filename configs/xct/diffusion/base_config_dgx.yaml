@@ -3,24 +3,24 @@ trainer:
   max_epochs: 2000
   data_type: "bfloat16"
   gpu_type: "nvidia"
-  checkpoint_path: "/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/test_0.2/4Node_lrAdaptive_Init0.01_Patch8"
+  checkpoint_path: "/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_3D/XCTConcrete_600/256x256x256/N32_Adaptivelr0.08_P8_BS2_ED576" #32x32x32/32Node_lr0.01_Patch8_batch1" # 
   checkpoint_filename: "xct_concrete_base"
   checkpoint_filename_for_loading: "xct_concrete_base_0" #xct_concrete_base_[EPOCH]
-  inference_path: "/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/test_0.2/4Node_lrAdaptive_Init0.01_Patch8/inference"
+  inference_path: "/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_3D/XCTConcrete_600/256x256x256/N32_Adaptivelr0.08_P8_BS2_ED576/inference" #/32x32x32/32Node_lr0.01_Patch8_batch1/inference"
 
   resume_from_checkpoint: False
 
 # ---------------------------- PARALLELISM -------------------------------------
 parallelism:
   fsdp_size: 1
-  simple_ddp_size: 32  #num of nodes * gpus
+  simple_ddp_size: 256  #num of nodes * gpus
   tensor_par_size: 1
   seq_par_size: 1
   cpu_offloading: False
 
 # ---------------------------- MODEL -------------------------------------------
 model:
-  lr: 0.01
+  lr: 0.08
   beta_1: 0.9
   beta_2: 0.95
   weight_decay: 1e-5
@@ -60,13 +60,14 @@ model:
 data:
   dataset: "xct"
   dict_root_dirs: {
-    'xct1': '/lustre/fs0/scratch/lyngaasir/DiffusiveINR_Data/XCT_Concrete_Z00730_650Files',
+    'xct1': "/lustre/fs0/scratch/lyngaasir/DiffusiveINR_Data/XCT_Concrete_Z00730_650Files", #'/lustre/fs0/scratch/ziabariak/XCT_Concrete_32x32x32_Z00730', #
+    # 'xct1': "/lustre/fs0/scratch/lyngaasir/DiffusiveINR_Data/XCT_Concrete_256x256x256",  
   }
   dict_start_idx: {
     'xct1': 0,
   }
   dict_end_idx: {
-    'xct1': 0.2,
+    'xct1': 1,
   }
   dict_buffer_sizes: {
     'xct1': 100,

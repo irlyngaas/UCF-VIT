@@ -1,0 +1,145 @@
+# ---------------------------- TRAINER -------------------------------------------
+trainer:
+  max_epochs: 2000
+  data_type: "bfloat16"
+  gpu_type: "nvidia"
+  checkpoint_path: "/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D/XCT_NCT_All/256x256x256/N28_lr0.001_P8_BS128_ED576" #32x32x32/32Node_lr0.01_Patch8_batch1" # 
+  checkpoint_filename: "XCT_NCT_base" #  "Breaker_AM_base" # "XCT_half_concrete_base" #  
+  checkpoint_filename_for_loading: "XCT_NCT_base_0" #  "Breaker_AM_base_0" #  "XCT_half_concrete_base_0" #  xct_concrete_base_[EPOCH]
+  inference_path: "/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D/XCT_NCT_All/256x256x256/N28_lr0.001_P8_BS128_ED576/inference" #/32x32x32/32Node_lr0.01_Patch8_batch1/inference"
+
+  resume_from_checkpoint: False
+
+# ---------------------------- PARALLELISM -------------------------------------
+parallelism:
+  fsdp_size: 1
+  simple_ddp_size: 224  #num of nodes * gpus
+  tensor_par_size: 1
+  seq_par_size: 1
+  cpu_offloading: False
+
+# ---------------------------- MODEL -------------------------------------------
+model:
+  lr: 0.001
+  beta_1: 0.9
+  beta_2: 0.95
+  weight_decay: 1e-5
+  warmup_steps: 1000
+  max_steps: 20000
+  warmup_start_lr: 1e-8
+  eta_min: 1e-8
+  loss_fn: "MSE"
+  use_grad_scaler: True
+
+  net:
+    init_args:
+      default_vars: [
+        # "xct", 
+        # "nct",
+        # "xctC",
+        # "xctT",
+        "xctB",
+        "xctA",
+      ]
+      tile_size: [256, 256, 256]
+      patch_size: 8
+      embed_dim: 576
+      depth: 8
+      num_heads: 8
+      decoder_embed_dim: 576
+      decoder_depth: 8
+      decoder_num_heads: 16
+      mlp_ratio: 4
+      mlp_ratio_decoder: 4
+      drop_path: 0.0
+      drop_rate: 0.0
+      linear_decoder: True
+      twoD: True
+      use_varemb: False
+      adaptive_patching: False
+      fixed_length: 196
+      separate_channels: False
+      num_time_steps: 1000
+
+# ---------------------------- DATA -------------------------------------------
+data:
+  dataset: "xct"
+  dict_root_dirs: {
+    'xct1': "/lustre/fs0/scratch/lyngaasir/DiffusiveINR_Data/XCT_Concrete_Z00730_650Files", #599 #'/lustre/fs0/scratch/ziabariak/XCT_Concrete_32x32x32_Z00730', # 
+    'nct1': "/lustre/fs0/scratch/ziabariak/data_LDRD/NeutronCT_Concrete_256x256x256/", # 1539
+    'xct2': "/lustre/fs0/scratch/lyngaasir/DiffusiveINR_Data/XCT_Concrete", #38906
+    'xct3': "/lustre/fs0/scratch/ziabariak/data_LDRD/TRISO_Data/Triso_Data_256x256x256", #680
+    'xct4': "/lustre/fs0/scratch/ziabariak/data_LDRD/Breaker_data/256x256x256", # 5120
+    'xct5': "/lustre/fs0/scratch/ziabariak/data_LDRD/AM_ScattCorrected_data/AM_ScatterCorrected_Data_256x256x256", # 2322
+  }
+  dict_start_idx: {
+    'xct1': 0,
+    'nct1': 0,
+    'xct2': 0,
+    'xct3': 0,
+    'xct4': 0,
+    'xct5': 0,
+  }
+  dict_end_idx: {
+    'xct1': 1,
+    'nct1': 1,
+    'xct2': 1,
+    'xct3': 1,
+    'xct4': 1,
+    'xct5': 1,
+  }
+  dict_buffer_sizes: {
+    'xct1': 100,
+    'nct1': 100,
+    'xct2': 100,
+    'xct3': 100,
+    'xct4': 100,
+    'xct5': 100,
+  }
+  num_channels_used: {
+    'xct1': 1,
+    'nct1': 1,
+    'xct2': 1,
+    'xct3': 1,
+    'xct4': 1,
+    'xct5': 1,
+  }
+  dict_in_variables: {
+    'xct1': [
+     "xct", 
+    ],
+    'nct1': [
+     "nct", 
+    ],
+    'xct2': [
+     "xctC", 
+    ],
+    'xct3': [
+     "xctT", 
+    ],
+    'xct4': [
+     "xctB", 
+    ],
+    'xct5': [
+     "xctA", 
+    ],
+  }
+  batch_size: 128
+  num_workers: 1
+  pin_memory: False
+  single_channel: False
+  tile_overlap: 0.0
+  use_all_data: False
+
+# ---------------------------- LOAD BALANCING -------------------------------------------
+load_balancing:
+  auto_load_balancing: True
+  batches_per_rank_epoch: {
+  'xct1': 600,
+  'nct1': 1200,
+  'xct2': 5000,
+  'xct3': 600,
+  'xct4': 2000,
+  'xct5': 1000,
+  }
+  dataset_group_list: '1:3:75:1:8:4' # '2:1' # '16' # 75:

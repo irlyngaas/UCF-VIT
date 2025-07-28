@@ -237,43 +237,43 @@ def init_par_groups(world_rank, data_par_size, tensor_par_size, seq_par_size, fs
 
     return seq_par_group, ddp_group, tensor_par_group, data_seq_ort_group, fsdp_group, simple_ddp_group
 
-def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size):
-    conf = yaml.load(open(yaml_file,'r'),Loader=yaml.FullLoader)
-    num_total_ddp_ranks = data_par_size
+# def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size):
+#     conf = yaml.load(open(yaml_file,'r'),Loader=yaml.FullLoader)
+#     num_total_ddp_ranks = data_par_size
 
-    dict_root_dirs = conf['data']['dict_root_dirs']
-    dict_start_idx = conf['data']['dict_start_idx']
-    dict_end_idx = conf['data']['dict_end_idx']
-    num_channels_available = conf['data']['num_channels_available']
-    dict_in_variables = conf['data']['dict_in_variables']
-    tile_size =  conf['model']['net']['init_args']['tile_size']
-    twoD = conf['model']['net']['init_args']['twoD']
-    num_channels_used = conf['data']['num_channels_used']
-    single_channel = conf['data']['single_channel']
-    batch_size = conf['data']['batch_size']
-    tile_overlap = conf['data']['tile_overlap']
-    use_all_data = conf['data']['use_all_data']
-    patch_size =  conf['model']['net']['init_args']['patch_size']
-    max_epochs=conf['trainer']['max_epochs']
-    dataset = conf['data']['dataset']
+#     dict_root_dirs = conf['data']['dict_root_dirs']
+#     dict_start_idx = conf['data']['dict_start_idx']
+#     dict_end_idx = conf['data']['dict_end_idx']
+#     num_channels_available = conf['data']['num_channels_available']
+#     dict_in_variables = conf['data']['dict_in_variables']
+#     tile_size =  conf['model']['net']['init_args']['tile_size']
+#     twoD = conf['model']['net']['init_args']['twoD']
+#     num_channels_used = conf['data']['num_channels_used']
+#     single_channel = conf['data']['single_channel']
+#     batch_size = conf['data']['batch_size']
+#     tile_overlap = conf['data']['tile_overlap']
+#     use_all_data = conf['data']['use_all_data']
+#     patch_size =  conf['model']['net']['init_args']['patch_size']
+#     max_epochs=conf['trainer']['max_epochs']
+#     dataset = conf['data']['dataset']
 
-    if dataset == "imagenet":
-        imagenet_resize = conf['dataset_options']['imagenet_resize']
+#     if dataset == "imagenet":
+#         imagenet_resize = conf['dataset_options']['imagenet_resize']
 
-    tile_size_x = int(tile_size[0])
-    tile_size_y = int(tile_size[1])
-    if dataset != "imagenet":
-        tile_size_z = int(tile_size[2])
+#     tile_size_x = int(tile_size[0])
+#     tile_size_y = int(tile_size[1])
+#     if dataset != "imagenet":
+#         tile_size_z = int(tile_size[2])
 
-    #ADD NEW DATASET HERE
-    #Corresponds to the process_root_dirs function of the NativePytorchDataModule in src/UCF_VIT/dataloaders/datamodule.py
-    if dataset == "imagenet":
-        dict_lister_trains = {}
-        for k, root_dir in dict_root_dirs.items():
-            classes = sorted(os.listdir(root_dir))
-            class_to_idx = {cls_name: idx for idx, cls_name in enumerate(classes)}
-            if len(classes) > num_total_ddp_ranks:
-                classes_to_combine = int(len(classes) // num_total_ddp_ranks)
+#     #ADD NEW DATASET HERE
+#     #Corresponds to the process_root_dirs function of the NativePytorchDataModule in src/UCF_VIT/dataloaders/datamodule.py
+#     if dataset == "imagenet":
+#         dict_lister_trains = {}
+#         for k, root_dir in dict_root_dirs.items():
+#             classes = sorted(os.listdir(root_dir))
+#             class_to_idx = {cls_name: idx for idx, cls_name in enumerate(classes)}
+#             if len(classes) > num_total_ddp_ranks:
+#                 classes_to_combine = int(len(classes) // num_total_ddp_ranks)
 
 def process_root_dirs(dataset, dict_root_dirs, data_par_size):
     if dataset == "imagenet":

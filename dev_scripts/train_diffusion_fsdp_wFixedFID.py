@@ -1,6 +1,7 @@
 import glob
 import os
 import sys
+import copy
 import random
 from datetime import timedelta
 import numpy as np
@@ -27,12 +28,336 @@ import functools
 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from timm.layers import use_fused_attn
 
+sys.path.insert(0, '/home/ziabariak/git/UCF-VIT/src')
+
 from UCF_VIT.fsdp.arch import DiffusionVIT
 from UCF_VIT.fsdp.building_blocks import Block
 from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, unpatchify, init_par_groups, calculate_load_balancing_on_the_fly
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.utils.fused_attn import FusedAttn
-from UCF_VIT.ddpm.ddpm import DDPM_Scheduler, sample_images
+
+from UCF_VIT.ddpm.ddpm import DDPM_Scheduler#, sample_images#,save_intermediate_data
+import matplotlib.pyplot as plt
+
+from torcheval.metrics import FrechetInceptionDistance
+
+## plots
+
+def plotLoss(lossVec, save_path='./'):
+    loss_array = np.array([x.cpu().item() if isinstance(x, torch.Tensor) else x for x in lossVec])
+
+    fig, ax = plt.subplots(1, 1, facecolor='w')
+    ax.plot(loss_array, '-k', label='train')
+    ax.set_yscale('log')
+    plt.legend()
+    ax.set_ylim([min(loss_array), 1])
+    fig.savefig(os.path.join(save_path, 'loss.png'), format='png', dpi=150)
+    plt.close(fig)
+
+
+
+def plot_3D_array_center_slices_up(arrays, filename='3D_center_slices.png'):
+    """
+    Plot center X-slices (axis 0) for each sample and timestep.
+
+    arrays: list of arrays, each with shape [B, H, W, D, C] for a diffusion step.
+    """
+    colormap = "gray"
+    B = arrays[0].shape[0]         # number of samples
+    T = len(arrays)                # number of time steps
+
+    fig, ax = plt.subplots(B, T, figsize=(T * 2, B * 2))
+
+    for i in range(B):
+        for j in range(T):
+            vol = arrays[j][i, ..., 0]  # shape: (H, W, D)
+
+            # Take center slice along the first axis (X direction)
+            center_slice = vol[vol.shape[0] // 2, :, :]  # (W, D)
+
+            if B > 1 and T > 1:
+                ax_ij = ax[i, j]
+            elif B == 1:
+                ax_ij = ax[j]        # Single row
+            else:
+                ax_ij = ax[i]        # Single column
+
+            ax_ij.imshow(center_slice, cmap=colormap)
+            ax_ij.axis('off')
+
+    plt.subplots_adjust(left=0.01, right=0.99, hspace=0.05, wspace=0.05, top=0.99, bottom=0.01)
+    fig.savefig(filename, format='png', dpi=300)
+    plt.close(fig)
+
+
+
+def plot_3D_array_center_slices(arrays,filename='3D_center_slices.png'):
+    # arrays is a list with N entries (corresponding to N reverse diffusion time steps)
+    # array[j] is a [B,C,H,W,D] array corresponding to the generated modality at time step t 
+
+    colormap = "gray"#plt.cm.jet
+    fig,ax = plt.subplots(arrays[0].shape[0],len(arrays),figsize=(10,10))#,facecolor='w',subplot_kw={'projection':'3d'})
+    
+    for i in range(ax.shape[0]):
+        for j in range(ax.shape[1]):
+            x_slice = arrays[j][i,...,0][arrays[j][i,...,0].shape[0]//2, :, :]
+            # y_slice = arrays[j][i,...,0][:, arrays[j][i,...,0].shape[1]//2, :]
+            # z_slice = arrays[j][i,...,0][:, :, arrays[j][i,...,0].shape[2]//2]
+            ax[i][j].imshow(x_slice,cmap=colormap)
+            # plot_quadrants(ax[i][j], x_slice, 'x', arrays[j][i,...,0].shape[0]//2, colormap, arrays[j][i,...,0].shape, -2, 2)
+            # plot_quadrants(ax[i][j], y_slice, 'y', arrays[j][i,...,0].shape[1]//2, colormap, arrays[j][i,...,0].shape, -2, 2)
+            # plot_quadrants(ax[i][j], z_slice, 'z', arrays[j][i,...,0].shape[2]//2, colormap, arrays[j][i,...,0].shape, -2, 2)
+            ax[i][j].set_axis_off()
+
+    plt.subplots_adjust(left=0.01,right=0.99,hspace=-0.05,wspace=-0.05,top=0.99,bottom=0.01)
+    fig.savefig(filename,format='png',dpi=300)
+    plt.close(fig)
+
+
+
+
+def sample_images(model, var, device, res, precision_dt, patch_size, epoch=0, num_samples=10, twoD=False, save_path='figures', num_time_steps=1000):
+
+    scheduler = DDPM_Scheduler(num_time_steps=num_time_steps)
+    times = [0, 15, 50, 100, 200, 300, 400, 550, 700, 999]
+
+    images = []
+    if not twoD:
+        z = torch.randn(num_samples, 1, res[0], res[1], res[2])
+    else:
+        z = torch.randn(num_samples, 1, res[1], res[2])
+
+    with torch.no_grad():
+        for t in reversed(range(1, num_time_steps)):
+            if not twoD:
+                e = torch.randn(num_samples, 1, res[0], res[1], res[2])
+            else:
+                e = torch.randn(num_samples, 1, res[1], res[2])
+
+            t = [t]
+            temp = (scheduler.beta[t]/( (torch.sqrt(1-scheduler.alpha[t]))*(torch.sqrt(1-scheduler.beta[t]))))
+            predicted_noise = model(z.to(precision_dt).to(device), torch.tensor(t).to(device), [var]) 
+            predicted_noise = unpatchify(predicted_noise, z.to(precision_dt).to(device), patch_size, twoD)
+            z = (1/(torch.sqrt(1-scheduler.beta[t])))*z - (temp*predicted_noise.cpu())
+            if t[0] in times:
+                images.append(z)
+            z = z + (e*torch.sqrt(scheduler.beta[t]))
+
+        temp = scheduler.beta[0]/( (torch.sqrt(1-scheduler.alpha[0]))*(torch.sqrt(1-scheduler.beta[0])))
+        predicted_noise = model(z.to(precision_dt).to(device), torch.tensor([0]).to(device), [var])
+        predicted_noise = unpatchify(predicted_noise, z.to(precision_dt).to(device), patch_size, twoD)
+        x = (1/(torch.sqrt(1-scheduler.beta[0])))*z - (temp*predicted_noise.cpu())
+        images.append(x)
+
+    if not twoD:
+        images = [rearrange(img.squeeze(0), 'b c h w d -> b h w d c').detach().numpy() for img in images]
+    else:
+        images = [rearrange(img.squeeze(0), 'b c h w -> b h w c').detach().numpy() for img in images]
+
+    if save_path is not None:
+        if not twoD:
+            plot_3D_array_center_slices_up(images, filename=os.path.join(save_path, '3D_GEN_%s_%i_%i_%i_%irank%i.png' %(var, epoch, res[0], res[1], res[2], dist.get_rank())))
+        else:
+            fig,ax = plt.subplots(num_samples,ncols = len(times),figsize=(10,10),facecolor='w')
+            for i in range(images[0].shape[0]):
+                for j in range(len(times)):
+                    ax[i,j].axis('off')
+                    ax[i,j].imshow(images[j][i,:,:,0], interpolation='none')
+            plt.subplots_adjust(left=0.01, right=0.99, top=0.99, bottom=0.01, hspace=0.025, wspace=0.025)
+            fig.savefig(os.path.join(save_path,'2D_gen_%s_%i_%i_%i_rank%i.png' %(var, epoch, res[1], res[2], dist.get_rank())), format='png', dpi=300)
+            plt.close(fig)
+
+
+def save_intermediate_data(model, var, device, res, precision_dt, patch_size, epoch=0, num_samples=10, twoD=False, save_path='figures', num_time_steps=1000):
+
+    scheduler = DDPM_Scheduler(num_time_steps=num_time_steps)
+    times = [0, 15, 50, 100, 200, 300, 400, 550, 700, 999]
+
+    images = []
+    if not twoD:
+        z = torch.randn(num_samples, 1, res[0], res[1], res[2])
+    else:
+        z = torch.randn(num_samples, 1, res[1], res[2])
+
+    with torch.no_grad():
+        for t in reversed(range(1, num_time_steps)):
+            if not twoD:
+                e = torch.randn(num_samples, 1, res[0], res[1], res[2])
+            else:
+                e = torch.randn(num_samples, 1, res[1], res[2])
+
+            t = [t]
+            temp = (scheduler.beta[t]/( (torch.sqrt(1-scheduler.alpha[t]))*(torch.sqrt(1-scheduler.beta[t]))))
+            predicted_noise = model(z.to(precision_dt).to(device), torch.tensor(t).to(device), [var]) 
+            predicted_noise = unpatchify(predicted_noise, z.to(precision_dt).to(device), patch_size, twoD)
+            z = (1/(torch.sqrt(1-scheduler.beta[t])))*z - (temp*predicted_noise.cpu())
+            if t[0] in times:
+                images.append(z)
+            z = z + (e*torch.sqrt(scheduler.beta[t]))
+
+        temp = scheduler.beta[0]/( (torch.sqrt(1-scheduler.alpha[0]))*(torch.sqrt(1-scheduler.beta[0])))
+        predicted_noise = model(z.to(precision_dt).to(device), torch.tensor([0]).to(device), [var])
+        predicted_noise = unpatchify(predicted_noise, z.to(precision_dt).to(device), patch_size, twoD)
+        x = (1/(torch.sqrt(1-scheduler.beta[0])))*z - (temp*predicted_noise.cpu())
+        images.append(x)
+
+    if not twoD:
+        images = [rearrange(img.squeeze(0), 'b c h w d -> b h w d c').detach().numpy() for img in images]
+    else:
+        images = [rearrange(img.squeeze(0), 'b c h w -> b h w c').detach().numpy() for img in images]
+    
+    # images = np.array(images)
+    # images = images.astype('float32')
+
+    if not twoD:
+        plot_3D_array_center_slices_up(images, filename=os.path.join(save_path, '3D_GEN_centerSlice_%s_%i_%i_%i_%irank%i.png' %(var, epoch, res[0], res[1], res[2], dist.get_rank())))
+        # plot_3D_array_center_slices(images, filename=os.path.join(save_path, '3D_gen_centerSlice_%s_%i_%i_%i_%irank%i.png' %(var, epoch, res[0], res[1], res[2], dist.get_rank())))
+        images = np.array(images)
+        images = images.astype('float32')
+        np.savez(os.path.join(save_path,'Output_gen_%s_%i_%i_%i_rank%i.npz' %(var, epoch, res[1], res[2], dist.get_rank())),images)
+    else:
+        plot_2D_array_slices(images, filename=os.path.join(save_path, '2D_gen_%s_%i_%i_%i_%irank%i.png' %(var, epoch, res[1], res[2], dist.get_rank())))
+        np.savez(os.path.join(save_path,'Output_gen_%s_%i_%i_%i_%i_rank%i.npz' %(var, epoch, res[0], res[1], res[2], dist.get_rank())),images)
+
+
+
+def extract_rgb_like_slices(volume, num_samples=5):
+    """
+    Converts a 3D volume (1, D, H, W) to multiple (3, H, W) pseudo-RGB slices.
+    """
+    _, D, H, W = volume.shape
+    indices = torch.linspace(1, D - 2, steps=num_samples).long()
+    slices = []
+
+    for i in indices:
+        s = torch.cat([
+            volume[:, i - 1, :, :],
+            volume[:, i, :, :],
+            volume[:, i + 1, :, :]
+        ], dim=0)  # (3, H, W)
+        slices.append(s)
+
+    return torch.stack(slices)  # (num_samples, 3, H, W)
+
+
+def save_intermediate_data_with_fid(model, var, device, res, precision_dt, patch_size,
+                                    epoch=0, num_samples=10, twoD=False,
+                                    save_path='figures', num_time_steps=1000,
+                                    test_volume_path=None,downscale=1):
+    
+    scheduler = DDPM_Scheduler(num_time_steps=num_time_steps)
+    times = [0, 15, 50, 100, 200, 300, 400, 550, 700, 999]
+
+    images = []
+
+    # Initial noise input
+    if not twoD:
+        z = torch.randn(num_samples, 1, res[0], res[1], res[2])
+    else:
+        z = torch.randn(num_samples, 1, res[1], res[2])
+
+    with torch.no_grad():
+        for t in reversed(range(1, num_time_steps)):
+            if not twoD:
+                e = torch.randn(num_samples, 1, res[0], res[1], res[2])
+            else:
+                e = torch.randn(num_samples, 1, res[1], res[2])
+
+            t = [t]
+            temp = (scheduler.beta[t] / ((torch.sqrt(1 - scheduler.alpha[t])) * (torch.sqrt(1 - scheduler.beta[t]))))
+            predicted_noise = model(z.to(precision_dt).to(device), torch.tensor(t).to(device), [var])
+            predicted_noise = unpatchify(predicted_noise, z.to(precision_dt).to(device), patch_size, twoD)
+            z = (1 / torch.sqrt(1 - scheduler.beta[t])) * z - (temp * predicted_noise.cpu())
+            if t[0] in times:
+                images.append(z)
+            z = z + (e * torch.sqrt(scheduler.beta[t]))
+
+        # Final step at t = 0
+        temp = scheduler.beta[0] / ((torch.sqrt(1 - scheduler.alpha[0])) * (torch.sqrt(1 - scheduler.beta[0])))
+        predicted_noise = model(z.to(precision_dt).to(device), torch.tensor([0]).to(device), [var])
+        predicted_noise = unpatchify(predicted_noise, z.to(precision_dt).to(device), patch_size, twoD)
+        x = (1 / torch.sqrt(1 - scheduler.beta[0])) * z - (temp * predicted_noise.cpu())
+        images.append(x)
+
+    # Rearrange and convert to numpy
+    if not twoD:
+        images = [rearrange(img, 'b c h w d -> b h w d c').detach().numpy() for img in images]
+    else:
+        images = [rearrange(img, 'b c h w -> b h w c').detach().numpy() for img in images]
+    
+    # images = np.array(images).astype('float32')
+    # images = images.astype('float32')
+
+    # Save visuals and arrays
+    if not twoD:
+        print("writing the center slice!")
+        plot_3D_array_center_slices_up(images, filename=os.path.join(save_path, '3D_GEN_FID_centerSlice_%s_%i_%i_%i_%irank%i.png' %(var, epoch, res[0], res[1], res[2], dist.get_rank())))
+    else:
+        fig,ax = plt.subplots(num_samples,ncols = len(times),figsize=(10,10),facecolor='w')
+        for i in range(images[0].shape[0]):
+            for j in range(len(times)):
+                ax[i,j].axis('off')
+                ax[i,j].imshow(images[j][i,:,:,0], interpolation='none')
+        plt.subplots_adjust(left=0.01, right=0.99, top=0.99, bottom=0.01, hspace=0.025, wspace=0.025)
+        fig.savefig(os.path.join(save_path,'2D_gen_FID_%s_%i_%i_%i_rank%i.png' %(var, epoch, res[1], res[2], dist.get_rank())), format='png', dpi=300)
+        plt.close(fig)
+        
+    # ----- FID Calculation -----
+    if test_volume_path is not None and dist.get_rank() == 0:
+        try:
+            idx = random.randint(0, num_samples - 1)
+            gen_vol = images[-1][idx, ..., 0]  # (H, W, D)
+
+            # Load GT volume
+            gt_vol = np.load(test_volume_path)
+            if gt_vol.ndim != 3:
+                raise ValueError("Expected 3D test volume (H, W, D)")
+            gt_vol = gt_vol.astype('float32')
+            if downscale>1:
+                gt_vol = gt_vol[::downscale,::downscale,::downscale]
+
+            # Extract RGB-style 2D slices
+            gen_slices = extract_rgb_slices(gen_vol)
+            gt_slices = extract_rgb_slices(gt_vol)
+
+            # Convert to torch tensors on device
+            gen_tensor = torch.tensor(gen_slices).float().to(device)
+            gt_tensor = torch.tensor(gt_slices).float().to(device)
+
+            # Compute FID
+            fid_metric = FrechetInceptionDistance().to(device)
+            fid_metric.update(gt_tensor, real=True)
+            fid_metric.update(gen_tensor, real=False)
+            fid = fid_metric.compute()
+
+            print(f"[Epoch {epoch}] FID (1-of-N sample vs. test volume): {fid.item():.4f}", flush=True)
+            return fid.item()
+
+        except Exception as e:
+            print(f"[Epoch {epoch}] FID calculation failed: {e}", flush=True)
+            return None
+
+    return None
+
+
+
+def log_and_plot_fid(fid, epoch, fid_scores, fid_epochs, save_path):
+    fid_scores.append(fid)
+    fid_epochs.append(epoch)
+
+    np.save(os.path.join(save_path, "fid_scores.npy"), np.array(fid_scores))
+    np.save(os.path.join(save_path, "fid_epochs.npy"), np.array(fid_epochs))
+
+    plt.figure()
+    plt.plot(fid_epochs, fid_scores, marker='o')
+    plt.xlabel("Epoch")
+    plt.ylabel("FID Score")
+    plt.title("FID vs. Epoch")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_path, "fid_vs_epoch.png"))
+    plt.close()
+
 
 def training_step(data, variables, t, e, net: DiffusionVIT, patch_size, twoD, loss_fn):
 
@@ -446,6 +771,25 @@ def main(device):
         if batches_per_rank_epoch[k] > iterations_per_epoch:
             iterations_per_epoch = batches_per_rank_epoch[k]
 
+    ### to get the best loss saved
+    fid_scores = []
+    fid_epochs = []
+    fid_eval_period = 10
+    
+    best_loss = float("inf")
+    best_epoch = -1
+    epochs_without_improvement = 0
+    max_patience = 20
+    patience = 4
+    lr_decay_count = 0
+    save_period = 15
+    decay_factor = 0.5
+    patience_inc_rate = 1.25 
+        
+    best_model_state = None
+    best_optimizer_state = None
+    best_scheduler_state = None
+
     for epoch in range(epoch_start,max_epochs+1):
         #Reset dataloader module every epoch to ensure all files get used
         if epoch != epoch_start:
@@ -544,33 +888,105 @@ def main(device):
                 scheduler.step()
                 optimizer.zero_grad()
         loss_list.append(epoch_loss)
-
+        
+        # if epoch % fid_eval_period == 0 and world_rank == 0:
+        #     model.eval()
+        #     for var in default_vars:
+        #         fid = save_intermediate_data_with_fid(model, var, device, tile_size, precision_dt, patch_size,
+        #                         epoch=epoch, num_samples=4, twoD=twoD, save_path=inference_path,
+        #                         num_time_steps=num_time_steps,
+        #                         test_volume_path="/lustre/fs0/scratch/lyngaasir/DiffusiveINR_Data/single_validation/XCT_Concrete/XCT_Concrete_256x256_Z00730_pixel30.8985um_Pair_97.npy") # ,downscale=1#add in config
+        #     model.train()
+        #     if fid is not None and np.isfinite(fid):
+        #         log_and_plot_fid(fid, epoch, fid_scores, fid_epochs, inference_path)
+        #     else:
+        #         print(f"FID computation failed at epoch {epoch}")
+        
         if world_rank==0:
             print("epoch: ",epoch," epoch_loss ",epoch_loss, flush=True)
+            if epoch % 100 == 0:
+                plotLoss(loss_list, save_path=checkpoint_path)
 
-        model_states = model.state_dict()
-        optimizer_states = optimizer.state_dict()
-        scheduler_states = scheduler.state_dict()
+        # Check for improvement
+        if epoch_loss.item() < best_loss:
+            best_loss = epoch_loss.item()
+            best_epoch = epoch
+            epochs_without_improvement = 0
 
-        if epoch % 10 == 0:
-            if world_rank < tensor_par_size:
+            best_model_state = copy.deepcopy(model.state_dict())
+            best_optimizer_state = copy.deepcopy(optimizer.state_dict())
+            best_scheduler_state = copy.deepcopy(scheduler.state_dict())
+
+            # Save intermediate best model every 15 epochs
+            if epoch>0 and epoch % save_period == 0 and world_rank < tensor_par_size:
                 torch.save({
                     'epoch': epoch,
-                    'model_state_dict': model_states,
-                    'optimizer_state_dict': optimizer_states,
-                    'scheduler_state_dict': scheduler_states,
-                    'loss_list' : loss_list,
-                    }, checkpoint_path+"/"+checkpoint_filename+"_"+str(epoch)+"_rank_"+str(world_rank)+".ckpt".format(epoch))
-     
-        dist.barrier()
-        del model_states
-        del optimizer_states
-        del scheduler_states
+                    'model_state_dict': best_model_state,
+                    'optimizer_state_dict': best_optimizer_state,
+                    'scheduler_state_dict': best_scheduler_state,
+                    'loss_list': loss_list,
+                }, checkpoint_path+"/"+checkpoint_filename+"_BEST_"+str(epoch)+"_rank_"+str(world_rank)+".ckpt".format(epoch))
+                
+                model.load_state_dict(best_model_state)
 
-        if epoch % 10 == 0:
-            for var in default_vars:
-                # sample_images(model, var, device, tile_size, precision_dt, patch_size, epoch=epoch, num_samples=10, twoD=twoD, save_path=inference_path, num_time_steps=num_time_steps)
-                save_intermediate_data(model, var, device, tile_size, precision_dt, patch_size, epoch=epoch, num_samples=10, twoD=twoD, save_path=inference_path, num_time_steps=num_time_steps)
+                for var in default_vars:
+                    # sample_images(model, var, device, tile_size, precision_dt, patch_size,
+                    #                     epoch=epoch, num_samples=10, twoD=twoD, save_path=inference_path,
+                    #                     num_time_steps=num_time_steps)
+                    save_intermediate_data(model, var, device, tile_size, precision_dt, patch_size,
+                                        epoch=epoch, num_samples=3, twoD=twoD, save_path=inference_path,
+                                        num_time_steps=num_time_steps)
+        else:
+            epochs_without_improvement += 1
+
+            # Reduce LR if no improvement for `patience` epochs
+            if epochs_without_improvement >= patience:
+
+                lr_decay_count += 1
+
+                # Apply LR decay on all ranks
+                for i, param_group in enumerate(optimizer.param_groups):
+                    if world_rank == 0:
+                        print(f"LR for param group {i} was: {param_group['lr']:.2e}")
+                    param_group['lr'] *= decay_factor
+                    if world_rank == 0:
+                        print(f"LR for param group {i} updated to: {param_group['lr']:.2e}")
+
+                # Log patience change (optional)
+                if world_rank == 0:
+                    print(f"Increasing patience: old={patience}", flush=True)
+
+                # Update patience
+                patience = min(int(patience * patience_inc_rate), max_patience)
+
+                # Reset counter
+                epochs_without_improvement = 0
+
+        dist.barrier()
+
+    # Final save of best model
+    if world_rank == 0:
+        print(f"Training completed. Best loss: {best_loss:.6f} at epoch {best_epoch}")
+
+    if best_model_state is not None and world_rank < tensor_par_size:
+        torch.save({
+            'epoch': best_epoch,
+            'model_state_dict': best_model_state,
+            'optimizer_state_dict': best_optimizer_state,
+            'scheduler_state_dict': best_scheduler_state,
+            'loss_list': loss_list,
+        }, checkpoint_path+"/"+checkpoint_filename+"_FINALBEST_"+str(best_epoch)+"_rank_"+str(world_rank)+".ckpt".format(best_epoch)) 
+
+        model.load_state_dict(best_model_state)
+
+        for var in default_vars:
+            # sample_images(model, var, device, tile_size, precision_dt, patch_size,
+            #                     epoch=best_epoch, num_samples=10, twoD=twoD, save_path=inference_path,
+            #                     num_time_steps=num_time_steps)
+            save_intermediate_data(model, var, device, tile_size, precision_dt, patch_size,
+                                epoch=best_epoch, num_samples=3, twoD=twoD, save_path=inference_path,
+                                num_time_steps=num_time_steps)
+
 
 
 if __name__ == "__main__":
@@ -600,3 +1016,5 @@ if __name__ == "__main__":
     main(device)
 
     dist.destroy_process_group()
+
+
