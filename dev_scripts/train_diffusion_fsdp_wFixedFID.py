@@ -589,7 +589,7 @@ def main(device):
             if epoch % 100 == 0:
                 plotLoss(loss_list, save_path=checkpoint_path)
 
-        # Check for improvement
+        # Track best model independently
         if epoch_loss.item() < best_loss:
             best_loss = epoch_loss.item()
             best_epoch = epoch
@@ -598,51 +598,37 @@ def main(device):
             best_model_state = copy.deepcopy(model.state_dict())
             best_optimizer_state = copy.deepcopy(optimizer.state_dict())
             best_scheduler_state = copy.deepcopy(scheduler.state_dict())
-
-            # Save intermediate best model every 15 epochs
-            if epoch>0 and epoch % save_period == 0 and world_rank < tensor_par_size:
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': best_model_state,
-                    'optimizer_state_dict': best_optimizer_state,
-                    'scheduler_state_dict': best_scheduler_state,
-                    'loss_list': loss_list,
-                }, checkpoint_path+"/"+checkpoint_filename+"_BEST_"+str(epoch)+"_rank_"+str(world_rank)+".ckpt".format(epoch))
-                
-                model.load_state_dict(best_model_state)
-
-                for var in default_vars:
-                    sample_images(model, var, device, tile_size, precision_dt, patch_size,
-                                        epoch=epoch, num_samples=3, twoD=twoD, save_path=inference_path,
-                                        num_time_steps=num_time_steps)
-                    # save_intermediate_data(model, var, device, tile_size, precision_dt, patch_size,
-                    #                     epoch=epoch, num_samples=3, twoD=twoD, save_path=inference_path,
-                    #                     num_time_steps=num_time_steps)
         else:
             epochs_without_improvement += 1
 
             # Reduce LR if no improvement for `patience` epochs
             if epochs_without_improvement >= patience:
-
                 lr_decay_count += 1
-
-                # Apply LR decay on all ranks
                 for i, param_group in enumerate(optimizer.param_groups):
                     if world_rank == 0:
                         print(f"LR for param group {i} was: {param_group['lr']:.2e}")
                     param_group['lr'] *= decay_factor
                     if world_rank == 0:
                         print(f"LR for param group {i} updated to: {param_group['lr']:.2e}")
-
-                # Log patience change (optional)
-                if world_rank == 0:
-                    print(f"Increasing patience: old={patience}", flush=True)
-
-                # # Update patience
-                # patience = min(int(patience * patience_inc_rate), max_patience)
-
-                # Reset counter
                 epochs_without_improvement = 0
+
+        # Save the best model periodically
+        if epoch > 0 and epoch % save_period == 0 and world_rank < tensor_par_size:
+            torch.save({
+                'epoch': best_epoch,
+                'model_state_dict': best_model_state,
+                'optimizer_state_dict': best_optimizer_state,
+                'scheduler_state_dict': best_scheduler_state,
+                'loss_list': loss_list,
+            }, f"{checkpoint_path}/{checkpoint_filename}_BEST_{epoch}_rank_{world_rank}.ckpt")
+
+            model.load_state_dict(best_model_state)
+
+            for var in default_vars:
+                sample_images(model, var, device, tile_size, precision_dt, patch_size,
+                            epoch=epoch, num_samples=3, twoD=twoD, save_path=inference_path,
+                            num_time_steps=num_time_steps)
+
 
         dist.barrier()
 
