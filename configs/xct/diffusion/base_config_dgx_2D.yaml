@@ -1,26 +1,26 @@
 # ---------------------------- TRAINER -------------------------------------------
 trainer:
-  max_epochs: 2000
+  max_epochs: 5000
   data_type: "bfloat16"
   gpu_type: "nvidia"
-  checkpoint_path: "/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D/XCT_Conc/256x256x256/N2_lr0.001_P8_BS128_ED576" #32x32x32/32Node_lr0.01_Patch8_batch1" # 
+  checkpoint_path: "/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D/XCT_Conc/600Vols/256x256x256/N4_Adaptivelr0.002_P8_BS512_ED576" #32x32x32/32Node_lr0.01_Patch8_batch1" # 
   checkpoint_filename: "XCT_Conc_base" #  "Breaker_AM_base" # "XCT_half_concrete_base" #  
   checkpoint_filename_for_loading: "XCT_Conc_base_0" #  "Breaker_AM_base_0" #  "XCT_half_concrete_base_0" #  xct_concrete_base_[EPOCH]
-  inference_path: "/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D/XCT_Conc/256x256x256/N2_lr0.001_P8_BS128_ED576/inference" #/32x32x32/32Node_lr0.01_Patch8_batch1/inference"
+  inference_path: "/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D/XCT_Conc/600Vols/256x256x256/N4_Adaptivelr0.002_P8_BS512_ED576/inference" #/32x32x32/32Node_lr0.01_Patch8_batch1/inference"
 
   resume_from_checkpoint: False
 
 # ---------------------------- PARALLELISM -------------------------------------
 parallelism:
   fsdp_size: 1
-  simple_ddp_size: 16  #num of nodes * gpus
+  simple_ddp_size: 32  #num of nodes * gpus
   tensor_par_size: 1
   seq_par_size: 1
   cpu_offloading: False
 
 # ---------------------------- MODEL -------------------------------------------
 model:
-  lr: 0.001
+  lr: 0.002
   beta_1: 0.9
   beta_2: 0.95
   weight_decay: 1e-5
@@ -79,7 +79,7 @@ data:
      "xct", 
     ],
   }
-  batch_size: 128
+  batch_size: 512
   num_workers: 1
   pin_memory: False
   single_channel: False
