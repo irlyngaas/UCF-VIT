@@ -461,11 +461,11 @@ def main(device):
     best_loss = float("inf")
     best_epoch = -1
     epochs_without_improvement = 0
-    max_patience = 25#
-    patience = 25#4
+    max_patience = 400
+    patience = 100
     lr_decay_count = 0
-    save_period = 15
-    decay_factor = 0.5
+    save_period = 50
+    decay_factor = 0.9
     patience_inc_rate = 1.25 
         
     best_model_state = None
@@ -587,7 +587,7 @@ def main(device):
         if world_rank==0:
             print("epoch: ",epoch," epoch_loss ",epoch_loss, flush=True)
             if epoch % 100 == 0:
-                plotLoss(loss_list, save_path=checkpoint_path)
+                plotLoss(loss_list, save_path=os.path.join(checkpoint_path, f'3D_data_loss_N{simple_ddp_size//8}_BS{batch_size}_PS{patch_size}_ED{emb_dim}.png'))
 
         # Track best model independently
         if epoch_loss.item() < best_loss:
@@ -603,6 +603,13 @@ def main(device):
 
             # Reduce LR if no improvement for `patience` epochs
             if epochs_without_improvement >= patience:
+                
+                # model.load_state_dict(best_model_state)
+                # optimizer.load_state_dict(best_optimizer_state)
+                # scheduler.load_state_dict(best_scheduler_state)
+                # if world_rank == 0:
+                #     print(f"[Epoch {epoch}] Reloading best model from epoch {best_epoch} after LR decay.")
+                    
                 lr_decay_count += 1
                 for i, param_group in enumerate(optimizer.param_groups):
                     if world_rank == 0:
@@ -610,6 +617,12 @@ def main(device):
                     param_group['lr'] *= decay_factor
                     if world_rank == 0:
                         print(f"LR for param group {i} updated to: {param_group['lr']:.2e}")
+                    # Log patience change (optional)
+                    if world_rank == 0:
+                        print(f"Increasing patience: old={patience}", flush=True)
+
+                    # Update patience
+                    patience = min(int(patience * patience_inc_rate),max_patience)
                 epochs_without_improvement = 0
 
         # Save the best model periodically

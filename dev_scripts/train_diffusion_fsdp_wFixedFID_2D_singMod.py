@@ -466,7 +466,7 @@ def main(device):
     lr_decay_count = 0
     save_period = 50
     decay_factor = 0.9
-    patience_inc_rate = 1.2 
+    patience_inc_rate = 1.25 
         
     best_model_state = None
     best_optimizer_state = None
