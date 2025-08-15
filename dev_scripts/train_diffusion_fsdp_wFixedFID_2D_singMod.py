@@ -556,6 +556,14 @@ def main(device):
     
                 if world_rank==0:
                     print("epoch: ",epoch,"batch_idx",counter,"world_rank",world_rank,"it_loss ",loss,flush=True)
+
+                if epoch % 100 == 0:
+                    if world_rank==1:
+                        print("epoch: ",epoch,"batch_idx",counter,"world_rank",world_rank,"it_loss ",loss,flush=True)
+                    # if world_rank==2:
+                    #     print("epoch: ",epoch,"batch_idx",counter,"world_rank",world_rank,"it_loss ",loss,flush=True)
+                    # if world_rank==3:
+                    #     print("epoch: ",epoch,"batch_idx",counter,"world_rank",world_rank,"it_loss ",loss,flush=True)
     
                 if use_grad_scaler:
                     scaler.scale(loss).backward()
@@ -587,7 +595,12 @@ def main(device):
         if world_rank==0:
             print("epoch: ",epoch," epoch_loss ",epoch_loss, flush=True)
             if epoch % 100 == 0:
-                plotLoss(loss_list, save_path=os.path.join(checkpoint_path, f'loss_N{simple_ddp_size//8}_BS{batch_size}_PS{patch_size}_ED{emb_dim}.png'))
+                plotLoss(loss_list, save_path=os.path.join(checkpoint_path, f'loss_N{simple_ddp_size//8}_BS{batch_size}_PS{patch_size}_ED{emb_dim}_rank0.png'))
+        if world_rank==1:
+            if epoch % 100 == 0:
+                print("epoch: ",epoch," epoch_loss ",epoch_loss, flush=True)
+                plotLoss(loss_list, save_path=os.path.join(checkpoint_path, f'loss_N{simple_ddp_size//8}_BS{batch_size}_PS{patch_size}_ED{emb_dim}_rank1.png'))
+
 
         # Track best model independently
         if epoch_loss.item() < best_loss:
@@ -639,7 +652,7 @@ def main(device):
 
             for var in default_vars:
                 sample_images(model, var, device, tile_size, precision_dt, patch_size,
-                            epoch=epoch, num_samples=3, twoD=twoD, save_path=inference_path,
+                            epoch=epoch, num_samples=5, twoD=twoD, save_path=inference_path,
                             num_time_steps=num_time_steps)
 
 
@@ -662,7 +675,7 @@ def main(device):
 
         for var in default_vars:
             sample_images(model, var, device, tile_size, precision_dt, patch_size,
-                                epoch=best_epoch, num_samples=3, twoD=twoD, save_path=inference_path,
+                                epoch=best_epoch, num_samples=10, twoD=twoD, save_path=inference_path,
                                 num_time_steps=num_time_steps)
             # save_intermediate_data(model, var, device, tile_size, precision_dt, patch_size,
             #                     epoch=best_epoch, num_samples=2, twoD=twoD, save_path=inference_path,

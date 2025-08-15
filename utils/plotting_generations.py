@@ -45,7 +45,9 @@ def plot_2D_array_slices(arrays,filename='2D_slices.png'):
 
             ax_ij.imshow(image_slice, cmap=colormap)
             ax_ij.axis('off')
-
+            if i == B - 1:
+                print(f'for the last sampl, at time step {j}, the max/min values are: [{np.max(image_slice),np.min(image_slice)}]')
+            
     plt.subplots_adjust(left=0.01, right=0.99, hspace=0.05, wspace=0.05, top=0.99, bottom=0.01)
     fig.savefig(filename, format='png', dpi=300)
     plt.close(fig)
@@ -111,57 +113,173 @@ def plot_3D_array_center_slices(arrays,filename='3D_center_slices.png'):
 
 
 
-def sample_images(model, var, device, res, precision_dt, patch_size, epoch=0, num_samples=10, twoD=False, save_path='figures', num_time_steps=1000):
+# def sample_images(model, var, device, res, precision_dt, patch_size, epoch=0, num_samples=10, twoD=False, save_path='figures', num_time_steps=1000):
 
+#     scheduler = DDPM_Scheduler(num_time_steps=num_time_steps)
+#     times = [0, 15, 50, 100, 200, 300, 400, 550, 700, 999]
+
+#     images = []
+#     if not twoD:
+#         z = torch.randn(num_samples, 1, res[0], res[1], res[2])
+#     else:
+#         z = torch.randn(num_samples, 1, res[1], res[2])
+
+#     with torch.no_grad():
+#         for t in reversed(range(1, num_time_steps)):
+#             if not twoD:
+#                 e = torch.randn(num_samples, 1, res[0], res[1], res[2])
+#             else:
+#                 e = torch.randn(num_samples, 1, res[1], res[2])
+
+#             t = [t]
+#             temp = (scheduler.beta[t]/( (torch.sqrt(1-scheduler.alpha[t]))*(torch.sqrt(1-scheduler.beta[t]))))
+#             predicted_noise = model(z.to(precision_dt).to(device), torch.tensor(t).to(device), [var]) 
+#             predicted_noise = unpatchify(predicted_noise, z.to(precision_dt).to(device), patch_size, twoD)
+#             z = (1/(torch.sqrt(1-scheduler.beta[t])))*z - (temp*predicted_noise.cpu())
+#             if t[0] in times:
+#                 images.append(z)
+#             z = z + (e*torch.sqrt(scheduler.beta[t]))
+
+#         temp = scheduler.beta[0]/( (torch.sqrt(1-scheduler.alpha[0]))*(torch.sqrt(1-scheduler.beta[0])))
+#         predicted_noise = model(z.to(precision_dt).to(device), torch.tensor([0]).to(device), [var])
+#         predicted_noise = unpatchify(predicted_noise, z.to(precision_dt).to(device), patch_size, twoD)
+#         x = (1/(torch.sqrt(1-scheduler.beta[0])))*z - (temp*predicted_noise.cpu())
+#         images.append(x)
+
+#     if not twoD:
+#         images = [rearrange(img.squeeze(0), 'b c h w d -> b h w d c').detach().numpy() for img in images]
+#     else:
+#         images = [rearrange(img.squeeze(0), 'b c h w -> b h w c').detach().numpy() for img in images]
+    
+#     # images = np.array(images)
+#     # images = images.astype('float32')
+
+#     if not twoD:
+#         plot_3D_array_center_slices_up(images, filename=os.path.join(save_path, '3D_GEN_centerSlice_%s_%i_%i_%i_%irank%i.png' %(var, epoch, res[0], res[1], res[2], dist.get_rank())))
+#         # # plot_3D_array_center_slices(images, filename=os.path.join(save_path, '3D_gen_centerSlice_%s_%i_%i_%i_%irank%i.png' %(var, epoch, res[0], res[1], res[2], dist.get_rank())))
+#         # images = np.array(images)
+#         # images = images.astype('float32')
+#         # np.savez(os.path.join(save_path,'Output_gen_%s_%i_%i_%i_%irank%i.npz' %(var, epoch, res[0], res[1], res[2], dist.get_rank())),images)
+#     else:
+#         plot_2D_array_slices(images, filename=os.path.join(save_path, '2D_gen_%s_%i_%i_%i_rank%i.png' %(var, epoch, res[1], res[2], dist.get_rank())))
+#         # np.savez(os.path.join(save_path,'Output_gen_%s_%i_%i_%i_rank%i.npz' %(var, epoch, res[1], res[2], dist.get_rank())),images)
+
+
+## correct sample images (supposedly!)
+
+def sample_images(
+    model,
+    var,                       # kept for API compatibility (unused here)
+    device,
+    res,
+    precision_dt,
+    patch_size,
+    epoch=0,
+    num_samples=10,
+    twoD=False,
+    save_path="figures",
+    num_time_steps=1000,
+):
+    """
+    Minimal fixes for dtype/device:
+      - Keep tensors on one device.
+      - Allow bf16 compute but cast to fp32 right before numpy conversion.
+    """
+
+    os.makedirs(save_path, exist_ok=True)
+
+    # model to eval
+    inner = model.module if hasattr(model, "module") else model
+    inner.eval()
+
+    # scheduler on CPU; we'll index on CPU and move values to `device`
     scheduler = DDPM_Scheduler(num_time_steps=num_time_steps)
-    times = [0, 15, 50, 100, 200, 300, 400, 550, 700, 999]
+
+    # shapes
+    if twoD:
+        if isinstance(res, (tuple, list)):
+            H, W = int(res[0]), int(res[1])
+        else:
+            H = W = int(res)
+        z = torch.randn(num_samples, 1, H, W, device=device, dtype=precision_dt)
+    else:
+        if isinstance(res, (tuple, list)):
+            D, H, W = int(res[0]), int(res[1]), int(res[2])
+        else:
+            D = H = W = int(res)
+        z = torch.randn(num_samples, 1, D, H, W, device=device, dtype=precision_dt)
 
     images = []
-    if not twoD:
-        z = torch.randn(num_samples, 1, res[0], res[1], res[2])
-    else:
-        z = torch.randn(num_samples, 1, res[1], res[2])
+    times_to_save = {0, 15, 50, 100, 200, 300, 400, 550, 700,num_time_steps - 1}
 
     with torch.no_grad():
-        for t in reversed(range(1, num_time_steps)):
-            if not twoD:
-                e = torch.randn(num_samples, 1, res[0], res[1], res[2])
+        for t_scalar in reversed(range(1, num_time_steps)):
+            # CPU indices for CPU scheduler tensors, then move gathered values to GPU with same dtype as z
+            t_idx  = torch.full((num_samples,), t_scalar, dtype=torch.long, device=scheduler.beta.device)
+            beta_t = scheduler.beta[t_idx].to(device=device, dtype=z.dtype)     # β_t
+            abar_t = scheduler.alpha[t_idx].to(device=device, dtype=z.dtype)    # \bar{α}_t
+            alpha_t = (1.0 - beta_t)                                            # α_t
+
+            view_shape = (num_samples,) + (1,) * (z.ndim - 1)
+            beta_t_b  = beta_t.view(view_shape)
+            abar_t_b  = abar_t.view(view_shape)
+            alpha_t_b = alpha_t.view(view_shape)
+
+            # model time tensor on same device as z
+            t_model = t_idx.to(device)
+
+            # predict noise ε̂
+            eps_hat = model(z, t_model, [var])
+            eps_hat = unpatchify(eps_hat, z,patch_size, twoD)
+
+            # # μ_t = 1/√α_t * ( x_t − (β_t / √(1 − \bar{α}_t)) * ε̂ )
+            # mu = (z - (beta_t_b / torch.sqrt(1.0 - abar_t_b)) * eps_hat) / torch.sqrt(alpha_t_b)
+            
+            # μ_t = 1/√α_t * ( x_t − (β_t / √(1 − \bar{α}_t)) * ε̂ )
+            denom = torch.sqrt(torch.clamp(1.0 - abar_t_b, min=1e-12))
+            mu = (z - (beta_t_b / denom) * eps_hat) / torch.sqrt(alpha_t_b)
+
+
+            if t_scalar > 1:
+                e = torch.randn_like(z, device=device, dtype=z.dtype)
+                z = mu + torch.sqrt(beta_t_b) * e
             else:
-                e = torch.randn(num_samples, 1, res[1], res[2])
+                z = mu
 
-            t = [t]
-            temp = (scheduler.beta[t]/( (torch.sqrt(1-scheduler.alpha[t]))*(torch.sqrt(1-scheduler.beta[t]))))
-            predicted_noise = model(z.to(precision_dt).to(device), torch.tensor(t).to(device), [var]) 
-            predicted_noise = unpatchify(predicted_noise, z.to(precision_dt).to(device), patch_size, twoD)
-            z = (1/(torch.sqrt(1-scheduler.beta[t])))*z - (temp*predicted_noise.cpu())
-            if t[0] in times:
-                images.append(z)
-            z = z + (e*torch.sqrt(scheduler.beta[t]))
+            if t_scalar in times_to_save:
+                images.append(z.clone())
 
-        temp = scheduler.beta[0]/( (torch.sqrt(1-scheduler.alpha[0]))*(torch.sqrt(1-scheduler.beta[0])))
-        predicted_noise = model(z.to(precision_dt).to(device), torch.tensor([0]).to(device), [var])
-        predicted_noise = unpatchify(predicted_noise, z.to(precision_dt).to(device), patch_size, twoD)
-        x = (1/(torch.sqrt(1-scheduler.beta[0])))*z - (temp*predicted_noise.cpu())
-        images.append(x)
+        images.append(z.clone())  # final
 
+    # Cast to float32 right before numpy to avoid "Unsupported ScalarType BFloat16"
     if not twoD:
-        images = [rearrange(img.squeeze(0), 'b c h w d -> b h w d c').detach().numpy() for img in images]
+        images = [rearrange(img.float().detach().cpu(), "b c d h w -> b d h w c").numpy() for img in images]
+        plot_3D_array_center_slices_up(
+            images,
+            filename=os.path.join(save_path, '3D_GEN_centerSlice_%s_%i_%i_%i_%irank%i.png'
+                                  % (var, epoch, (res[0] if isinstance(res,(tuple,list)) else res),
+                                     (res[1] if isinstance(res,(tuple,list)) else res),
+                                     (res[2] if isinstance(res,(tuple,list)) else res),
+                                     dist.get_rank()))
+        )
     else:
-        images = [rearrange(img.squeeze(0), 'b c h w -> b h w c').detach().numpy() for img in images]
-    
-    # images = np.array(images)
-    # images = images.astype('float32')
+        images = [rearrange(img.float().detach().cpu(), "b c h w -> b h w c").numpy() for img in images]
+        plot_2D_array_slices(
+            images,
+            filename=os.path.join(save_path, '2D_gen_%s_%i_%i_%i_rank%i.png'
+                                  % (var, epoch,
+                                     (res[0] if isinstance(res,(tuple,list)) else res),
+                                     (res[1] if isinstance(res,(tuple,list)) else res),
+                                     dist.get_rank()))
+        )
 
-    if not twoD:
-        plot_3D_array_center_slices_up(images, filename=os.path.join(save_path, '3D_GEN_centerSlice_%s_%i_%i_%i_%irank%i.png' %(var, epoch, res[0], res[1], res[2], dist.get_rank())))
-        # # plot_3D_array_center_slices(images, filename=os.path.join(save_path, '3D_gen_centerSlice_%s_%i_%i_%i_%irank%i.png' %(var, epoch, res[0], res[1], res[2], dist.get_rank())))
-        # images = np.array(images)
-        # images = images.astype('float32')
-        # np.savez(os.path.join(save_path,'Output_gen_%s_%i_%i_%i_%irank%i.npz' %(var, epoch, res[0], res[1], res[2], dist.get_rank())),images)
-    else:
-        plot_2D_array_slices(images, filename=os.path.join(save_path, '2D_gen_%s_%i_%i_%i_rank%i.png' %(var, epoch, res[1], res[2], dist.get_rank())))
-        # np.savez(os.path.join(save_path,'Output_gen_%s_%i_%i_%i_rank%i.npz' %(var, epoch, res[1], res[2], dist.get_rank())),images)
-
+    #  # to numpy for plotting
+    # if twoD:
+    #     images_np = [rearrange(img, "b c h w -> b h w c").detach().cpu().numpy() for img in images]
+    #     plot_2D_array_slices(images_np, filename=os.path.join(save_path, f"2D_gen_{epoch}_{H}_{W}.png"))
+    # else:
+    #     images_np = [rearrange(img, "b c d h w -> b d h w c").detach().cpu().numpy() for img in images]
+    #     plot_3D_array_center_slices_up(images_np, filename=os.path.join(save_path, f"3D_GEN_centerSlice_{epoch}_{D}_{H}_{W}.png"))
 
 # def sample_images(model, var, device, res, precision_dt, patch_size, epoch=0, num_samples=10, twoD=False, save_path='figures', num_time_steps=1000):
 

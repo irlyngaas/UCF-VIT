@@ -556,7 +556,7 @@ def main(device):
     
                 if world_rank==0:
                     print("epoch: ",epoch,"batch_idx",counter,"world_rank",world_rank,"it_loss ",loss,flush=True)
-    
+                    
                 if use_grad_scaler:
                     scaler.scale(loss).backward()
                     scaler.step(optimizer)
