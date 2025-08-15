@@ -79,11 +79,6 @@ data:
     'P1F3R96': 100,
     'P1F4R96': 100,
   }
-  num_channels_available: {
-    'P1F2R96': 4,
-    'P1F3R96': 4,
-    'P1F4R96': 4,
-  }
   num_channels_used: {
     'P1F2R96': 4,
     'P1F3R96': 4,
@@ -172,6 +167,7 @@ dataset_options:
 
 # ---------------------------- LOAD BALANCING -------------------------------------------
 load_balancing:
+  auto_load_balancing: True
   batches_per_rank_epoch: {
   'P1F2R96': 358912,
   'P1F3R96': 239232,

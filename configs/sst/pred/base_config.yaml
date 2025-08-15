@@ -13,9 +13,9 @@ trainer:
 
 # ---------------------------- PARALLELISM -------------------------------------
 parallelism:
-  fsdp_size: 2
-  simple_ddp_size: 4
-  tensor_par_size: 1
+  fsdp_size: 1
+  simple_ddp_size: 2
+  tensor_par_size: 4
   seq_par_size: 1
   cpu_offloading: False
 # ---------------------------- MODEL -------------------------------------------
@@ -71,9 +71,6 @@ data:
   dict_buffer_sizes: {
     'P1F4R32': 100,
   }
-  num_channels_available: {
-    'P1F4R32': 4,
-  }
   num_channels_used: {
     'P1F4R32': 4,
   }
@@ -128,7 +125,8 @@ dataset_options:
 
 # ---------------------------- LOAD BALANCING -------------------------------------------
 load_balancing:
+  auto_load_balancing: True
   batches_per_rank_epoch: {
-    'P1F4R32': 3072,
+    'P1F4R32': 3200,
   }
-  dataset_group_list: '8'
+  dataset_group_list: '2'

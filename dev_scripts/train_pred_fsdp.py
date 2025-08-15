@@ -32,7 +32,7 @@ from functools import partial
 
 from UCF_VIT.fsdp.arch import UNETR, MAE
 from UCF_VIT.fsdp.building_blocks import Block
-from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, init_par_groups
+from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, init_par_groups, calculate_load_balancing_on_the_fly
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.utils.fused_attn import FusedAttn
 
@@ -190,10 +190,6 @@ def main(device):
 
     assert not use_all_data, "Don't use all_data=True, need to make some changes within the code for this option to work"
 
-    batches_per_rank_epoch = conf['load_balancing']['batches_per_rank_epoch']
-
-    dataset_group_list = conf['load_balancing']['dataset_group_list']
-
     #These configs need only for finetuning with pre-trained MAE model
     decoder_embed_dim = conf['model']['net']['init_args']['decoder_embed_dim']
 
@@ -241,6 +237,13 @@ def main(device):
     assert (data_par_size * seq_par_size * tensor_par_size)==world_size, "DATA_PAR_SIZE * SEQ_PAR_SIZE * TENSOR_PAR_SIZE must equal to world_size"
     assert (num_heads % tensor_par_size) == 0, "model heads % tensor parallel size must be 0"
     assert (decoder_num_heads % tensor_par_size) == 0, "decoder model heads % tensor parallel size must be 0"
+
+    auto_load_balancing = conf['load_balancing']['auto_load_balancing']
+    if auto_load_balancing:
+        batches_per_rank_epoch, dataset_group_list = calculate_load_balancing_on_the_fly(config_path, data_par_size, batch_size)
+    else:
+        batches_per_rank_epoch = conf['load_balancing']['batches_per_rank_epoch']
+        dataset_group_list = conf['load_balancing']['dataset_group_list']
 
 #2. Initialize model, optimizer, and scheduler
 ##############################################################################################################
