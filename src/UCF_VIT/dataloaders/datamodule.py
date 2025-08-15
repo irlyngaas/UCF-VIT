@@ -473,7 +473,6 @@ class NativePytorchDataModule(torch.nn.Module):
                     ImageBlockDataIter_3D_Memmap(
                             FileReader(
                                 lister_train,
-                                num_channels_available,
                                 gx = self.gx,
                                 start_idx=start_idx,
                                 end_idx=end_idx,
