@@ -688,7 +688,7 @@ class ImageBlockDataIter_3D_Memmap(IterableDataset):
                                 LTOP_z += 1
                         else: #>0
                             #if self.nz % tile_overlap_size_z != 0:
-                            if self.chun_size[2] % tile_overlap_size_z != 0:
+                            if self.chunk_size[2] % tile_overlap_size_z != 0:
                                 LTOP_z += 1
                         num_blocks_z = int(num_blocks_z + LTOP_z)
 
@@ -892,28 +892,36 @@ class ImageBlockDataIter_3D_Memmap(IterableDataset):
         else:
             for (data,variables,chunk_idx) in self.dataset:
                 #Total Tiles Evenly Spaced
-                TTE_x = self.nx//self.tile_size_x
-                TTE_y = self.ny//self.tile_size_y
+                #TTE_x = self.nx//self.tile_size_x
+                TTE_x = self.chunk_size[0]//self.tile_size_x
+                #TTE_y = self.ny//self.tile_size_y
+                TTE_y = self.chunk_size[1]//self.tile_size_y
                 num_blocks_x = (TTE_x-1)*OTP2_x + 1
                 num_blocks_y = (TTE_y-1)*OTP2_y + 1
                 if self.use_all_data:
                     #Total Tiles
-                    TT_x = self.nx/(self.tile_size_x)
-                    TT_y = self.ny/(self.tile_size_y)
+                    #TT_x = self.nx/(self.tile_size_x)
+                    TT_x = self.chunk_size[0]/(self.tile_size_x)
+                    #TT_y = self.ny/(self.tile_size_y)
+                    TT_y = self.chunk_size[1]/(self.tile_size_y)
                     # Number of leftover overlap patches for last tile
                     LTOP_x = np.floor((TT_x-TTE_x)*OTP2_x)
                     LTOP_y = np.floor((TT_y-TTE_y)*OTP2_y)
                     if tile_overlap_size_x == 0:
-                        if self.nx % self.tile_size_x != 0:
+                        #if self.nx % self.tile_size_x != 0:
+                        if self.chunk_size[0] % self.tile_size_x != 0:
                             LTOP_x += 1
                     else: #>0
-                        if self.nx % tile_overlap_size_x != 0:
+                        #if self.nx % tile_overlap_size_x != 0:
+                        if self.chunk_size[0] % tile_overlap_size_x != 0:
                             LTOP_x += 1
                     if tile_overlap_size_y == 0:
-                        if self.ny % self.tile_size_y != 0:
+                        #if self.ny % self.tile_size_y != 0:
+                        if self.chunk_size[1] % self.tile_size_y != 0:
                             LTOP_y += 1
                     else: #>0
-                        if self.ny % tile_overlap_size_y != 0:
+                        #if self.ny % tile_overlap_size_y != 0:
+                        if self.chunk_size[1] % tile_overlap_size_y != 0:
                             LTOP_y += 1
                     num_blocks_x = int(num_blocks_x + LTOP_x)
                     num_blocks_y = int(num_blocks_y + LTOP_y)
@@ -924,28 +932,39 @@ class ImageBlockDataIter_3D_Memmap(IterableDataset):
                     else:
                         num_blocks_z = self.nz//self.tile_size_z
                 else:
-                    TTE_z = self.nz//self.tile_size_z
+                    #TTE_z = self.nz//self.tile_size_z
+                    TTE_z = self.chunk_size[2]//self.tile_size_z
                     num_blocks_z = (TTE_z-1)*OTP2_z + 1
                     if self.use_all_data:
                         #Total Tiles
-                        TT_z = self.nz/(self.tile_size_z)
+                        #TT_z = self.nz/(self.tile_size_z)
+                        TT_z = self.chunk_size[2]/(self.tile_size_z)
                         # Number of leftover overlap patches for last tile
                         LTOP_z = np.floor((TT_z-TTE_z)*OTP2_z)
                         if tile_overlap_size_z == 0:
-                            if self.nz % self.tile_size_z != 0:
+                            #if self.nz % self.tile_size_z != 0:
+                            if self.chunk_size[2] % self.tile_size_z != 0:
                                 LTOP_z += 1
                         else: #>0
-                            if self.nz % tile_overlap_size_z != 0:
+                            #if self.nz % tile_overlap_size_z != 0:
+                            if self.chunk_size[2] % tile_overlap_size_z != 0:
                                 LTOP_z += 1
                         num_blocks_z = int(num_blocks_z + LTOP_z)
 
-                datalen_x = self.nx
-                datalen_y = self.ny
-                datalen_z = self.nz
+                #datalen_x = self.nx
+                datalen_x = self.chunk_size[0]
+                #datalen_y = self.ny
+                datalen_y = self.chunk_size[1]
+                #datalen_z = self.nz
+                datalen_z = self.chunk_size[2]
                 #channels, datalen_x, datalen_y, datalen_z = data.shape
 
                 x_step_size = self.tile_size_x-tile_overlap_size_x
                 y_step_size = self.tile_size_y-tile_overlap_size_y
+
+                chunk_offset_x = chunk_idx[0]*self.chunk_size[0]
+                chunk_offset_y = chunk_idx[1]*self.chunk_size[1]
+                chunk_offset_z = chunk_idx[2]*self.chunk_size[2]
                 if not self.twoD:
                     z_step_size = self.tile_size_z-tile_overlap_size_z
                 for ii in range(num_blocks_x):
@@ -956,7 +975,7 @@ class ImageBlockDataIter_3D_Memmap(IterableDataset):
                                     if not self.use_all_data:
                                         datalist = []
                                         for cc in range(len(data)):
-                                            data_cube = data[cc][kkk+kk*self.tile_size_z, jj*y_step_size:(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip, ii*x_step_size:(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
+                                            data_cube = data[cc][chunk_offset_z+kkk+kk*self.tile_size_z, chunk_offset_y+jj*y_step_size:chunk_offset_y+(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip, chunk_offset_x+ii*x_step_size:chunk_offset_x+(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
                                             datalist.append(data_cube.copy().transpose(1,0))
                                         yield np.stack(datalist, axis=0), variables
                                         #yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kkk+kk*self.tile_size_z], variables
