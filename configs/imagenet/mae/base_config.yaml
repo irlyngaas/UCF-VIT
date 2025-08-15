@@ -2,6 +2,7 @@
 trainer:
   max_epochs: 600
   data_type: "float32"
+  gpu_type: "amd"
   checkpoint_path: "../../checkpoint/imagenet/mae/base"
   checkpoint_filename: "multi_last"
   checkpoint_filename_for_loading: "multi_last_odd" #multi_last_odd or multi_last_even
@@ -14,7 +15,6 @@ parallelism:
   simple_ddp_size: 8
   tensor_par_size: 1
   seq_par_size: 1
-  cpu_offloading: False
 
 # ---------------------------- MODEL -------------------------------------------
 model:
@@ -27,6 +27,7 @@ model:
   warmup_start_lr: 1e-8
   eta_min: 1e-8
   loss_fn: "MSE"
+  use_grad_scaler: True
 
   net:
     init_args:
@@ -70,9 +71,6 @@ data:
   dict_buffer_sizes: {
     'imagenet': 100,
   }
-  num_channels_available: {
-    'imagenet': 3,
-  }
   num_channels_used: {
     'imagenet': 3,
   }
@@ -99,6 +97,7 @@ dataset_options:
 
 # ---------------------------- LOAD BALANCING -------------------------------------------
 load_balancing:
+  auto_load_balancing: True
   batches_per_rank_epoch: {
     'imagenet': 4935,
   }

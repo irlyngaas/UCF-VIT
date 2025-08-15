@@ -17,7 +17,6 @@ class FileReader(IterableDataset):
     def __init__(
         self,
         file_list,
-        num_channels_available,
         start_idx,
         end_idx,
         variables,
@@ -37,7 +36,7 @@ class FileReader(IterableDataset):
         chunk_list: Optional[list] = None,
     ) -> None:
         super().__init__()
-        self.num_channels_available = num_channels_available
+        self.num_channels_available = len(variables)
         start_idx = int(start_idx * len(file_list))
         end_idx = int(end_idx * len(file_list))
         file_list = file_list[start_idx:end_idx]

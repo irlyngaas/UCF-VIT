@@ -14,7 +14,6 @@ parallelism:
   simple_ddp_size: 8
   tensor_par_size: 1
   seq_par_size: 1
-  cpu_offloading: False
 
 # ---------------------------- MODEL -------------------------------------------
 model:
@@ -63,9 +62,6 @@ data:
   dict_buffer_sizes: {
     'imagenet': 100,
   }
-  num_channels_available: {
-    'imagenet': 3,
-  }
   num_channels_used: {
     'imagenet': 3,
   }
@@ -93,6 +89,7 @@ dataset_options:
 
 # ---------------------------- LOAD BALANCING -------------------------------------------
 load_balancing:
+  auto_load_balancing: True
   batches_per_rank_epoch: {
     'imagenet': 4935,
   }

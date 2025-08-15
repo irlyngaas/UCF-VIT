@@ -9,33 +9,17 @@ import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
-from torchvision.utils import save_image
 import time
 import yaml
 from einops import rearrange
 from timm.layers import use_fused_attn
 
 from UCF_VIT.simple.arch import DiffusionVIT
-from UCF_VIT.utils.metrics import masked_mse, adaptive_patching_mse
-from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, unpatchify
+from UCF_VIT.utils.metrics import masked_mse
+from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, unpatchify, calculate_load_balancing_on_the_fly
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.utils.fused_attn import FusedAttn
 from UCF_VIT.ddpm.ddpm import DDPM_Scheduler
-
-def training_step_adaptive(data, seq, size, pos, variables, net: DiffusionVIT, patch_size, twoD, loss_fn):
-
-        
-    output, mask = net.forward(seq, variables)
-    if loss_fn == "realMSE": #Real Loss
-        criterion = adaptive_patching_mse
-        loss = criterion(output, data, size, pos, patch_size, twoD)
-    else: #Compression Loss
-        criterion = nn.MSELoss()
-        target = rearrange(seq, 'b c s p -> b s (p c)')
-        loss = criterion(output, target)
-
-
-    return loss
 
 def training_step(data, variables, t, e, net: DiffusionVIT, patch_size, twoD, loss_fn):
 
@@ -48,12 +32,12 @@ def training_step(data, variables, t, e, net: DiffusionVIT, patch_size, twoD, lo
     return loss
 
 
-def main(device):
+def main(device, local_rank):
 #1. Load arguments from config file and setup parallelization
 ##############################################################################################################
 
     print("in main()","sys.argv[1] ",sys.argv[1],flush=True) 
-    world_size = int(os.environ['SLURM_NTASKS'])
+    world_size = dist.get_world_size()
     world_rank = dist.get_rank()
 
     config_path = sys.argv[1]
@@ -147,6 +131,9 @@ def main(device):
     dataset = conf['data']['dataset']
     assert dataset in ["basic_ct", "imagenet"], "This training script only supports basic_ct, imagenet datasets"
 
+    if dataset == "imagenet":
+        assert twoD, "twoD must be True if using imagenet"
+
 
     dict_root_dirs = conf['data']['dict_root_dirs']
 
@@ -155,8 +142,6 @@ def main(device):
     dict_end_idx = conf['data']['dict_end_idx']
 
     dict_buffer_sizes = conf['data']['dict_buffer_sizes']
-
-    num_channels_available = conf['data']['num_channels_available']
 
     num_channels_used = conf['data']['num_channels_used']
 
@@ -173,10 +158,6 @@ def main(device):
     tile_overlap = conf['data']['tile_overlap']
 
     use_all_data = conf['data']['use_all_data']
-
-    batches_per_rank_epoch = conf['load_balancing']['batches_per_rank_epoch']
-
-    dataset_group_list = conf['load_balancing']['dataset_group_list']
 
     #Datset specific options
     if dataset == "imagenet":
@@ -196,6 +177,13 @@ def main(device):
     assert (tile_size_y%patch_size)==0, "tile_size_y % patch_size must be 0"
     if dataset != "imagenet":
         assert (tile_size_z%patch_size)==0, "tile_size_z % patch_size must be 0"
+
+    auto_load_balancing = conf['load_balancing']['auto_load_balancing']
+    if auto_load_balancing:
+        batches_per_rank_epoch, dataset_group_list = calculate_load_balancing_on_the_fly(config_path, world_size, batch_size)
+    else:
+        batches_per_rank_epoch = conf['load_balancing']['batches_per_rank_epoch']
+        dataset_group_list = conf['load_balancing']['dataset_group_list']
 
 #2. Initialize model, optimizer, and scheduler
 ##############################################################################################################
@@ -240,7 +228,6 @@ def main(device):
         weight_init='skip',
     ).to(device)
 
-    local_rank = int(os.environ['SLURM_LOCALID'])
     #model = DDP(model,device_ids=[local_rank],output_device=[local_rank])
     #find_unused_parameters=True is needed under these circumstances
     model = DDP(model,device_ids=[local_rank],output_device=[local_rank],find_unused_parameters=True)
@@ -258,8 +245,8 @@ def main(device):
         loss_list = []
     else:
         dist.barrier()
-        #map_location = 'cuda:'+str(device)
         map_location = 'cpu'
+        #map_location = 'cuda:'+str(device)
         checkpoint = torch.load(checkpoint_path+"/"+checkpoint_filename_for_loading+".ckpt",map_location=map_location)
         model.load_state_dict(checkpoint['model_state_dict'])
         epoch_start = checkpoint['epoch']
@@ -279,7 +266,6 @@ def main(device):
         dict_end_idx=dict_end_idx,
         dict_buffer_sizes=dict_buffer_sizes,
         dict_in_variables=dict_in_variables,
-        num_channels_available = num_channels_available,
         num_channels_used = num_channels_used,
         batch_size=batch_size,
         num_workers=num_workers,
@@ -336,22 +322,16 @@ def main(device):
                     print("A GPU ran out of data, moving to next epoch", flush=True)
                     break
 
-                if adaptive_patching:
-                    data, seq, size, pos, variables = batch
-                    seq = seq.to(device)
-                    loss = training_step_adaptive(data, seq, size, pos, variables, model, patch_size, twoD, loss_fn)
-
+                data, variables, _ = batch
+                data = data.to(device)
+                t = torch.randint(0,num_time_steps,(batch_size,))
+                e = torch.randn_like(data, requires_grad=False)
+                if twoD:
+                    a = ddpm_scheduler.alpha[t].view(batch_size,1,1,1).to(device)
                 else:
-                    data, variables = batch
-                    data = data.to(device)
-                    t = torch.randint(0,num_time_steps,(batch_size,))
-                    e = torch.randn_like(data, requires_grad=False)
-                    if twoD:
-                        a = ddpm_scheduler.alpha[t].view(batch_size,1,1,1).to(device)
-                    else:
-                        a = ddpm_scheduler.alpha[t].view(batch_size,1,1,1,1).to(device)
-                    data = (torch.sqrt(a)*data) + (torch.sqrt(1-a)*e)
-                    loss = training_step(data, variables, t, e, model, patch_size, twoD, loss_fn)
+                    a = ddpm_scheduler.alpha[t].view(batch_size,1,1,1,1).to(device)
+                data = (torch.sqrt(a)*data) + (torch.sqrt(1-a)*e)
+                loss = training_step(data, variables, t, e, model, patch_size, twoD, loss_fn)
 
                 epoch_loss += loss.detach()
     
@@ -401,28 +381,53 @@ def main(device):
 
 if __name__ == "__main__":
 
-    os.environ['MASTER_ADDR'] = str(os.environ['HOSTNAME'])
+    if len(sys.argv) > 2:
+        LAUNCHER = sys.argv[2]
+    else:
+        LAUNCHER = None
+
+    if LAUNCHER == "MPI":
+        from mpi4py import MPI
+        import socket 
+
+        num_gpus_per_node = torch.cuda.device_count()
+        comm = MPI.COMM_WORLD
+        world_size = comm.Get_size()
+        world_rank = rank = comm.Get_rank()
+        local_rank = int(rank) % int(num_gpus_per_node) if num_gpus_per_node>0 else 0 # local_rank and device are 0 when using 1 GPU per task
+        os.environ['WORLD_SIZE'] = str(world_size)
+        os.environ['RANK'] = str(world_rank)
+        os.environ['LOCAL_RANK'] = str(local_rank)
+
+        master_addr = None
+        if rank == 0:
+            hostname = socket.gethostname()
+            ip_address = socket.gethostbyname(hostname)
+            master_addr = ip_address
+        master_addr = comm.bcast(master_addr, root=0)
+        os.environ['MASTER_ADDR'] = master_addr
+
+        torch.cuda.set_device(local_rank)
+        device = torch.device(local_rank) if torch.cuda.is_available() else torch.device("cpu")
+
+    else:#elif LAUNCHER == "SLURM":
+
+        os.environ['MASTER_ADDR'] = str(os.environ['HOSTNAME'])
+        os.environ['WORLD_SIZE'] = os.environ['SLURM_NTASKS']
+        os.environ['RANK'] = os.environ['SLURM_PROCID']
+
+        world_size = int(os.environ['SLURM_NTASKS'])
+        world_rank = int(os.environ['SLURM_PROCID'])
+        local_rank = int(os.environ['SLURM_LOCALID'])
+
+        torch.cuda.set_device(local_rank)
+        device = torch.cuda.current_device()
+
     os.environ['MASTER_PORT'] = "29500"
-    os.environ['WORLD_SIZE'] = os.environ['SLURM_NTASKS']
-    os.environ['RANK'] = os.environ['SLURM_PROCID']
-
-    world_size = int(os.environ['SLURM_NTASKS'])
-    world_rank = int(os.environ['SLURM_PROCID'])
-    local_rank = int(os.environ['SLURM_LOCALID'])
-
-    torch.cuda.set_device(local_rank)
-    device = torch.cuda.current_device()
-
-
-
-    #torch.backends.cudnn.benchmark = True
-
     dist.init_process_group('nccl', timeout=timedelta(seconds=7200000), rank=world_rank, world_size=world_size)
-
-#    initialize_process()
 
     print("Using dist.init_process_group. world_size ",world_size,flush=True)
     
-    main(device)
+    main(device, local_rank)
 
     dist.destroy_process_group()
