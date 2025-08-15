@@ -36,6 +36,11 @@ from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, init_pa
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.utils.fused_attn import FusedAttn
 
+import warnings
+warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
 
 
 def training_step(data, label, variables, net: UNETR, patch_size, twoD):
@@ -394,14 +399,14 @@ def main(device):
                 loss_list = []
 
     else: #Train from checkpoint 
-        if world_rank< tensor_par_size:
+        if world_rank < tensor_par_size:
             if os.path.exists(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(world_rank)+".ckpt"):
                 print("resume from checkpoint was set to True. Checkpoint path found.",flush=True)
 
                 print("rank",dist.get_rank(),"src_rank",world_rank,flush=True)
 
-                #map_location = 'cuda:'+str(device)
                 map_location = 'cpu'
+                #map_location = 'cuda:'+str(device)
 
                 checkpoint = torch.load(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(world_rank)+".ckpt",map_location=map_location)
                 model.load_state_dict(checkpoint['model_state_dict'])
@@ -463,8 +468,8 @@ def main(device):
 
         src_rank = world_rank - tensor_par_size * dist.get_rank(group=data_seq_ort_group)
 
-        #map_location = 'cuda:'+str(device)
         map_location = 'cpu'
+        #map_location = 'cuda:'+str(device)
 
         if tensor_par_size > 1:
             checkpoint = torch.load(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(src_rank)+".ckpt",map_location=map_location)
@@ -554,6 +559,7 @@ def main(device):
         if batches_per_rank_epoch[k] > iterations_per_epoch:
             iterations_per_epoch = batches_per_rank_epoch[k]
 
+    tps_list1 = []
     for epoch in range(epoch_start,max_epochs):
         #Reset dataloader module every epoch to ensure all files get used
         if epoch != epoch_start:
@@ -566,110 +572,163 @@ def main(device):
         epoch_loss = torch.tensor(0.0 , dtype=torch.float32, device=device)
         if world_rank==0:
             print("epoch ",epoch,flush=True)
-        
+
+        it_loader = iter(train_dataloader)
         counter = 0
-        for batch_idx, batch in enumerate(train_dataloader):
-            start_time = time.time()            
-            counter = counter + 1 
-            if counter > iterations_per_epoch:
-                print("A GPU ran out of data, moving to next epoch", flush=True)
-                break
-
-            data, label, variables = batch
-            data = data.to(precision_dt)
-            data = data.to(device)
-            label = label.to(precision_dt)
-            label = label.to(device)
-
-            loss, output = training_step(data, label, variables, model, patch_size, twoD)
-            epoch_loss += loss.detach()
-
-            if world_rank == 0:
-                print("epoch: ",epoch,"batch_idx",batch_idx,"world_rank",world_rank,"it_loss ",loss, flush=True)
-    
-            if use_scaler:
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-                if scaler._scale < min_scale:
-                    scaler._scale = torch.tensor(min_scale).to(scaler._scale)
+        while counter < iterations_per_epoch:
+            if dist.get_rank(tensor_par_group) == 0:
+                #print("DIST_GET_RANK_LOAD", dist.get_rank(), flush=True)
+                data, label, variables, dict_key = next(it_loader)
+                data = data.to(precision_dt)
+                data = data.to(device)
+                label = label.to(precision_dt)
+                label = label.to(device)
+                dict_key_len = torch.tensor(len(dict_key)).to(device)
             else:
-                loss.backward()
-                optimizer.step()
+                dict_key_len = torch.tensor(0).to(device)
+            dist.broadcast(dict_key_len, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group = tensor_par_group)
 
-            scheduler.step()
-            optimizer.zero_grad()
 
-            if world_rank == 0:
-                print("Tiles/s {:.2f}".format(data_par_size*batch_size/(time.time() - start_time)))
+
+            if dist.get_rank(tensor_par_group) != 0:
+                dict_key = [None] * dict_key_len.item()
+            dist.broadcast_object_list(dict_key, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+            if dist.get_rank(tensor_par_group) != 0:
+                dict_key = ''.join(dict_key)
+            #print("DICT_KEY",dict_key,flush=True)
+
+
                 
-        loss_list.append(epoch_loss)
+            #else:
+            if dist.get_rank(tensor_par_group) != 0:
+                #print("DIST_GET_RANK_NOT", dist.get_rank(), flush=True)
+                data = torch.zeros(batch_size, num_channels_used[dict_key], tile_size_x, tile_size_y, tile_size_z, dtype=precision_dt).to(device)
+                label = torch.zeros(batch_size, 1, tile_size_x, tile_size_y, tile_size_z, dtype=precision_dt).to(device)
+                variables = [None] * num_channels_used[dict_key]
+            
+            dist.broadcast(data, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+            dist.broadcast(label, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+            dist.broadcast_object_list(variables, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+            #if counter == 0:
+            #    print("Rank :", dist.get_rank(), "MEAN DATA:", torch.mean(data), flush=True)
+            #    print("Rank :", dist.get_rank(), "MEAN LABEL:", torch.mean(label), flush=True)
+            #    print("Rank :", dist.get_rank(), "Variables:", variables,flush=True)
+            counter = counter + 1 
+            if dist.get_rank() == 0:
+                print(counter,flush=True)
+                
 
+        
+        #counter = 0
+        #for batch_idx, batch in enumerate(train_dataloader):
+        #    start_time = time.time()            
+        #    counter = counter + 1 
+        #    if counter > iterations_per_epoch:
+        #        print("A GPU ran out of data, moving to next epoch", flush=True)
+        #        break
 
-        if world_rank==0:
-            print("epoch: ",epoch," epoch_loss ",epoch_loss, flush=True)
+        #    data, label, variables = batch
+        #    if batch_idx == 0:
+        #        print("Rank :", dist.get_rank(), "MEAN :", torch.mean(data), flush=True)
+        #    data = data.to(precision_dt)
+        #    data = data.to(device)
+        #    label = label.to(precision_dt)
+        #    label = label.to(device)
 
-        #only do full evaluation every 5 epochs
-        #if (epoch+1) % 1 == 0: 
-        #    with torch.no_grad():
-        #        model.eval()
-        #        for batch_idx, batch in enumerate(test_dataloader):
+        #    loss, output = training_step(data, label, variables, model, patch_size, twoD)
+        #    epoch_loss += loss.detach()
 
-        #            data, label, variables = batch
-        #            data = data.to(device)
-        #            label = label.to(device)
-
-        #            output = test_step(data, label, variables, model, tile_size, twoD)
-
-        #            train_labels_list = decollate_batch(label)
-        #            train_labels_convert = [post_label(train_label_tensor) for train_label_tensor in train_labels_list]
-        #            train_outputs_list = decollate_batch(output)
-        #            train_output_convert = [post_pred(train_pred_tensor) for train_pred_tensor in train_outputs_list]
-        #            acc = dice_acc(y_pred=train_output_convert, y=train_labels_convert)
+        #    if world_rank == 0:
+        #        print("epoch: ",epoch,"batch_idx",batch_idx,"world_rank",world_rank,"it_loss ",loss, flush=True)
     
-        #            if world_rank==0:
-        #                print("Test epoch: ",epoch,"batch_idx",batch_idx,"world_rank",world_rank,"acc", acc, flush=True)
+        #    if use_scaler:
+        #        scaler.scale(loss).backward()
+        #        scaler.step(optimizer)
+        #        scaler.update()
+        #        if scaler._scale < min_scale:
+        #            scaler._scale = torch.tensor(min_scale).to(scaler._scale)
+        #    else:
+        #        loss.backward()
+        #        optimizer.step()
+
+        #    scheduler.step()
+        #    optimizer.zero_grad()
+
+        #    if world_rank == 0:
+        #        tps_list1.append(data_par_size*batch_size/(time.time() - start_time))
+        #        # tps_list2.append(iterations_per_epoch * batch_size * data_par_size / (time.time() - start_time) / dist.get_world_size())
+        #        print("Tiles/s: {:.2f}".format(tps_list1[-1]),
+        #              "Avg. tiles/sec: {}".format(np.mean(tps_list1)),
+        #              "Time for iteration: {:.4f}s".format(time.time() - start_time)
+        #              )
+        #        
+        #loss_list.append(epoch_loss)
+
+
+        #if world_rank==0:
+        #    print("epoch: ",epoch," epoch_loss ",epoch_loss, flush=True)
+
+        ##only do full evaluation every 5 epochs
+        ##if (epoch+1) % 1 == 0: 
+        ##    with torch.no_grad():
+        ##        model.eval()
+        ##        for batch_idx, batch in enumerate(test_dataloader):
+
+        ##            data, label, variables = batch
+        ##            data = data.to(device)
+        ##            label = label.to(device)
+
+        ##            output = test_step(data, label, variables, model, tile_size, twoD)
+
+        ##            train_labels_list = decollate_batch(label)
+        ##            train_labels_convert = [post_label(train_label_tensor) for train_label_tensor in train_labels_list]
+        ##            train_outputs_list = decollate_batch(output)
+        ##            train_output_convert = [post_pred(train_pred_tensor) for train_pred_tensor in train_outputs_list]
+        ##            acc = dice_acc(y_pred=train_output_convert, y=train_labels_convert)
     
-        if world_rank ==0:    
-            # Check whether the specified checkpointing path exists or not
-            isExist = os.path.exists(checkpoint_path)
-            if not isExist:
-                # Create a new directory because it does not exist
-                os.makedirs(checkpoint_path,exist_ok=True)
-                print("The new checkpoint directory is created!")        
+        ##            if world_rank==0:
+        ##                print("Test epoch: ",epoch,"batch_idx",batch_idx,"world_rank",world_rank,"acc", acc, flush=True)
+    
+        #if world_rank ==0:    
+        #    # Check whether the specified checkpointing path exists or not
+        #    isExist = os.path.exists(checkpoint_path)
+        #    if not isExist:
+        #        # Create a new directory because it does not exist
+        #        os.makedirs(checkpoint_path,exist_ok=True)
+        #        print("The new checkpoint directory is created!")        
 
 
-        model_states = model.state_dict()
-        optimizer_states = optimizer.state_dict()
-        scheduler_states = scheduler.state_dict()
+        #model_states = model.state_dict()
+        #optimizer_states = optimizer.state_dict()
+        #scheduler_states = scheduler.state_dict()
 
 
-        if epoch % 2 == 0:
+        #if epoch % 2 == 0:
      
-            if world_rank < tensor_par_size:
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model_states,
-                    'optimizer_state_dict': optimizer_states,
-                    'scheduler_state_dict': scheduler_states,
-                    'loss_list' : loss_list,
-                    }, checkpoint_path+"/"+checkpoint_filename+"_even_rank_"+str(world_rank)+".ckpt")
+        #    if world_rank < tensor_par_size:
+        #        torch.save({
+        #            'epoch': epoch,
+        #            'model_state_dict': model_states,
+        #            'optimizer_state_dict': optimizer_states,
+        #            'scheduler_state_dict': scheduler_states,
+        #            'loss_list' : loss_list,
+        #            }, checkpoint_path+"/"+checkpoint_filename+"_even_rank_"+str(world_rank)+".ckpt")
 
-        if epoch % 2 == 1:
+        #if epoch % 2 == 1:
      
-            if world_rank < tensor_par_size:
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model_states,
-                    'optimizer_state_dict': optimizer_states,
-                    'scheduler_state_dict': scheduler_states,
-                    'loss_list' : loss_list,
-                    }, checkpoint_path+"/"+checkpoint_filename+"_odd_rank_"+str(world_rank)+".ckpt")
+        #    if world_rank < tensor_par_size:
+        #        torch.save({
+        #            'epoch': epoch,
+        #            'model_state_dict': model_states,
+        #            'optimizer_state_dict': optimizer_states,
+        #            'scheduler_state_dict': scheduler_states,
+        #            'loss_list' : loss_list,
+        #            }, checkpoint_path+"/"+checkpoint_filename+"_odd_rank_"+str(world_rank)+".ckpt")
      
-        dist.barrier()
-        del model_states
-        del optimizer_states
-        del scheduler_states
+        #dist.barrier()
+        #del model_states
+        #del optimizer_states
+        #del scheduler_states
     
 
 if __name__ == "__main__":

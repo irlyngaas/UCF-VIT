@@ -451,7 +451,7 @@ class VIT(nn.Module):
         
         if self.tensor_par_size > 1:
             src_rank = dist.get_rank() - dist.get_rank(group=self.tensor_par_group)
-            dist.broadcast(x, src_rank, group=self.tensor_par_group)
+            dist.broadcast(x.contiguous(), src_rank, group=self.tensor_par_group)
 
         x = self.blocks(x)
         x = self.norm(x)
