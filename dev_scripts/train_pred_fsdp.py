@@ -573,50 +573,99 @@ def main(device):
         if world_rank==0:
             print("epoch ",epoch,flush=True)
 
-        it_loader = iter(train_dataloader)
+        if dist.get_rank(tensor_par_group) == 0:
+            it_loader = iter(train_dataloader)
+
         counter = 0
         while counter < iterations_per_epoch:
-            if dist.get_rank(tensor_par_group) == 0:
-                #print("DIST_GET_RANK_LOAD", dist.get_rank(), flush=True)
-                data, label, variables, dict_key = next(it_loader)
-                data = data.to(precision_dt)
-                data = data.to(device)
+            if tensor_par_size > 1:
+                if dist.get_rank(tensor_par_group) == 0:
+                    data, label, variables, dict_key = next(it_loader)
+                    data = data.to(precision_dt)
+                    data = data.to(device)
+                    label = label.to(precision_dt)
+                    label = label.to(device)
+                    dict_key_len = torch.tensor(len(dict_key)).to(device)
+                else:
+                    dict_key_len = torch.tensor(0).to(device)
+                dist.broadcast(dict_key_len, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group = tensor_par_group)
+
+
+
+                if dist.get_rank(tensor_par_group) != 0:
+                    dict_key = [None] * dict_key_len.item()
+                dist.broadcast_object_list(dict_key, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+                if dist.get_rank(tensor_par_group) != 0:
+                    dict_key = ''.join(dict_key)
+
+                if dist.get_rank(tensor_par_group) != 0:
+                    data = torch.zeros(batch_size, num_channels_used[dict_key], tile_size_x, tile_size_y, tile_size_z, dtype=precision_dt).to(device)
+                    label = torch.zeros(batch_size, 1, tile_size_x, tile_size_y, tile_size_z, dtype=precision_dt).to(device)
+                    variables = [None] * num_channels_used[dict_key]
+                
+                dist.broadcast(data, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+                dist.broadcast(label, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+                dist.broadcast_object_list(variables, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+            else: #Avoid unnecesary broadcasts if not using tensor parallelism
+                data, label, variables, _ = next(it_loader)
+                seq = seq.to(precision_dt)
+                seq = seq.to(device)
                 label = label.to(precision_dt)
                 label = label.to(device)
-                dict_key_len = torch.tensor(len(dict_key)).to(device)
+
+            loss, output = training_step(data, label, variables, model, patch_size, twoD)
+            epoch_loss += loss.detach()
+
+            if world_rank == 0:
+                print("epoch: ",epoch,"batch_idx",counter,"world_rank",world_rank,"it_loss ",loss, flush=True)
+    
+            if use_scaler:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                if scaler._scale < min_scale:
+                    scaler._scale = torch.tensor(min_scale).to(scaler._scale)
             else:
-                dict_key_len = torch.tensor(0).to(device)
-            dist.broadcast(dict_key_len, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group = tensor_par_group)
+                loss.backward()
+                optimizer.step()
 
+            scheduler.step()
+            optimizer.zero_grad()
 
-
-            if dist.get_rank(tensor_par_group) != 0:
-                dict_key = [None] * dict_key_len.item()
-            dist.broadcast_object_list(dict_key, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
-            if dist.get_rank(tensor_par_group) != 0:
-                dict_key = ''.join(dict_key)
-            #print("DICT_KEY",dict_key,flush=True)
-
-
+        if world_rank==0:
+            print("epoch: ",epoch," epoch_loss ",epoch_loss, flush=True)
                 
-            #else:
-            if dist.get_rank(tensor_par_group) != 0:
-                #print("DIST_GET_RANK_NOT", dist.get_rank(), flush=True)
-                data = torch.zeros(batch_size, num_channels_used[dict_key], tile_size_x, tile_size_y, tile_size_z, dtype=precision_dt).to(device)
-                label = torch.zeros(batch_size, 1, tile_size_x, tile_size_y, tile_size_z, dtype=precision_dt).to(device)
-                variables = [None] * num_channels_used[dict_key]
-            
-            dist.broadcast(data, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
-            dist.broadcast(label, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
-            dist.broadcast_object_list(variables, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
-            #if counter == 0:
-            #    print("Rank :", dist.get_rank(), "MEAN DATA:", torch.mean(data), flush=True)
-            #    print("Rank :", dist.get_rank(), "MEAN LABEL:", torch.mean(label), flush=True)
-            #    print("Rank :", dist.get_rank(), "Variables:", variables,flush=True)
-            counter = counter + 1 
-            if dist.get_rank() == 0:
-                print(counter,flush=True)
-                
+        model_states = model.state_dict()
+        optimizer_states = optimizer.state_dict()
+        scheduler_states = scheduler.state_dict()
+
+
+        if epoch % 2 == 0:
+     
+            if world_rank < tensor_par_size:
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model_states,
+                    'optimizer_state_dict': optimizer_states,
+                    'scheduler_state_dict': scheduler_states,
+                    'loss_list' : loss_list,
+                    }, checkpoint_path+"/"+checkpoint_filename+"_even_rank_"+str(world_rank)+".ckpt")
+
+        if epoch % 2 == 1:
+     
+            if world_rank < tensor_par_size:
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model_states,
+                    'optimizer_state_dict': optimizer_states,
+                    'scheduler_state_dict': scheduler_states,
+                    'loss_list' : loss_list,
+                    }, checkpoint_path+"/"+checkpoint_filename+"_odd_rank_"+str(world_rank)+".ckpt")
+     
+        dist.barrier()
+        del model_states
+        del optimizer_states
+        del scheduler_states
 
         
         #counter = 0
@@ -635,24 +684,6 @@ def main(device):
         #    label = label.to(precision_dt)
         #    label = label.to(device)
 
-        #    loss, output = training_step(data, label, variables, model, patch_size, twoD)
-        #    epoch_loss += loss.detach()
-
-        #    if world_rank == 0:
-        #        print("epoch: ",epoch,"batch_idx",batch_idx,"world_rank",world_rank,"it_loss ",loss, flush=True)
-    
-        #    if use_scaler:
-        #        scaler.scale(loss).backward()
-        #        scaler.step(optimizer)
-        #        scaler.update()
-        #        if scaler._scale < min_scale:
-        #            scaler._scale = torch.tensor(min_scale).to(scaler._scale)
-        #    else:
-        #        loss.backward()
-        #        optimizer.step()
-
-        #    scheduler.step()
-        #    optimizer.zero_grad()
 
         #    if world_rank == 0:
         #        tps_list1.append(data_par_size*batch_size/(time.time() - start_time))
@@ -665,8 +696,6 @@ def main(device):
         #loss_list.append(epoch_loss)
 
 
-        #if world_rank==0:
-        #    print("epoch: ",epoch," epoch_loss ",epoch_loss, flush=True)
 
         ##only do full evaluation every 5 epochs
         ##if (epoch+1) % 1 == 0: 
@@ -698,37 +727,6 @@ def main(device):
         #        print("The new checkpoint directory is created!")        
 
 
-        #model_states = model.state_dict()
-        #optimizer_states = optimizer.state_dict()
-        #scheduler_states = scheduler.state_dict()
-
-
-        #if epoch % 2 == 0:
-     
-        #    if world_rank < tensor_par_size:
-        #        torch.save({
-        #            'epoch': epoch,
-        #            'model_state_dict': model_states,
-        #            'optimizer_state_dict': optimizer_states,
-        #            'scheduler_state_dict': scheduler_states,
-        #            'loss_list' : loss_list,
-        #            }, checkpoint_path+"/"+checkpoint_filename+"_even_rank_"+str(world_rank)+".ckpt")
-
-        #if epoch % 2 == 1:
-     
-        #    if world_rank < tensor_par_size:
-        #        torch.save({
-        #            'epoch': epoch,
-        #            'model_state_dict': model_states,
-        #            'optimizer_state_dict': optimizer_states,
-        #            'scheduler_state_dict': scheduler_states,
-        #            'loss_list' : loss_list,
-        #            }, checkpoint_path+"/"+checkpoint_filename+"_odd_rank_"+str(world_rank)+".ckpt")
-     
-        #dist.barrier()
-        #del model_states
-        #del optimizer_states
-        #del scheduler_states
     
 
 if __name__ == "__main__":
