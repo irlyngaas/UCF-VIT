@@ -461,10 +461,11 @@ def main(device):
     best_loss = float("inf")
     best_epoch = -1
     epochs_without_improvement = 0
-    max_patience = 500
-    patience = 200
+    max_patience = 500000
+    patience = 200000
     lr_decay_count = 0
-    save_period = 50
+    save_period = 1 # this allows for us ensuring the data is plotted and saved correctly, and then we cahnge it to 50 or some other number for less frequent saving!
+    save_period_main = 50
     decay_factor = 0.9
     patience_inc_rate = 1.25 
         
@@ -560,10 +561,10 @@ def main(device):
                 if epoch % 100 == 0:
                     if world_rank==1:
                         print("epoch: ",epoch,"batch_idx",counter,"world_rank",world_rank,"it_loss ",loss,flush=True)
-                    # if world_rank==2:
-                    #     print("epoch: ",epoch,"batch_idx",counter,"world_rank",world_rank,"it_loss ",loss,flush=True)
-                    # if world_rank==3:
-                    #     print("epoch: ",epoch,"batch_idx",counter,"world_rank",world_rank,"it_loss ",loss,flush=True)
+                    if world_rank==2:
+                        print("epoch: ",epoch,"batch_idx",counter,"world_rank",world_rank,"it_loss ",loss,flush=True)
+                    if world_rank==3:
+                        print("epoch: ",epoch,"batch_idx",counter,"world_rank",world_rank,"it_loss ",loss,flush=True)
     
                 if use_grad_scaler:
                     scaler.scale(loss).backward()
@@ -651,9 +652,13 @@ def main(device):
             model.load_state_dict(best_model_state)
 
             for var in default_vars:
+                model.eval()
                 sample_images(model, var, device, tile_size, precision_dt, patch_size,
                             epoch=epoch, num_samples=5, twoD=twoD, save_path=inference_path,
                             num_time_steps=num_time_steps)
+                model.train()
+            if save_period<save_period_main:
+                save_period = save_period_main
 
 
         dist.barrier()
@@ -674,9 +679,11 @@ def main(device):
         model.load_state_dict(best_model_state)
 
         for var in default_vars:
+            model.eval()
             sample_images(model, var, device, tile_size, precision_dt, patch_size,
                                 epoch=best_epoch, num_samples=10, twoD=twoD, save_path=inference_path,
                                 num_time_steps=num_time_steps)
+            model.train()
             # save_intermediate_data(model, var, device, tile_size, precision_dt, patch_size,
             #                     epoch=best_epoch, num_samples=2, twoD=twoD, save_path=inference_path,
             #                     num_time_steps=num_time_steps)

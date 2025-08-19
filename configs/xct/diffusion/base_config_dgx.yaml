@@ -1,12 +1,12 @@
 # ---------------------------- TRAINER -------------------------------------------
 trainer:
-  max_epochs: 20000
+  max_epochs: 50000
   data_type: "bfloat16"
   gpu_type: "nvidia"
-  checkpoint_path: "/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_3D/XCTConcrete_600/256x256x256/Pat100_Dec0.9/N4_Adaptivelr0.02_P8_BS2_ED576_redo_from2000" #32x32x32/32Node_lr0.01_Patch8_batch1" # 
+  checkpoint_path: "/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_3D/XCTConcrete_600/256x256x256/Pat100_Dec0.9/N4_Adaptivelr0.02_P8_BS2_ED576_redo_from20000_correctPlotting" #32x32x32/32Node_lr0.01_Patch8_batch1" # 
   checkpoint_filename: "xct_concrete_base"
   checkpoint_filename_for_loading: "xct_concrete_base_0" #xct_concrete_base_[EPOCH]
-  inference_path: "/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_3D/XCTConcrete_600/256x256x256/Pat100_Dec0.9/N4_Adaptivelr0.02_P8_BS2_ED576_redo_from2000/inference" #/32x32x32/32Node_lr0.01_Patch8_batch1/inference"
+  inference_path: "/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_3D/XCTConcrete_600/256x256x256/Pat100_Dec0.9/N4_Adaptivelr0.02_P8_BS2_ED576_redo_from20000_correctPlotting/inference" #/32x32x32/32Node_lr0.01_Patch8_batch1/inference"
 
   resume_from_checkpoint: True
 

@@ -1,12 +1,12 @@
 # ---------------------------- TRAINER -------------------------------------------
 trainer:
   max_epochs: 10000
-  data_type: "bfloat16"
+  data_type: "float32" #"bfloat16" #
   gpu_type: "nvidia"
-  checkpoint_path: "/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D/XCT_Conc_Synth/1200Vols/32x32x32/Pat200_Dec0.9/N1_Adaptivelr0.001_P1_BS256_ED2048_CorrectPlotting" #32x32x32/32Node_lr0.01_Patch8_batch1" # 
+  checkpoint_path: "/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D/XCT_Conc_Synth/1200Vols/32x32x32/Pat200000_Dec0.9_ALLGPUs_OneNode/N1_Adaptivelr0.00001_P1_BS256_ED1024_float32" #32x32x32/32Node_lr0.01_Patch8_batch1" # 
   checkpoint_filename: "XCT_Conc_base_Synth" #  "Breaker_AM_base" # "XCT_half_concrete_base" #  
   checkpoint_filename_for_loading: "XCT_Conc_base_Synth_0" #  "Breaker_AM_base_0" #  "XCT_half_concrete_base_0" #  xct_concrete_base_[EPOCH]
-  inference_path: "/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D/XCT_Conc_Synth/1200Vols/32x32x32/Pat200_Dec0.9/N1_Adaptivelr0.001_P1_BS256_ED2048_CorrectPlotting/inference" #/32x32x32/32Node_lr0.01_Patch8_batch1/inference"
+  inference_path: "/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D/XCT_Conc_Synth/1200Vols/32x32x32/Pat200000_Dec0.9_ALLGPUs_OneNode/N1_Adaptivelr0.00001_P1_BS256_ED1024_float32/inference" #/32x32x32/32Node_lr0.01_Patch8_batch1/inference"
 
   resume_from_checkpoint: False
 
@@ -20,7 +20,7 @@ parallelism:
 
 # ---------------------------- MODEL -------------------------------------------
 model:
-  lr: 0.001
+  lr: 0.00001
   beta_1: 0.9
   beta_2: 0.95
   weight_decay: 1e-5
@@ -38,16 +38,16 @@ model:
       ]
       tile_size: [32,32,32] #[256, 256, 256]
       patch_size: 1 # 8
-      embed_dim: 2048 #512 #1024
-      depth: 8
+      embed_dim: 1024 #512 #1024
+      depth: 8 # 10
       num_heads: 8
-      decoder_embed_dim: 576
+      decoder_embed_dim: 1024 # 576
       decoder_depth: 8
       decoder_num_heads: 16
       mlp_ratio: 4
       mlp_ratio_decoder: 4
       drop_path: 0.0
-      drop_rate: 0.0
+      drop_rate: 0.0  # 0.05 # 
       linear_decoder: True
       twoD: True
       use_varemb: False
@@ -61,7 +61,7 @@ data:
   dataset: "xct"
   dict_root_dirs: {
     # 'xct1': "/lustre/fs0/scratch/ziabariak/XCT_Concrete_32x32_Z00730/",
-    'xct1': "/lustre/fs0/scratch/ziabariak/data_LDRD/XCT_NCT_Synth/Downsampled_128x128_128_beforeCrop/XCT_Concrete_32x32x32_Synth/",
+    'xct1': "/lustre/fs0/scratch/ziabariak/data_LDRD/XCT_NCT_Synth/Downsampled_128x128_128_beforeCrop/XCT_Concrete_32x32x32_Synth_artificallyStandardized/",
     #"/lustre/fs0/scratch/lyngaasir/DiffusiveINR_Data/XCT_Concrete_Z00730_650Files", #599 #'/lustre/fs0/scratch/ziabariak/XCT_Concrete_32x32x32_Z00730', # 
     }
   dict_start_idx: {
