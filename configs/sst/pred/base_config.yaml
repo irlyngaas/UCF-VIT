@@ -5,6 +5,7 @@ trainer:
   checkpoint_path: "../../checkpoint/sst/pred/base"
   checkpoint_filename: "multi_last"
   checkpoint_filename_for_loading: "multi_last_odd" #multi_last_odd or multi_last_even
+  inference_path: "../../checkpoint/sst/pred/base/inference"
 
   resume_from_checkpoint: False
   use_pretrained_mae_model: False
@@ -14,8 +15,8 @@ trainer:
 # ---------------------------- PARALLELISM -------------------------------------
 parallelism:
   fsdp_size: 1
-  simple_ddp_size: 2
-  tensor_par_size: 4
+  simple_ddp_size: 1
+  tensor_par_size: 1
   seq_par_size: 1
   cpu_offloading: False
 # ---------------------------- MODEL -------------------------------------------

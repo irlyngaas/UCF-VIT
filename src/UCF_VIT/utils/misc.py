@@ -672,3 +672,121 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
 def is_power_of_two(n):
     return (n != 0) and (n & (n-1) == 0)
 
+def get_test_data(data_dir, timestamp, vars_input, vars_output, tile_size_z, tile_size_y, tile_size_x, nz, ny, nx, nzskip, nyskip, nxskip, overlap=0.0):
+    if overlap<0 or overlap>1:
+      raise Exception(f"Overlap of windows for inference should be in [0,1]. Current value = {overlap}")
+
+    # size of the patch (sub-cube) to be extracted from full file
+    nzsl, nysl, nxsl = tile_size_z, tile_size_y, tile_size_x
+
+    # Calculate step size based on overlap
+    nz_step = max(int(nzsl * (1 - overlap)), 1)
+    ny_step = max(int(nysl * (1 - overlap)), 1)
+    nx_step = max(int(nxsl * (1 - overlap)), 1)
+
+    # corner in the full file from which the sub-cube is extracted
+    nzoffsets = np.arange(0, nz-nzsl + 1, nz_step)
+    if nzoffsets[-1]+nzsl < nz:
+        nzoffsets = np.append(nzoffsets, nz-nzsl)
+    nyoffsets = np.arange(0, ny-nysl + 1, ny_step)
+    if nyoffsets[-1]+nysl < ny:
+        nyoffsets = np.append(nyoffsets, ny-nysl)
+    nxoffsets = np.arange(0, nx-2-nxsl + 1, nx_step)
+    if nxoffsets[-1]+nxsl < nx-2:
+        nxoffsets = np.append(nxoffsets, nx-2-nxsl)
+
+    # Batch size and data shapes
+    batch_size = len(nzoffsets) * len(nyoffsets) * len(nxoffsets)
+    #data_shape = (batch_size, len(vars_input), *patch_size)
+    data_shape = (batch_size, len(vars_input), tile_size_x, tile_size_y, tile_size_z)
+    #seg_shape = (batch_size, len(vars_output), *patch_size)
+    seg_shape = (batch_size, len(vars_output), tile_size_x, tile_size_y, tile_size_z)
+    data = np.zeros(data_shape, dtype=np.float32)
+    seg = np.zeros(seg_shape, dtype=np.float32)
+
+    # Preload data arrays for efficiency
+    #input_data_maps = {var: np.memmap(f"{data_dir}/{var}_{timestamp}", dtype=np.float32, mode='r', shape=(nz, ny, nx)) for var in vars_input}
+    input_data_maps = {var: np.memmap(f"{data_dir}/{var}_{timestamp}", dtype=np.float32, mode='r', shape=(nz, ny, nx+2)) for var in vars_input}
+    #output_data_maps = {var: np.memmap(f"{data_dir}/{var}_{timestamp}", dtype=np.float32, mode='r', shape=(nz, ny, nx)) for var in vars_output}
+    output_data_maps = {var: np.memmap(f"{data_dir}/{var}_{timestamp}", dtype=np.float32, mode='r', shape=(nz, ny, nx+2)) for var in vars_output}
+
+    # Extract sub-cubes
+    j = 0
+    for nzoffset in nzoffsets:
+        for nyoffset in nyoffsets:
+            for nxoffset in nxoffsets:
+                # Extract and store input sub-cubes
+                data[j] = np.stack([input_data_maps[var][nzoffset:nzoffset + nzsl, nyoffset:nyoffset + nysl, nxoffset:nxoffset + nxsl].copy().transpose(2, 1, 0) for var in vars_input], axis=0)
+
+                # Extract and store output sub-cubes
+                seg[j] = np.stack([output_data_maps[var][nzoffset:nzoffset + nzsl, nyoffset:nyoffset + nysl, nxoffset:nxoffset + nxsl].copy().transpose(2, 1, 0) for var in vars_output], axis=0)
+
+                j += 1
+
+    # Close memmap files
+    for var in vars_input + vars_output:
+        if var in input_data_maps:
+            input_data_maps[var]._mmap.close()
+        if var in output_data_maps:
+            output_data_maps[var]._mmap.close()
+
+    return data, seg
+
+# Function to stitch-up testing data for a given snapshot and parameters of the model input/output
+def stitch_data(output, nz, ny, nx, tile_size_z, tile_size_y, tile_size_x, nzskip, nyskip, nxskip, overlap=0.5):
+    
+    # size of the patch (sub-cube) to be extracted from full file
+    nzsl, nysl, nxsl = tile_size_z, tile_size_y, tile_size_x
+
+    # Calculate step size based on overlap
+    nz_step = max(int(nzsl * (1 - overlap)), 1)
+    ny_step = max(int(nysl * (1 - overlap)), 1)
+    nx_step = max(int(nxsl * (1 - overlap)), 1)
+
+    # corner in the full file from which the sub-cube is extracted
+    nzoffsets = np.arange(0, nz-nzsl + 1, nz_step)
+    if nzoffsets[-1]+nzsl < nz:
+        nzoffsets = np.append(nzoffsets, nz-nzsl)
+    nyoffsets = np.arange(0, ny-nysl + 1, ny_step)
+    if nyoffsets[-1]+nysl < ny:
+        nyoffsets = np.append(nyoffsets, ny-nysl)
+    #nxoffsets = np.arange(0, nx-2-nxsl + 1, nx_step)
+    nxoffsets = np.arange(0, nx-nxsl + 1, nx_step)
+    #if nxoffsets[-1]+nxsl < nx-2:
+    if nxoffsets[-1]+nxsl < nx:
+        #nxoffsets = np.append(nxoffsets, nx-2-nxsl)
+        nxoffsets = np.append(nxoffsets, nx-nxsl)
+
+    # num vars and data shapes
+    num_vars = output.shape[1]
+    #data_shape = (nx-2, ny, nz, num_vars)
+    data_shape = (nx, ny, nz, num_vars)
+    data = np.zeros(data_shape, dtype=np.float32)
+    data_count = np.zeros(data_shape, dtype=np.float32)
+    
+    # Loop over sub-cubes
+    j = 0
+    for nzoffset in nzoffsets:
+        for nyoffset in nyoffsets:
+            for nxoffset in nxoffsets:
+                # Loop over each variable in the output
+                for var in range(num_vars):
+                    # Extract the current sub-cube from `output`
+                    sub_cube = output[j, var, :] # .reshape((nxsl, nysl, nzsl))
+                    
+                    # Define the region in the full data array where this sub-cube will be added
+                    data[nxoffset:nxoffset+(nxsl*nxskip):nxskip, 
+                         nyoffset:nyoffset+(nysl*nyskip):nyskip, 
+                         nzoffset:nzoffset+(nzsl*nzskip):nzskip, var] += sub_cube
+                    
+                    # Increment the count array in the corresponding region
+                    data_count[nxoffset:nxoffset+(nxsl*nxskip):nxskip, 
+                               nyoffset:nyoffset+(nysl*nyskip):nyskip, 
+                               nzoffset:nzoffset+(nzsl*nzskip):nzskip, var] += 1
+                j += 1
+
+    # Average the overlapping regions
+    # with np.errstate(divide='ignore', invalid='ignore'):
+    data = np.divide(data, data_count, where=data_count > 0)
+
+    return data
