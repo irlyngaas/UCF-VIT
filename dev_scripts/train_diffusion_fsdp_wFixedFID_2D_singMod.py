@@ -461,8 +461,8 @@ def main(device):
     best_loss = float("inf")
     best_epoch = -1
     epochs_without_improvement = 0
-    max_patience = 500000
-    patience = 200000
+    max_patience = 50000
+    patience = 2000
     lr_decay_count = 0
     save_period = 1 # this allows for us ensuring the data is plotted and saved correctly, and then we cahnge it to 50 or some other number for less frequent saving!
     save_period_main = 50
@@ -601,6 +601,27 @@ def main(device):
             if epoch % 100 == 0:
                 print("epoch: ",epoch," epoch_loss ",epoch_loss, flush=True)
                 plotLoss(loss_list, save_path=os.path.join(checkpoint_path, f'loss_N{simple_ddp_size//8}_BS{batch_size}_PS{patch_size}_ED{emb_dim}_rank1.png'))
+
+        if ((epoch==1) or (epoch % 100 == 0)) and (dist.get_rank(tensor_par_group) == 0):
+            # grab a small batch from the current loader (only this rank has it)
+            it_eval = iter(train_dataloader)
+            x_eval, variables_eval, _ = next(it_eval)
+            x_eval = x_eval.to(precision_dt).to(device)
+
+            plotPerformance(
+                model=model,
+                device=device,
+                x=x_eval,
+                variables=variables_eval,
+                num_time_steps=num_time_steps,
+                patch_size=patch_size,
+                twoD=twoD,
+                scheduler=ddpm_scheduler,   # your DDPM_Scheduler from above
+                epoch=epoch,
+                savefol=inference_path,     # where to save the figure
+                precision_dt=precision_dt,
+                Ntimes=9
+            )
 
 
         # Track best model independently

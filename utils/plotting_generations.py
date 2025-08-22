@@ -7,6 +7,7 @@ from UCF_VIT.ddpm.ddpm import DDPM_Scheduler
 from UCF_VIT.utils.misc import  unpatchify
 from einops import rearrange
 import torch.distributed as dist
+import math
 ## plots
 def plotLoss(lossVec, save_path='./'):
     loss_array = np.array([x.cpu().item() if isinstance(x, torch.Tensor) else x for x in lossVec])
@@ -853,3 +854,140 @@ def save_intermediate_data_with_fid(model, var, device, res, precision_dt, patch
 #             # plt.subplots_adjust(left=0.01, right=0.99, top=0.99, bottom=0.01, hspace=0.025, wspace=0.025)
 #             # fig.savefig(os.path.join(save_path,'2D_gen_%s_%i_%i_%i_rank%i.png' %(var, epoch, res[1], res[2], dist.get_rank())), format='png', dpi=300)
 #             # plt.close(fig)
+
+ 
+# def plotPerformance(model,device,it_loader,
+#                     num_time_steps,modality,scheduler,epoch,savefol,
+#                     Ntimes=9):
+    
+#     print('-------- assessing performance of denoising epoch %i --------' %(epoch))
+ 
+#     model.eval()
+ 
+#     fol = os.path.join(savefol,'performance')
+#     os.makedirs(fol,exist_ok=True)
+ 
+#     with torch.no_grad():
+ 
+ 
+#         # i forget how many things their loader outputs - change here
+#         # i think its like data, vars, etc..
+#         x, var, _ = next(it_loader)
+ 
+#         Nsamples = x.shape[0]
+    
+#         dt = int(num_time_steps/(Ntimes-1))
+#         times = [1] + \
+#                 [int(i) for i in np.linspace(1+dt,num_time_steps-1-dt,Ntimes-2)] + \
+#                 [num_time_steps-1]
+ 
+#         Nsubplots = int(math.ceil(Ntimes**0.5))
+#         fig,ax = plt.subplots(Nsubplots,Nsubplots,figsize=(Nsubplots*3,Nsubplots*3),facecolor='w')
+#         ax=ax.ravel()
+#         for i,ti in enumerate(times):
+#             t = torch.Tensor([ti]).repeat(Nsamples).to(torch.int64)
+#             e = torch.randn_like(x, requires_grad=False)
+#             f not twoD:
+#                 a = scheduler.alpha[t].view(y.shape[0],1,1,1,1).to(device)
+#             else:
+#                 a = scheduler.alpha[t].view(y.shape[0],1,1,1).to(device)
+#             x = (torch.sqrt(a)*x) + (torch.sqrt(1-a)*e)
+#             # output = model(x, y,t,c)
+#             output = model(x.to(precision_dt), torch.tensor(t).to(device), [var])
+ 
+#             mu = e[:,0,::4,::4].detach().to('cpu').flatten().numpy().mean()
+#             R2 = 1-(np.sum((output[:,0,::4,::4].detach().to('cpu').flatten().numpy()\
+#                          -e[:,0,::4,::4].detach().to('cpu').flatten().numpy())**2)/\
+#                    np.sum((e[:,0,::4,::4].detach().to('cpu').flatten().numpy()-mu)**2))
+ 
+#             for j in range(e.shape[1]):
+#                 ax[i].plot(e[:,j,::4,::4].detach().to('cpu').flatten(),
+#                         output[:,j,::4,::4].detach().to('cpu').flatten(),'o',alpha=0.1)
+#             ax[i].xaxis.set_ticks([])
+#             ax[i].yaxis.set_ticks([])
+#             ax[i].set_xlim([-4,4])
+#             ax[i].set_ylim([-4,4])
+#             ax[i].text(0.95,0.05,ti,ha='right',va='bottom',transform=ax[i].transAxes)
+#             ax[i].text(0.05,0.95,'R2=%1.3f' %R2,ha='left',va='top',transform=ax[i].transAxes)
+        
+#         plt.subplots_adjust(left=0.01,right=0.99,top=0.99,bottom=0.01,wspace=0,hspace=0)
+#         plt.savefig(os.path.join(fol,'performance_%i.jpg' %epoch),dpi=150,format='jpg')
+#         plt.close(fig)
+ 
+#     model.train()
+
+
+# def sample_images(model, var, device, res, precision_dt, patch_size, epoch=0, num_samples=10, twoD=False, save_path='figures', num_time_steps=1000):
+ 
+def plotPerformance(model, device, x, variables, patch_size,
+                    num_time_steps, twoD, scheduler, epoch, savefol,
+                    precision_dt=torch.float32, Ntimes=9):
+
+
+    model.eval()
+    fol = os.path.join(savefol, 'performance')
+    os.makedirs(fol, exist_ok=True)
+
+    # small helper
+    def safe_sqrt(v, eps=1e-12):
+        return torch.sqrt(torch.clamp(v, min=eps))
+
+    with torch.no_grad():
+        B = x.shape[0]
+        # choose times across the chain
+        dt = int(num_time_steps / max(Ntimes - 1, 1))
+        times = [1] + [int(i) for i in np.linspace(1 + dt, num_time_steps - 1 - dt, max(Ntimes - 2, 0))] + [num_time_steps - 1]
+        times = [t for t in times if 0 <= t < num_time_steps]
+
+        # create a clean copy each time so steps are independent
+        x_clean = x.detach().clone().to(device)
+
+        Nsub = int(math.ceil(len(times) ** 0.5))
+        fig, ax = plt.subplots(Nsub, Nsub, figsize=(Nsub * 3, Nsub * 3), facecolor='w')
+        ax = ax.ravel()
+
+        for i, ti in enumerate(times):
+            # noise
+            e = torch.randn_like(x_clean, device=device)
+            t = torch.full((B,), ti, dtype=torch.long, device=device)
+
+            # a_bar dim shaping
+            if twoD:
+                a_bar = scheduler.alpha[t.cpu()].view(B, 1, 1, 1).to(device)
+            else:
+                a_bar = scheduler.alpha[t.cpu()].view(B, 1, 1, 1, 1).to(device)
+
+            x_t = (safe_sqrt(a_bar) * x_clean) + (safe_sqrt(1.0 - a_bar) * e)
+
+            # predict ε̂
+            eps_hat = model(x_t.to(dtype=precision_dt), t, [variables])
+            eps_hat = unpatchify(eps_hat, x_t, patch_size, twoD)
+            # predicted_noise = model(z.to(precision_dt).to(device), torch.tensor(t).to(device), [var])
+            # predicted_noise = unpatchify(predicted_noise, z.to(precision_dt).to(device), patch_size, twoD)
+            ## scatter on a subsample grid to keep it light
+            if twoD:
+                ref = e[:, 0, ::4, ::4].detach().float().cpu().flatten().numpy()
+                out = eps_hat[:, 0, ::4, ::4].detach().float().cpu().flatten().numpy()
+            else:
+                ref = e[:, 0, ::4, ::4, ::4].detach().float().cpu().flatten().numpy()
+                out = eps_hat[:, 0, ::4, ::4, ::4].detach().float().cpu().flatten().numpy()
+
+            mu = ref.mean() if ref.size else 0.0
+            denom = np.sum((ref - mu) ** 2) + 1e-12
+            R2 = 1.0 - (np.sum((out - ref) ** 2) / denom)
+
+            ax[i].plot(ref, out, 'o', alpha=0.1, markersize=2)
+            ax[i].set_xlim([-4, 4]); ax[i].set_ylim([-4, 4])
+            ax[i].set_xticks([]); ax[i].set_yticks([])
+            ax[i].text(0.95, 0.05, f"t={ti}", ha='right', va='bottom', transform=ax[i].transAxes)
+            ax[i].text(0.05, 0.95, f"R²={R2:.3f}", ha='left', va='top', transform=ax[i].transAxes)
+
+        # hide any leftover axes
+        for k in range(len(times), len(ax)):
+            ax[k].axis('off')
+
+        plt.subplots_adjust(left=0.01, right=0.99, top=0.99, bottom=0.01, wspace=0, hspace=0)
+        plt.savefig(os.path.join(fol, f'performance_{epoch}.jpg'), dpi=150)
+        plt.close(fig)
+
+    model.train()

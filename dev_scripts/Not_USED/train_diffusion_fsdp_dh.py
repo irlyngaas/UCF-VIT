@@ -597,7 +597,7 @@ def main(args, device):
 
         # Early stopping or normal final epoch
         if epochs_without_improvement >= patience or epoch == max_epochs:
-            if world_rank == 0:
+            if world_rank == 0:#torch.dist.all_reduce ... (to get the average loss across all ranks for optimization)
                 # print(f"MUST-{world_rank} {best_loss:.6f} (from epoch {best_epoch})", flush=True)
                 print(" MUST-"+str(world_rank), best_loss, end=' ', flush=True)
             # Save best checkpoint

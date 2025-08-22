@@ -1,26 +1,30 @@
 # ---------------------------- TRAINER -------------------------------------------
 trainer:
-  max_epochs: 10000
+  max_epochs: 20000
   data_type: "float32" #"bfloat16" #
   gpu_type: "nvidia"
-  checkpoint_path: "/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D/XCT_Conc_Synth/1200Vols/32x32x32/Pat200000_Dec0.9_ALLGPUs_OneNode/N1_Adaptivelr0.00001_P1_BS256_ED1024_float32" #32x32x32/32Node_lr0.01_Patch8_batch1" # 
-  checkpoint_filename: "XCT_Conc_base_Synth" #  "Breaker_AM_base" # "XCT_half_concrete_base" #  
-  checkpoint_filename_for_loading: "XCT_Conc_base_Synth_0" #  "Breaker_AM_base_0" #  "XCT_half_concrete_base_0" #  xct_concrete_base_[EPOCH]
-  inference_path: "/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D/XCT_Conc_Synth/1200Vols/32x32x32/Pat200000_Dec0.9_ALLGPUs_OneNode/N1_Adaptivelr0.00001_P1_BS256_ED1024_float32/inference" #/32x32x32/32Node_lr0.01_Patch8_batch1/inference"
-
+  checkpoint_path: "/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D/XCT_Conc_normalized/600Vols/256x256x256/Pat2000_Dec0.9/N16_Adaptivelr0.001_P8_BS256_ED4096_float32" 
+  #"/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D/XCT_Conc_Synth/1200Vols/32x32x32/Pat200000_Dec0.9_OneGPU/N1_GPU1_Adaptivelr0.00001_P1_BS256_ED1024_float32"
+  ##32x32x32/32Node_lr0.01_Patch8_batch1" # 
+  checkpoint_filename: "XCT_Conc_Norm_base" # "XCT_Conc_base_Synth" # "Breaker_AM_base" # "XCT_half_concrete_base" #  
+  checkpoint_filename_for_loading: "XCT_Conc_Norm_base_0" # "XCT_Conc_base_Synth_0" # "Breaker_AM_base_0" #  "XCT_half_concrete_base_0" #  xct_concrete_base_[EPOCH]
+  inference_path: "/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D/XCT_Conc_normalized/600Vols/256x256x256/Pat2000_Dec0.9/N16_Adaptivelr0.001_P8_BS256_ED4096_float32/inference"
+  #"/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D/XCT_Conc_Synth/1200Vols/32x32x32/Pat200000_Dec0.9_OneGPU/N1_GPU1_Adaptivelr0.00001_P1_BS256_ED1024_float32/inference"
+  # #/32x32x32/32Node_lr0.01_Patch8_batch1/inference"
+  # /lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D/XCT_Conc_Synth/1200Vols/32x32x32/Pat200000_Dec0.9_OneGPU/N1_GPU1_Adaptivelr0.00001_P1_BS256_ED1024_float32
   resume_from_checkpoint: False
 
 # ---------------------------- PARALLELISM -------------------------------------
 parallelism:
   fsdp_size: 1
-  simple_ddp_size: 8  #num of nodes * gpus
+  simple_ddp_size: 128  #num of nodes * gpus
   tensor_par_size: 1
   seq_par_size: 1
   cpu_offloading: False
 
 # ---------------------------- MODEL -------------------------------------------
 model:
-  lr: 0.00001
+  lr: 0.001
   beta_1: 0.9
   beta_2: 0.95
   weight_decay: 1e-5
@@ -29,19 +33,19 @@ model:
   warmup_start_lr: 1e-8
   eta_min: 1e-8
   loss_fn: "MSE"
-  use_grad_scaler: True
+  use_grad_scaler: False #True
 
   net:
     init_args:
       default_vars: [
         "xct", 
       ]
-      tile_size: [32,32,32] #[256, 256, 256]
-      patch_size: 1 # 8
-      embed_dim: 1024 #512 #1024
+      tile_size: [256, 256, 256] #[32,32,32] #
+      patch_size: 8 #8 # 1
+      embed_dim: 4096 #512 #1024
       depth: 8 # 10
       num_heads: 8
-      decoder_embed_dim: 1024 # 576
+      decoder_embed_dim: 4096 # 576
       decoder_depth: 8
       decoder_num_heads: 16
       mlp_ratio: 4
@@ -60,9 +64,9 @@ model:
 data:
   dataset: "xct"
   dict_root_dirs: {
-    # 'xct1': "/lustre/fs0/scratch/ziabariak/XCT_Concrete_32x32_Z00730/",
-    'xct1': "/lustre/fs0/scratch/ziabariak/data_LDRD/XCT_NCT_Synth/Downsampled_128x128_128_beforeCrop/XCT_Concrete_32x32x32_Synth_artificallyStandardized/",
-    #"/lustre/fs0/scratch/lyngaasir/DiffusiveINR_Data/XCT_Concrete_Z00730_650Files", #599 #'/lustre/fs0/scratch/ziabariak/XCT_Concrete_32x32x32_Z00730', # 
+    # 'xct1': "/lustre/fs0/scratch/ziabariak/XCT_Concrete_32x32_Z00730/",'/lustre/fs0/scratch/lyngaasir/DiffusiveINR_Data/Normalized_Data/XCT_Concrete_Z00730_650Files_normalized'
+    'xct1': '/lustre/fs0/scratch/lyngaasir/DiffusiveINR_Data/Normalized_Data/XCT_Concrete_Z00730_650Files_normalized', #599 #'/lustre/fs0/scratch/ziabariak/XCT_Concrete_32x32x32_Z00730', #
+    # 'xct1': "/lustre/fs0/scratch/ziabariak/data_LDRD/XCT_NCT_Synth/Downsampled_128x128_128_beforeCrop/XCT_Concrete_32x32x32_Synth_artificallyStandardized/", 
     }
   dict_start_idx: {
     'xct1': 0,
