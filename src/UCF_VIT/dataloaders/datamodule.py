@@ -100,7 +100,13 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                             seq_label_list.append([])
                             for j in range(num_labels):
                                 seq_label_list[i].append(torch.from_numpy(batch[i][5][j]))
-                    seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
+                    if dataset == "basic_ct":
+                        seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
+                    else:
+                        channel_list = []
+                        for i in range(len(batch)):
+                            channel_list.append(torch.stack([seq_label_list[i][j] for j in range(num_labels)]))
+                        seq_label = torch.stack([channel_list[i] for i in range(len(batch))])
                     variables = batch[0][6]
                     if return_qdt:
                         qdt_list = []
