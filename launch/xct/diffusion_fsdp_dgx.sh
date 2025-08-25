@@ -1,19 +1,19 @@
 #!/bin/bash
 #SBATCH --partition defq
-#SBATCH --nodes 4
+#SBATCH --nodes 2
 #SBATCH --exclusive
 #SBATCH --job-name=diffusion_fsdp
 #SBATCH --gpus-per-node=8
 #SBATCH --ntasks-per-node=8
-#SBATCH --output=/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_3D/XCTConcrete_600/256x256x256/Pat100_Dec0.9/N4_Adaptivelr0.02_P8_BS2_ED576_redo_from20000_correctPlotting/inference/%x_%j.out
-#SBATCH --error=/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_3D/XCTConcrete_600/256x256x256/Pat100_Dec0.9/N4_Adaptivelr0.02_P8_BS2_ED576_redo_from20000_correctPlotting/inference/%x_%j.err
+#SBATCH --output=/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_3D/XCTConcrete_600_standardized_correctContainer/256x256x256/Pat2000_Dec0.9/N2_Adaptivelr0.005_P8_BS8_ED1152/inference/%x_%j.out
+#SBATCH --error=/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_3D/XCTConcrete_600_standardized_correctContainer/256x256x256/Pat2000_Dec0.9/N2_Adaptivelr0.005_P8_BS8_ED1152/inference/%x_%j.err
 
 #[ -z $JOBID ] && JOBID=$SLURM_JOB_ID
 #[ -z $JOBSIZE ] && JOBSIZE=$SLURM_JOB_NUM_NODES
 
 #ulimit -n 65536
 
-srun --mpi=pmix --container-mounts /lustre/fs0 --container-mount-home --container-image /lustre/fs0/scratch/lyngaasir/sqsh-files/0698614322576143+ucf-vit+25.05-upd3.sqsh python /home/ziabariak/git/UCF-VIT/dev_scripts/train_diffusion_fsdp_wFixedFID.py /home/ziabariak/git/UCF-VIT/configs/xct/diffusion/base_config_dgx.yaml
+srun --mpi=pmix --container-mounts /lustre/fs0 --container-mount-home --container-image /lustre/fs0/scratch/ziabariak/sqsh-files/0698614322576143+ucf-vit+25.05-upd4.sqsh python /home/ziabariak/git/UCF-VIT/dev_scripts/train_diffusion_fsdp_wFixedFID.py /home/ziabariak/git/UCF-VIT/configs/xct/diffusion/base_config_dgx.yaml
 
 
 # srun --mpi=pmix --container-mounts /lustre/fs0 --container-mount-home --container-image /lustre/fs0/scratch/lyngaasir/sqsh-files/0698614322576143+ucf-vit+25.05-upd2.sqsh python $HOME/git/UCF-VIT/dev_scripts/train_diffusion_fsdp.py $HOME/git/UCF-VIT/configs/xct/diffusion/base_config_dgx.yaml

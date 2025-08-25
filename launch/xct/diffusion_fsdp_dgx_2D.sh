@@ -1,14 +1,12 @@
 #!/bin/bash
 #SBATCH --partition defq
-#SBATCH --nodes 16
+#SBATCH --nodes 2
 #SBATCH --exclusive
 #SBATCH --job-name=diffusion_fsdp
 #SBATCH --gpus-per-node=8
 #SBATCH --ntasks-per-node=8
-#SBATCH --output=/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D/XCT_Conc_normalized/600Vols/256x256x256/Pat2000_Dec0.9/N16_Adaptivelr0.001_P8_BS256_ED4096_float32/inference/%x_%j.out
-# /lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D/XCT_Conc_Synth/1200Vols/32x32x32/Pat200000_Dec0.9_OneGPU/N1_GPU1_Adaptivelr0.00001_P1_BS256_ED1024_float32/inference/%x_%j.out
-#SBATCH --error=/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D/XCT_Conc_normalized/600Vols/256x256x256/Pat2000_Dec0.9/N16_Adaptivelr0.001_P8_BS256_ED4096_float32/inference/%x_%j.err
-# /lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D/XCT_Conc_Synth/1200Vols/32x32x32/Pat200000_Dec0.9_OneGPU/N1_GPU1_Adaptivelr0.00001_P1_BS256_ED1024_float32/inference/%x_%j.err
+#SBATCH --output=/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D/XCT_Conc_standardized/600Vols/256x256x256/Pat2000_Dec0.9/N2_Adaptivelr0.004_P8_BS256_ED1024_float32/inference/%x_%j.out
+#SBATCH --error=/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D/XCT_Conc_standardized/600Vols/256x256x256/Pat2000_Dec0.9/N2_Adaptivelr0.004_P8_BS256_ED1024_float32/inference/%x_%j.err
 
 #[ -z $JOBID ] && JOBID=$SLURM_JOB_ID
 #[ -z $JOBSIZE ] && JOBSIZE=$SLURM_JOB_NUM_NODES
@@ -20,5 +18,8 @@ srun --mpi=pmix --container-mounts /lustre/fs0 --container-mount-home --containe
 
 # srun --mpi=pmix --container-mounts /lustre/fs0 --container-mount-home --container-image /lustre/fs0/scratch/lyngaasir/sqsh-files/0698614322576143+ucf-vit+25.05-upd2.sqsh python $HOME/git/UCF-VIT/dev_scripts/train_diffusion_fsdp.py $HOME/git/UCF-VIT/configs/xct/diffusion/base_config_dgx.yaml
 
-# 
-# 
+#/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D/XCT_Conc_normalized/600Vols/256x256x256/Pat2000_Dec0.9/N16_Adaptivelr0.001_P8_BS256_ED2048_float32/inference/%x_%j.out
+#/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D/XCT_Conc_Synth/1200Vols/32x32x32/Pat200000_Dec0.9_OneGPU/N1_GPU1_Adaptivelr0.00001_P1_BS256_ED1024_float32/inference/%x_%j.out
+#/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D/XCT_Conc_normalized/600Vols/256x256x256/Pat2000_Dec0.9/N16_Adaptivelr0.001_P8_BS256_ED2048_float32/inference/%x_%j.err
+#/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D/XCT_Conc_Synth/1200Vols/32x32x32/Pat200000_Dec0.9_OneGPU/N1_GPU1_Adaptivelr0.00001_P1_BS256_ED1024_float32/inference/%x_%j.err
+#/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D/XCT_Conc_Synth/1200Vols/32x32x32/Pat2000_Dec0.9_OneGPU/N1_GPU1_Adaptivelr0.00001_P1m_BS256_ED1024_float32/inference
