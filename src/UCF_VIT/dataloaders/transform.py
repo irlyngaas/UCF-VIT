@@ -64,45 +64,109 @@ class Patchify_3D(torch.nn.Module):
         self.dataset = dataset
 
     def forward(self, img):  # we assume inputs are always structured like this
-        img = np.squeeze(img,axis=None)
-        self.smooth_factor = random.choice(self.sths)
-        c = random.choice(self.cannys)
-        self.canny = [c, c+50]
-        grey_img = gaussian_filter(img, sigma=self.smooth_factor)
+        if self.num_channels == 1:
+            img = np.squeeze(img,axis=None)
+            self.smooth_factor = random.choice(self.sths)
+            c = random.choice(self.cannys)
+            self.canny = [c, c+50]
+            grey_img = gaussian_filter(img, sigma=self.smooth_factor)
 
-        gradient_magnitude = np.zeros_like(grey_img)
-        gradient_direction = np.zeros_like(grey_img)
+            gradient_magnitude = np.zeros_like(grey_img)
+            gradient_direction = np.zeros_like(grey_img)
 
-        for i in range(grey_img.shape[0]):
-            sobelx = cv.Sobel(grey_img[i, :, :], cv.CV_64F, 1, 0, ksize=5)
-            sobely = cv.Sobel(grey_img[i, :, :], cv.CV_64F, 0, 1, ksize=5)
-            gradient_magnitude[i, :, :] = np.sqrt(sobelx**2 + sobely**2)
-            gradient_direction[i, :, :] = np.arctan2(sobely, sobelx)
+            for i in range(grey_img.shape[0]):
+                sobelx = cv.Sobel(grey_img[i, :, :], cv.CV_64F, 1, 0, ksize=5)
+                sobely = cv.Sobel(grey_img[i, :, :], cv.CV_64F, 0, 1, ksize=5)
+                gradient_magnitude[i, :, :] = np.sqrt(sobelx**2 + sobely**2)
+                gradient_direction[i, :, :] = np.arctan2(sobely, sobelx)
 
-        edges_combined = np.zeros(grey_img.shape, dtype=bool)
+            edges_combined = np.zeros(grey_img.shape, dtype=bool)
 
-        for i in range(grey_img.shape[0]):
-            canny_edges = cv.Canny(grey_img[i, :, :].astype(np.uint8), self.canny[0], self.canny[1])
-            edges_combined[i, :, :] != (canny_edges > 0)
+            for i in range(grey_img.shape[0]):
+                canny_edges = cv.Canny(grey_img[i, :, :].astype(np.uint8), self.canny[0], self.canny[1])
+                edges_combined[i, :, :] != (canny_edges > 0)
 
-        edge_direction_data = np.zeros_like(gradient_direction)
-        edge_direction_data[edges_combined] = gradient_direction[edges_combined]
-        
-        edge_data_normalized = (edge_direction_data - edge_direction_data.min()) / (edge_direction_data.max() - edge_direction_data.min())
-        #TODO: Add parameter for this threshold
-        threshold = 0.5
-        binary_edges = (edge_data_normalized > threshold).astype(np.uint8) * 255
-        edges = binary_edges
+            edge_direction_data = np.zeros_like(gradient_direction)
+            edge_direction_data[edges_combined] = gradient_direction[edges_combined]
+            
+            edge_data_normalized = (edge_direction_data - edge_direction_data.min()) / (edge_direction_data.max() - edge_direction_data.min())
+            #TODO: Add parameter for this threshold
+            threshold = 0.5
+            binary_edges = (edge_data_normalized > threshold).astype(np.uint8) * 255
+            edges = binary_edges
 
-        octtree = FixedOctTree(domain=edges, fixed_length=self.fixed_length)
+            octtree = FixedOctTree(domain=edges, fixed_length=self.fixed_length)
 
-        seq_img, seq_size, seq_pos = octtree.serialize(img, size=(self.patch_size,self.patch_size,self.patch_size))
-        seq_size = np.asarray(seq_size)
-        seq_img = np.asarray(seq_img, dtype=np.float32)
-        if self.num_channels > 1:
-            seq_img = np.reshape(seq_img, [self.num_channels, -1, self.patch_size*self.patch_size*self.patch_size])
+            seq_img, seq_size, seq_pos = octtree.serialize(img, size=(self.patch_size,self.patch_size,self.patch_size))
+            seq_size = np.asarray(seq_size)
+            seq_img = np.asarray(seq_img, dtype=np.float32)
+            if self.num_channels > 1:
+                seq_img = np.reshape(seq_img, [self.num_channels, -1, self.patch_size*self.patch_size*self.patch_size])
+            else:
+                seq_img = np.reshape(seq_img, [-1, self.patch_size*self.patch_size*self.patch_size])
+
+            seq_pos = np.asarray(seq_pos)
+            return seq_img, seq_size, seq_pos, octtree
         else:
-            seq_img = np.reshape(seq_img, [-1, self.patch_size*self.patch_size*self.patch_size])
+            self.smooth_factor = random.choice(self.sths)
+            c = random.choice(self.cannys)
+            self.canny = [c, c+50]
+            grey_img = gaussian_filter(img, sigma=(self.smooth_factor,self.smooth_factor,self.smooth_factor,0))
+            gradient_magnitude = np.zeros_like(grey_img[:,:,:,0])
+            #print("SHAPE_GRADIENT_MAGNITUDE: ", gradient_magnitude.shape,flush=True)
+            gradient_direction = np.zeros_like(grey_img[:,:,:,0])
 
-        seq_pos = np.asarray(seq_pos)
-        return seq_img, seq_size, seq_pos, octtree
+            for i in range(grey_img.shape[0]):
+                for j in range(self.num_channels):
+                    if j == 0:
+                        sobelx = cv.Sobel(grey_img[i, :, :, j], cv.CV_64F, 1, 0, ksize=5)
+                        sobely = cv.Sobel(grey_img[i, :, :, j], cv.CV_64F, 0, 1, ksize=5)
+                    else:
+                        sx = cv.Sobel(grey_img[i, :, :, j], cv.CV_64F, 1, 0, ksize=5)
+                        if np.mean(sx) > np.mean(sobelx):
+                            sobelx = sx
+                        sy = cv.Sobel(grey_img[i, :, :, j], cv.CV_64F, 0, 1, ksize=5)
+                        if np.mean(sy) > np.mean(sobely):
+                            sobely = sy
+
+                gradient_magnitude[i, :, :] = np.sqrt(sobelx**2 + sobely**2)
+                gradient_direction[i, :, :] = np.arctan2(sobely, sobelx)
+
+            #edges_combined = np.zeros(grey_img.shape, dtype=bool)
+            edges_combined = np.zeros_like(grey_img[:,:,:,0], dtype=bool)
+
+            for i in range(grey_img.shape[0]):
+                for j in range(self.num_channels):
+                    if j == 0:
+                        canny_edges = cv.Canny(grey_img[i, :, :, j].astype(np.uint8), self.canny[0], self.canny[1])
+                    else:
+                        canny_edges = canny_edges + cv.Canny(grey_img[i, :, :, j].astype(np.uint8), self.canny[0], self.canny[1])
+                edges_combined[i, :, :] != (canny_edges > 0)
+
+            edge_direction_data = np.zeros_like(gradient_direction)
+            edge_direction_data[edges_combined] = gradient_direction[edges_combined]
+            
+            edge_data_normalized = (edge_direction_data - edge_direction_data.min()) / (edge_direction_data.max() - edge_direction_data.min())
+            #print("edge_data_normalized_shape", edge_data_normalized.shape,flush=True)
+            #print("edge_data_normalized_max", edge_data_normalized.max,flush=True)
+            #TODO: Add parameter for this threshold
+            threshold = 0.5
+            #binary_edges = (edge_data_normalized > threshold).astype(np.uint8) * 255
+            binary_edges = (edge_data_normalized > threshold).astype(np.uint8)
+            #print("binary_edge_shape", binary_edges.shape,flush=True)
+            #print("binary_edge_max", binary_edges.max,flush=True)
+            edges = binary_edges
+
+            octtree = FixedOctTree(domain=edges, fixed_length=self.fixed_length)
+
+            #seq_img, seq_size, seq_pos = octtree.serialize(img, size=(self.patch_size,self.patch_size,self.patch_size))
+            seq_img, seq_size, seq_pos = octtree.serialize(img, size=(self.patch_size,self.patch_size,self.patch_size, self.num_channels))
+            seq_size = np.asarray(seq_size)
+            seq_img = np.asarray(seq_img, dtype=np.float32)
+            if self.num_channels > 1:
+                seq_img = np.reshape(seq_img, [self.num_channels, -1, self.patch_size*self.patch_size*self.patch_size])
+            else:
+                seq_img = np.reshape(seq_img, [-1, self.patch_size*self.patch_size*self.patch_size])
+
+            seq_pos = np.asarray(seq_pos)
+            return seq_img, seq_size, seq_pos, octtree
