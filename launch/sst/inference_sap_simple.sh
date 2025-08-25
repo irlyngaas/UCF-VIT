@@ -17,8 +17,6 @@
 #ulimit -n 65536
 
 
-#source /lustre/orion/proj-shared/stf006/irl1/conda/bin/activate
-#conda activate /lustre/orion/stf006/proj-shared/irl1/vit-2.7-sst
 eval "$(/lustre/orion/stf006/proj-shared/irl1/miniforge3/bin/conda shell.bash hook)"
 conda activate forge-vit
 
@@ -36,8 +34,4 @@ mkdir -p $MIOPEN_USER_DB_PATH
 export OMP_NUM_THREADS=7
 export PYTHONPATH=$PWD:$PYTHONPATH
 
-#time srun -n $((SLURM_JOB_NUM_NODES*8)) \
-#python ../../dev_scripts/train_pred_fsdp.py ../../configs/sst/pred/base_config.yaml
-
-#srun -n 1 --ntasks-per-node=1 -c 1 python ../../dev_scripts/inference_pred_fsdp.py ../../configs/sst/pred/base_config.yaml 28.040000 z UNETR
 srun python ../../dev_scripts/inference_sap_simple.py ../../configs/sst/sap/base_config3D.yaml 28.040000 z
