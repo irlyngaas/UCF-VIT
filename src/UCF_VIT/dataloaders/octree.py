@@ -30,7 +30,6 @@ class Cube:
         # import pdb
         # pdb.set_trace()
         patch_size = self.get_size()
-        print("patch_size", patch_size)
         h1, w1, d1, c1 = patch.shape
         assert h1==w1==d1, "Need squared input."
 
