@@ -631,6 +631,7 @@ def main(device, local_rank):
 
             scheduler.step()
             optimizer.zero_grad()
+            counter = counter + 1
 
         if world_rank==0:
             print("epoch: ",epoch," epoch_loss ",epoch_loss, flush=True)
