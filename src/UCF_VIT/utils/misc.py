@@ -691,9 +691,12 @@ def get_test_data(data_dir, timestamp, vars_input, vars_output, tile_size_z, til
     nyoffsets = np.arange(0, ny-nysl + 1, ny_step)
     if nyoffsets[-1]+nysl < ny:
         nyoffsets = np.append(nyoffsets, ny-nysl)
-    nxoffsets = np.arange(0, nx-2-nxsl + 1, nx_step)
-    if nxoffsets[-1]+nxsl < nx-2:
-        nxoffsets = np.append(nxoffsets, nx-2-nxsl)
+    #nxoffsets = np.arange(0, nx-2-nxsl + 1, nx_step)
+    nxoffsets = np.arange(0, nx-nxsl + 1, nx_step)
+    #if nxoffsets[-1]+nxsl < nx-2:
+    if nxoffsets[-1]+nxsl < nx:
+        #nxoffsets = np.append(nxoffsets, nx-2-nxsl)
+        nxoffsets = np.append(nxoffsets, nx-nxsl)
 
     # Batch size and data shapes
     batch_size = len(nzoffsets) * len(nyoffsets) * len(nxoffsets)
