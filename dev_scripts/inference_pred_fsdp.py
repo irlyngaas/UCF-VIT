@@ -28,29 +28,21 @@ from timm.layers import use_fused_attn
 
 from functools import partial
 
-from UCF_VIT.fsdp.arch import UNETR, MAE
+from UCF_VIT.fsdp.arch import UNETR
 from UCF_VIT.fsdp.building_blocks import Block
-from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, init_par_groups, get_test_data, stitch_data
+from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, init_par_groups, get_test_data, stitch_data, is_power_of_two
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.utils.fused_attn import FusedAttn
 
 from sklearn.metrics import mean_squared_error, r2_score
 import math
 from UCF_VIT.utils.plotting import *
+from UCF_VIT.dataloaders.transform import Patchify, Patchify_3D
 
 import warnings
 warnings.filterwarnings("ignore")
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
-
-def training_step(data, label, variables, net: UNETR, patch_size, twoD):
-
-    output = net.forward(data, variables)
-
-    criterion = nn.MSELoss()
-    loss = criterion(output,label)
-
-    return loss, output
 
 def test_step(data, variables, net: UNETR):
     output = net.forward(data, variables)
@@ -89,7 +81,9 @@ def main(device, local_rank):
 
     checkpoint_filename_for_loading = conf['trainer']['checkpoint_filename_for_loading']
 
-    assert checkpoint_filename_for_loading not None, "Checkpoint needs to be specified for inferencing"
+    resume_from_checkpoint = conf['trainer']['resume_from_checkpoint']
+
+    #assert checkpoint_filename_for_loading not None, "Checkpoint needs to be specified for inferencing"
 
     inference_path =conf['trainer']['inference_path']
 
@@ -223,25 +217,65 @@ def main(device, local_rank):
         weight_init='skip',
     ).to(device)
 
-    if world_rank < tensor_par_size:
-        if os.path.exists(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(world_rank)+".ckpt"):
-            print("resume from checkpoint was set to True. Checkpoint path found.",flush=True)
+    if not resume_from_checkpoint:
+        epoch_start = 0
+        loss_list = []
+        if world_rank==0:
 
-            print("rank",dist.get_rank(),"src_rank",world_rank,flush=True)
+            # Check whether the specified checkpointing path exists or not
+
+            isExist = os.path.exists(checkpoint_path)
+            if not isExist:
+                # Create a new directory because it does not exist
+                os.makedirs(checkpoint_path)
+                print("The new checkpoint directory is created!")
+
+            #save initial model weights and distribute to all GPUs in the tensor parallel group to synchronize model weights that do not belong to the training block
+            init_model_dict = {k: v for k, v in model.state_dict().items() if ('attn' not in  k and 'mlp' not in k and 'var_agg' not in k)}
+
+            print("rank",dist.get_rank(),"init_model_dict.keys()",init_model_dict.keys(),flush=True)
+
+            torch.save(init_model_dict,
+                    checkpoint_path+'/initial_'+str(dist.get_rank())+'.pth')
+
+            print("rank", dist.get_rank(),"after torch.save for initial",flush=True)
+
+            loss_list = []
+            del init_model_dict
+        dist.barrier()
+
+        if world_rank!=0 and world_rank <tensor_par_size:
+
+
+            #load initial model weights and synchronize model weights that are not in the training block among sequence parallel GPUs
+            src_rank = dist.get_rank() - dist.get_rank(group=tensor_par_group)
+
+            print("rank",dist.get_rank(),"src_rank",src_rank,flush=True)
 
             map_location = 'cpu'
             #map_location = 'cuda:'+str(device)
+            model.load_state_dict(torch.load(checkpoint_path+'/initial_'+str(0)+'.pth',map_location=map_location),strict=False)
+            loss_list = []
+    else:
+        if world_rank < tensor_par_size:
+            if os.path.exists(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(world_rank)+".ckpt"):
+                print("resume from checkpoint was set to True. Checkpoint path found.",flush=True)
 
-            checkpoint = torch.load(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(world_rank)+".ckpt",map_location=map_location)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            epoch_start = checkpoint['epoch']
-            loss_list = checkpoint['loss_list']
-            del checkpoint
+                print("rank",dist.get_rank(),"src_rank",world_rank,flush=True)
 
-        else:
-            print("resume from checkpoint was set to True. But the checkpoint path does not exist.",flush=True)
+                map_location = 'cpu'
+                #map_location = 'cuda:'+str(device)
 
-            sys.exit("checkpoint path does not exist")
+                checkpoint = torch.load(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(world_rank)+".ckpt",map_location=map_location)
+                model.load_state_dict(checkpoint['model_state_dict'])
+                epoch_start = checkpoint['epoch']
+                loss_list = checkpoint['loss_list']
+                del checkpoint
+
+            else:
+                print("resume from checkpoint was set to True. But the checkpoint path does not exist.",flush=True)
+
+                sys.exit("checkpoint path does not exist")
 
     dist.barrier()
 
@@ -283,6 +317,8 @@ def main(device, local_rank):
         model, checkpoint_wrapper_fn=checkpoint_wrapper, check_fn=check_fn
     )
 
+    dist.barrier()
+
     isExist = os.path.exists(inference_path)
     if not isExist:
         # Create a new directory because it does not exist
@@ -299,7 +335,8 @@ def main(device, local_rank):
     # batched inference
     batch_inference = batch_size
     output = np.zeros(label.shape)
-    start_time_i = time.time()
+    start_time = time.time()
+    batch_inference_num_ranks = batch_inference*world_size
     for i in range(0, data.shape[0], batch_inference):
         idx_start = i
         idx_end = min(i + batch_inference, data.shape[0])
@@ -310,9 +347,7 @@ def main(device, local_rank):
             data_test = torch.from_numpy(data_test)
             data_test = data_test.to(precision_dt)
             data_test = data_test.to(device)
-        start_time = time.time()
-        #output[idx_start:idx_end, :, :, :, :] = model_seq_par(torch.from_numpy( np.array(data_test) ) ).detach().cpu().numpy()
-        output[idx_start:idx_end, :, :, :, :] = test_step(data_test, dict_in_variables[key], model).detach().cpu().numpy()
+            output[idx_start:idx_end, :, :, :, :] = test_step(data_test, dict_in_variables[key], model).detach().cpu().numpy()
         elpsdt = time.time() - start_time
         print(f'Time elapsed for testing batch samples: {int(elpsdt//60)} min {elpsdt%60:.2f} sec')
 
