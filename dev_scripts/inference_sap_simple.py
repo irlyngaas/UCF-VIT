@@ -263,6 +263,12 @@ def main(device, local_rank):
 
 
     dist.barrier()
+    if dist.get_rank() == 0:
+        isExist = os.path.exists(inference_path)
+        if not isExist:
+            # Create a new directory because it does not exist
+            os.makedirs(inference_path, exist_ok=True)
+            print("The new inference directory is created!")
 
     model.eval()
 
@@ -311,7 +317,7 @@ def main(device, local_rank):
         print(f'RANK: {world_rank}, Time elapsed for testing batch samples: {int(elpsdt//60)} min {elpsdt%60:.2f} sec')
 
     output = torch.from_numpy(output).to(device)
-    dist.all_reduce(ouput, op=dist.ReduceOp.SUM)
+    dist.all_reduce(output, op=dist.ReduceOp.SUM)
     output = output.detach().cpu().numpy()
 
     if world_rank == 0:
