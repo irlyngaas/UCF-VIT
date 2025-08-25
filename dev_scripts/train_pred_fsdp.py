@@ -608,8 +608,8 @@ def main(device, local_rank):
                 dist.broadcast_object_list(variables, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
             else: #Avoid unnecesary broadcasts if not using tensor parallelism
                 data, label, variables, _ = next(it_loader)
-                seq = seq.to(precision_dt)
-                seq = seq.to(device)
+                data = data.to(precision_dt)
+                data = data.to(device)
                 label = label.to(precision_dt)
                 label = label.to(device)
 
