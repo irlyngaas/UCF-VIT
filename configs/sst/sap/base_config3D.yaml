@@ -5,7 +5,7 @@ trainer:
   checkpoint_path: "../../checkpoint/sst/sap/base3D"
   checkpoint_filename: "multi_last"
   checkpoint_filename_for_loading: "multi_last_even" #multi_last_odd or multi_last_even
-  inference_path: "../../checkpoint/sst/pred/sap/base3D/inference"
+  inference_path: "../../checkpoint/sst/sap/base3D/inference"
 
   resume_from_checkpoint: True
   use_pretrained_mae_model: False
