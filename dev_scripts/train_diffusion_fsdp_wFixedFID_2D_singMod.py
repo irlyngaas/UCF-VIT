@@ -602,7 +602,7 @@ def main(device):
                 print("epoch: ",epoch," epoch_loss ",epoch_loss, flush=True)
                 plotLoss(loss_list, save_path=os.path.join(checkpoint_path, f'loss_N{simple_ddp_size//8}_BS{batch_size}_PS{patch_size}_ED{emb_dim}_rank1.png'))
 
-        if ((epoch==1) or (epoch % 20 == 0)) and (dist.get_rank(tensor_par_group) == 0):
+        if ((epoch==1) or (epoch % 50 == 0)) and (dist.get_rank(tensor_par_group) == 0):
             # grab a small batch from the current loader (only this rank has it)
             it_eval = iter(train_dataloader)
             x_eval, variables_eval, _ = next(it_eval)
@@ -640,7 +640,8 @@ def main(device):
                 Ntimes=9
             )
 
-
+        dist.barrier()
+            
         # Track best model independently
         if epoch_loss.item() < best_loss:
             best_loss = epoch_loss.item()
@@ -677,6 +678,8 @@ def main(device):
                     patience = min(int(patience * patience_inc_rate),max_patience)
                 epochs_without_improvement = 0
 
+        dist.barrier()
+        
         # Save the best model periodically
         if epoch > 0 and epoch % save_period == 0 and world_rank < tensor_par_size:
             torch.save({

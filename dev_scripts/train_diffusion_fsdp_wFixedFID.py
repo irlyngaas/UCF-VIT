@@ -599,7 +599,7 @@ def main(device):
                 plotLoss(loss_list, save_path=os.path.join(checkpoint_path, f'loss_N{simple_ddp_size//8}_BS{batch_size}_PS{patch_size}_ED{emb_dim}_rank2.png'))
 
 
-        if ((epoch==1) or (epoch % 20 == 0)) and (dist.get_rank(tensor_par_group) == 0):
+        if ((epoch==1) or (epoch % 50 == 0)) and (dist.get_rank(tensor_par_group) == 0):
             # grab a small batch from the current loader (only this rank has it)
             it_eval = iter(train_dataloader)
             x_eval, variables_eval, _ = next(it_eval)

@@ -461,12 +461,13 @@ def main(device):
     best_loss = float("inf")
     best_epoch = -1
     epochs_without_improvement = 0
-    max_patience = 500
-    patience = 200
+    max_patience = 50000
+    patience = 2000
     lr_decay_count = 0
-    save_period = 50
+    save_period = 1 # this allows for us ensuring the data is plotted and saved correctly, and then we cahnge it to 50 or some other number for less frequent saving!
+    save_period_main = 50
     decay_factor = 0.9
-    patience_inc_rate = 1.2 
+    patience_inc_rate = 1.25 
         
     best_model_state = None
     best_optimizer_state = None
@@ -556,6 +557,15 @@ def main(device):
     
                 if world_rank==0:
                     print("epoch: ",epoch,"batch_idx",counter,"world_rank",world_rank,"it_loss ",loss,flush=True)
+
+                if epoch % 100 == 0:
+                    if world_rank==1:
+                        print("epoch: ",epoch,"batch_idx",counter,"world_rank",world_rank,"it_loss ",loss,flush=True)
+                    if world_rank==2:
+                        print("epoch: ",epoch,"batch_idx",counter,"world_rank",world_rank,"it_loss ",loss,flush=True)
+                    if world_rank==3:
+                        print("epoch: ",epoch,"batch_idx",counter,"world_rank",world_rank,"it_loss ",loss,flush=True)
+    
                     
                 if use_grad_scaler:
                     scaler.scale(loss).backward()
@@ -588,6 +598,49 @@ def main(device):
             print("epoch: ",epoch," epoch_loss ",epoch_loss, flush=True)
             if epoch % 100 == 0:
                 plotLoss(loss_list, save_path=os.path.join(checkpoint_path, f'loss_N{simple_ddp_size//8}_BS{batch_size}_PS{patch_size}_ED{emb_dim}.png'))
+        if world_rank==1:
+            if epoch % 100 == 0:
+                print("epoch: ",epoch," epoch_loss ",epoch_loss, flush=True)
+                plotLoss(loss_list, save_path=os.path.join(checkpoint_path, f'loss_N{simple_ddp_size//8}_BS{batch_size}_PS{patch_size}_ED{emb_dim}_rank1.png'))
+
+        if ((epoch==1) or (epoch % 50 == 0)) and (dist.get_rank(tensor_par_group) == 0):
+            # grab a small batch from the current loader (only this rank has it)
+            it_eval = iter(train_dataloader)
+            x_eval, variables_eval, _ = next(it_eval)
+            x_eval = x_eval.to(precision_dt).to(device)
+
+            # plotPerformance
+            plotPerformance(
+                model=model,
+                device=device,
+                x=x_eval,
+                variables=variables_eval,
+                num_time_steps=num_time_steps,
+                patch_size=patch_size,
+                twoD=twoD,
+                scheduler=ddpm_scheduler,   # your DDPM_Scheduler from above
+                epoch=epoch,
+                savefol=inference_path,     # where to save the figure
+                precision_dt=precision_dt,
+                Ntimes=9
+            )
+
+            # plotPerformance
+            plotPerformanceImgs(
+                model=model,
+                device=device,
+                x=x_eval,
+                variables=variables_eval,
+                num_time_steps=num_time_steps,
+                patch_size=patch_size,
+                twoD=twoD,
+                scheduler=ddpm_scheduler,   # your DDPM_Scheduler from above
+                epoch=epoch,
+                savefol=inference_path,     # where to save the figure
+                precision_dt=precision_dt,
+                Ntimes=9
+            )
+
 
         # Track best model independently
         if epoch_loss.item() < best_loss:
@@ -638,10 +691,13 @@ def main(device):
             model.load_state_dict(best_model_state)
 
             for var in default_vars:
+                model.eval()
                 sample_images(model, var, device, tile_size, precision_dt, patch_size,
-                            epoch=epoch, num_samples=3, twoD=twoD, save_path=inference_path,
+                            epoch=epoch, num_samples=5, twoD=twoD, save_path=inference_path,
                             num_time_steps=num_time_steps)
-
+                model.train()
+            if save_period<save_period_main:
+                save_period = save_period_main
 
         dist.barrier()
 
@@ -661,12 +717,15 @@ def main(device):
         model.load_state_dict(best_model_state)
 
         for var in default_vars:
+            model.eval()
             sample_images(model, var, device, tile_size, precision_dt, patch_size,
-                                epoch=best_epoch, num_samples=3, twoD=twoD, save_path=inference_path,
+                                epoch=best_epoch, num_samples=10, twoD=twoD, save_path=inference_path,
                                 num_time_steps=num_time_steps)
+            model.train()
             # save_intermediate_data(model, var, device, tile_size, precision_dt, patch_size,
             #                     epoch=best_epoch, num_samples=2, twoD=twoD, save_path=inference_path,
             #                     num_time_steps=num_time_steps)
+
 
 
 
