@@ -97,8 +97,6 @@ def main(device, local_rank):
 
     resume_from_checkpoint = conf['trainer']['resume_from_checkpoint']
 
-    assert checkpoint_filename_for_loading not None, "Checkpoint needs to be specified for inferencing"
-
     inference_path =conf['trainer']['inference_path']
 
     default_vars =  conf['model']['net']['init_args']['default_vars']
@@ -263,12 +261,11 @@ def main(device, local_rank):
 
 
     dist.barrier()
-    if dist.get_rank() == 0:
-        isExist = os.path.exists(inference_path)
-        if not isExist:
-            # Create a new directory because it does not exist
-            os.makedirs(inference_path, exist_ok=True)
-            print("The new inference directory is created!")
+    isExist = os.path.exists(inference_path)
+    if not isExist:
+        # Create a new directory because it does not exist
+        os.makedirs(inference_path, exist_ok=True)
+        print("The new inference directory is created!")
 
     model.eval()
 
