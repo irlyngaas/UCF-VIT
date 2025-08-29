@@ -97,7 +97,7 @@ def main(device, local_rank):
 
     resume_from_checkpoint = conf['trainer']['resume_from_checkpoint']
 
-    #assert checkpoint_filename_for_loading not None, "Checkpoint needs to be specified for inferencing"
+    assert checkpoint_filename_for_loading not None, "Checkpoint needs to be specified for inferencing"
 
     inference_path =conf['trainer']['inference_path']
 
@@ -282,14 +282,13 @@ def main(device, local_rank):
     output = np.zeros(label.shape)
     start_time_i = time.time()
     batch_inference_num_ranks = batch_inference*world_size
-    #for i in range(0, data.shape[0], batch_inference):
-    for i in range(0, data.shape[0], batch_inference_num_ranks):
-        #idx_start = i
-        #idx_end = min(i + batch_inference, data.shape[0])
-        idx_start = i + batch_size*world_rank
-        idx_end = i + batch_size*world_rank + batch_size
+    for i in range(0, data.shape[0], batch_inference):
+    #for i in range(0, data.shape[0], batch_inference_num_ranks):
+        idx_start = i
+        idx_end = min(i + batch_inference, data.shape[0])
+        #idx_start = i + batch_size*world_rank
+        #idx_end = i + batch_size*world_rank + batch_size
         data_test = data[idx_start:idx_end, :, :, :, :]
-        print("DATA_TEST_SHAPE", data_test.shape, flush=True)
         if separate_channels:
             if twoD:
                 patchify = Patchify(fixed_length=fixed_length, patch_size=patch_size, num_channels=1, dataset=dataset)
@@ -316,109 +315,108 @@ def main(device, local_rank):
         elpsdt = time.time() - start_time
         print(f'RANK: {world_rank}, Time elapsed for testing batch samples: {int(elpsdt//60)} min {elpsdt%60:.2f} sec')
 
-    output = torch.from_numpy(output).to(device)
-    dist.all_reduce(output, op=dist.ReduceOp.SUM)
-    output = output.detach().cpu().numpy()
+    #output = torch.from_numpy(output).to(device)
+    #dist.all_reduce(output, op=dist.ReduceOp.SUM)
+    #output = output.detach().cpu().numpy()
 
-    if world_rank == 0:
-        # Flatten the arrays across the desired dimensions
-        label_flat = label.reshape(label.shape[0], -1)
-        output_flat = output.reshape(output.shape[0], -1)
+    # Flatten the arrays across the desired dimensions
+    label_flat = label.reshape(label.shape[0], -1)
+    output_flat = output.reshape(output.shape[0], -1)
 
-        # Compute inference metrics
-        mse = mean_squared_error(label_flat, output_flat, multioutput='uniform_average') # compute the averaged mse over all dims
-        msefull = mean_squared_error(label_flat, output_flat, multioutput='raw_values') # compute the mse over each dim
+    # Compute inference metrics
+    mse = mean_squared_error(label_flat, output_flat, multioutput='uniform_average') # compute the averaged mse over all dims
+    msefull = mean_squared_error(label_flat, output_flat, multioutput='raw_values') # compute the mse over each dim
 
-        print(f"Test MSE: {mse:1.3e} (RMSE: {math.sqrt(mse):1.3e})") # mse and RMSE (same unit as the vars compared)
-        print(f"R2 values = {np.round([r2_score(label_flat[:,i], output_flat[:,i]) for i in range(4)], 2)}") # R2 score (coeff. determination) over each dim
+    print(f"Test MSE: {mse:1.3e} (RMSE: {math.sqrt(mse):1.3e})") # mse and RMSE (same unit as the vars compared)
+    print(f"R2 values = {np.round([r2_score(label_flat[:,i], output_flat[:,i]) for i in range(4)], 2)}") # R2 score (coeff. determination) over each dim
 
-        # Plot results
-        print("Plotting results...")
-        # Plot learning curve(s)
-        plot_learning_curve(loss_list)
-        plt.savefig(f'{inference_path}/loss_curves.png', bbox_inches='tight', dpi=200)
+    # Plot results
+    print("Plotting results...")
+    # Plot learning curve(s)
+    plot_learning_curve(loss_list)
+    plt.savefig(f'{inference_path}/loss_curves.png', bbox_inches='tight', dpi=200)
 
-        # Plot box contours
-        sampleID = 0  # sample (sub-cube) to plot
-        varID = 0  # variable to plot
-        # Grid
-        nxoffset = 0
-        nyoffset = 0
-        nzoffset = 0
-        nxsl = tile_size_x
-        nysl = tile_size_y
-        nzsl = tile_size_z
+    # Plot box contours
+    sampleID = 0  # sample (sub-cube) to plot
+    varID = 0  # variable to plot
+    # Grid
+    nxoffset = 0
+    nyoffset = 0
+    nzoffset = 0
+    nxsl = tile_size_x
+    nysl = tile_size_y
+    nzsl = tile_size_z
 
-        Lh = 1.0
-        Lv = 0.5
+    Lh = 1.0
+    Lv = 0.5
 
 
-        #x = get_1Dgrid(Lh, nx-2, nxoffset, nxsl, nxskip)
-        x = get_1Dgrid(Lh, int(nx[key]), nxoffset, nxsl, int(nx_skip[key]))
-        if gravity == 'y':
-            y = get_1Dgrid(Lv, int(ny[key]), nyoffset, nysl, int(ny_skip[key]))
-            z = get_1Dgrid(Lh, int(nz[key]), nzoffset, nzsl, int(nz_skip[key]))
-        elif gravity == 'z':
-            y = get_1Dgrid(Lh, int(ny[key]), nyoffset, nysl, int(ny_skip[key]))
-            z = get_1Dgrid(Lv, int(nz[key]), nzoffset, nzsl, int(nz_skip[key]))
-        else:
-            raise Exception("Gravity should be defined")
+    #x = get_1Dgrid(Lh, nx-2, nxoffset, nxsl, nxskip)
+    x = get_1Dgrid(Lh, int(nx[key]), nxoffset, nxsl, int(nx_skip[key]))
+    if gravity == 'y':
+        y = get_1Dgrid(Lv, int(ny[key]), nyoffset, nysl, int(ny_skip[key]))
+        z = get_1Dgrid(Lh, int(nz[key]), nzoffset, nzsl, int(nz_skip[key]))
+    elif gravity == 'z':
+        y = get_1Dgrid(Lh, int(ny[key]), nyoffset, nysl, int(ny_skip[key]))
+        z = get_1Dgrid(Lv, int(nz[key]), nzoffset, nzsl, int(nz_skip[key]))
+    else:
+        raise Exception("Gravity should be defined")
 
-        for varID in range(len(dict_out_variables[key])):
-            # Plot true results
-            datacube = label[sampleID, varID, :]
-            plot_contour_box(x, y, z, datacube, gravity)
-            plt.savefig(f'{inference_path}/{snapshot}_test_box_plot_var-{dict_out_variables[key][varID]}_true.png', bbox_inches='tight', dpi=200)
-            # Plot ML results
-            datacubeML = output[sampleID, varID, :]
-            mse_plot = mean_squared_error(datacube.reshape(datacube.shape[0], -1), datacubeML.reshape(datacubeML.shape[0], -1), multioutput='uniform_average') # compute the averaged mse over all dims
-            ax = plot_contour_box(x, y, z, datacubeML, gravity)
-            ax.set_title(f'MSE: {mse_plot:1.3e} (RMSE: {math.sqrt(mse_plot):1.3e})')
-            plt.savefig(f'{inference_path}/{snapshot}_test_box_plot_var-{dict_out_variables[key][varID]}_ML.png', bbox_inches='tight', dpi=200)
+    for varID in range(len(dict_out_variables[key])):
+        # Plot true results
+        datacube = label[sampleID, varID, :]
+        plot_contour_box(x, y, z, datacube, gravity)
+        plt.savefig(f'{inference_path}/{snapshot}_test_box_plot_var-{dict_out_variables[key][varID]}_true.png', bbox_inches='tight', dpi=200)
+        # Plot ML results
+        datacubeML = output[sampleID, varID, :]
+        mse_plot = mean_squared_error(datacube.reshape(datacube.shape[0], -1), datacubeML.reshape(datacubeML.shape[0], -1), multioutput='uniform_average') # compute the averaged mse over all dims
+        ax = plot_contour_box(x, y, z, datacubeML, gravity)
+        ax.set_title(f'MSE: {mse_plot:1.3e} (RMSE: {math.sqrt(mse_plot):1.3e})')
+        plt.savefig(f'{inference_path}/{snapshot}_test_box_plot_var-{dict_out_variables[key][varID]}_ML.png', bbox_inches='tight', dpi=200)
 
-        # Plot full data
-        data_full = stitch_data(data, int(nz[key]), int(ny[key]), int(nx[key]), tile_size_z, tile_size_y, tile_size_x, int(nz_skip[key]), int(ny_skip[key]), int(nx_skip[key]), overlap=tile_overlap)
-        label_full = stitch_data(label, int(nz[key]), int(ny[key]), int(nx[key]), tile_size_z, tile_size_y, tile_size_x, int(nz_skip[key]), int(ny_skip[key]), int(nx_skip[key]), overlap=tile_overlap)
-        output_full = stitch_data(output, int(nz[key]), int(ny[key]), int(nx[key]), tile_size_z, tile_size_y, tile_size_x, int(nz_skip[key]), int(ny_skip[key]), int(nx_skip[key]), overlap=tile_overlap)
+    # Plot full data
+    data_full = stitch_data(data, int(nz[key]), int(ny[key]), int(nx[key]), tile_size_z, tile_size_y, tile_size_x, int(nz_skip[key]), int(ny_skip[key]), int(nx_skip[key]), overlap=tile_overlap)
+    label_full = stitch_data(label, int(nz[key]), int(ny[key]), int(nx[key]), tile_size_z, tile_size_y, tile_size_x, int(nz_skip[key]), int(ny_skip[key]), int(nx_skip[key]), overlap=tile_overlap)
+    output_full = stitch_data(output, int(nz[key]), int(ny[key]), int(nx[key]), tile_size_z, tile_size_y, tile_size_x, int(nz_skip[key]), int(ny_skip[key]), int(nx_skip[key]), overlap=tile_overlap)
 
-        # Full grid
-        nxoffset = 0
-        nyoffset = 0
-        nzoffset = 0
-        #nxsl = nx-2
-        nxsl = int(nx[key])
-        nysl = int(ny[key])
-        nzsl = int(nz[key])
-        #x = get_1Dgrid(Lh, nx-2, nxoffset, nxsl, nx_skip)
-        x = get_1Dgrid(Lh, int(nx[key]), nxoffset, nxsl, int(nx_skip[key]))
-        if gravity == 'y':
-            y = get_1Dgrid(Lv, int(ny[key]), nyoffset, nysl, int(ny_skip[key]))
-            z = get_1Dgrid(Lh, int(nz[key]), nzoffset, nzsl, int(nz_skip[key]))
-        elif gravity == 'z':
-            y = get_1Dgrid(Lh, int(ny[key]), nyoffset, nysl, int(ny_skip[key]))
-            z = get_1Dgrid(Lv, int(nz[key]), nzoffset, nzsl, int(nz_skip[key]))
-        else:
-            raise Exception("Gravity should be defined")
+    # Full grid
+    nxoffset = 0
+    nyoffset = 0
+    nzoffset = 0
+    #nxsl = nx-2
+    nxsl = int(nx[key])
+    nysl = int(ny[key])
+    nzsl = int(nz[key])
+    #x = get_1Dgrid(Lh, nx-2, nxoffset, nxsl, nx_skip)
+    x = get_1Dgrid(Lh, int(nx[key]), nxoffset, nxsl, int(nx_skip[key]))
+    if gravity == 'y':
+        y = get_1Dgrid(Lv, int(ny[key]), nyoffset, nysl, int(ny_skip[key]))
+        z = get_1Dgrid(Lh, int(nz[key]), nzoffset, nzsl, int(nz_skip[key]))
+    elif gravity == 'z':
+        y = get_1Dgrid(Lh, int(ny[key]), nyoffset, nysl, int(ny_skip[key]))
+        z = get_1Dgrid(Lv, int(nz[key]), nzoffset, nzsl, int(nz_skip[key]))
+    else:
+        raise Exception("Gravity should be defined")
 
-        for varID in range(len(dict_out_variables[key])):
-            # Plot true results
-            datacube = label_full[:,:,:, varID]
-            plot_contour_box(x, y, z, datacube, gravity)
-            plt.savefig(f'{inference_path}/{snapshot}_test_box_plotFull_var-{dict_out_variables[key][varID]}_true.png', bbox_inches='tight', dpi=200)
-            # Plot ML results
-            datacubeML = output_full[:,:,:, varID] 
-            mse_plot = mean_squared_error(datacube.reshape(datacube.shape[0], -1), datacubeML.reshape(datacubeML.shape[0], -1), multioutput='uniform_average') # compute the averaged mse over all dims
-            ax = plot_contour_box(x, y, z, datacubeML, gravity)
-            ax.set_title(f'MSE: {mse_plot:1.3e} (RMSE: {math.sqrt(mse_plot):1.3e})')
-            plt.savefig(f'{inference_path}/{snapshot}_test_box_plotFull_var-{dict_out_variables[key][varID]}_ML.png', bbox_inches='tight', dpi=200)
+    for varID in range(len(dict_out_variables[key])):
+        # Plot true results
+        datacube = label_full[:,:,:, varID]
+        plot_contour_box(x, y, z, datacube, gravity)
+        plt.savefig(f'{inference_path}/{snapshot}_test_box_plotFull_var-{dict_out_variables[key][varID]}_true.png', bbox_inches='tight', dpi=200)
+        # Plot ML results
+        datacubeML = output_full[:,:,:, varID] 
+        mse_plot = mean_squared_error(datacube.reshape(datacube.shape[0], -1), datacubeML.reshape(datacubeML.shape[0], -1), multioutput='uniform_average') # compute the averaged mse over all dims
+        ax = plot_contour_box(x, y, z, datacubeML, gravity)
+        ax.set_title(f'MSE: {mse_plot:1.3e} (RMSE: {math.sqrt(mse_plot):1.3e})')
+        plt.savefig(f'{inference_path}/{snapshot}_test_box_plotFull_var-{dict_out_variables[key][varID]}_ML.png', bbox_inches='tight', dpi=200)
 
-        # Plot input data
-        for varID in range(len(dict_in_variables[key])):
-            datacube = data_full[:,:,:, varID]
-            plot_contour_box(x, y, z, datacube, gravity)
-            plt.savefig(f'{inference_path}/{snapshot}_input_box_plotFull_var-{dict_in_variables[key][varID]}.png', bbox_inches='tight', dpi=200)
+    # Plot input data
+    for varID in range(len(dict_in_variables[key])):
+        datacube = data_full[:,:,:, varID]
+        plot_contour_box(x, y, z, datacube, gravity)
+        plt.savefig(f'{inference_path}/{snapshot}_input_box_plotFull_var-{dict_in_variables[key][varID]}.png', bbox_inches='tight', dpi=200)
 
-        print("Finished plotting. Done!")
+    print("Finished plotting. Done!")
 
 if __name__ == "__main__":
 

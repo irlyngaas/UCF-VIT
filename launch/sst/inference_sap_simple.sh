@@ -2,9 +2,9 @@
 #SBATCH -A stf006
 #SBATCH -J inference_sap
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:8
-#SBATCH --ntasks-per-node=8
-#SBATCH --cpus-per-task=7
+#SBATCH --gres=gpu:1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=56
 #SBATCH -t 00:30:00
 #SBATCH -p batch
 #SBATCH -o inference_sap-%j.out
