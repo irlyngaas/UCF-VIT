@@ -1130,8 +1130,8 @@ class DiffusionVIT(VIT):
         #Remove decoder from VIT
         self.head = None 
 
-        self.temporalEmbeddings = SinusoidalEmbeddings(time_steps=self.time_steps, embed_dim=self.embed_dim)
-        self.timeEmbeddingMap = EmbeddingDenseLayer(self.embed_dim, self.embed_dim, 0.5) # dropout_prob = 0.5
+        # self.temporalEmbeddings = SinusoidalEmbeddings(time_steps=self.time_steps, embed_dim=self.embed_dim)
+        # self.timeEmbeddingMap = EmbeddingDenseLayer(self.embed_dim, self.embed_dim, 0.5) # dropout_prob = 0.5
         
         # map the var/classes to integer IDs and then map to latent dim
         self.var_map = {}
@@ -1274,9 +1274,9 @@ class DiffusionVIT(VIT):
                
         x = self._pos_embed(x)
         x = self.patch_drop(x)
-        time_emb = self.temporalEmbeddings(x,t)
-        time_emb = self.timeEmbeddingMap(time_emb.to(x.dtype))[:,None,:]
-        x = x + time_emb
+        # time_emb = self.temporalEmbeddings(x,t)
+        # time_emb = self.timeEmbeddingMap(time_emb.to(x.dtype))[:,None,:]
+        # x = x + time_emb
 
         if self.tensor_par_size > 1:
             src_rank = dist.get_rank() - dist.get_rank(group=self.tensor_par_group)
