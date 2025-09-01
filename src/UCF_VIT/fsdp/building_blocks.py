@@ -28,6 +28,7 @@ from monai.networks.blocks.dynunet_block import get_conv_layer
 from UCF_VIT.utils.dist_functions import F_AllReduce_B_Identity
 from UCF_VIT.utils.dist_functions import F_Identity_B_AllReduce
 from UCF_VIT.utils.fused_attn import FusedAttn
+from UCF_VIT.utils.pos_embed import SinusoidalEmbeddings
 
 import xformers
 from xformers.components.attention.core import scaled_dot_product_attention as xformers_sdpa
@@ -267,8 +268,17 @@ class Block(nn.Module):
         self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
+        self.temporalEmbeddings = SinusoidalEmbeddings(time_steps=1000, embed_dim=dim)
+        self.timeEmbeddingMap = EmbeddingDenseLayer(dim, dim, 0.1) # dropout_prob
+        self.condEmbeddingMap = EmbeddingDenseLayer(dim, dim, 0.1) # dropout_prob
+
+
+    def forward(self, x: torch.Tensor, t, c) -> torch.Tensor:
+        time_emb = self.temporalEmbeddings(x,t)
+        time_emb = self.timeEmbeddingMap(time_emb.to(x.dtype))[:,None,:]
+        cond_emb = self.condEmbeddingMap(c)[:,None,:]
+
+        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x + time_emb + cond_emb))))
         x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
         return x
 
