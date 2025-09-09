@@ -3,24 +3,24 @@ trainer:
   max_epochs: 20000
   data_type: "float32" #"bfloat16"
   gpu_type: "nvidia"
-  checkpoint_path: "/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D_standardized/XCT_NCT_All/256x256x256/Pat2000_Dec0.9/N8_Adaptlr0.008_P16_BS1024_ED1024" #32x32x32/32Node_lr0.01_Patch8_batch1" # 
+  checkpoint_path: "/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D_standardized/XCT_NCT_All/256x256x256/Pat2000_Dec0.9/N16_Adaptlr0.005_P8_BS256_ED1536_usevaremb" #32x32x32/32Node_lr0.01_Patch8_batch1" # 
   checkpoint_filename: "XCT_NCT_base" #   "Breaker_AM_base" # "XCT_half_concrete_base" #  
   checkpoint_filename_for_loading: "XCT_NCT_base_0" # "Breaker_AM_base_0" #   "XCT_half_concrete_base_0" #  xct_concrete_base_[EPOCH]
-  inference_path: "/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D_standardized/XCT_NCT_All/256x256x256/Pat2000_Dec0.9/N8_Adaptlr0.008_P16_BS1024_ED1024/inference" #/32x32x32/32Node_lr0.01_Patch8_batch1/inference"
+  inference_path: "/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D_standardized/XCT_NCT_All/256x256x256/Pat2000_Dec0.9/N16_Adaptlr0.005_P8_BS256_ED1536_usevaremb/inference" #/32x32x32/32Node_lr0.01_Patch8_batch1/inference"
 
   resume_from_checkpoint: False
 
 # ---------------------------- PARALLELISM -------------------------------------
 parallelism:
   fsdp_size: 1
-  simple_ddp_size: 64  #num of nodes * gpus
+  simple_ddp_size: 128  #num of nodes * gpus
   tensor_par_size: 1
   seq_par_size: 1
   cpu_offloading: False
 
 # ---------------------------- MODEL -------------------------------------------
 model:
-  lr: 0.008
+  lr: 0.005
   beta_1: 0.9
   beta_2: 0.95
   weight_decay: 1e-5
@@ -42,11 +42,11 @@ model:
         "xctA",
       ]
       tile_size: [256, 256, 256]
-      patch_size: 16
-      embed_dim: 1024
+      patch_size: 8
+      embed_dim: 1536
       depth: 8
       num_heads: 8
-      decoder_embed_dim: 1024
+      decoder_embed_dim: 1536
       decoder_depth: 8
       decoder_num_heads: 16
       mlp_ratio: 6
@@ -55,7 +55,7 @@ model:
       drop_rate: 0.0
       linear_decoder: True
       twoD: True
-      use_varemb: False
+      use_varemb: True
       adaptive_patching: False
       fixed_length: 196
       separate_channels: False
@@ -124,7 +124,7 @@ data:
      "xctA", 
     ],
   }
-  batch_size: 512
+  batch_size: 256
   num_workers: 1
   pin_memory: False
   single_channel: False

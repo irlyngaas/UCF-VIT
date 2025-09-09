@@ -605,38 +605,40 @@ def main(device):
             x_eval, variables_eval, _ = next(it_eval)
             x_eval = x_eval.to(precision_dt).to(device)
 
-            # plotPerformance
-            plotPerformance(
-                model=model,
-                device=device,
-                x=x_eval,
-                variables=variables_eval,
-                num_time_steps=num_time_steps,
-                patch_size=patch_size,
-                twoD=twoD,
-                scheduler=ddpm_scheduler,   # your DDPM_Scheduler from above
-                epoch=epoch,
-                savefol=inference_path,     # where to save the figure
-                precision_dt=precision_dt,
-                Ntimes=9
-            )
+            for var in variables_eval:
+                # plotPerformance
+                plotPerformance(
+                    model=model,
+                    device=device,
+                    x=x_eval,
+                    variables=variables_eval,
+                    num_time_steps=num_time_steps,
+                    patch_size=patch_size,
+                    twoD=twoD,
+                    scheduler=ddpm_scheduler,   # your DDPM_Scheduler from above
+                    epoch=epoch,
+                    savefol=inference_path,     # where to save the figure
+                    precision_dt=precision_dt,
+                    Ntimes=9
+                )
 
-            # plotPerformance
-            plotPerformanceImgs(
-                model=model,
-                device=device,
-                x=x_eval,
-                variables=variables_eval,
-                num_time_steps=num_time_steps,
-                patch_size=patch_size,
-                twoD=twoD,
-                scheduler=ddpm_scheduler,   # your DDPM_Scheduler from above
-                epoch=epoch,
-                savefol=inference_path,     # where to save the figure
-                precision_dt=precision_dt,
-                Ntimes=9
-            )
+                # plotPerformance
+                plotPerformanceImgs(
+                    model=model,
+                    device=device,
+                    x=x_eval,
+                    variables=variables_eval,
+                    num_time_steps=num_time_steps,
+                    patch_size=patch_size,
+                    twoD=twoD,
+                    scheduler=ddpm_scheduler,   # your DDPM_Scheduler from above
+                    epoch=epoch,
+                    savefol=inference_path,     # where to save the figure
+                    precision_dt=precision_dt,
+                    Ntimes=9
+                )
 
+        dist.barrier()
 
         # Track best model independently
         if epoch_loss.item() < best_loss:
@@ -673,7 +675,8 @@ def main(device):
                     # Update patience
                     patience = min(int(patience * patience_inc_rate),max_patience)
                 epochs_without_improvement = 0
-
+        dist.barrier()
+        
         # Save the best model periodically
         if epoch > 0 and epoch % save_period == 0 and world_rank < tensor_par_size:
             torch.save({
@@ -723,7 +726,7 @@ def main(device):
             #                     epoch=best_epoch, num_samples=3, twoD=twoD, save_path=inference_path,
             #                     num_time_steps=num_time_steps)
 
-
+    dist.barrier()
 
 if __name__ == "__main__":
 

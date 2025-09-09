@@ -933,62 +933,73 @@ def plotPerformance(model, device, x, variables, patch_size,
         return torch.sqrt(torch.clamp(v, min=eps))
 
     with torch.no_grad():
-        B = x.shape[0]
-        # choose times across the chain
-        dt = int(num_time_steps / max(Ntimes - 1, 1))
-        times = [1] + [int(i) for i in np.linspace(1 + dt, num_time_steps - 1 - dt, max(Ntimes - 2, 0))] + [num_time_steps - 1]
-        times = [t for t in times if 0 <= t < num_time_steps]
-
         # create a clean copy each time so steps are independent
         x_clean = x.detach().clone().to(device)
+        if x_clean.shape[0]>4:
+            x_clean =  x_clean[:4]
+        B = x_clean.shape[0]
+        # choose times across the chain
+        
+        for var_eval in variables:
+            # print(f"variable is: {var_eval}!")
+            
+            dt = int(num_time_steps / max(Ntimes - 1, 1))
+            times = [1] + [int(i) for i in np.linspace(1 + dt, num_time_steps - 1 - dt, max(Ntimes - 2, 0))] + [num_time_steps - 1]
+            times = [t for t in times if 0 <= t < num_time_steps]
 
-        Nsub = int(math.ceil(len(times) ** 0.5))
-        fig, ax = plt.subplots(Nsub, Nsub, figsize=(Nsub * 3, Nsub * 3), facecolor='w')
-        ax = ax.ravel()
+            # # create a clean copy each time so steps are independent
+            # x_clean = x.detach().clone().to(device)
+            # if x_clean.shape[0]>4:
+            #     x_clean =  x_clean[:4]
+            # B = x_clean.shape[0]
 
-        for i, ti in enumerate(times):
-            # noise
-            e = torch.randn_like(x_clean, device=device)
-            t = torch.full((B,), ti, dtype=torch.long, device=device)
+            Nsub = int(math.ceil(len(times) ** 0.5))
+            fig, ax = plt.subplots(Nsub, Nsub, figsize=(Nsub * 3, Nsub * 3), facecolor='w')
+            ax = ax.ravel()
 
-            # a_bar dim shaping
-            if twoD:
-                a_bar = scheduler.alpha[t.cpu()].view(B, 1, 1, 1).to(device)
-            else:
-                a_bar = scheduler.alpha[t.cpu()].view(B, 1, 1, 1, 1).to(device)
+            for i, ti in enumerate(times):
+                # noise
+                e = torch.randn_like(x_clean, device=device)
+                t = torch.full((B,), ti, dtype=torch.long, device=device)
 
-            x_t = (safe_sqrt(a_bar) * x_clean) + (safe_sqrt(1.0 - a_bar) * e)
+                # a_bar dim shaping
+                if twoD:
+                    a_bar = scheduler.alpha[t.cpu()].view(B, 1, 1, 1).to(device)
+                else:
+                    a_bar = scheduler.alpha[t.cpu()].view(B, 1, 1, 1, 1).to(device)
 
-            # predict ε̂
-            eps_hat = model(x_t.to(dtype=precision_dt), t, [variables])
-            eps_hat = unpatchify(eps_hat, x_t, patch_size, twoD)
-            # predicted_noise = model(z.to(precision_dt).to(device), torch.tensor(t).to(device), [var])
-            # predicted_noise = unpatchify(predicted_noise, z.to(precision_dt).to(device), patch_size, twoD)
-            ## scatter on a subsample grid to keep it light
-            if twoD:
-                ref = e[:, 0, ::4, ::4].detach().float().cpu().flatten().numpy()
-                out = eps_hat[:, 0, ::4, ::4].detach().float().cpu().flatten().numpy()
-            else:
-                ref = e[:, 0, ::4, ::4, ::4].detach().float().cpu().flatten().numpy()
-                out = eps_hat[:, 0, ::4, ::4, ::4].detach().float().cpu().flatten().numpy()
+                x_t = (safe_sqrt(a_bar) * x_clean) + (safe_sqrt(1.0 - a_bar) * e)
 
-            mu = ref.mean() if ref.size else 0.0
-            denom = np.sum((ref - mu) ** 2) + 1e-12
-            R2 = 1.0 - (np.sum((out - ref) ** 2) / denom)
+                # predict ε̂
+                eps_hat = model(x_t.to(dtype=precision_dt), t, [var_eval])
+                eps_hat = unpatchify(eps_hat, x_t, patch_size, twoD)
+                # predicted_noise = model(z.to(precision_dt).to(device), torch.tensor(t).to(device), [var])
+                # predicted_noise = unpatchify(predicted_noise, z.to(precision_dt).to(device), patch_size, twoD)
+                ## scatter on a subsample grid to keep it light
+                if twoD:
+                    ref = e[:, 0, ::4, ::4].detach().float().cpu().flatten().numpy()
+                    out = eps_hat[:, 0, ::4, ::4].detach().float().cpu().flatten().numpy()
+                else:
+                    ref = e[:, 0, ::4, ::4, ::4].detach().float().cpu().flatten().numpy()
+                    out = eps_hat[:, 0, ::4, ::4, ::4].detach().float().cpu().flatten().numpy()
 
-            ax[i].plot(ref, out, 'o', alpha=0.1, markersize=2)
-            ax[i].set_xlim([-4, 4]); ax[i].set_ylim([-4, 4])
-            ax[i].set_xticks([]); ax[i].set_yticks([])
-            ax[i].text(0.95, 0.05, f"t={ti}", ha='right', va='bottom', transform=ax[i].transAxes)
-            ax[i].text(0.05, 0.95, f"R²={R2:.3f}", ha='left', va='top', transform=ax[i].transAxes)
+                mu = ref.mean() if ref.size else 0.0
+                denom = np.sum((ref - mu) ** 2) + 1e-12
+                R2 = 1.0 - (np.sum((out - ref) ** 2) / denom)
 
-        # hide any leftover axes
-        for k in range(len(times), len(ax)):
-            ax[k].axis('off')
+                ax[i].plot(ref, out, 'o', alpha=0.1, markersize=2)
+                ax[i].set_xlim([-4, 4]); ax[i].set_ylim([-4, 4])
+                ax[i].set_xticks([]); ax[i].set_yticks([])
+                ax[i].text(0.95, 0.05, f"t={ti}", ha='right', va='bottom', transform=ax[i].transAxes)
+                ax[i].text(0.05, 0.95, f"R²={R2:.3f}", ha='left', va='top', transform=ax[i].transAxes)
 
-        plt.subplots_adjust(left=0.01, right=0.99, top=0.99, bottom=0.01, wspace=0, hspace=0)
-        plt.savefig(os.path.join(fol, f'performance_{epoch}.jpg'), dpi=150)
-        plt.close(fig)
+            # hide any leftover axes
+            for k in range(len(times), len(ax)):
+                ax[k].axis('off')
+
+            plt.subplots_adjust(left=0.01, right=0.99, top=0.99, bottom=0.01, wspace=0, hspace=0)
+            plt.savefig(os.path.join(fol, f'performance_{epoch}_{var_eval}.jpg'), dpi=150)
+            plt.close(fig)
 
     model.train()
 
@@ -1021,88 +1032,93 @@ def plotPerformanceImgs(
         return img3d[:, :, d0, :, :]  # [B, C, H, W]
 
     with torch.no_grad():
+        
         x = x.to(device=device, dtype=precision_dt)
+        if x.shape[0]>4:
+            x =  x[:4]
         B = x.shape[0]
 
-        # choose times across the chain
-        dt = max(int(num_time_steps / max(Ntimes - 1, 1)), 1)
-        # make sure we don’t include t=0 (we’re evaluating denoising at nonzero t)
-        times = [1] + [int(i) for i in np.linspace(1 + dt, num_time_steps - 1 - dt, max(Ntimes - 2, 0))] + [num_time_steps - 1]
-        # de-dup & clamp
-        times = sorted(set(int(t) for t in times if 0 < t < num_time_steps))
+        for var_eval in variables:
+            # print(f"variable is: {var_eval}!")
+            # choose times across the chain
+            dt = max(int(num_time_steps / max(Ntimes - 1, 1)), 1)
+            # make sure we don’t include t=0 (we’re evaluating denoising at nonzero t)
+            times = [1] + [int(i) for i in np.linspace(1 + dt, num_time_steps - 1 - dt, max(Ntimes - 2, 0))] + [num_time_steps - 1]
+            # de-dup & clamp
+            times = sorted(set(int(t) for t in times if 0 < t < num_time_steps))
 
-        # figure: B rows, (len(times)+1) cols (left column = clean input)
-        ncols = len(times) + 1
-        figsize = (max(3 * ncols, 6), max(3 * B, 3))
-        fig, ax = plt.subplots(B, ncols, figsize=figsize, facecolor="w")
-        if B == 1:
-            ax = np.expand_dims(ax, axis=0)  # ensure 2D indexing
-        if ncols == 1:
-            ax = np.expand_dims(ax, axis=1)
+            # figure: B rows, (len(times)+1) cols (left column = clean input)
+            ncols = len(times) + 1
+            figsize = (max(3 * ncols, 6), max(3 * B, 3))
+            fig, ax = plt.subplots(B, ncols, figsize=figsize, facecolor="w")
+            if B == 1:
+                ax = np.expand_dims(ax, axis=0)  # ensure 2D indexing
+            if ncols == 1:
+                ax = np.expand_dims(ax, axis=1)
 
-        # show the clean x in the first column
-        if twoD:
-            x_show = x  # [B, C, H, W]
-        else:
-            # center slice in depth
-            x_show = to_2d(x)  # [B, C, H, W]
-
-        x_show_cpu = x_show[:, 0].float().detach().cpu().numpy()  # [B, H, W]
-        for b in range(B):
-            if b<2:
-                print(f"max and min values are: {np.min(x_show_cpu)}, {np.max(x_show_cpu)}!")
-            ax[b, 0].imshow(x_show_cpu[b], interpolation="none", cmap="gray",vmin=0,vmax=1)
-            if b == 0:
-                ax[b, 0].set_title("clean x")
-            ax[b, 0].set_xticks([]); ax[b, 0].set_yticks([])
-
-        # compute errors at selected timesteps
-        for j, ti in enumerate(times, start=1):
-            # fresh copy of x each time -> evaluate denoising at exactly t=ti
-            x_clean = x.clone()
-
-            # noise
-            e = torch.randn_like(x_clean, device=device)
-
-            # a_bar(ti) on GPU (index on CPU)
+            # show the clean x in the first column
             if twoD:
-                a_bar = scheduler.alpha[torch.tensor(ti)].to(device=device, dtype=precision_dt)
-                a_bar = a_bar.view(1, 1, 1, 1).expand(B, 1, x.shape[-2], x.shape[-1])
+                x_show = x  # [B, C, H, W]
             else:
-                a_bar = scheduler.alpha[torch.tensor(ti)].to(device=device, dtype=precision_dt)
-                a_bar = a_bar.view(1, 1, 1, 1, 1).expand(B, 1, x.shape[-3], x.shape[-2], x.shape[-1])
+                # center slice in depth
+                x_show = to_2d(x)  # [B, C, H, W]
 
-            x_t = safe_sqrt(a_bar) * x_clean + safe_sqrt(1.0 - a_bar) * e
-
-            # predict ε̂
-            t_batch = torch.full((B,), ti, dtype=torch.long, device=device)
-            eps_hat = model(x_t, t_batch, variables)      # same signature as training
-            eps_hat = unpatchify(eps_hat, x_t, patch_size, twoD)  # returns same shape as x_t
-
-            # get a 2D view for plotting
-            if twoD:
-                ref = e[:, 0]           # [B, H, W]
-                out = eps_hat[:, 0]     # [B, H, W]
-            else:
-                ref = to_2d(e)[:, 0]           # [B, H, W]
-                out = to_2d(eps_hat)[:, 0]     # [B, H, W]
-
-            # robust scaling for error map
-            err = (ref - out).float().detach().cpu().numpy()  # [B, H, W]
-            abs_err = np.abs(err)
-            # vmax = np.percentile(abs_err, 99.5) if np.isfinite(abs_err).all() else 1.0
-            vmax = 3#1#max(vmax, 1e-6)
-            vmin = -3#0
-
+            x_show_cpu = x_show[:, 0].float().detach().cpu().numpy()  # [B, H, W]
             for b in range(B):
-                ax[b, j].imshow(abs_err[b], interpolation="none", cmap="magma", vmin=vmin, vmax=vmax)
+                # if b<2:
+                #     print(f"max and min values are: {np.min(x_show_cpu)}, {np.max(x_show_cpu)}!")
+                ax[b, 0].imshow(x_show_cpu[b], interpolation="none", cmap="gray",vmin=0,vmax=1)
                 if b == 0:
-                    ax[b, j].set_title(f"t={ti}")
-                ax[b, j].set_xticks([]); ax[b, j].set_yticks([])
+                    ax[b, 0].set_title("clean x")
+                ax[b, 0].set_xticks([]); ax[b, 0].set_yticks([])
 
-        plt.subplots_adjust(left=0.01, right=0.99, top=0.95, bottom=0.05, wspace=0.05, hspace=0.05)
-        plt.savefig(os.path.join(fol, f"performanceImgs_{epoch}.png"), dpi=100)
-        plt.close(fig)
+            # compute errors at selected timesteps
+            for j, ti in enumerate(times, start=1):
+                # fresh copy of x each time -> evaluate denoising at exactly t=ti
+                x_clean = x.clone()
+
+                # noise
+                e = torch.randn_like(x_clean, device=device)
+
+                # a_bar(ti) on GPU (index on CPU)
+                if twoD:
+                    a_bar = scheduler.alpha[torch.tensor(ti)].to(device=device, dtype=precision_dt)
+                    a_bar = a_bar.view(1, 1, 1, 1).expand(B, 1, x.shape[-2], x.shape[-1])
+                else:
+                    a_bar = scheduler.alpha[torch.tensor(ti)].to(device=device, dtype=precision_dt)
+                    a_bar = a_bar.view(1, 1, 1, 1, 1).expand(B, 1, x.shape[-3], x.shape[-2], x.shape[-1])
+
+                x_t = safe_sqrt(a_bar) * x_clean + safe_sqrt(1.0 - a_bar) * e
+
+                # predict ε̂
+                t_batch = torch.full((B,), ti, dtype=torch.long, device=device)
+                eps_hat = model(x_t, t_batch, [var_eval])      # same signature as training
+                eps_hat = unpatchify(eps_hat, x_t, patch_size, twoD)  # returns same shape as x_t
+
+                # get a 2D view for plotting
+                if twoD:
+                    ref = e[:, 0]           # [B, H, W]
+                    out = eps_hat[:, 0]     # [B, H, W]
+                else:
+                    ref = to_2d(e)[:, 0]           # [B, H, W]
+                    out = to_2d(eps_hat)[:, 0]     # [B, H, W]
+
+                # robust scaling for error map
+                err = (ref - out).float().detach().cpu().numpy()  # [B, H, W]
+                abs_err = np.abs(err)
+                # vmax = np.percentile(abs_err, 99.5) if np.isfinite(abs_err).all() else 1.0
+                vmax = 3#1#max(vmax, 1e-6)
+                vmin = -3#0
+
+                for b in range(B):
+                    ax[b, j].imshow(abs_err[b], interpolation="none", cmap="magma", vmin=vmin, vmax=vmax)
+                    if b == 0:
+                        ax[b, j].set_title(f"t={ti}")
+                    ax[b, j].set_xticks([]); ax[b, j].set_yticks([])
+
+            plt.subplots_adjust(left=0.01, right=0.99, top=0.95, bottom=0.05, wspace=0.05, hspace=0.05)
+            plt.savefig(os.path.join(fol, f"performanceImgs_{epoch}_{var_eval}.png"), dpi=100)
+            plt.close(fig)
 
     model.train()
 

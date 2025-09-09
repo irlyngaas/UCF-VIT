@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH --partition defq
-#SBATCH --nodes 8
+#SBATCH --nodes 16
 #SBATCH --exclusive
 #SBATCH --job-name=diffusion_fsdp
 #SBATCH --gpus-per-node=8
 #SBATCH --ntasks-per-node=8
-#SBATCH --output=/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D_standardized/XCT_NCT_All/256x256x256/Pat2000_Dec0.9/N8_Adaptlr0.008_P16_BS1024_ED1024/inference/%x_%j.out
-#SBATCH --error=/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D_standardized/XCT_NCT_All/256x256x256/Pat2000_Dec0.9/N8_Adaptlr0.008_P16_BS1024_ED1024/inference/%x_%j.err
+#SBATCH --output=/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D_standardized/XCT_NCT_All/256x256x256/Pat2000_Dec0.9/N16_Adaptlr0.005_P8_BS256_ED1536_usevaremb/inference/%x_%j.out
+#SBATCH --error=/lustre/fs0/scratch/ziabariak/checkpoint/xct/diffusion/base/full_2D_standardized/XCT_NCT_All/256x256x256/Pat2000_Dec0.9/N16_Adaptlr0.005_P8_BS256_ED1536_usevaremb/inference/%x_%j.err
 
 #[ -z $JOBID ] && JOBID=$SLURM_JOB_ID
 #[ -z $JOBSIZE ] && JOBSIZE=$SLURM_JOB_NUM_NODES

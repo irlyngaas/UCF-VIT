@@ -641,7 +641,8 @@ def main(device):
                 Ntimes=9
             )
 
-
+        dist.barrier()
+        
         # Track best model independently
         if epoch_loss.item() < best_loss:
             best_loss = epoch_loss.item()
@@ -678,6 +679,8 @@ def main(device):
                     patience = min(int(patience * patience_inc_rate),max_patience)
                 epochs_without_improvement = 0
 
+        dist.barrier()
+        
         # Save the best model periodically
         if epoch > 0 and epoch % save_period == 0 and world_rank < tensor_par_size:
             torch.save({
@@ -726,6 +729,7 @@ def main(device):
             #                     epoch=best_epoch, num_samples=2, twoD=twoD, save_path=inference_path,
             #                     num_time_steps=num_time_steps)
 
+    dist.barrier()
 
 
 
