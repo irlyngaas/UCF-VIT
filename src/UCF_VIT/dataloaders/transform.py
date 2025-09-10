@@ -7,7 +7,7 @@ from .quadtree import FixedQuadTree
 from .octree import FixedOctTree
 
 class Patchify(torch.nn.Module):
-    def __init__(self, sths=[0,1,3,5], fixed_length=196, cannys=[50, 100], patch_size=16, num_channels=3, dataset="imagenet") -> None:
+    def __init__(self, sths=[0,1,3,5], fixed_length=196, cannys=[50, 100], patch_size=16, num_channels=3, dataset="imagenet", return_edges=False) -> None:
         super().__init__()
         
         self.sths = sths
@@ -16,6 +16,7 @@ class Patchify(torch.nn.Module):
         self.patch_size = patch_size
         self.num_channels = num_channels
         self.dataset = dataset
+        self.return_edges = return_edges
         
     def forward(self, img):  # we assume inputs are always structured like this
         # Do some transformations. Here, we're just passing though the input
@@ -34,7 +35,12 @@ class Patchify(torch.nn.Module):
                 grey_img = cv.GaussianBlur(img, (self.smooth_factor, self.smooth_factor), 0)
                 edges = cv.Canny(grey_img, self.canny[0], self.canny[1])
             else:
+                #img = (img-img.min())/(img.max()-img.min())
+                print(img.min())
+                print(img.max())
                 grey_img = cv.GaussianBlur(img, (self.smooth_factor, self.smooth_factor), 0)
+                print(grey_img.min())
+                print(grey_img.max())
                 edges = cv.Canny((grey_img*255).astype(np.uint8), self.canny[0], self.canny[1])
 
         qdt = FixedQuadTree(domain=edges, fixed_length=self.fixed_length)
@@ -49,11 +55,14 @@ class Patchify(torch.nn.Module):
             seq_img = np.reshape(seq_img, [-1, self.patch_size*self.patch_size])
 
         seq_pos = np.asarray(seq_pos)
-        return seq_img, seq_size, seq_pos, qdt
+        if self.return_edges:
+            return seq_img, seq_size, seq_pos, qdt, edges
+        else:
+            return seq_img, seq_size, seq_pos, qdt
 
 class Patchify_3D(torch.nn.Module):
     #TODO: Pass dtype for preferred return dtype
-    def __init__(self, sths=[0,1,3,5], fixed_length=196, cannys=[50, 100], patch_size=16, num_channels=3, dataset="basic_ct") -> None:
+    def __init__(self, sths=[0,1,3,5], fixed_length=196, cannys=[50, 100], patch_size=16, num_channels=3, dataset="basic_ct", return_edges=False) -> None:
         super().__init__()
         
         self.sths = sths
@@ -62,6 +71,7 @@ class Patchify_3D(torch.nn.Module):
         self.patch_size = patch_size
         self.num_channels = num_channels
         self.dataset = dataset
+        self.return_edges = return_edges
 
     def forward(self, img):  # we assume inputs are always structured like this
 
@@ -124,5 +134,8 @@ class Patchify_3D(torch.nn.Module):
             seq_img = np.reshape(seq_img, [-1, self.patch_size*self.patch_size*self.patch_size])
 
         seq_pos = np.asarray(seq_pos)
-        return seq_img, seq_size, seq_pos, octtree
+        if self.return_edges:
+            return seq_img, seq_size, seq_pos, octtree, edges
+        else:
+            return seq_img, seq_size, seq_pos, octtree
 

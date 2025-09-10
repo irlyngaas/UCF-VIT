@@ -146,16 +146,21 @@ def main():
     canny2 = 100
 
     if twoD:
-        patchify = Patchify(sths=smooth_factor,cannys=[canny1,canny2],fixed_length=fixed_length, patch_size=patch_size, num_channels=len(variables[dict_key]), dataset=dataset)
+        patchify = Patchify(sths=smooth_factor,cannys=[canny1,canny2],fixed_length=fixed_length, patch_size=patch_size, num_channels=len(variables[dict_key]), dataset=dataset, return_edges = True)
     else:
-        patchify = Patchify_3D(sths=smooth_factor,cannys=[canny1,canny2],fixed_length=fixed_length, patch_size=patch_size, num_channels=len(variables[dict_key]), dataset=dataset)
+        patchify = Patchify_3D(sths=smooth_factor,cannys=[canny1,canny2],fixed_length=fixed_length, patch_size=patch_size, num_channels=len(variables[dict_key]), dataset=dataset, return_edges = True)
 
-    seq_image, seq_size, seq_pos, qdt = patchify(np.moveaxis(np_image,0,-1))
+    seq_image, seq_size, seq_pos, qdt, edges = patchify(np.moveaxis(np_image,0,-1))
     print(seq_size)
     print("NNZ", np.count_nonzero(seq_size))
     print(seq_pos)
+    print(edges.shape)
 
     if twoD:
+        fig, ax = plt.subplots()
+        ax.imshow(edges)
+        qdt.draw(ax=ax)
+        plt.savefig(f'images/edges.png', bbox_inches='tight', dpi=200)
         for i in range(len(variables[dict_key])):
             fig, ax = plt.subplots()
             ax.imshow(np_image[i])
