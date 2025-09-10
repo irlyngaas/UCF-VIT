@@ -13,6 +13,7 @@ from torchvision.utils import save_image
 import time
 from collections import OrderedDict
 import yaml
+import math
 from torch.nn import Sequential
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import (
@@ -32,9 +33,11 @@ from functools import partial
 
 from UCF_VIT.fsdp.arch import UNETR, MAE
 from UCF_VIT.fsdp.building_blocks import Block
-from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, init_par_groups, calculate_load_balancing_on_the_fly
+from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, init_par_groups, calculate_load_balancing_on_the_fly, is_power_of_two
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.utils.fused_attn import FusedAttn
+
+import einops
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -46,6 +49,25 @@ warnings.filterwarnings("ignore", category=UserWarning)
 def training_step(data, label, variables, net: UNETR, patch_size, twoD):
 
     output = net.forward(data, variables)
+
+    criterion = nn.MSELoss()
+    loss = criterion(output,label)
+
+    return loss, output
+
+def training_step_adaptive(data, seq, label, variables, net: UNETR, patch_size, twoD, seq_ps, in_chans, sqrt_len):
+    #print("SEQ_SHAPE", seq.shape, flush=True)
+    if twoD:
+        seq = torch.reshape(seq, shape=(-1,in_chans,patch_size*sqrt_len, patch_size*sqrt_len))
+    else:
+        #seq = torch.reshape(seq, shape=(-1,in_chans,patch_size*sqrt_len, patch_size*sqrt_len, patch_size*sqrt_len))
+        #seq = torch.reshape(seq, shape=(-1,in_chans,fixed_length,patch_size,patch_size,patch_size))
+        seq = einops.rearrange(seq, 'b c (s1 s2 s3) (ps1 ps2 ps3)-> b c (s1 ps1) (s2 ps2) (s3 ps3)', s1=sqrt_len, s2=sqrt_len, s3=sqrt_len, ps1=patch_size, ps2=patch_size, ps3=patch_size)
+
+    #print("DATA_SHAPE", data.shape, flush=True)
+    #print("INPUT_SHAPE", seq.shape, flush=True)
+    output = net.forward(data, variables, seq_ps, seq)
+    #print("OUTPUT_SHAPE", output.shape, flush=True)
 
     criterion = nn.MSELoss()
     loss = criterion(output,label)
@@ -155,6 +177,22 @@ def main(device, local_rank):
 
     use_varemb = conf['model']['net']['init_args']['use_varemb']
 
+    adaptive_patching = conf['model']['net']['init_args']['adaptive_patching']
+
+    if adaptive_patching:
+        fixed_length = conf['model']['net']['init_args']['fixed_length']
+        separate_channels = conf['model']['net']['init_args']['separate_channels']
+        sqrt_len_method = True
+        use_qdt_pos = True
+
+        if not twoD:
+            assert not separate_channels, "Adaptive Patching in 3D with multiple channels (non-separated) is not currently implemented"
+    else:
+        fixed_length = None
+        separate_channels = None
+        sqrt_len_method = False
+        use_qdt_pos = False
+
     feature_size = conf['model']['net']['init_args']['feature_size']
 
     skip_connection = conf['model']['net']['init_args']['skip_connection']
@@ -238,6 +276,21 @@ def main(device, local_rank):
     assert (num_heads % tensor_par_size) == 0, "model heads % tensor parallel size must be 0"
     assert (decoder_num_heads % tensor_par_size) == 0, "decoder model heads % tensor parallel size must be 0"
 
+    if adaptive_patching:
+        x_p2 = is_power_of_two(tile_size_x)
+        assert x_p2, "tile_size_x must be a power of 2"
+        y_p2 = is_power_of_two(tile_size_y)
+        assert y_p2, "tile_size_y must be a power of 2"
+        if dataset != "imagenet":
+            z_p2 = is_power_of_two(tile_size_z)
+            assert z_p2, "tile_size_z must be a power of 2"
+
+        if twoD:
+            assert fixed_length % 3 == 1 % 3, "Quadtree fixed length needs to be 3n+1, where n is some integer"
+        else:
+            sqrt_len=int(np.rint(math.pow(fixed_length,1/3)))
+            assert fixed_length % 7 == 1 % 7, "Octtree fixed length needs to be 7n+1, where n is some integer"
+
     auto_load_balancing = conf['load_balancing']['auto_load_balancing']
     if auto_load_balancing:
         batches_per_rank_epoch, dataset_group_list = calculate_load_balancing_on_the_fly(config_path, data_par_size, batch_size)
@@ -282,10 +335,15 @@ def main(device, local_rank):
         feature_size=feature_size,
         skip_connection=skip_connection,
         single_channel=single_channel,
+        adaptive_patching=adaptive_patching,
+        fixed_length=fixed_length,
+        sqrt_len=sqrt_len,
         use_varemb=use_varemb,
         tensor_par_size=tensor_par_size,
         tensor_par_group=tensor_par_group,
         FusedAttn_option=FusedAttn_option,
+        sqrt_len_method=sqrt_len_method,
+        use_qdt_pos=use_qdt_pos,
         class_token=False,
         weight_init='skip',
     ).to(device)
@@ -472,8 +530,7 @@ def main(device, local_rank):
         map_location = 'cpu'
         #map_location = 'cuda:'+str(device)
 
-        if tensor_par_size > 1:
-            checkpoint = torch.load(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(src_rank)+".ckpt",map_location=map_location)
+        checkpoint = torch.load(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(src_rank)+".ckpt",map_location=map_location)
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         epoch_start = checkpoint['epoch'] + 1
@@ -494,6 +551,7 @@ def main(device, local_rank):
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        patch_size = patch_size,
         tile_size_x = tile_size_x,
         tile_size_y = tile_size_y,
         tile_size_z = tile_size_z,
@@ -504,6 +562,8 @@ def main(device, local_rank):
         batches_per_rank_epoch = batches_per_rank_epoch,
         tile_overlap = tile_overlap,
         use_all_data = use_all_data,
+        adaptive_patching = adaptive_patching,
+        fixed_length = fixed_length,
         data_par_size = data_par_size,
         ddp_group = ddp_group,
         dataset = dataset,
@@ -607,13 +667,27 @@ def main(device, local_rank):
                 dist.broadcast(label, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
                 dist.broadcast_object_list(variables, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
             else: #Avoid unnecesary broadcasts if not using tensor parallelism
-                data, label, variables, _ = next(it_loader)
+                #data, label, variables, _ = next(it_loader)
+                data, seq, seq_size, seq_pos, label, seq_label, variables, _ = next(it_loader)
                 data = data.to(precision_dt)
                 data = data.to(device)
+                seq = seq.to(precision_dt)
+                seq = seq.to(device)
                 label = label.to(precision_dt)
                 label = label.to(device)
+                seq_size = torch.squeeze(seq_size)
+                seq_size = seq_size.to(torch.float32)
+                seq_size = seq_size.to(device)
+                seq_pos = torch.squeeze(seq_pos)
+                seq_pos = seq_pos.to(torch.float32)
+                seq_pos = seq_pos.to(device)
+                seq_size = seq_size.unsqueeze(-1)
+                seq_ps = torch.concat([seq_size, seq_pos],dim=-1)
 
-            loss, output = training_step(data, label, variables, model, patch_size, twoD)
+            if adaptive_patching:
+                loss, output = training_step_adaptive(data, seq, label, variables, model, patch_size, twoD, seq_ps, max_channels, sqrt_len)
+            else:
+                loss, output = training_step(data, label, variables, model, patch_size, twoD)
             epoch_loss += loss.detach()
 
             if world_rank == 0:
