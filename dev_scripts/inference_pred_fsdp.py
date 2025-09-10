@@ -39,6 +39,8 @@ import math
 from UCF_VIT.utils.plotting import *
 from UCF_VIT.dataloaders.transform import Patchify, Patchify_3D
 
+import einops
+
 import warnings
 warnings.filterwarnings("ignore")
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -46,6 +48,13 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 def test_step(data, variables, net: UNETR):
     output = net.forward(data, variables)
+
+    return output
+
+def test_step_adaptive(data, seq, seq_ps, variables, net: UNETR, in_chans, patch_size, sqrt_len):
+    seq = einops.rearrange(seq, 'b c (s1 s2 s3) (ps1 ps2 ps3)-> b c (s1 ps1) (s2 ps2) (s3 ps3)', s1=sqrt_len, s2=sqrt_len, s3=sqrt_len, ps1=patch_size, ps2=patch_size, ps3=patch_size)
+    #seq = torch.reshape(seq, shape=(-1,in_chans,patch_size*sqrt_len, patch_size*sqrt_len, patch_size*sqrt_len))
+    output = net.forward(data, variables, seq_ps, seq)
 
     return output
 
@@ -117,6 +126,22 @@ def main(device, local_rank):
 
     use_varemb = conf['model']['net']['init_args']['use_varemb']
 
+    adaptive_patching = conf['model']['net']['init_args']['adaptive_patching']
+
+    if adaptive_patching:
+        fixed_length = conf['model']['net']['init_args']['fixed_length']
+        separate_channels = conf['model']['net']['init_args']['separate_channels']
+        sqrt_len_method = True
+        use_qdt_pos = True
+
+        if not twoD:
+            assert not separate_channels, "Adaptive Patching in 3D with multiple channels (non-separated) is not currently implemented"
+    else:
+        fixed_length = None
+        separate_channels = None
+        sqrt_len_method = False
+        use_qdt_pos = False
+
     feature_size = conf['model']['net']['init_args']['feature_size']
 
     skip_connection = conf['model']['net']['init_args']['skip_connection']
@@ -172,6 +197,21 @@ def main(device, local_rank):
     assert (data_par_size * seq_par_size * tensor_par_size)==world_size, "DATA_PAR_SIZE * SEQ_PAR_SIZE * TENSOR_PAR_SIZE must equal to world_size"
     assert (num_heads % tensor_par_size) == 0, "model heads % tensor parallel size must be 0"
 
+    if adaptive_patching:
+        x_p2 = is_power_of_two(tile_size_x)
+        assert x_p2, "tile_size_x must be a power of 2"
+        y_p2 = is_power_of_two(tile_size_y)
+        assert y_p2, "tile_size_y must be a power of 2"
+        if dataset != "imagenet":
+            z_p2 = is_power_of_two(tile_size_z)
+            assert z_p2, "tile_size_z must be a power of 2"
+
+        if twoD:
+            assert fixed_length % 3 == 1 % 3, "Quadtree fixed length needs to be 3n+1, where n is some integer"
+        else:
+            sqrt_len=int(np.rint(math.pow(fixed_length,1/3)))
+            assert fixed_length % 7 == 1 % 7, "Octtree fixed length needs to be 7n+1, where n is some integer"
+
 #2. Initialize model
 ##############################################################################################################
     if data_type == "bfloat16":
@@ -209,10 +249,15 @@ def main(device, local_rank):
         feature_size=feature_size,
         skip_connection=skip_connection,
         single_channel=single_channel,
+        adaptive_patching=adaptive_patching,
+        fixed_length=fixed_length,
+        sqrt_len=sqrt_len,
         use_varemb=use_varemb,
         tensor_par_size=tensor_par_size,
         tensor_par_group=tensor_par_group,
         FusedAttn_option=FusedAttn_option,
+        sqrt_len_method=sqrt_len_method,
+        use_qdt_pos=use_qdt_pos,
         class_token=False,
         weight_init='skip',
     ).to(device)
@@ -341,13 +386,55 @@ def main(device, local_rank):
         idx_start = i
         idx_end = min(i + batch_inference, data.shape[0])
         data_test = data[idx_start:idx_end, :, :, :, :]
-        if tensor_par_size > 1:
-            asdf = 123
-        else:
+        if adaptive_patching:
+            if separate_channels:
+                if twoD:
+                    patchify = Patchify(fixed_length=fixed_length, patch_size=patch_size, num_channels=1, dataset=dataset)
+                else:
+                    patchify = Patchify_3D(fixed_length=fixed_length, patch_size=patch_size, num_channels=1, dataset=dataset)
+            else:
+                if twoD:
+                    patchify = Patchify(fixed_length=fixed_length, patch_size=patch_size, num_channels=num_channels_used[key], dataset=dataset)
+                else:
+                    patchify = Patchify_3D(fixed_length=fixed_length, patch_size=patch_size, num_channels=num_channels_used[key], dataset=dataset)
+
+            data_test_seq = []
+            qdt_list = []
+            seq_size_list = []
+            seq_pos_list = []
+            for j in range(data_test.shape[0]):
+                seq_image, seq_size, seq_pos, qdt = patchify(np.moveaxis(data_test[j],0,-1))
+                data_test_seq.append(seq_image)
+                qdt_list.append(qdt)
+                seq_size_list.append(seq_size)
+                seq_pos_list.append(seq_pos)
+            data_test_seq = torch.stack([torch.from_numpy(data_test_seq[i]) for i in range(data_test.shape[0])]).to(device)
+            seq_size = torch.stack([torch.from_numpy(seq_size_list[i]) for i in range(data_test.shape[0])]).to(device)
+            seq_pos = torch.stack([torch.from_numpy(seq_pos_list[i]) for i in range(data_test.shape[0])]).to(device)
+
+            seq_size = torch.squeeze(seq_size)
+            seq_size = seq_size.to(torch.float32)
+            #seq_size = seq_size.to(device)
+            seq_pos = torch.squeeze(seq_pos)
+            seq_pos = seq_pos.to(torch.float32)
+            #seq_pos = seq_pos.to(device)
+            seq_size = seq_size.unsqueeze(-1)
+            #print("SEQ_SIZE", seq_size.shape, flush=True)
+            #print("SEQ_POS", seq_pos.shape, flush=True)
+            seq_ps = torch.concat([seq_size, seq_pos],dim=-1)
             data_test = torch.from_numpy(data_test)
             data_test = data_test.to(precision_dt)
             data_test = data_test.to(device)
-            output[idx_start:idx_end, :, :, :, :] = test_step(data_test, dict_in_variables[key], model).detach().cpu().numpy()
+            output[idx_start:idx_end, :, :, :, :] = test_step_adaptive(data_test, data_test_seq, seq_ps, dict_in_variables[key], model, max_channels, patch_size, sqrt_len).detach().cpu().numpy()
+
+        else:
+            if tensor_par_size > 1:
+                asdf = 123
+            else:
+                data_test = torch.from_numpy(data_test)
+                data_test = data_test.to(precision_dt)
+                data_test = data_test.to(device)
+                output[idx_start:idx_end, :, :, :, :] = test_step(data_test, dict_in_variables[key], model).detach().cpu().numpy()
         elpsdt = time.time() - start_time
         print(f'Time elapsed for testing batch samples: {int(elpsdt//60)} min {elpsdt%60:.2f} sec')
 
