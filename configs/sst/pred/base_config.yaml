@@ -2,10 +2,10 @@
 trainer:
   max_epochs: 600
   data_type: "float32"
-  checkpoint_path: "../../checkpoint/sst/pred/base"
+  checkpoint_path: "../../checkpoint/sst/pred/base-adaptive"
   checkpoint_filename: "multi_last"
-  checkpoint_filename_for_loading: "multi_last_odd" #multi_last_odd or multi_last_even
-  inference_path: "../../checkpoint/sst/pred/base/inference"
+  checkpoint_filename_for_loading: "multi_last_even" #multi_last_odd or multi_last_even
+  inference_path: "../../checkpoint/sst/pred/base-adaptive/inference"
 
   resume_from_checkpoint: False
   use_pretrained_mae_model: False
@@ -15,7 +15,7 @@ trainer:
 # ---------------------------- PARALLELISM -------------------------------------
 parallelism:
   fsdp_size: 1
-  simple_ddp_size: 1
+  simple_ddp_size: 32
   tensor_par_size: 1
   seq_par_size: 1
   cpu_offloading: False
@@ -39,7 +39,7 @@ model:
         "w",
       ]
       tile_size: [64, 64, 64]
-      patch_size: 4
+      patch_size: 8
       embed_dim: 768
       depth: 12
       num_heads: 12
@@ -48,8 +48,11 @@ model:
       linear_decoder: False
       twoD: False
       use_varemb: False
+      adaptive_patching: True
+      fixed_length: 729
+      separate_channels: False
       feature_size: 16
-      skip_connection: False
+      skip_connection: True
 
       decoder_embed_dim: 576
       decoder_depth: 8
