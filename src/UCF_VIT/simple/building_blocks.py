@@ -78,11 +78,11 @@ class PatchEmbed(nn.Module):
             B, C, H, W = x.shape
         else:
             B, C, H, W, D = x.shape
-        if self.img_size is not None:
-            _assert(H == self.img_size[0], f"Input height ({H}) doesn't match model ({self.img_size[0]}).")
-            _assert(W == self.img_size[1], f"Input width ({W}) doesn't match model ({self.img_size[1]}).")
-            if not self.twoD:
-                _assert(D == self.img_size[2], f"Input width ({D}) doesn't match model ({self.img_size[2]}).")
+        #if self.img_size is not None:
+        #    _assert(H == self.img_size[0], f"Input height ({H}) doesn't match model ({self.img_size[0]}).")
+        #    _assert(W == self.img_size[1], f"Input width ({W}) doesn't match model ({self.img_size[1]}).")
+        #    if not self.twoD:
+        #        _assert(D == self.img_size[2], f"Input width ({D}) doesn't match model ({self.img_size[2]}).")
         x = self.proj(x)
         x = x.flatten(2).transpose(1, 2)  # NCHW -> NLC or NCHW -> NLC
         x = self.norm(x)
