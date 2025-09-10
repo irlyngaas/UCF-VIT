@@ -167,10 +167,16 @@ def main():
             qdt.draw(ax=ax)
             plt.savefig(f'images/qdt_image_{variables[dict_key][i]}.png', bbox_inches='tight', dpi=200)
     else:
-        z_slice = 0
+        z_slice = 32
         fig, ax = plt.subplots()
         ax.imshow(edges[:,:,z_slice])
+        #qdt.draw(ax=ax)
         plt.savefig(f'images/edges.png', bbox_inches='tight', dpi=200)
+        for i in range(len(variables[dict_key])):
+            fig, ax = plt.subplots()
+            ax.imshow(np_image[i,:,:,z_slice])
+            #qdt.draw(ax=ax)
+            plt.savefig(f'images/qdt_image_{variables[dict_key][i]}.png', bbox_inches='tight', dpi=200)
 
 
 if __name__ == "__main__":
