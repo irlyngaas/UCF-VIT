@@ -121,11 +121,11 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                     return (seq, label, variables, dict_key)
             else:
                 if return_qdt:
-                    #return (inp, seq, size, pos, label, seq_label, variables, qdt_list, dict_key)
-                    return (seq, seq_label, variables, qdt_list, dict_key)
+                    return (inp, seq, size, pos, label, seq_label, variables, qdt_list, dict_key)
+                    #return (seq, seq_label, variables, qdt_list, dict_key)
                 else:
-                    #return (inp, seq, size, pos, label, seq_label, variables, dict_key)
-                    return (seq, seq_label, variables, dict_key)
+                    return (inp, seq, size, pos, label, seq_label, variables, dict_key)
+                    #return (seq, seq_label, variables, dict_key)
         else:
             if single_channel:
                 inp = torch.stack([torch.from_numpy(np.expand_dims(batch[i][0],axis=0)) for i in range(len(batch))])
