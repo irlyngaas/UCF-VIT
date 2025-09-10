@@ -1258,16 +1258,16 @@ class ProcessChannels(IterableDataset):
                                                 else:
                                                     seq_label, _, _ = qdt_.serialize(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,1))
                                                     seq_label = np.asarray(seq_label, dtype=np.float32)
-                                                seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size, -1, 1])
+                                                seq_label = np.reshape(seq_label, [-1, self.patch_size*self.patch_size])
                                             else:
                                                 if self._dataset == "basic_ct":
                                                     seq_label, _, _ = qdt_.serialize_labels(np_label[j], size=(self.patch_size,self.patch_size,self.patch_size,1))
                                                     seq_label = np.asarray(seq_label)
-                                                    seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size*self.patch_size, -1, 1])
+                                                    seq_label = np.reshape(seq_label, [-1, self.patch_size*self.patch_size*self.patch_size])
                                                 else:
                                                     seq_label, _, _ = qdt_.serialize(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,self.patch_size,1))
                                                     seq_label = np.asarray(seq_label, dtype=np.float32)
-                                                    seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size*self.patch_size, -1, 1])
+                                                    seq_label = np.reshape(seq_label, [-1, self.patch_size*self.patch_size*self.patch_size])
                                                     #assert self.num_channels <=1, "num_channels >1 not implemented for 3D yet"
                                                     #if self.num_channels > 1:
                                                     #    seq_label = np.reshape(seq_label, [self.num_channels, -1, self.patch_size*self.patch_size*self.patch_size])
