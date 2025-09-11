@@ -3,7 +3,7 @@ FROM nvcr.io/nvidia/pytorch:25.05-py3
 
 RUN pip install xformers \
   timm \
-  monai \
+  monai==1.4.0 \
   nibabel \
   torchdata==0.9.0 \
   einops \

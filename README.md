@@ -1,5 +1,6 @@
 ## Table of Contents
 - [UCF-VIT](#ucf-vit)
+- [Motivation](#motivation)
 - [Install](#install)
 - [Features](#features)
 - [Model Architectures](#model-architectures)
@@ -17,14 +18,20 @@
 - [Datasets](#datasets)
 
 ## UCF-VIT
-This repository provides a unified coding framework for scalable Vision Transformer (ViT) models, designed to support both extreme-scale model training on leadership-class supercomputers and efficient deployment on smaller systems such as DGX nodes. The framework integrates several cutting-edge innovations in efficient computing, including optimized attention mechanisms, advanced parallelism strategies (data, tensor, sequence, and pipeline parallelism), and mixed-precision acceleration, enabling the training of vision models with hundreds of billions of parameters and achieving sustained ExaFLOP-scale performance on systems like the Frontier supercomputer.
+This repository provides a unified coding framework for scalable Vision Transformer (ViT) model training, designed to support both extreme-scale model training on leadership-class supercomputers and efficient deployment on smaller systems such as DGX nodes. The framework integrates several cutting-edge innovations in efficient computing, including optimized attention mechanisms, advanced parallelism strategies, and mixed-precision acceleration, enabling the training of vision models with hundreds of billions of parameters and achieving sustained ExaFLOP-scale performance on systems like the Frontier supercomputer.
 
 At the same time, the codebase is modular and flexible, allowing researchers and practitioners to run the same models on smaller compute environments without sacrificing performance or usability. This unified approach lowers the barrier to entry for next-generation large-scale vision model research while ensuring reproducibility and scalability across diverse computing platforms.
 
-The repository is open-source and maintained on GitLab to foster collaboration and accelerate innovation in vision transformer research at scale.
+The repository is open-source and maintained on GitLab to foster collaboration and accelerate innovation in ViT research at scale.
 
-## Why use UCF-VIT?
-Training large Vision Transformer (ViT) models at scale remains a major technical challenge in both AI research and deployment, with most existing codebases narrowly optimized for either small-scale experiments or vendor-specific hardware, creating barriers to portability, scalability, and reproducibility. A unified coding framework is essential to streamline development, maximize resource efficiency, and enable seamless scaling from small machines to the world’s largest supercomputers. This repository provides such a unified solution—offering robust support for both NVIDIA and AMD GPUs, across systems ranging from single-node DGX machines to leadership-class clusters like the Frontier supercomputer. The framework incorporates our in-house hybrid-stop extreme-scale parallel computing technique, which won the HPCWire Supercomputing Achievement Award, to unlock scalable and efficient ViT model training. It also introduces our adaptive patching method to reduce the computational complexity of ViT attention, alongside variable aggregation for handling large-channel ViTs. Additionally, it integrates widely used techniques such as lower-precision training, layer wrapping, fused attention, and FlashAttention for further efficiency gains. The framework is compatible with a variety of ViT architectural variants, making it a powerful, flexible tool for researchers and practitioners aiming to push the frontier of scalable vision model development and deployment.
+## Motivation
+The purpose of this framework is to provide capabilities to train large scale ViT models with state-of-the-art efficient computing techniques while still being usable and adaptable for a general audience looking to train on various different types of data and downstream tasks. While frameworks for scalable computing with transformers currently exist they are 1) mostly focused on training with 1D text data with generative tasks, 2) provide inefficient implementations for scaling to more accelerator resources when targetting large models and inputs, and 3) are difficult for users to adapt the code to their desired data and downstream tasks.
+
+### Target Audience
+The target audience for this framework is users who have either very large datasets and/or datasets with large volume data. In the case of users with very large datasets, transformer models often need to scale to large parameter counts (on the order of tens to hundreds of billions of parameters) in order to accurately capture features across the entire training dataset. In the case of users with large volume data, typically resulting from high-resolution scientific simulations or image acquistion, vision transfomer models either become intractable due to resultant long input sequences being combined with the quadratic scaling of the attention mechanism in the transformer architecture, or become inaccurate from the necessary coarsening of the patch embeddings in order to even be able to train with the data. While the target audience are users that are eventually looking to train models with 1000's of GPUs, the framework is also built such that it can be used on smaller scale systems in order to test and develop new methodologies. 
+
+### Why use UCF-VIT?
+Training large ViT models at scale remains a major technical challenge in both AI research and deployment, with most existing codebases narrowly optimized for either small-scale experiments or vendor-specific hardware, creating barriers to portability, scalability, and reproducibility. A unified coding framework is essential to streamline development, maximize resource efficiency, and enable seamless scaling from small machines to the world’s largest supercomputers. This repository provides such a unified solution—offering robust support for both NVIDIA and AMD GPUs, across systems ranging from single-node DGX machines to leadership-class clusters like the Frontier supercomputer. The framework incorporates our in-house hybrid-op extreme-scale parallel computing technique, which won the HPCWire Supercomputing Achievement Award, to unlock scalable and efficient ViT model training. It also introduces our adaptive patching method to reduce the computational complexity of ViT attention, alongside variable aggregation for handling large-channel ViTs. Additionally, it integrates widely used techniques such as lower-precision training, layer wrapping, fused attention, and FlashAttention for further efficiency gains. The framework is compatible with a variety of ViT architectural variants, making it a powerful, flexible tool for researchers and practitioners aiming to push the frontier of scalable vision model development and deployment.
 
 # Install
 Installation instruction are provide for running on systems with both AMD and NVIDIA GPU hardware. Instructions are included for systems ranging from a local DGX cluster to the Frontier Supercomputer.
@@ -47,7 +54,7 @@ TORCHAUDIO_VERSION=2.7.0
 pip install torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} torchaudio==${TORCHAUDIO_VERSION} --index-url ${TORCH_URL}
 pip install xformers==0.0.30 --extra-index-url=https://download.pytorch.org/whl/rocm${ROCM_VERSION}
 pip install timm \
- monai \
+ monai==1.4.0 \
  nibabel \
  torchdata==0.9.0 \
  einops \
@@ -59,6 +66,7 @@ pip install timm \
 #Default install mpi4py 
 MPI_DIST=mpich
 conda install -c conda-forge mpi4py ${MPI_DIST}
+
 #mpi4py install on Frontier
 MPICC="cc -shared" pip install --no-cache-dir --no-binary=mpi4py mpi4py
 
@@ -129,15 +137,15 @@ Various example scripts for launching jobs are in the launch folder. Those ident
 # Features
 In this codebase, we provide various Advanced Parallelism & Efficient Computing techniques that we have used to explore larger model and input sizes with VITs than has been previously possible. These techniques range from novel methods to the utilization of several techniques provided by external libraries that are integrated with these novel techniques.
 
-## Hybrid-STOP 
-Hybrid Sharded Tensor-Data Orthogonal Parallelism (Hybrid-STOP) [[1]](#1),[[11]](#11) is a novel parallelism algorithm that combines tensor parallelism and Fully Sharded Data Parallelism (FSDP). It avoids the peak memory use probelm in FSDP and leads to better memory reduction capability by keeping parameters sharded throughout training. 
+## Hybrid-OP 
+Hybrid Sharded Tensor-Data Orthogonal Parallelism (Hybrid-OP) [[1]](#1),[[11]](#11) is a novel parallelism algorithm that combines tensor parallelism and Fully Sharded Data Parallelism (FSDP). It avoids the peak memory use problem in FSDP by working in coordination with Tensor Parallel ranks. 
 ### Usage
-The Hybrid-STOP algorithm is available when using our fsdp [parallelism mode](#parallelism-modes). The following example shows how to initialize and do the forward pass of a [MAE](#masked-autoencoder-mae) model using this algorithm for different number of simple_ddp, fsdp, and tensor parallel ranks (see scripts in the training_script folder full end-to-end training examples). Our custom [dataloader](#dataloader) with the [Imagenet](#imagenet) dataset is used to facilitate proper dataloading when tensor parallelism is > 1 (In this case each tensor parallel rank needs the same batch of input data). 
+The Hybrid-OP algorithm is available when using our fsdp [parallelism mode](#parallelism-modes). The following example shows how to initialize and do the forward pass of a [MAE](#masked-autoencoder-mae) model using this algorithm for different number of simple_ddp, fsdp, and tensor parallel ranks (see scripts in the training_script folder for full end-to-end training examples). Our custom [dataloader](#dataloader) with the [Imagenet](#imagenet) dataset is used to facilitate proper dataloading when tensor parallelism is > 1 (In this case each tensor parallel rank needs the same batch of input data). 
 
-This example is meant to be run on a system that uses a slurm resource scheduler or with an installed MPI library. To run with a single node on a system with a slurm scheduler use the following command `srun -n [NUM_TASKS] -c [NUM_CPUS_PER_TASK] --gpus [NUM_GPUS] python test-hstop.py SLURM`. To run on a local system via MPI use the following command `mpirun -n [NUM_GPUS] python -u test-hstop.py MPI`
+To run with a single node on a system with a slurm scheduler use the following command `srun -n [NUM_TASKS] -c [NUM_CPUS_PER_TASK] --gpus [NUM_GPUS] python test-hstop.py SLURM`. To run on a local system via MPI use the following command `mpirun -n [NUM_GPUS] python -u test-hybrid-op.py MPI`
 
 ```python
-#test-hstop.py
+#test-hybrid-op.py
 
 import os
 import sys
@@ -290,7 +298,7 @@ if dist.get_rank(tensor_par_group) == 0:
             data_par_size = data_par_size,
             ddp_group = ddp_group,
             dataset = 'imagenet',
-            imagenet_resize = {'imagenet':[256,256]},
+            imagenet_resize = {'imagenet': [256,256]},
         ).to(device)
 
     data_module.setup()
@@ -321,7 +329,7 @@ while counter < 9945:
 ```
 
 ### Implementation Details 
-In order to properly implement the H-STOP algorithm, specifically the tensor parallelism aspects, the architecture code requires modifications (from that of the code for the ([simple architecture mode](#parallelism-modes)) to correctly split up and communicate the tensor calculations amongst the tensor parallel ranks. Currently tensor parallelism is only enacted over the attention and mlp calculations, which are the costliest components. The below code snippet shows how the tensor parallel implementation is implemented in the FSDP parallelism mode, corresponding modifications are built into the attention mechanism in `src/UCF-VIT/fsdp/building_blocks.py`. Tensor parallelism is not implemented in simple parallelism mode, so the tensor_par_group communicator group is not required to be passed to the neural network architecture for that case. Here `self.blocks` corresponds to the attention and multi-layer perceptron (mlp) layers that consist of the bulk of the computing in each of the VIT architectures.  
+In order to properly implement the Hybrid-OP algorithm, specifically the tensor parallelism aspects, the architecture code requires modifications (from that of the code for the ([simple architecture mode](#parallelism-modes)) to correctly split up and communicate the tensor calculations amongst the tensor parallel ranks. Currently tensor parallelism is only enacted over the attention and mlp calculations, which are the costliest components of transformer architectures. The below code snippet shows how the tensor parallel implementation is implemented in the FSDP parallelism mode, corresponding modifications are built into the attention mechanism in `src/UCF-VIT/fsdp/building_blocks.py`. Tensor parallelism is not implemented in simple parallelism mode, so the tensor_par_group communicator group is not required to be passed to the neural network architecture for that case. Here `self.blocks` corresponds to the attention and multi-layer perceptron (mlp) layers that consist of the bulk of the computing in each of the VIT architectures.  
 
 ```python
 if self.tensor_par_size > 1:
@@ -340,7 +348,7 @@ if self.tensor_par_size > 1:
 The ability to implement lower precision support is facilitated by using a MixedPrecision Policy which is passed as an argument to the FSDP wrapper. Using lower precision data types such as bfloat16 reduces storage size to allow for large model sizes and increased throughput due to the faster computing that is possible with lower precision.
 
 ### Usage 
-Add the following code and replace the FSDP Wrapper calls in the [full example](#Hybrid-STOP) to apply mixed precision training (specifically bfloat16 in this case). 
+Add the following code and replace the FSDP Wrapper calls in the [full example](#Hybrid-OP) to apply mixed precision training (specifically bfloat16 in this case). 
 ```python
 precision_dt = torch.bfloat16
 mixedPrecisionPolicy = MixedPrecision(
@@ -360,7 +368,7 @@ else:
 ## Layer Wrapping
 The ability to use layer wrapping is facilitated by using a custom autowrap policy which is passed as an argument to the FSDP wrapper. The purpose of this wrapping is to control how and when the parameters of each layer are sharded and gathered during the forward and backward passes. By wrapping layers in the Block submodule (which contains the transformer computational layers) peak GPU memory usage is reduced, and communication and computations have improved overlapping.
 ### Usage 
-Add the following code and replace the FSDP Wrapper calls in the [full example](#Hybrid-STOP) to apply layer wrapping
+Add the following code and replace the FSDP Wrapper calls in the [full example](#Hybrid-OP) to apply layer wrapping
 ```python
 from UCF_VIT.fsdp.building_blocks import Block
 from torch.nn import Sequential
@@ -380,6 +388,7 @@ else:
     model = FSDP(model, device_id=local_rank, process_group= simple_ddp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.NO_SHARD, auto_wrap_policy = my_auto_wrap_policy, forward_prefetch=True, limit_all_gathers = False )
 )
 ```
+
 ## Activation Checkpointing
 The ability to invoke activation checkpointing to the model is provided through FSDP's `apply_activation_checkpointing` function. In our cases we apply activation checkpointing only to the `Block` submodule containing the transformer computational layers to reduce the memory storage required by that component of the model training. With activation checkpointing, the gradients are no longer stored for that component to be used during the backward pass of optimatization. Rather the gradients are recomputed from previously stored states when necessary during the backwards pass, significantly reducing the amount of GPU memory used during runtime.
 ### Usage
@@ -397,8 +406,8 @@ apply_activation_checkpointing(
 )
 
 ```
-## Fused Attention via XFormers
-In order to integrate computationally efficient kernels across different GPU accelerated hardware, we rely on the XFormers [[2]](#2) libary. The XFormers library provides an interface to memory efficient implementations of fused multi-head attention (FMHA) for various different hardwares. On AMD GPUs we use the ComposableKernel (CK)[[3]](#3) implementation of FMHA and on NVIDIA GPUs we use the FlashAttention [[4]](#4),[[5]](#5) implementation of FMHA. These two implementations only have compatibility with bfloat16 operations, thus with float32 data types we use the default torch FMHA kernel implementation.
+## Fused Attention (Flash Attention)
+In order to use computationally efficient implementations of the fused multi-head attention (FMHA) kernel on different GPU accelerated hardware, we provide several different options. One option is to use the native implementation of FlashAttention [[4]](#4),[[5]](#5) provided through Pytorch. Otherwise we can use flash attention implementations provided by the XFormers [[2]](#2) libary. The XFormers library provides an interface to memory efficient implementations of FMHA for various different hardwares. On AMD GPUs we use the ComposableKernel (CK)[[3]](#3) implementation of FMHA, and on NVIDIA GPUs we again use the FlashAttention implementation of FMHA, similar to the implementation provided through Pytorch. The XFormer implementations only have compatibility with bfloat16 operations, thus with float32 data types we use the default torch FMHA implementation.
 
 ### Usage 
 We provide an enumerated class with which to choose the FMHA implementation to use in the architecture class.
@@ -406,7 +415,7 @@ We provide an enumerated class with which to choose the FMHA implementation to u
 from UCF_VIT.utils.fused_attn import FusedAttn
 
 #Choose from these options
-FusedAttn_option = FusedAttn.DEFAULT #Default torch implementation of FMHA compatible with float32 datatype
+FusedAttn_option = FusedAttn.DEFAULT #Default torch implementation of FlashAttention FMHA compatible with float32 and bfloat16 datatypes
 #FusedAttn_option = FusedAttn.FLASH #Flash Attention implementation of FMHA comatible with bloat16 datatype and NVIDIA GPUs
 #FusedAttn_option = FusedAttn.CK #Composable Kernel implementation of FMHA comatible with bloat16 datatype and AMD GPUs
 #FusedAttn_option = FusedAttn.None #Basic Python implementation of FMHA
@@ -440,7 +449,7 @@ A recent innovation for efficient computing with VITs that we have implemented w
 In our implementation, adaptive patching is currently handled during dataloading time. Therefore if `adaptive_patching` is set to True rather then the dataloader passing back a batch of input images, instead a batch of adaptively patched input images are passed through the dataloader. If adaptive patching is being used, an integer fixed length needs to be defined and it must be chosen such that 3n+1 = fixed_length where n is some integer if the input is 2D or such that 7n+1 = fixed_length where n is some integer if the input is 3D, to satisify the requirements for the underlying quadtree/octtree. Also it is a requirement that the each dimension of the input images be of a size that is a power of 2, i.e. 32, 64, ..., in order to properly split the data. 
 
 ## Variable Aggregation
-Another advanced technique that we have introduced into this codebase particularly for the purpose of foundational model training is the capability to incorporate variable aggregation [[12]](#12). Variable aggregation is a technique where instead of tokenizing multi-channel inputs all at once and transforming them into the latent embedding dimension space, each individual channel is tokenize individually  and transformed into the latent embedding dimensions space based on the type of channel data, given some direction via the `variables` argument in the forward pass. Each of these channel embedding vectors are then fed through an additional attention mechanism to compress all of the input into a single dimension, a process we call variable aggregation. The reason it is important that these input channels be tokenized and embedded separately is because it allows the flexibility to use a pre-trained foundational model in a flexible manner. Variable aggregation allows for the ability to use different types of data during training, e.g. data that does not contain all of the input channels contained in other datasets that the model is being trained with.
+Another advanced technique that we have introduced into this codebase particularly for the purpose of foundational model training is the capability to incorporate variable aggregation [[12]](#12). Variable aggregation is a technique where instead of tokenizing multi-channel inputs all at once and transforming them into the latent embedding dimension space, each channel is tokenized individually and transformed into the latent embedding dimensions space based on the type of channel data, given some direction via the `variables` argument in the forward pass. Each of these channel embedding vectors are then fed through an additional attention mechanism to compress all of the input into a single dimension, a process we call variable aggregation. The reason it is important that these input channels be tokenized and embedded separately is because it allows the flexibility to use a pre-trained foundational model in a flexible manner. Variable aggregation allows for the ability to use different types of data during training, e.g. data that does not contain all of the input channels contained in other datasets that the model is being trained with.
 
 ### Usage 
 In order to use variable aggregation set the `use_varemb` to True. In the case where `use_varemb=False` multi-channel tokenization will be performed and thus any further training or finetuning with that model will require data to match the specific number of channels as the original data used with that model. Variable aggregation is controlled by sending a list of variables identifiers to the forward pass of the model architecture, i.e. `["red","green","blue"]` for the case of RGB images. This list of variables must correspond correctly with the order that the data is formatted in and this process is facilitated through our [dataloader](#dataloader) via passing in the identifier list to the `dict_in_variables` argument of the config file. `default_vars` controls the type of types of input channels that the model will allow for ingestion. Thus every variable in `dict_in_variables` must be in `default_vars`, however not every input channel is necessary when passing through the model. 
@@ -449,7 +458,7 @@ In order to use variable aggregation set the `use_varemb` to True. In the case w
 Currently we provide 5 different model architecutres **(VIT, MAE, UNETR, SAP, VIT-DIFFUSION)**, all of which use the same VIT encoder, but a different decoder architecture depending on the task being trained. All code for the different architectures inherit the encoder from the VIT architecture class in order to facilitate using the same encoder. In the following sections we provide working examples for exectuing a forward pass with each of these architectures that can be ran on a single CPU. For more complex full training runs on multiple GPUs look to the example scripts in the `training_scripts/` directory.
 
 ## Vision Transformer (VIT)
-VIT based on [[7]](#7). Code slimmed down from (https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/vision_transformer.py#L425) to only contain basic options for VIT Training and adapted to integrate our [innovations](#innovations). Task: Image Classification. Input: Image or Image Tile (A tile is a subset portion of a full image).
+VIT based on [[7]](#7). Code slimmed down from (https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/vision_transformer.py#L425) to only contain basic options for VIT Training and adapted to integrate our [innovations](#innovations). Task: Image Classification. Input: Image or Image Tile (A tile is a contiguous subset of a full image).
 
 ### Usage
 ```python
@@ -951,7 +960,7 @@ For Examples, see the XCT-Diffusion, SST, and S8D branches
 In order for the dataloader to handle multiple datasets at the same time, the data needs to be spread out amongst the GPUs evenly. In the case where different datasets have different amounts and/or different sizes of images, it's difficult to evenly spread this data amongst the GPUs evenly. We provide example load balancing scripts that for a given setting in a config file determines how the data should be split amongst a given set of N GPUs, in order to evenly balance the data amongst the compute resources. The output from this script gives the necessary information to the dataloader in order to do this in a proper fashion. If you want this load_balancing to be done automatically set `auto_load_balancing` to True in your config file. If you want to do the load balancing manually to check for correct implementation run `python utils/load_balance.py [CONFIG_FILE] [NUM_GPUS]` and use the output from this script to add to the load balancing portion of the config file.
 
 ## Parallelism Modes
-All of the currently existing architectures exist in 2 independent sub-folders, simple and fsdp, for which we separate the network architecture code into what we call modes. The choice of mode to be used will depend on the types of advanced parallelism and computing techniques needed for the model being trained.  The first `src/UCF_VIT/simple`, provides a simplified version for training in Distributed Data Parallel (DDP) fashion only. The second `src/UCF_VIT/fsdp`, provides a more complex version with different parallel and efficient computing training techniques. This includes options for training with a combination of Sharded Data Parallelism , DDP, and Tensor Parallelism. These parallelisms are all integrated via the [Hybrid-Stop](#hybrid-stop) algorithm. Both modes can be used with the same data loading module and load balancing scripts provided. While the training done within the simple mode can be done with the correct choice of options in the fsdp mode, the purpose of keeping the simple mode is 1) to provide an entry point for new users and developers to add new architectures without the intricacies of the advanced features and 2) to provide a simple reference point to compare with when new innovations are added in order to test how they interact with the more complex parallelism methods.
+All of the currently existing architectures exist in 2 independent sub-folders, simple and fsdp, for which we separate the network architecture code into what we call modes. The choice of mode to be used will depend on the types of advanced parallelism and computing techniques needed for the model being trained.  The first `src/UCF_VIT/simple`, provides a simplified version for training in Distributed Data Parallel (DDP) fashion only. The second `src/UCF_VIT/fsdp`, provides a more complex version with different parallel and efficient computing training techniques. This includes options for training with a combination of Sharded Data Parallelism , DDP, and Tensor Parallelism. These parallelisms are all integrated via the [Hybrid-Op](#hybrid-op) algorithm. Both modes can be used with the same data loading module and load balancing scripts provided. While the training done within the simple mode can be done with the correct choice of options in the fsdp mode, the purpose of keeping the simple mode is 1) to provide an entry point for new users and developers to add new architectures without the intricacies of the advanced features and 2) to provide a simple reference point to compare with when new innovations are added in order to test how they interact with the more complex parallelism methods.
 
 ### Building Blocks
 The main building blocks for the VIT based archictectures are in the **Attention** and **Feed-forward** functions, provided in the Attention class and MLP class in `src/UCF_VIT/simple/building_blocks.py` and `src/UCF_VIT/fsdp/building_blocks.py`. We ask that you use these functions as is and do not modify them, as these common building blocks will be used across the different network architectures.
