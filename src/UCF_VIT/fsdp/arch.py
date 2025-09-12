@@ -137,6 +137,7 @@ class VIT(nn.Module):
             tensor_par_size: int = 1,
             tensor_par_group: Optional[dist.ProcessGroup] = None,
             FusedAttn_option = FusedAttn.NONE,
+            use_adaptive_pos_emb: bool = False
     ) -> None:
         """
         Args:
@@ -202,6 +203,7 @@ class VIT(nn.Module):
         self.tensor_par_size = tensor_par_size
         self.tensor_par_group = tensor_par_group
         self.FusedAttn_option = FusedAttn_option
+        self.use_adaptive_pos_emb = use_adaptive_pos_emb
 
 
         #ASSUMES INPUT HAS ALREADY BEEN ADAPTIVELY PATCHED
@@ -309,6 +311,19 @@ class VIT(nn.Module):
                 #self.var_agg = nn.MultiheadAttention(self.embed_dim, self.num_heads, batch_first=True)
                 self.var_agg = VariableMapping_Attention(self.embed_dim, fused_attn=self.FusedAttn_option, num_heads=self.num_heads, qkv_bias=False, tensor_par_size = self.tensor_par_size, tensor_par_group = self.tensor_par_group)
 
+        if self.use_adaptive_pos_emb:
+            if self.twoD:
+                self.adaptive_pos_dep_emb = nn.Sequential(
+                    nn.Linear(in_features=3, out_features=self.embed_dim),
+                    nn.GELU()
+                )
+            else:
+                self.adaptive_pos_dep_emb = nn.Sequential(
+                    nn.Linear(in_features=4, out_features=self.embed_dim),
+                    nn.GELU()
+                )
+
+
         if weight_init != 'skip':
             self.init_weights('')
 
@@ -352,11 +367,14 @@ class VIT(nn.Module):
 
         named_apply(get_init_weights_vit(head_bias), self)
 
-    def _pos_embed(self, x: torch.Tensor) -> torch.Tensor:
+    def _pos_embed(self, x: torch.Tensor, seq_ps) -> torch.Tensor:
         if self.pos_embed is None:
             return x.view(x.shape[0], -1, x.shape[-1])
 
-        pos_embed = self.pos_embed
+        if self.use_adaptive_pos_emb:
+            pos_embed = self.adaptive_pos_dep_emb(seq_ps)
+        else:
+            pos_embed = self.pos_embed
 
         to_cat = []
         if self.cls_token is not None:
@@ -414,7 +432,7 @@ class VIT(nn.Module):
 
         return x
 
-    def forward_features(self, x: torch.Tensor, variables) -> torch.Tensor:
+    def forward_features(self, x: torch.Tensor, variables, seq_ps) -> torch.Tensor:
         if self.use_varemb:
             embeds = []
             if isinstance(variables, list):
@@ -450,7 +468,7 @@ class VIT(nn.Module):
             else:
                 x = self.token_embeds(x)
 
-        x = self._pos_embed(x)
+        x = self._pos_embed(x, seq_ps)
         x = self.patch_drop(x)
         
         if self.tensor_par_size > 1:
@@ -474,8 +492,8 @@ class VIT(nn.Module):
         x = self.head_drop(x)
         return x
 
-    def forward(self, x: torch.Tensor, variables) -> torch.Tensor:
-        x = self.forward_features(x, variables)
+    def forward(self, x: torch.Tensor, variables, seq_ps=None) -> torch.Tensor:
+        x = self.forward_features(x, variables, seq_ps)
         x = self.forward_head(x)
         return x
 

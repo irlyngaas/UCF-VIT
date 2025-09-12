@@ -21,9 +21,9 @@ from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.utils.fused_attn import FusedAttn
 
 
-def training_step(data, variables, label, net: VIT):
+def training_step(data, variables, label, net: VIT, seq_ps):
 
-    output = net.forward(data, variables)
+    output = net.forward(data, variables, seq_ps)
     criterion = nn.CrossEntropyLoss()
     loss = criterion(output,label)
 
@@ -105,9 +105,11 @@ def main(device, local_rank):
     if adaptive_patching:
         fixed_length = conf['model']['net']['init_args']['fixed_length']
         separate_channels = conf['model']['net']['init_args']['separate_channels']
+        use_adaptive_pos_emb = conf['model']['net']['init_args']['use_adaptive_pos_emb']
     else:
         fixed_length = None
         separate_channels = None
+        use_adaptive_pos_emb = None
 
     dataset = conf['data']['dataset']
     assert dataset in ["imagenet"], "This training script only supports imagenet"
@@ -218,6 +220,7 @@ def main(device, local_rank):
         adaptive_patching=adaptive_patching,
         fixed_length=fixed_length,
         FusedAttn_option=FusedAttn_option,
+        use_adaptive_pos_emb=use_adaptive_pos_emb,
     ).to(device)
 
     #model = DDP(model,device_ids=[local_rank],output_device=[local_rank])
@@ -315,16 +318,26 @@ def main(device, local_rank):
                 break
 
             if adaptive_patching:
-                seq, label, variables, _ = batch
+                data, seq, seq_size, seq_pos, label, variables, _ = batch
                 seq = seq.to(device)
                 label = label.to(device)
-                loss, output = training_step(seq, variables, label, model)
+                seq_size = torch.squeeze(seq_size)
+                seq_size = seq_size.to(torch.float32)
+                seq_size = seq_size.to(device)
+                seq_pos = torch.squeeze(seq_pos)
+                seq_pos = seq_pos.to(torch.float32)
+                seq_pos = seq_pos.to(device)
+                seq_size = seq_size.unsqueeze(-1)
+                seq_ps = torch.concat([seq_size, seq_pos],dim=-1)
+
+                loss, output = training_step(seq, variables, label, model, seq_ps)
 
             else:
                 data, label, variables, _ = batch
                 data = data.to(device)
                 label = label.to(device)
-                loss, output = training_step(data, variables, label, model)
+                seq_ps = None
+                loss, output = training_step(data, variables, label, model, seq_ps)
 
             acc = (output.argmax(dim=1) == label).float().mean()
 
