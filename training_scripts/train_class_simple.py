@@ -106,6 +106,7 @@ def main(device, local_rank):
         fixed_length = conf['model']['net']['init_args']['fixed_length']
         separate_channels = conf['model']['net']['init_args']['separate_channels']
         use_adaptive_pos_emb = conf['model']['net']['init_args']['use_adaptive_pos_emb']
+        assert separate_channels and not use_adaptive_pos_emb, "Capability to use separate channels and adaptive pos_emb not implemented yet"
     else:
         fixed_length = None
         separate_channels = None
@@ -321,14 +322,18 @@ def main(device, local_rank):
                 data, seq, seq_size, seq_pos, label, variables, _ = batch
                 seq = seq.to(device)
                 label = label.to(device)
-                seq_size = torch.squeeze(seq_size)
-                seq_size = seq_size.to(torch.float32)
-                seq_size = seq_size.to(device)
-                seq_pos = torch.squeeze(seq_pos)
-                seq_pos = seq_pos.to(torch.float32)
-                seq_pos = seq_pos.to(device)
-                seq_size = seq_size.unsqueeze(-1)
-                seq_ps = torch.concat([seq_size, seq_pos],dim=-1)
+                if separate_channels:
+                    #TODO: Move seq_size and seq_pos to a single channel
+                    seq_ps = None
+                else:
+                    seq_size = torch.squeeze(seq_size)
+                    seq_size = seq_size.to(torch.float32)
+                    seq_size = seq_size.to(device)
+                    seq_pos = torch.squeeze(seq_pos)
+                    seq_pos = seq_pos.to(torch.float32)
+                    seq_pos = seq_pos.to(device)
+                    seq_size = seq_size.unsqueeze(-1)
+                    seq_ps = torch.concat([seq_size, seq_pos],dim=-1)
 
                 loss, output = training_step(seq, variables, label, model, seq_ps)
 
