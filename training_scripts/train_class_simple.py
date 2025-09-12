@@ -106,7 +106,8 @@ def main(device, local_rank):
         fixed_length = conf['model']['net']['init_args']['fixed_length']
         separate_channels = conf['model']['net']['init_args']['separate_channels']
         use_adaptive_pos_emb = conf['model']['net']['init_args']['use_adaptive_pos_emb']
-        assert separate_channels and not use_adaptive_pos_emb, "Capability to use separate channels and adaptive pos_emb not implemented yet"
+        if separate_channels:
+            assert not use_adaptive_pos_emb, "Capability to use separate channels and adaptive pos_emb not implemented yet"
     else:
         fixed_length = None
         separate_channels = None
