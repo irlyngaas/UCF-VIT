@@ -50,7 +50,14 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                             seq_label_list.append([])
                             for j in range(num_labels):
                                 seq_label_list[i].append(torch.from_numpy(batch[i][5][j]))
-                    seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
+                    if dataset == "basic_ct":
+                        seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
+                    else:
+                        channel_list = []
+                        for i in range(len(batch)):
+                            channel_list.append(torch.stack([seq_label_list[i][j] for j in range(num_labels)]))
+                        seq_label = torch.stack([channel_list[i] for i in range(len(batch))])
+
                     variables = []
                     variables.append(batch[0][6])
                     if return_qdt:
@@ -91,7 +98,14 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                             seq_label_list.append([])
                             for j in range(num_labels):
                                 seq_label_list[i].append(torch.from_numpy(batch[i][5][j]))
-                    seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
+                    if dataset == "basic_ct":
+                        seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
+                    else:
+                        channel_list = []
+                        for i in range(len(batch)):
+                            channel_list.append(torch.stack([seq_label_list[i][j] for j in range(num_labels)]))
+                        seq_label = torch.stack([channel_list[i] for i in range(len(batch))])
+
                     variables = batch[0][6]
                     if return_qdt:
                         qdt_list = []
@@ -99,18 +113,18 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                             qdt_list.append(batch[i][7])
             if dataset == "imagenet":                
                 if return_qdt:
-                    #return (inp, seq, size, pos, label, variables, qdt_list, dict_key)
-                    return (seq, label, variables, qdt_list, dict_key)
+                    return (inp, seq, size, pos, label, variables, qdt_list, dict_key)
+                    #return (seq, label, variables, qdt_list, dict_key)
                 else:
-                    #return (inp, seq, size, pos, label, variables, dict_key)
-                    return (seq, label, variables, dict_key)
+                    return (inp, seq, size, pos, label, variables, dict_key)
+                    #return (seq, label, variables, dict_key)
             else:
                 if return_qdt:
-                    #return (inp, seq, size, pos, label, seq_label, variables, qdt_list, dict_key)
-                    return (seq, seq_label, variables, qdt_list, dict_key)
+                    return (inp, seq, size, pos, label, seq_label, variables, qdt_list, dict_key)
+                    #return (seq, seq_label, variables, qdt_list, dict_key)
                 else:
-                    #return (inp, seq, size, pos, label, seq_label, variables, dict_key)
-                    return (seq, seq_label, variables, dict_key)
+                    return (inp, seq, size, pos, label, seq_label, variables, dict_key)
+                    #return (seq, seq_label, variables, dict_key)
         else:
             if single_channel:
                 inp = torch.stack([torch.from_numpy(np.expand_dims(batch[i][0],axis=0)) for i in range(len(batch))])
@@ -135,11 +149,11 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                 qdt_list = []
                 for i in range(len(batch)):
                     qdt_list.append(batch[i][5])
-                #return (inp, seq, size, pos, variables, qdt_list, dict_key)
-                return (seq, variables, qdt_list, dict_key)
+                return (inp, seq, size, pos, variables, qdt_list, dict_key)
+                #return (seq, variables, qdt_list, dict_key)
             else:
-                #return (inp, seq, size, pos, variables, dict_key)
-                return (seq, variables, dict_key)
+                return (inp, seq, size, pos, variables, dict_key)
+                #return (seq, variables, dict_key)
     else:
         if return_label:
             if single_channel:

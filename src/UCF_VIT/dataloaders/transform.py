@@ -7,7 +7,7 @@ from .quadtree import FixedQuadTree
 from .octree import FixedOctTree
 
 class Patchify(torch.nn.Module):
-    def __init__(self, sths=[0,1,3,5], fixed_length=196, cannys=[50, 100], patch_size=16, num_channels=3, dataset="imagenet") -> None:
+    def __init__(self, sths=[0,1,3,5], fixed_length=196, cannys=[50, 100], patch_size=16, num_channels=3, dataset="imagenet", return_edges=False) -> None:
         super().__init__()
         
         self.sths = sths
@@ -16,6 +16,7 @@ class Patchify(torch.nn.Module):
         self.patch_size = patch_size
         self.num_channels = num_channels
         self.dataset = dataset
+        self.return_edges = return_edges
         
     def forward(self, img):  # we assume inputs are always structured like this
         # Do some transformations. Here, we're just passing though the input
@@ -49,11 +50,14 @@ class Patchify(torch.nn.Module):
             seq_img = np.reshape(seq_img, [-1, self.patch_size*self.patch_size])
 
         seq_pos = np.asarray(seq_pos)
-        return seq_img, seq_size, seq_pos, qdt
+        if self.return_edges:
+            return seq_img, seq_size, seq_pos, qdt, edges
+        else:
+            return seq_img, seq_size, seq_pos, qdt
 
 class Patchify_3D(torch.nn.Module):
     #TODO: Pass dtype for preferred return dtype
-    def __init__(self, sths=[0,1,3,5], fixed_length=196, cannys=[50, 100], patch_size=16, num_channels=3, dataset="basic_ct") -> None:
+    def __init__(self, sths=[0,1,3,5], fixed_length=196, cannys=[50, 100], patch_size=16, num_channels=3, dataset="basic_ct", return_edges=False) -> None:
         super().__init__()
         
         self.sths = sths
@@ -62,28 +66,46 @@ class Patchify_3D(torch.nn.Module):
         self.patch_size = patch_size
         self.num_channels = num_channels
         self.dataset = dataset
+        self.return_edges = return_edges
 
     def forward(self, img):  # we assume inputs are always structured like this
-        img = np.squeeze(img,axis=None)
         self.smooth_factor = random.choice(self.sths)
         c = random.choice(self.cannys)
         self.canny = [c, c+50]
-        grey_img = gaussian_filter(img, sigma=self.smooth_factor)
+        grey_img = gaussian_filter(img, sigma=(self.smooth_factor,self.smooth_factor,self.smooth_factor,0))
 
-        gradient_magnitude = np.zeros_like(grey_img)
-        gradient_direction = np.zeros_like(grey_img)
-
+        gradient_magnitude = np.zeros_like(grey_img[:,:,:,0])
+        gradient_direction = np.zeros_like(grey_img[:,:,:,0])
         for i in range(grey_img.shape[0]):
-            sobelx = cv.Sobel(grey_img[i, :, :], cv.CV_64F, 1, 0, ksize=5)
-            sobely = cv.Sobel(grey_img[i, :, :], cv.CV_64F, 0, 1, ksize=5)
-            gradient_magnitude[i, :, :] = np.sqrt(sobelx**2 + sobely**2)
+            for j in range(self.num_channels):
+                if j == 0:
+                    sobelx = cv.Sobel(grey_img[i, :, :, j], cv.CV_64F, 1, 0, ksize=5)
+                    sobely = cv.Sobel(grey_img[i, :, :, j], cv.CV_64F, 0, 1, ksize=5)
+                    g_mag = np.sqrt(sobelx**2 + sobely**2)
+                else:
+                    sx = cv.Sobel(grey_img[i, :, :, j], cv.CV_64F, 1, 0, ksize=5)
+                    sy = cv.Sobel(grey_img[i, :, :, j], cv.CV_64F, 0, 1, ksize=5)
+                    if np.mean(np.sqrt(sx**2 + sy**2)) > np.mean(g_mag):
+                        sobelx = sx
+                    if np.mean(sy) > np.mean(sobely):
+                        sobely = sy
+            gradient_magnitude[i, :, :] = g_mag
             gradient_direction[i, :, :] = np.arctan2(sobely, sobelx)
-
-        edges_combined = np.zeros(grey_img.shape, dtype=bool)
+        edges_combined = np.zeros_like(grey_img[:,:,:,0], dtype=bool)
+        edges_combined_counter = np.zeros_like(grey_img[:,:,:,0], dtype=np.uint8)
 
         for i in range(grey_img.shape[0]):
-            canny_edges = cv.Canny(grey_img[i, :, :].astype(np.uint8), self.canny[0], self.canny[1])
-            edges_combined[i, :, :] != (canny_edges > 0)
+            for j in range(self.num_channels):
+                if j == 0:
+                    canny_edges = cv.Canny((grey_img[i, :, :, j]*255).astype(np.uint8), self.canny[0], self.canny[1])
+                    cond1 = canny_edges >0
+                    edges_combined_counter[i,:,:] = edges_combined_counter[i,:,:] + cond1.astype(np.uint8)
+                else:
+                    canny = cv.Canny((grey_img[i, :, :, j]*255).astype(np.uint8), self.canny[0], self.canny[1])
+                    canny_edges = canny_edges + canny
+                    cond1 = canny >0
+                    edges_combined_counter[i,:,:] = edges_combined_counter[i,:,:] + cond1.astype(np.uint8)
+            edges_combined[i, :, :] = (canny_edges > 0)
 
         edge_direction_data = np.zeros_like(gradient_direction)
         edge_direction_data[edges_combined] = gradient_direction[edges_combined]
@@ -91,12 +113,13 @@ class Patchify_3D(torch.nn.Module):
         edge_data_normalized = (edge_direction_data - edge_direction_data.min()) / (edge_direction_data.max() - edge_direction_data.min())
         #TODO: Add parameter for this threshold
         threshold = 0.5
-        binary_edges = (edge_data_normalized > threshold).astype(np.uint8) * 255
+        norm_factor = int(255/self.num_channels)
+        binary_edges = (edge_data_normalized > threshold).astype(np.uint8) * (edges_combined_counter*norm_factor)
         edges = binary_edges
 
-        octtree = FixedOctTree(domain=edges, fixed_length=self.fixed_length)
+        octtree = FixedOctTree(domain=edges, fixed_length=self.fixed_length, norm_factor=norm_factor)
 
-        seq_img, seq_size, seq_pos = octtree.serialize(img, size=(self.patch_size,self.patch_size,self.patch_size))
+        seq_img, seq_size, seq_pos = octtree.serialize(img, size=(self.patch_size,self.patch_size,self.patch_size, self.num_channels))
         seq_size = np.asarray(seq_size)
         seq_img = np.asarray(seq_img, dtype=np.float32)
         if self.num_channels > 1:
@@ -105,4 +128,7 @@ class Patchify_3D(torch.nn.Module):
             seq_img = np.reshape(seq_img, [-1, self.patch_size*self.patch_size*self.patch_size])
 
         seq_pos = np.asarray(seq_pos)
-        return seq_img, seq_size, seq_pos, octtree
+        if self.return_edges:
+            return seq_img, seq_size, seq_pos, octtree, edges
+        else:
+            return seq_img, seq_size, seq_pos, octtree
