@@ -35,9 +35,9 @@ from UCF_VIT.utils.fused_attn import FusedAttn
 
 
 
-def training_step_adaptive(seq, variables, net: MAE, patch_size, twoD, loss_fn):
+def training_step_adaptive(seq, variables, net: MAE, patch_size, twoD, loss_fn, seq_ps):
 
-    output, mask = net.forward(seq, variables)
+    output, mask = net.forward(seq, variables, seq_ps)
     criterion = nn.MSELoss()
     target = rearrange(seq, 'b c s p -> b s (p c)')
     loss = criterion(output, target)
@@ -47,13 +47,13 @@ def training_step_adaptive(seq, variables, net: MAE, patch_size, twoD, loss_fn):
 def training_step(data, variables, net: MAE, patch_size, twoD, loss_fn):
 
     if loss_fn == "maskMSE":
-        output, mask = net.forward(data, variables)
+        output, mask = net.forward(data, variables, None)
         criterion = masked_mse
         target = patchify(data, patch_size, twoD)
         loss = criterion(output,target,mask)
 
     else: #Default use full MSE
-        output, _ = net.forward(data, variables)
+        output, _ = net.forward(data, variables, None)
         criterion = nn.MSELoss()
         target = patchify(data, patch_size, twoD)
         loss = criterion(output,target)
@@ -156,12 +156,13 @@ def main(device, local_rank):
     if adaptive_patching:
         fixed_length = conf['model']['net']['init_args']['fixed_length']
         separate_channels = conf['model']['net']['init_args']['separate_channels']
-
-        if not twoD:
-            assert not separate_channels, "Adaptive Patching in 3D with multiple channels (non-separated) is not currently implemented"
+        use_adaptive_pos_emb = conf['model']['net']['init_args']['use_adaptive_pos_emb']
+        if separate_channels:
+            assert not use_adaptive_pos_emb, "Capability to use separate channels and adaptive pos_emb not implemented yet"
     else:
         fixed_length = None
         separate_channels = None
+        use_adaptive_pos_emb = None
 
     use_grad_scaler = conf['model']['use_grad_scaler']
 
@@ -293,6 +294,7 @@ def main(device, local_rank):
         tensor_par_size=tensor_par_size,
         tensor_par_group=tensor_par_group,
         FusedAttn_option=FusedAttn_option,
+        use_adaptive_pos_emb=use_adaptive_pos_emb,
         class_token=False,
         weight_init='skip',
     ).to(device)
@@ -483,7 +485,8 @@ def main(device, local_rank):
             if adaptive_patching:
                 if tensor_par_size > 1:
                     if dist.get_rank(tensor_par_group) == 0:
-                        seq, variables, dict_key = next(it_loader)
+                        #seq, variables, dict_key = next(it_loader)
+                        data, seq, seq_size, seq_pos, variables, _ = next(it_loader)
                         seq = seq.to(precision_dt)
                         seq = seq.to(device)
                         if dataset != "imagenet":
@@ -508,17 +511,45 @@ def main(device, local_rank):
                     if dist.get_rank(tensor_par_group) != 0:
                         if twoD:
                             seq = torch.zeros(batch_size, num_channels_used[dict_key], fixed_length, patch_size*patch_size, dtype=precision_dt).to(device)
+                            if separate_channels:
+                                seq_size = torch.zeros(batch_size, num_channels_used[dict_key], fixed_length, dtype=precision_dt).to(device)
+                                seq_pos = torch.zeros(batch_size, num_channels_used[dict_key], fixed_length, 2, dtype=precision_dt).to(device)
+                            else:
+                                seq_size = torch.zeros(batch_size, 1, fixed_length, 1, dtype=precision_dt).to(device)
+                                seq_pos = torch.zeros(batch_size, 1, fixed_length, 1, 1, dtype=precision_dt).to(device)
                         else:
                             seq = torch.zeros(batch_size, num_channels_used[dict_key], fixed_length, patch_size*patch_size*patch_size, dtype=precision_dt).to(device)
+                            if separate_channels:
+                                seq_size = torch.zeros(batch_size, num_channels_used[dict_key], fixed_length, dtype=precision_dt).to(device)
+                                seq_pos = torch.zeros(batch_size, num_channels_used[dict_key], fixed_length, 3, dtype=precision_dt).to(device)
+                            else:
+                                seq_size = torch.zeros(batch_size, 1, fixed_length, 1, dtype=precision_dt).to(device)
+                                seq_pos = torch.zeros(batch_size, 1, fixed_length, 1, 1, 1, dtype=precision_dt).to(device)
                         variables = [None] * num_channels_used[dict_key]
                     dist.broadcast(seq, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+                    dist.broadcast(seq_size, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+                    dist.broadcast(seq_pos, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
                     dist.broadcast_object_list(variables, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
                 else: #Avoid unnecesary broadcasts if not using tensor parallelism
-                    seq, variables, _ = next(it_loader)
+                    #seq, variables, _ = next(it_loader)
+                    data, seq, seq_size, seq_pos, variables, _ = next(it_loader)
                     seq = seq.to(precision_dt)
                     seq = seq.to(device)
 
-                loss = training_step_adaptive(seq, variables, model, patch_size, twoD, loss_fn)
+                if separate_channels:
+                    #TODO: Move seq_size and seq_pos to a single channel
+                    seq_ps = None
+                else:
+                    seq_size = torch.squeeze(seq_size)
+                    seq_size = seq_size.to(torch.float32)
+                    seq_size = seq_size.to(device)
+                    seq_pos = torch.squeeze(seq_pos)
+                    seq_pos = seq_pos.to(torch.float32)
+                    seq_pos = seq_pos.to(device)
+                    seq_size = seq_size.unsqueeze(-1)
+                    seq_ps = torch.concat([seq_size, seq_pos],dim=-1)
+
+                loss = training_step_adaptive(seq, variables, model, patch_size, twoD, loss_fn, seq_ps)
 
             else:
                 if tensor_par_size > 1:

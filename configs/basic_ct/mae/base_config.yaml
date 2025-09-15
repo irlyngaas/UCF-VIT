@@ -52,6 +52,7 @@ model:
       adaptive_patching: True
       fixed_length: 196
       separate_channels: False
+      use_adaptive_pos_emb: True
 
 # ---------------------------- DATA -------------------------------------------
 data:

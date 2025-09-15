@@ -52,9 +52,10 @@ model:
       linear_decoder: False
       twoD: True
       use_varemb: False
-      adaptive_patching: False
+      adaptive_patching: True
       fixed_length: 196
       separate_channels: False
+      use_adaptive_pos_emb: False
 
 # ---------------------------- DATA -------------------------------------------
 data:

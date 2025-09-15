@@ -551,10 +551,13 @@ class MAE(VIT):
         if not self.linear_decoder:
             self.decoder_embed = nn.Linear(self.embed_dim, self.decoder_embed_dim)
             self.decoder_norm = nn.LayerNorm(self.decoder_embed_dim)
-            if self.adaptive_patching:
-                self.decoder_pos_embed = nn.Parameter(torch.randn(1, self.num_patches, self.decoder_embed_dim) * .02)
+            if self.use_adaptive_pos_emb:
+                self.decoder_pos_embed = None
             else:
-                self.decoder_pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, self.decoder_embed_dim))
+                if self.adaptive_patching:
+                    self.decoder_pos_embed = nn.Parameter(torch.randn(1, self.num_patches, self.decoder_embed_dim) * .02)
+                else:
+                    self.decoder_pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, self.decoder_embed_dim))
             dpr = [x.item() for x in torch.linspace(0, self.drop_path_rate, self.decoder_depth)]  # stochastic depth decay rule
             #ASSUME same settings as Transformer Encoder for now
             self.decoder_blocks = nn.Sequential(*[
@@ -574,8 +577,21 @@ class MAE(VIT):
                     mlp_layer=self.mlp_layer,
                 )
                 for i in range(self.decoder_depth)])
+
+            if self.use_adaptive_pos_emb:
+                if self.twoD:
+                    self.decoder_adaptive_pos_dep_emb = nn.Sequential(
+                        nn.Linear(in_features=3, out_features=self.decoder_embed_dim),
+                        nn.GELU()
+                    )
+                else:
+                    self.decoder_adaptive_pos_dep_emb = nn.Sequential(
+                        nn.Linear(in_features=4, out_features=self.decoder_embed_dim),
+                        nn.GELU()
+                    )
         else:
             self.decoder_pos_embed = None
+
 
         self.init_weights('')
 
@@ -657,7 +673,7 @@ class MAE(VIT):
 
         return sequence_unmasked, mask, ids_restore
 
-    def mask_head(self, x: torch.Tensor, ids_restore):
+    def mask_head(self, x: torch.Tensor, ids_restore, seq_ps):
         if not self.linear_decoder:
             x = self.decoder_embed(x)
 
@@ -667,14 +683,18 @@ class MAE(VIT):
         if self.linear_decoder:
             x = self.decoder_pred(x_)
         else:
-            x = x_ + self.decoder_pos_embed
+            if self.use_adaptive_pos_emb:
+                decoder_pos_embed = self.decoder_adaptive_pos_dep_emb(seq_ps)
+            else:
+                decoder_pos_embed = self.decoder_pos_embed
+            x = x_ + decoder_pos_embed
             x = self.decoder_blocks(x)
             x = self.decoder_norm(x)
             x = self.decoder_pred(x)
     
         return x
 
-    def forward_features(self, x: torch.Tensor, variables) -> torch.Tensor:
+    def forward_features(self, x: torch.Tensor, variables, seq_ps) -> torch.Tensor:
         if self.use_varemb:
             embeds = []
             if isinstance(variables, list):
@@ -710,21 +730,21 @@ class MAE(VIT):
             else:
                 x = self.token_embeds(x)
                
-        x = self._pos_embed(x)
+        x = self._pos_embed(x, seq_ps)
         x, mask, ids_restore = self.random_masking(x)
         x = self.patch_drop(x)
         x = self.blocks(x)
         x = self.norm(x)
         return x, mask, ids_restore
 
-    def forward_head(self, x: torch.Tensor, ids_restore):
+    def forward_head(self, x: torch.Tensor, ids_restore, seq_ps):
         x = self.pool(x)
-        return self.mask_head(x, ids_restore)
+        return self.mask_head(x, ids_restore, seq_ps)
 
 
-    def forward(self, x: torch.Tensor, variables) -> torch.Tensor:
-        x, mask, ids_restore = self.forward_features(x, variables)
-        x = self.forward_head(x, ids_restore)
+    def forward(self, x: torch.Tensor, variables, seq_ps=None) -> torch.Tensor:
+        x, mask, ids_restore = self.forward_features(x, variables, seq_ps)
+        x = self.forward_head(x, ids_restore, seq_ps)
         return x, mask
 
 class UNETR(VIT):

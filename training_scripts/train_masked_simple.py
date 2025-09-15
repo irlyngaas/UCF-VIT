@@ -20,10 +20,10 @@ from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, patchif
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.utils.fused_attn import FusedAttn
 
-def training_step_adaptive(seq, variables, net: MAE, patch_size, twoD, loss_fn):
+def training_step_adaptive(seq, variables, net: MAE, patch_size, twoD, loss_fn, seq_ps):
 
         
-    output, mask = net.forward(seq, variables)
+    output, mask = net.forward(seq, variables, seq_ps)
     criterion = nn.MSELoss()
     target = rearrange(seq, 'b c s p -> b s (p c)')
     loss = criterion(output, target)
@@ -34,13 +34,13 @@ def training_step_adaptive(seq, variables, net: MAE, patch_size, twoD, loss_fn):
 def training_step(data, variables, net: MAE, patch_size, twoD, loss_fn):
 
     if loss_fn == "maskMSE":
-        output, mask = net.forward(data, variables)
+        output, mask = net.forward(data, variables, None)
         criterion = masked_mse
         target = patchify(data, patch_size, twoD)
         loss = criterion(output,target,mask)
 
     else: #Default use full MSE
-        output, _ = net.forward(data, variables)
+        output, _ = net.forward(data, variables, None)
         criterion = nn.MSELoss()
         target = patchify(data, patch_size, twoD)
         loss = criterion(output,target)
@@ -135,12 +135,13 @@ def main(device, local_rank):
     if adaptive_patching:
         fixed_length = conf['model']['net']['init_args']['fixed_length']
         separate_channels = conf['model']['net']['init_args']['separate_channels']
-
-        if not twoD:
-            assert not separate_channels, "Adaptive Patching in 3D with multiple channels (non-separated) is not currently implemented"
+        use_adaptive_pos_emb = conf['model']['net']['init_args']['use_adaptive_pos_emb']
+        if separate_channels:
+            assert not use_adaptive_pos_emb, "Capability to use separate channels and adaptive pos_emb not implemented yet"
     else:
         fixed_length = None
         separate_channels = None
+        use_adaptive_pos_emb = None
 
     dataset = conf['data']['dataset']
     assert dataset in ["basic_ct", "imagenet"], "This training script only supports basic_ct and imagenet datasets"
@@ -251,6 +252,7 @@ def main(device, local_rank):
         adaptive_patching=adaptive_patching,
         fixed_length=fixed_length,
         FusedAttn_option=FusedAttn_option,
+        use_adaptive_pos_emb=use_adaptive_pos_emb,
         class_token=False,
         weight_init='skip',
     ).to(device)
@@ -349,9 +351,22 @@ def main(device, local_rank):
                 break
 
             if adaptive_patching:
-                seq, variables, _ = batch
+                #seq, variables, _ = batch
+                data, seq, seq_size, seq_pos, variables, _ = batch
                 seq = seq.to(device)
-                loss = training_step_adaptive(seq, variables, model, patch_size, twoD, loss_fn)
+                if separate_channels:
+                    #TODO: Move seq_size and seq_pos to a single channel
+                    seq_ps = None
+                else:
+                    seq_size = torch.squeeze(seq_size)
+                    seq_size = seq_size.to(torch.float32)
+                    seq_size = seq_size.to(device)
+                    seq_pos = torch.squeeze(seq_pos)
+                    seq_pos = seq_pos.to(torch.float32)
+                    seq_pos = seq_pos.to(device)
+                    seq_size = seq_size.unsqueeze(-1)
+                    seq_ps = torch.concat([seq_size, seq_pos],dim=-1)
+                loss = training_step_adaptive(seq, variables, model, patch_size, twoD, loss_fn, seq_ps)
 
             else:
                 data, variables, _ = batch
