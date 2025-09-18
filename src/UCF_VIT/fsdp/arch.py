@@ -138,6 +138,7 @@ class VIT(nn.Module):
             tensor_par_group: Optional[dist.ProcessGroup] = None,
             FusedAttn_option = FusedAttn.NONE,
             use_adaptive_pos_emb: bool = False
+            sqrt_len_method: bool = False,
     ) -> None:
         """
         Args:
@@ -205,7 +206,6 @@ class VIT(nn.Module):
         self.FusedAttn_option = FusedAttn_option
         self.use_adaptive_pos_emb = use_adaptive_pos_emb
 
-
         #ASSUMES INPUT HAS ALREADY BEEN ADAPTIVELY PATCHED
         if self.adaptive_patching:
             num_patches = self.fixed_length
@@ -218,6 +218,7 @@ class VIT(nn.Module):
                     in_chans=1,
                     embed_dim=embed_dim,
                     twoD=twoD,
+                    sqrt_len_method=sqrt_len_method,
                 )
             else:
                 self.patch_embed = embed_layer(
@@ -226,6 +227,7 @@ class VIT(nn.Module):
                     in_chans=in_chans,
                     embed_dim=embed_dim,
                     twoD=twoD,
+                    sqrt_len_method=sqrt_len_method,
                 )
             num_patches = self.patch_embed.num_patches
             grid_size = self.patch_embed.grid_size
@@ -282,7 +284,7 @@ class VIT(nn.Module):
             self.patch_dim = self.in_chans*self.patch_size**3
             self.patch_dim_woc = self.patch_size**3
 
-        if self.adaptive_patching:
+        if self.adaptive_patching and not self.sqrt_len_method:
             #TODO: Find a way to do convolutional patch embedding with adaptive token input, PatchEmbed doesn't work correctly
             if self.use_varemb:
                 self.token_embeds = nn.ModuleList(
@@ -329,7 +331,7 @@ class VIT(nn.Module):
 
     def init_weights(self, mode: str = '') -> None:
         head_bias = 0.
-        if not self.adaptive_patching:
+        if not self.adaptive_patching or self.sqrt_len_method:
             if self.pos_embed is not None:
                 #trunc_normal_(self.pos_embed, std=.02)
                 if self.twoD:
@@ -462,7 +464,7 @@ class VIT(nn.Module):
                 var_embed = var_embed.unsqueeze(2) # 1, V=1, D -> 1, V=1, L=1, D
                 x = x + var_embed.squeeze(1)  # 1, V=1, L=1, D -> 1, L=1, D
         else:
-            if self.adaptive_patching:
+            if self.adaptive_patching or not self.sqrt_len_method:
                 x = rearrange(x, 'b c s p -> b s (p c)')
                 x = self.token_embeds(x)
             else:
@@ -794,21 +796,35 @@ class UNETR(VIT):
         self.linear_decoder = kwargs.pop('linear_decoder', '')
         self.feature_size = kwargs.pop('feature_size', '')
         self.skip_connection = kwargs.pop('skip_connection', '')
+        self.sqrt_len = kwargs.pop('sqrt_len', '')
         super().__init__(*args, **kwargs)
         #Remove decoder from VIT
         self.head = None 
 
-        if self.twoD:
-            self.feat_size = (
-                int(self.img_size[0] / self.patch_size),
-                int(self.img_size[1] / self.patch_size),
-            )
+        if self.adaptive_patching:
+            if self.twoD:
+                self.feat_size = (
+                    self.sqrt_len,
+                    self.sqrt_len,
+                )
+            else:
+                self.feat_size = (
+                    self.sqrt_len,
+                    self.sqrt_len,
+                    self.sqrt_len,
+                )
         else:
-            self.feat_size = (
-                int(self.img_size[0] / self.patch_size),
-                int(self.img_size[1] / self.patch_size),
-                int(self.img_size[2] / self.patch_size),
-            )
+            if self.twoD:
+                self.feat_size = (
+                    int(self.img_size[0] / self.patch_size),
+                    int(self.img_size[1] / self.patch_size),
+                )
+            else:
+                self.feat_size = (
+                    int(self.img_size[0] / self.patch_size),
+                    int(self.img_size[1] / self.patch_size),
+                    int(self.img_size[2] / self.patch_size),
+                )
 
         if not self.linear_decoder:
             if self.twoD:
@@ -834,32 +850,20 @@ class UNETR(VIT):
                     norm_name="instance",
                     res_block=True,
                 )
-                if self.patch_size == 8:
-                    self.encoder2 = UnetrPrUpBlock(
-                        spatial_dims=spatial_dims,
-                        in_channels=self.embed_dim, #Hidden_size
-                        out_channels=self.feature_size * 2,
-                        num_layer=2,
-                        kernel_size=3,
-                        stride=1,
-                        upsample_kernel_size=1,
-                        norm_name="instance",
-                        conv_block=True,
-                        res_block=True,
-                    )
-                else:
-                    self.encoder2 = UnetrPrUpBlock(
-                        spatial_dims=spatial_dims,
-                        in_channels=self.embed_dim, #Hidden_size
-                        out_channels=self.feature_size * 2,
-                        num_layer=2,
-                        kernel_size=3,
-                        stride=1,
-                        upsample_kernel_size=2,
-                        norm_name="instance",
-                        conv_block=True,
-                        res_block=True,
-                    )
+
+                self.encoder2 = UnetrPrUpBlock(
+                    spatial_dims=spatial_dims,
+                    in_channels=self.embed_dim, #Hidden_size
+                    out_channels=self.feature_size * 2,
+                    num_layer=2,
+                    kernel_size=3,
+                    stride=1,
+                    upsample_kernel_size=2,
+                    norm_name="instance",
+                    conv_block=True,
+                    res_block=True,
+                )
+
                 self.encoder3 = UnetrPrUpBlock(
                     spatial_dims=spatial_dims,
                     in_channels=self.embed_dim, #Hidden_size
@@ -872,6 +876,7 @@ class UNETR(VIT):
                     conv_block=True,
                     res_block=True,
                 )
+
                 self.encoder4 = UnetrPrUpBlock(
                     spatial_dims=spatial_dims,
                     in_channels=self.embed_dim, #Hidden_size
@@ -884,6 +889,7 @@ class UNETR(VIT):
                     conv_block=True,
                     res_block=True,
                 )
+
                 self.decoder5 = UnetrUpBlock(
                     spatial_dims=spatial_dims,
                     in_channels=self.embed_dim, #Hidden_size
@@ -893,6 +899,7 @@ class UNETR(VIT):
                     norm_name="instance",
                     res_block=True,
                 )
+
                 self.decoder4 = UnetrUpBlock(
                     spatial_dims=spatial_dims,
                     in_channels= self.feature_size * 8, #Out_channels from decoder5
@@ -902,27 +909,28 @@ class UNETR(VIT):
                     norm_name="instance",
                     res_block=True,
                 )
-                if self.patch_size == 4:
-                    self.decoder3 = UnetrUpBlock(
+
+                self.decoder3 = UnetrUpBlock(
+                    spatial_dims=spatial_dims,
+                    in_channels= self.feature_size * 4, #Out_channels from decoder4
+                    out_channels= self.feature_size * 2, #feature_size=4
+                    kernel_size=3, #Conv Kernel Size
+                    upsample_kernel_size=2, #Conv Kernel Stride
+                    norm_name="instance",
+                    res_block=True,
+                )
+
+                if self.feat_size[0]*16 == self.img_size[0]:
+                    self.decoder2 = UnetrUpBlock(
                         spatial_dims=spatial_dims,
-                        in_channels= self.feature_size * 4, #Out_channels from decoder4
-                        out_channels= self.feature_size * 2, #feature_size=4
+                        in_channels= self.feature_size * 2, #Out_channels from decoder3
+                        out_channels= self.feature_size, #feature_size=4
                         kernel_size=3, #Conv Kernel Size
-                        upsample_kernel_size=1, #Conv Kernel Stride
+                        upsample_kernel_size=2, #Conv Kernel Stride
                         norm_name="instance",
                         res_block=True,
                     )
                 else:
-                    self.decoder3 = UnetrUpBlock(
-                        spatial_dims=spatial_dims,
-                        in_channels= self.feature_size * 4, #Out_channels from decoder4
-                        out_channels= self.feature_size * 2, #feature_size=4
-                        kernel_size=3, #Conv Kernel Size
-                        upsample_kernel_size=2, #Conv Kernel Stride
-                        norm_name="instance",
-                        res_block=True,
-                    )
-                if self.patch_size == 8 or self.patch_size == 4:
                     self.decoder2 = UnetrUpBlock(
                         spatial_dims=spatial_dims,
                         in_channels= self.feature_size * 2, #Out_channels from decoder3
@@ -932,16 +940,7 @@ class UNETR(VIT):
                         norm_name="instance",
                         res_block=True,
                     )
-                else: #self.patch_size == 16
-                    self.decoder2 = UnetrUpBlock(
-                        spatial_dims=spatial_dims,
-                        in_channels= self.feature_size * 2, #Out_channels from decoder3
-                        out_channels= self.feature_size, #feature_size=4
-                        kernel_size=3, #Conv Kernel Size
-                        upsample_kernel_size=2, #Conv Kernel Stride
-                        norm_name="instance",
-                        res_block=True,
-                    )
+
             else:
                 self.decoder5 = MyUnetBlock(
                     spatial_dims=spatial_dims,
@@ -950,6 +949,7 @@ class UNETR(VIT):
                     upsample_kernel_size=2, #Conv Kernel Stride
                     res_block=True,
                 )
+
                 self.decoder4 = MyUnetBlock(
                     spatial_dims=spatial_dims,
                     in_channels= self.feature_size * 8, #Out_channels from decoder5
@@ -957,40 +957,26 @@ class UNETR(VIT):
                     upsample_kernel_size=2, #Conv Kernel Stride
                     res_block=True,
                 )
-                if self.patch_size == 4:
-                    self.decoder3 = MyUnetBlock(
-                        spatial_dims=spatial_dims,
-                        in_channels= self.feature_size * 4, #Out_channels from decoder4
-                        out_channels= self.feature_size * 2, #feature_size=4
-                        upsample_kernel_size=1, #Conv Kernel Stride
-                        res_block=True,
-                    )
-                else:
-                    self.decoder3 = MyUnetBlock(
-                        spatial_dims=spatial_dims,
-                        in_channels= self.feature_size * 4, #Out_channels from decoder4
-                        out_channels= self.feature_size * 2, #feature_size=4
-                        upsample_kernel_size=2, #Conv Kernel Stride
-                        res_block=True,
-                    )
-                if self.patch_size == 8 or self.patch_size == 4:
-                    self.decoder2 = MyUnetBlock(
-                        spatial_dims=spatial_dims,
-                        in_channels= self.feature_size * 2, #Out_channels from decoder3
-                        out_channels= self.feature_size, #feature_size=4
-                        upsample_kernel_size=1, #Conv Kernel Stride
-                        res_block=True,
-                    )
-                else: #self.patch_size == 16
-                    self.decoder2 = MyUnetBlock(
-                        spatial_dims=spatial_dims,
-                        in_channels= self.feature_size * 2, #Out_channels from decoder3
-                        out_channels= self.feature_size, #feature_size=4
-                        upsample_kernel_size=2, #Conv Kernel Stride
-                        #norm_name="instance",
-                        res_block=True,
-                    )
+
+                self.decoder3 = MyUnetBlock(
+                    spatial_dims=spatial_dims,
+                    in_channels= self.feature_size * 4, #Out_channels from decoder4
+                    out_channels= self.feature_size * 2, #feature_size=4
+                    upsample_kernel_size=2, #Conv Kernel Stride
+                    res_block=True,
+                )
+
+                self.decoder2 = MyUnetBlock(
+                    spatial_dims=spatial_dims,
+                    in_channels= self.feature_size * 2, #Out_channels from decoder3
+                    out_channels= self.feature_size, #feature_size=4
+                    upsample_kernel_size=2, #Conv Kernel Stride
+                    res_block=True,
+                )
             self.out = UnetOutBlock(spatial_dims=spatial_dims, in_channels=self.feature_size, out_channels=self.num_classes)
+
+            if self.feat_size[0]*16 != self.img_size[0]:
+                self.upsample = nn.Upsample(size=self.img_size,mode='trilinear',align_corners=True)
 
         else: #Use Linear Decoder
             self.mlp_head = nn.Linear(self.embed_dim, self.num_classes) 
@@ -1042,6 +1028,7 @@ class UNETR(VIT):
             self,
             x: torch.Tensor,
             variables,
+            seq_ps,
             indices: Optional[Union[int, List[int]]] = None,
             return_prefix_tokens: bool = False,
             norm: bool = False,
@@ -1093,13 +1080,13 @@ class UNETR(VIT):
                 var_embed = var_embed.unsqueeze(2) # 1, V=1, D -> 1, V=1, L=1, D
                 x = x + var_embed.squeeze(1)  # 1, V=1, L=1, D -> 1, L=1, D
         else:
-            if self.adaptive_patching:
+            if self.adaptive_patching and not self.sqrt_len_method:
                 x = rearrange(x, 'b c s p -> b s (p c)')
                 x = self.token_embeds(x)
             else:
                 x = self.token_embeds(x)
 
-        x = self._pos_embed(x)
+        x = self._pos_embed(x, seq_ps)
         x = self.patch_drop(x)
 
         if self.tensor_par_size > 1:
@@ -1146,16 +1133,27 @@ class UNETR(VIT):
         x = self.pool(x)
         return self.unetr_head(x, intermediates, enc1)
 
-    def forward(self, x: torch.Tensor, variables) -> torch.Tensor:
-        if self.skip_connection:
-            enc1 = self.encoder1(x)
-            x, intermediates = self.forward_intermediates(x, variables, indices=self.skip_indices)
-            x = self.forward_head(x, intermediates, enc1)
+    def forward(self, x: torch.Tensor, variables, seq_ps=None, x_seq=None) -> torch.Tensor:
+        if self.adaptive_patching:
+            if self.skip_connection:
+                enc1 = self.encoder1(x)
+                x, intermediates = self.forward_intermediates(x_seq, variables, seq_ps, indices=self.skip_indices)
+                x = self.forward_head(x, intermediates, enc1)
+            else:
+                enc1 = None
+                x = self.forward_features(x_seq, variables, seq_ps)
+                intermediates = None
+                x = self.forward_head(x, intermediates, enc1)
         else:
-            enc1 = None
-            x = self.forward_features(x, variables)
-            intermediates = None
-            x = self.forward_head(x, intermediates, enc1)
+            if self.skip_connection:
+                enc1 = self.encoder1(x)
+                x, intermediates = self.forward_intermediates(x, variables, seq_ps, indices=self.skip_indices)
+                x = self.forward_head(x, intermediates, enc1)
+            else:
+                enc1 = None
+                x = self.forward_features(x, variables, seq_ps)
+                intermediates = None
+                x = self.forward_head(x, intermediates, enc1)
         return x
 
 class DiffusionVIT(VIT):

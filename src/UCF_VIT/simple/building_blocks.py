@@ -40,9 +40,11 @@ class PatchEmbed(nn.Module):
             twoD: Optional[bool] = True,
             norm_layer: Optional[Callable] = None,
             bias: bool = True,
+            sqrt_len_method: bool = False,
     ):
         super().__init__()
         self.twoD = twoD
+        self.sqrt_len_method = sqrt_len_method
         if self.twoD:
             self.patch_size = to_2tuple(patch_size)
         else:
@@ -79,10 +81,11 @@ class PatchEmbed(nn.Module):
         else:
             B, C, H, W, D = x.shape
         if self.img_size is not None:
-            _assert(H == self.img_size[0], f"Input height ({H}) doesn't match model ({self.img_size[0]}).")
-            _assert(W == self.img_size[1], f"Input width ({W}) doesn't match model ({self.img_size[1]}).")
-            if not self.twoD:
-                _assert(D == self.img_size[2], f"Input width ({D}) doesn't match model ({self.img_size[2]}).")
+            if not self.sqrt_len_method:
+                _assert(H == self.img_size[0], f"Input height ({H}) doesn't match model ({self.img_size[0]}).")
+                _assert(W == self.img_size[1], f"Input width ({W}) doesn't match model ({self.img_size[1]}).")
+                if not self.twoD:
+                    _assert(D == self.img_size[2], f"Input width ({D}) doesn't match model ({self.img_size[2]}).")
         x = self.proj(x)
         x = x.flatten(2).transpose(1, 2)  # NCHW -> NLC or NCHW -> NLC
         x = self.norm(x)

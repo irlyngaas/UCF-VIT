@@ -139,10 +139,7 @@ class FixedOctTree:
         if len(seq_patch)<self.fixed_length:
             # import pdb
             # pdb.set_trace()
-            if c2 > 1:
-                seq_patch += [np.zeros(shape=(h2,w2,d2,c2))] * (self.fixed_length-len(seq_patch))
-            else:
-                seq_patch += [np.zeros(shape=(h2,w2,d2))] * (self.fixed_length-len(seq_patch))
+            seq_patch += [np.zeros(shape=(h2,w2,d2,c2))] * (self.fixed_length-len(seq_patch))
             seq_size += [0]*(self.fixed_length-len(seq_size))
             seq_pos += [tuple([-1,-1,-1])]*(self.fixed_length-len(seq_pos))
         elif len(seq_patch)>self.fixed_length:
@@ -191,10 +188,7 @@ class FixedOctTree:
         if len(seq_patch)<self.fixed_length:
             # import pdb
             # pdb.set_trace()
-            if c2 > 1:
-                seq_patch += [np.zeros(shape=(h2,w2,d2,c2))] * (self.fixed_length-len(seq_patch))
-            else:
-                seq_patch += [np.zeros(shape=(h2,w2,d2))] * (self.fixed_length-len(seq_patch))
+            seq_patch += [np.zeros(shape=(h2,w2,d2,c2))] * (self.fixed_length-len(seq_patch))
             seq_size += [0]*(self.fixed_length-len(seq_size))
             seq_pos += [tuple([-1,-1,-1])]*(self.fixed_length-len(seq_pos))
         elif len(seq_patch)>self.fixed_length:
