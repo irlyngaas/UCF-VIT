@@ -33,18 +33,19 @@ model:
       default_vars: [
         "ct_res1",
       ]
-      tile_size: [256,256,256]
-      patch_size: 8
+      tile_size: [64,64,64]
+      patch_size: 4
       embed_dim: 768
       depth: 12
       num_heads: 12
       mlp_ratio: 4
       drop_path: 0.0
-      twoD: True
+      twoD: False
       use_varemb: False
       adaptive_patching: True
-      fixed_length: 4096
+      fixed_length: 512
       separate_channels: False
+      use_adaptive_pos_emb: True
 
       decoder_embed_dim: 576
       decoder_depth: 8
@@ -79,7 +80,7 @@ data:
   batch_size: 2
   num_workers: 1
   pin_memory: False
-  single_channel: True
+  single_channel: False
   tile_overlap: 0.0
   use_all_data: False
   num_classes: 4
