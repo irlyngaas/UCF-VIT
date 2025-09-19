@@ -22,16 +22,25 @@ from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, interpo
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.utils.fused_attn import FusedAttn
 
+import einops
+
 #TODO: Add qdt_list back for visualization
-def training_step_adaptive(seq, seq_label, variables, net: SAP, patch_size, twoD, num_classes, sqrt_len):
+def training_step_adaptive(seq, seq_label, variables, net: SAP, patch_size, twoD, num_classes, sqrt_len, seq_ps, in_chans):
 
     #seq = torch.reshape(seq, shape=(-1,1,patch_size*sqrt_len, patch_size*sqrt_len))
     if twoD:
+        seq = torch.reshape(seq, shape=(-1,in_chans,patch_size*sqrt_len, patch_size*sqrt_len))
+        #seq = einops.rearrange(seq, 'b c (s1 s2) (ps1 ps2)-> b c (s1 ps1) (s2 ps2)', s1=sqrt_len, s2=sqrt_len, ps1=patch_size, ps2=patch_size, ps3=patch_size)
         seq_label = torch.reshape(seq_label, shape=(-1,num_classes,patch_size*sqrt_len, patch_size*sqrt_len))
+        #seq_label = einops.rearrange(seq_label, 'b c (ps1 ps2) (s1 s2)-> b c (s1 ps1) (s2 ps2)', s1=sqrt_len, s2=sqrt_len, ps1=patch_size, ps2=patch_size, ps3=patch_size)
+
     else:
+        seq = torch.reshape(seq, shape=(-1,in_chans,patch_size*sqrt_len, patch_size*sqrt_len, patch_size*sqrt_len))
+        #seq = einops.rearrange(seq, 'b c (s1 s2 s3) (ps1 ps2 ps3)-> b c (s1 ps1) (s2 ps2) (s3 ps3)', s1=sqrt_len, s2=sqrt_len, s3=sqrt_len, ps1=patch_size, ps2=patch_size, ps3=patch_size)
         seq_label = torch.reshape(seq_label, shape=(-1,num_classes,patch_size*sqrt_len, patch_size*sqrt_len, patch_size*sqrt_len))
+        #seq_label = einops.rearrange(seq_label, 'b c (ps1 ps2 ps3) (s1 s2 s3)-> b c (s1 ps1) (s2 ps2) (s3 ps3)', s1=sqrt_len, s2=sqrt_len, s3=sqrt_len, ps1=patch_size, ps2=patch_size, ps3=patch_size)
         
-    output = net.forward(seq, variables)
+    output = net.forward(seq, variables, seq_ps)
     criterion = DiceBLoss(num_class=num_classes)
     loss = criterion(output,seq_label)
     return loss
@@ -115,7 +124,11 @@ def main(device, local_rank):
     assert adaptive_patching, "SAP requires adaptive_patching"
 
     fixed_length = conf['model']['net']['init_args']['fixed_length']
+    use_adaptive_pos_emb = conf['model']['net']['init_args']['use_adaptive_pos_emb']
     separate_channels = conf['model']['net']['init_args']['separate_channels']
+    if separate_channels:
+        assert not use_adaptive_pos_emb, "Capability to use separate channels and adaptive pos_emb not implemented yet"
+    sqrt_len_method = True
 
     if not twoD:
         assert not separate_channels, "Adaptive Patching in 3D with multiple channels (non-separated) is not currently implemented"
@@ -230,6 +243,8 @@ def main(device, local_rank):
         fixed_length=fixed_length,
         sqrt_len=sqrt_len,
         FusedAttn_option=FusedAttn_option,
+        use_adaptive_pos_emb=use_adaptive_pos_emb,
+        sqrt_len_method=sqrt_len_method,
         class_token=False,
         weight_init='skip',
     ).to(device)
@@ -393,11 +408,22 @@ def main(device, local_rank):
                 break
 
             #TODO: Add qdt_list back for visualization
-            #data, seq, size, pos, label, seq_label, variables, qdt_list = batch
-            seq, seq_label, variables, _ = batch
+            data, seq, seq_size, seq_pos, label, seq_label, variables, _ = batch
             seq = seq.to(device)
             seq_label = seq_label.to(device)
-            loss = training_step_adaptive(seq, seq_label, variables, model, patch_size, twoD, num_classes, sqrt_len)
+            if separate_channels:
+                #TODO: Move seq_size and seq_pos to a single channel
+                seq_ps = None
+            else:
+                seq_size = torch.squeeze(seq_size)
+                seq_size = seq_size.to(torch.float32)
+                seq_size = seq_size.to(device)
+                seq_pos = torch.squeeze(seq_pos)
+                seq_pos = seq_pos.to(torch.float32)
+                seq_pos = seq_pos.to(device)
+                seq_size = seq_size.unsqueeze(-1)
+                seq_ps = torch.concat([seq_size, seq_pos],dim=-1)
+            loss = training_step_adaptive(seq, seq_label, variables, model, patch_size, twoD, num_classes, sqrt_len, seq_ps, max_channels)
 
             epoch_loss += loss.detach()
     
