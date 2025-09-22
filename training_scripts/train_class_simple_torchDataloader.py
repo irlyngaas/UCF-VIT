@@ -16,7 +16,7 @@ import math
 from timm.layers import use_fused_attn
 
 from UCF_VIT.simple.arch import VIT
-from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, calculate_load_balancing_on_the_fly, is_power_of_two
+from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, is_power_of_two
 from UCF_VIT.utils.fused_attn import FusedAttn
 
 from torch.utils.data import DataLoader
