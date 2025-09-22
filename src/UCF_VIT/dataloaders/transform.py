@@ -24,14 +24,13 @@ class Patchify(torch.nn.Module):
         self.smooth_factor = random.choice(self.sths)
         c = random.choice(self.cannys)
         self.canny = [c, c+50]
-        # self.smooth_factor = 0
-        if self.smooth_factor ==0 :
-            if self.dataset == "imagenet":
+        if self.smooth_factor == 0:
+            if self.dataset == "imagenet" or self.dataset == "catsdogs":
                 edges = np.random.uniform(low=0,high=1,size=(img.shape[0],img.shape[1]))
             else:
                 edges = np.random.uniform(low=np.min(img),high=np.max(img),size=(img.shape[0],img.shape[1]))
         else:
-            if self.dataset == "imagenet":
+            if self.dataset == "imagenet" or self.dataset == "catsdogs":
                 grey_img = cv.GaussianBlur(img, (self.smooth_factor, self.smooth_factor), 0)
                 edges = cv.Canny(grey_img, self.canny[0], self.canny[1])
             else:
@@ -43,7 +42,6 @@ class Patchify(torch.nn.Module):
         seq_size = np.asarray(seq_size)
         seq_img = np.asarray(seq_img, dtype=np.float32)
 
-        #seq_img = np.reshape(seq_img, [self.patch_size*self.patch_size, -1, 3])
         if self.num_channels > 1:
             seq_img = np.reshape(seq_img, [self.num_channels, -1, self.patch_size*self.patch_size])
         else:
