@@ -237,8 +237,8 @@ def main(device, local_rank):
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_data, shuffle=True, num_replicas=dist.get_world_size(),rank=dist.get_rank())
     #test_sampler = torch.utils.data.distributed.DistributedSampler(test_data, shuffle=True, num_replicas=dist.get_world_size(),rank=dist.get_rank())
 
-    train_loader = DataLoader(dataset = train_data, sampler=train_sampler,num_workers=0, batch_size=batch_size,drop_last=True, collate_fn=collate_fn)
-    #test_loader = DataLoader(dataset = test_data, sampler=test_sampler, num_workers=0, batch_size=batch_size,drop_last=True)
+    train_loader = DataLoader(dataset = train_data, sampler=train_sampler,num_workers=num_workers, pin_memory=pin_memory, batch_size=batch_size, drop_last=True, collate_fn=lambda batch: collate_fn(batch, adaptive_patching=adaptive_patching))
+    #test_loader = DataLoader(dataset = test_data, sampler=test_sampler, num_workers=num_workers, pin_memory=pin_memory, batch_size=batch_size,drop_last=True, collate_fn=lambda batch: collate_fn(batch, adaptive_patching=adaptive_patching))
 
     len_train_loader = torch.tensor(len(train_loader)).to(device)
 
@@ -270,14 +270,14 @@ def main(device, local_rank):
                 seq_size = seq_size.unsqueeze(-1)
                 seq_ps = torch.concat([seq_size, seq_pos],dim=-1)
 
-                loss, output = training_step(seq, variables, label, model, seq_ps)
-
             else:
-                data, label, variables, _ = batch
+                data, label, variables = next(train_loader_iter)
                 data = data.to(device)
+                data = data.to(torch.float32)
                 label = label.to(device)
                 seq_ps = None
-                loss, output = training_step(data, variables, label, model, seq_ps)
+
+            loss, output = training_step(data, variables, label, model, seq_ps)
 
             acc = (output.argmax(dim=1) == label).float().mean()
 

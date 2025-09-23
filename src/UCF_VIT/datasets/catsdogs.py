@@ -6,14 +6,20 @@ import numpy as np
 import torch
 from UCF_VIT.dataloaders.transform import Patchify, Patchify_3D
 
-def CatsDogsCollate(batch):
-    inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
-    seq = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
-    size = torch.stack([torch.from_numpy(np.expand_dims(batch[i][2],axis=0)) for i in range(len(batch))])
-    pos = torch.stack([torch.from_numpy(np.expand_dims(batch[i][3],axis=0)) for i in range(len(batch))])
-    label = torch.stack([torch.tensor(batch[i][4]) for i in range(len(batch))])
-    variables = batch[0][5]
-    return (inp, seq, size, pos, label, variables)
+def CatsDogsCollate(batch, adaptive_patching):
+    if adaptive_patching:
+        inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
+        seq = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
+        size = torch.stack([torch.from_numpy(np.expand_dims(batch[i][2],axis=0)) for i in range(len(batch))])
+        pos = torch.stack([torch.from_numpy(np.expand_dims(batch[i][3],axis=0)) for i in range(len(batch))])
+        label = torch.stack([torch.tensor(batch[i][4]) for i in range(len(batch))])
+        variables = batch[0][5]
+        return (inp, seq, size, pos, label, variables)
+    else:
+        inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
+        label = torch.stack([torch.tensor(batch[i][1]) for i in range(len(batch))])
+        variables = batch[0][2]
+        return (inp, label, variables)
 
 
 class CatsDogsDataset(Dataset):

@@ -335,15 +335,13 @@ def main(device, local_rank):
                     seq_pos = seq_pos.to(device)
                     seq_size = seq_size.unsqueeze(-1)
                     seq_ps = torch.concat([seq_size, seq_pos],dim=-1)
-
-                loss, output = training_step(seq, variables, label, model, seq_ps)
-
             else:
                 data, label, variables, _ = batch
                 data = data.to(device)
                 label = label.to(device)
                 seq_ps = None
-                loss, output = training_step(data, variables, label, model, seq_ps)
+
+            loss, output = training_step(data, variables, label, model, seq_ps)
 
             acc = (output.argmax(dim=1) == label).float().mean()
 
