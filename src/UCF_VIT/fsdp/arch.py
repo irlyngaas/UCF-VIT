@@ -137,7 +137,7 @@ class VIT(nn.Module):
             tensor_par_size: int = 1,
             tensor_par_group: Optional[dist.ProcessGroup] = None,
             FusedAttn_option = FusedAttn.NONE,
-            use_adaptive_pos_emb: bool = False
+            use_adaptive_pos_emb: bool = False,
             sqrt_len_method: bool = False,
     ) -> None:
         """
