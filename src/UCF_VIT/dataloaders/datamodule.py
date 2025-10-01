@@ -48,7 +48,7 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                             seq_label_list.append([])
                             for j in range(num_labels):
                                 seq_label_list[i].append(torch.from_numpy(batch[i][5][j]))
-                    if dataset == "basic_ct":
+                    if dataset == "basic_ct" or dataset == "s8d_2d_label":
                         seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
                     else:
                         channel_list = []
@@ -93,7 +93,7 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                             seq_label_list.append([])
                             for j in range(num_labels):
                                 seq_label_list[i].append(torch.from_numpy(batch[i][5][j]))
-                    if dataset == "basic_ct":
+                    if dataset == "basic_ct" or dataset == "s8d_2d_label":
                         seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
                     else:
                         channel_list = []
