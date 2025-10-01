@@ -2,7 +2,7 @@
 trainer:
   max_epochs: 600
   data_type: "float32"
-  checkpoint_path: "../../checkpoint/imagenet/classification/base"
+  checkpoint_path: "../../checkpoint/catsdogs/classification/base"
   checkpoint_filename: "multi_last"
   checkpoint_filename_for_loading: "multi_last_odd" #multi_last_odd or multi_last_even
 
@@ -43,31 +43,19 @@ model:
       drop_rate: 0.0
       twoD: True
       use_varemb: False
-      adaptive_patching: True
+      adaptive_patching: False
       fixed_length: 196
       separate_channels: False
       use_adaptive_pos_emb: True
 
 # ---------------------------- DATA -------------------------------------------
 data:
-  dataset: "imagenet"
+  dataset: "catsdogs"
   dict_root_dirs: {
-    'imagenet': '/lustre/orion/nro108/world-shared/enzhi/dataset/imagenet/train',
-  }
-  dict_start_idx: {
-    'imagenet': 0,
-  }
-  dict_end_idx: {
-    'imagenet': 1,
-  }
-  dict_buffer_sizes: {
-    'imagenet': 100,
-  }
-  num_channels_used: {
-    'imagenet': 3,
+    'catsdogs': '/lustre/orion/stf006/world-shared/irl1/CatsDogs/train',
   }
   dict_in_variables: {
-    'imagenet': [
+    'catsdogs': [
      "red", 
      "green", 
      "blue", 
@@ -76,22 +64,4 @@ data:
   batch_size: 32
   num_workers: 1
   pin_memory: False
-  single_channel: False
-  tile_overlap: 0.0
-  use_all_data: False
-  num_classes: 1000
-
-# ---------------------------- DATASET SPECIFIC OPTIONS -------------------------------------------
-dataset_options:
-
-  imagenet_resize: {
-      'imagenet': [256,256],
-    }
-
-# ---------------------------- LOAD BALANCING -------------------------------------------
-load_balancing:
-  auto_load_balancing: True
-  batches_per_rank_epoch: {
-    'imagenet': 4935,
-  }
-  dataset_group_list: '1:1:1:1:1:1:1:1'
+  num_classes: 2

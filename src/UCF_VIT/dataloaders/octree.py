@@ -18,12 +18,40 @@ class Cube:
         assert y1<=y2, 'y1 > y2, wrong coordinate.'
         assert z1<=z2, 'z1 > z2, wrong coordinate.'
     
-    def contains(self, domain):
+    def contains(self, domain, norm_factor):
         patch = domain[self.z1:self.z2, self.y1:self.y2, self.x1:self.x2]
-        return int(np.sum(patch)/255)
+        return int(np.sum(patch)/norm_factor)
         
     def get_area(self, img):
-        return img[self.z1:self.z2, self.y1:self.y2, self.x1:self.x2]
+        return img[self.z1:self.z2, self.y1:self.y2, self.x1:self.x2, :]
+
+    def set_area(self, mask, patch, num_channels):
+        # import pdb
+        # pdb.set_trace()
+        patch_size = self.get_size()
+        h1, w1, d1, c1 = patch.shape
+        assert h1==w1==d1, "Need squared input."
+
+        h1_ = np.linspace(0,h1,h1)
+        w1_ = np.linspace(0,w1,w1)
+        d1_ = np.linspace(0,d1,d1)
+        #4 to 8 -> (0,1,2,3,4) 0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4
+        #2 to 4 -> (0,2) to (0, .667, 1.3667, 2)
+        #_SPLINE_DEGREE_MAP = {"slinear": 1, "cubic": 3, "quintic": 5, 'pchip': 3}
+
+        interp_fct_list = []
+        for j in range(c1):
+            interp_fct_list.append(RegularGridInterpolator(points=[h1_,w1_,d1_], values=patch[:,:,:,j]))
+        patch = np.zeros([int(patch_size[0]),int(patch_size[1]),int(patch_size[2]),c1])
+        h2_ = np.linspace(0,h1,int(patch_size[0]))
+        w2_ = np.linspace(0,w1,int(patch_size[1]))
+        d2_ = np.linspace(0,d1,int(patch_size[2]))
+        H2_, W2_, D2_ = np.meshgrid(h2_, w2_, d2_, indexing='ij')
+        query_points = np.vstack([H2_.ravel(),W2_.ravel(),D2_.ravel()]).T
+        for j in range(c1):
+            patch[:,:,:,j] = interp_fct_list[j](query_points).reshape(H2_.shape)
+        mask[self.z1:self.z2, self.y1:self.y2, self.x1:self.x2, :] = patch
+        return mask
 
     def get_coord(self):
         return self.x1,self.x2,self.y1,self.y2,self.z1,self.z2
@@ -35,9 +63,10 @@ class Cube:
         return (self.x2+self.x1)/2, (self.y2+self.y1)/2, (self.z2+self.z1)/2
 
 class FixedOctTree:
-    def __init__(self, domain, fixed_length=128,) -> None:
+    def __init__(self, domain, fixed_length=128, norm_factor=255) -> None:
         self.domain = domain
         self.fixed_length = fixed_length
+        self.norm_factor = norm_factor
         self._build_tree()
 
     def _build_tree(self):
@@ -45,7 +74,7 @@ class FixedOctTree:
         h, w, d = self.domain.shape
         assert h>0 and w >0 and d>0, "Wrong img size."
         root = Cube(0,h,0,w,0,d)
-        self.nodes = [[root, root.contains(self.domain)]]
+        self.nodes = [[root, root.contains(self.domain, self.norm_factor)]]
         while len(self.nodes) < self.fixed_length:
             bbox, value = max(self.nodes, key=lambda x:x[1])
             idx = self.nodes.index([bbox, value])
@@ -54,25 +83,25 @@ class FixedOctTree:
 
             x1,x2,y1,y2,z1,z2 = bbox.get_coord()
             n1 = Cube(x1, int((x1+x2)/2), y1, int((y1+y2)/2), z1, int((z1+z2)/2))
-            v1 = n1.contains(self.domain)
+            v1 = n1.contains(self.domain, self.norm_factor)
             n2 = Cube(int((x1+x2)/2), x2, y1, int((y1+y2)/2), z1, int((z1+z2)/2))
-            v2 = n2.contains(self.domain)
+            v2 = n2.contains(self.domain, self.norm_factor)
             n3 = Cube(x1, int((x1+x2)/2), int((y1+y2)/2), y2, z1, int((z1+z2)/2))
-            v3 = n3.contains(self.domain)
+            v3 = n3.contains(self.domain, self.norm_factor)
             n4 = Cube(int((x1+x2)/2), x2, int((y1+y2)/2), y2, z1, int((z1+z2)/2))
-            v4 = n4.contains(self.domain)
+            v4 = n4.contains(self.domain, self.norm_factor)
             n5 = Cube(x1, int((x1+x2)/2), y1, int((y1+y2)/2), int((z1+z2)/2), z2)
-            v5 = n5.contains(self.domain)
+            v5 = n5.contains(self.domain, self.norm_factor)
             n6 = Cube(int((x1+x2)/2), x2, y1, int((y1+y2)/2), int((z1+z2)/2), z2)
-            v6 = n6.contains(self.domain)
+            v6 = n6.contains(self.domain, self.norm_factor)
             n7 = Cube(x1, int((x1+x2)/2), int((y1+y2)/2), y2, int((z1+z2)/2), z2)
-            v7 = n7.contains(self.domain)
+            v7 = n7.contains(self.domain, self.norm_factor)
             n8 = Cube(int((x1+x2)/2), x2, int((y1+y2)/2), y2, int((z1+z2)/2), z2)
-            v8 = n8.contains(self.domain)
+            v8 = n8.contains(self.domain, self.norm_factor)
 
             self.nodes = self.nodes[:idx] + [[n1,v1], [n2,v2], [n3,v3], [n4,v4],[n5,v5], [n6,v6], [n7,v7], [n8,v8]] +  self.nodes[idx+1:]
 
-    def serialize(self, img, size=(8,8,8)):
+    def serialize(self, img, size=(8,8,8,1)):
         seq_patch = []
         seq_size = []
         seq_pos = []
@@ -81,37 +110,36 @@ class FixedOctTree:
             seq_size.append(bbox.get_size()[0])
             seq_pos.append(bbox.get_center())
             
-        h2,w2,d2 = size
+        h2,w2,d2,c2 = size
         
         for i in range(len(seq_patch)):
-            h1, w1, d1 = seq_patch[i].shape
+            h1, w1, d1, c1 = seq_patch[i].shape
             assert h1==w1==d1, "Need squared input."
-
             h1_ = np.linspace(0,h1,h1)
             w1_ = np.linspace(0,w1,w1)
             d1_ = np.linspace(0,d1,d1)
             #4 to 8 -> (0,1,2,3,4) 0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4
             #2 to 4 -> (0,2) to (0, .667, 1.3667, 2)
             #_SPLINE_DEGREE_MAP = {"slinear": 1, "cubic": 3, "quintic": 5, 'pchip': 3}
-            interp_fct = RegularGridInterpolator((h1_, w1_, d1_), seq_patch[i])
-            #interp_fct = RegularGridInterpolator((h1_, w1_, d1_), seq_patch[i], method='cubic')
-            patch_ = np.zeros([h2,w2,d2])
+
+            interp_fct_list = []
+            for j in range(c2):
+                interp_fct_list.append(RegularGridInterpolator(points=[h1_,w1_,d1_], values=seq_patch[i][:,:,:,j]))
+
+            patch_ = np.zeros([h2,w2,d2,c2])
             h2_ = np.linspace(0,h1,h2)
             w2_ = np.linspace(0,w1,w2)
             d2_ = np.linspace(0,d1,d2)
-            for m in range (len(h2_)):
-                for n in range (len(w2_)):
-                    for o in range (len(d2_)):
-                        patch_[m,n,o] = interp_fct([h2_[m], w2_[n], d2_[o]])
+            H2_, W2_, D2_ = np.meshgrid(h2_, w2_, d2_, indexing='ij')
+            query_points = np.vstack([H2_.ravel(),W2_.ravel(),D2_.ravel()]).T
+            for j in range(c2):
+                patch_[:,:,:,j] = interp_fct_list[j](query_points).reshape(H2_.shape)
             seq_patch[i] = patch_
-            # assert seq_patch[i].shape == (h2,w2,c2), "Wrong shape {} get, need {}".format(seq_patch[i].shape, (h2,w2,c2))
+
         if len(seq_patch)<self.fixed_length:
             # import pdb
             # pdb.set_trace()
-            #if c2 > 1:
-            #    seq_patch += [np.zeros(shape=(h2,w2,d2,c2))] * (self.fixed_length-len(seq_patch))
-            #else:
-            seq_patch += [np.zeros(shape=(h2,w2,d2))] * (self.fixed_length-len(seq_patch))
+            seq_patch += [np.zeros(shape=(h2,w2,d2,c2))] * (self.fixed_length-len(seq_patch))
             seq_size += [0]*(self.fixed_length-len(seq_size))
             seq_pos += [tuple([-1,-1,-1])]*(self.fixed_length-len(seq_pos))
         elif len(seq_patch)>self.fixed_length:
@@ -121,7 +149,7 @@ class FixedOctTree:
         assert len(seq_size)==self.fixed_length, "Not equal fixed legnth."
         return seq_patch, seq_size, seq_pos
 
-    def serialize_labels(self, img, size=(8,8,8)):
+    def serialize_labels(self, img, size=(8,8,8,1)):
         seq_patch = []
         seq_size = []
         seq_pos = []
@@ -130,10 +158,10 @@ class FixedOctTree:
             seq_size.append(bbox.get_size()[0])
             seq_pos.append(bbox.get_center())
             
-        h2,w2,d2 = size
+        h2,w2,d2,c2 = size
         
         for i in range(len(seq_patch)):
-            h1, w1, d1 = seq_patch[i].shape
+            h1, w1, d1, c1 = seq_patch[i].shape
             assert h1==w1==d1, "Need squared input."
 
             h1_ = np.linspace(0,h1,h1)
@@ -142,25 +170,25 @@ class FixedOctTree:
             #4 to 8 -> (0,1,2,3,4) 0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4
             #2 to 4 -> (0,2) to (0, .667, 1.3667, 2)
             #_SPLINE_DEGREE_MAP = {"slinear": 1, "cubic": 3, "quintic": 5, 'pchip': 3}
-            interp_fct = RegularGridInterpolator((h1_, w1_, d1_), seq_patch[i], method='nearest')
-            #interp_fct = RegularGridInterpolator((h1_, w1_, d1_), seq_patch[i], method='cubic')
-            patch_ = np.zeros([h2,w2,d2])
+
+            interp_fct_list = []
+            for j in range(c2):
+                interp_fct_list.append(RegularGridInterpolator(points=[h1_,w1_,d1_], values=seq_patch[i][:,:,:,j], method='nearest'))
+
+            patch_ = np.zeros([h2,w2,d2,c2])
             h2_ = np.linspace(0,h1,h2)
             w2_ = np.linspace(0,w1,w2)
             d2_ = np.linspace(0,d1,d2)
-            for m in range (len(h2_)):
-                for n in range (len(w2_)):
-                    for o in range (len(d2_)):
-                        patch_[m,n,o] = interp_fct([h2_[m], w2_[n], d2_[o]])
+            H2_, W2_, D2_ = np.meshgrid(h2_, w2_, d2_, indexing='ij')
+            query_points = np.vstack([H2_.ravel(),W2_.ravel(),D2_.ravel()]).T
+            for j in range(c2):
+                patch_[:,:,:,j] = interp_fct_list[j](query_points).reshape(H2_.shape)
             seq_patch[i] = patch_
-            # assert seq_patch[i].shape == (h2,w2,c2), "Wrong shape {} get, need {}".format(seq_patch[i].shape, (h2,w2,c2))
+
         if len(seq_patch)<self.fixed_length:
             # import pdb
             # pdb.set_trace()
-            #if c2 > 1:
-            #    seq_patch += [np.zeros(shape=(h2,w2,d2,c2))] * (self.fixed_length-len(seq_patch))
-            #else:
-            seq_patch += [np.zeros(shape=(h2,w2,d2))] * (self.fixed_length-len(seq_patch))
+            seq_patch += [np.zeros(shape=(h2,w2,d2,c2))] * (self.fixed_length-len(seq_patch))
             seq_size += [0]*(self.fixed_length-len(seq_size))
             seq_pos += [tuple([-1,-1,-1])]*(self.fixed_length-len(seq_pos))
         elif len(seq_patch)>self.fixed_length:
@@ -169,3 +197,17 @@ class FixedOctTree:
         assert len(seq_patch)==self.fixed_length, "Not equal fixed legnth."
         assert len(seq_size)==self.fixed_length, "Not equal fixed legnth."
         return seq_patch, seq_size, seq_pos
+
+    def deserialize(self, seq, patch_size, channel):
+
+        H,W,D = self.domain.shape
+        seq = np.reshape(seq, (self.fixed_length, patch_size, patch_size, patch_size, channel))
+        #seq = seq.astype(int)
+        mask = np.zeros(shape=(H, W, D, channel))
+        #print("demask:", mask.shape)
+        
+        # mask = np.expand_dims(mask, axis=-1)
+        for idx,(bbox,value) in enumerate(self.nodes):
+            pred_mask = seq[idx, ...]
+            mask = bbox.set_area(mask, pred_mask, channel)
+        return mask

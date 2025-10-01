@@ -2,6 +2,7 @@
 trainer:
   max_epochs: 600
   data_type: "float32"
+  gpu_type: "amd"
   checkpoint_path: "../../checkpoint/basic_ct/mae/base"
   checkpoint_filename: "multi_last"
   checkpoint_filename_for_loading: "multi_last_odd" #multi_last_odd or multi_last_even
@@ -14,7 +15,6 @@ parallelism:
   simple_ddp_size: 8
   tensor_par_size: 1
   seq_par_size: 1
-  cpu_offloading: False
   
 # ---------------------------- MODEL -------------------------------------------
 model:
@@ -27,6 +27,7 @@ model:
   warmup_start_lr: 1e-8
   eta_min: 1e-8
   loss_fn: "MSE"
+  use_grad_scaler: True
 
   net:
     init_args:
@@ -51,6 +52,7 @@ model:
       adaptive_patching: True
       fixed_length: 196
       separate_channels: False
+      use_adaptive_pos_emb: True
 
 # ---------------------------- DATA -------------------------------------------
 data:
@@ -67,9 +69,6 @@ data:
   dict_buffer_sizes: {
     'ct1': 100,
   }
-  num_channels_available: {
-    'ct1': 1,
-  }
   num_channels_used: {
     'ct1': 1,
   }
@@ -78,7 +77,7 @@ data:
      "ct_res1", 
     ],
   }
-  batch_size: 2
+  batch_size: 32
   num_workers: 1
   pin_memory: False
   single_channel: True
@@ -87,7 +86,8 @@ data:
 
 # ---------------------------- LOAD BALANCING -------------------------------------------
 load_balancing:
+  auto_load_balancing: True
   batches_per_rank_epoch: {
-    'ct1': 217088,
+    'ct1': 13568,
   }
   dataset_group_list: '8'

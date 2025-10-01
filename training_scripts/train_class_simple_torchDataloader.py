@@ -12,24 +12,23 @@ import torch.distributed as dist
 import time
 import yaml
 from einops import rearrange
+import math
 from timm.layers import use_fused_attn
 
-from UCF_VIT.simple.arch import DiffusionVIT
-from UCF_VIT.utils.metrics import masked_mse
-from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, unpatchify, calculate_load_balancing_on_the_fly
-from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
+from UCF_VIT.simple.arch import VIT
+from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, is_power_of_two
 from UCF_VIT.utils.fused_attn import FusedAttn
-from UCF_VIT.ddpm.ddpm import DDPM_Scheduler
 
-def training_step(data, variables, t, e, net: DiffusionVIT, patch_size, twoD, loss_fn):
+from torch.utils.data import DataLoader
 
 
-    output = net.forward(data, t, variables)
-    output = unpatchify(output, data, patch_size, twoD)
-    criterion = nn.MSELoss()
-    loss = criterion(output,e)
+def training_step(data, variables, label, net: VIT, seq_ps):
 
-    return loss
+    output = net.forward(data, variables, seq_ps)
+    criterion = nn.CrossEntropyLoss()
+    loss = criterion(output,label)
+
+    return loss, output
 
 
 def main(device, local_rank):
@@ -80,8 +79,6 @@ def main(device, local_rank):
 
     eta_min = float(conf['model']['eta_min'])
 
-    loss_fn = conf['model']['loss_fn']
-
     default_vars =  conf['model']['net']['init_args']['default_vars']
 
     tile_size = conf['model']['net']['init_args']['tile_size']
@@ -94,19 +91,11 @@ def main(device, local_rank):
 
     num_heads = conf['model']['net']['init_args']['num_heads']
     
-    decoder_embed_dim = conf['model']['net']['init_args']['decoder_embed_dim']
-
-    decoder_depth = conf['model']['net']['init_args']['decoder_depth']
-
-    decoder_num_heads = conf['model']['net']['init_args']['decoder_num_heads']
-
     mlp_ratio = conf['model']['net']['init_args']['mlp_ratio']
-
-    mlp_ratio_decoder = conf['model']['net']['init_args']['mlp_ratio_decoder']
 
     drop_path = conf['model']['net']['init_args']['drop_path']
 
-    linear_decoder = conf['model']['net']['init_args']['linear_decoder'] 
+    drop_rate = conf['model']['net']['init_args']['drop_rate']
 
     twoD = conf['model']['net']['init_args']['twoD']
 
@@ -114,36 +103,22 @@ def main(device, local_rank):
 
     adaptive_patching = conf['model']['net']['init_args']['adaptive_patching']
 
-    assert not adaptive_patching, "Adaptive Patching not implemented for DiffusionVIT yet"
-
     if adaptive_patching:
         fixed_length = conf['model']['net']['init_args']['fixed_length']
-        separate_channels = conf['model']['net']['init_args']['separate_channels']
-
-        if not twoD:
-            assert not separate_channels, "Adaptive Patching in 3D with multiple channels (non-separated) is not currently implemented"
+        use_adaptive_pos_emb = conf['model']['net']['init_args']['use_adaptive_pos_emb']
     else:
         fixed_length = None
-        separate_channels = None
-
-    num_time_steps = conf['model']['net']['init_args']['num_time_steps']
+        use_adaptive_pos_emb = None
 
     dataset = conf['data']['dataset']
-    assert dataset in ["basic_ct", "imagenet"], "This training script only supports basic_ct, imagenet datasets"
-
-    if dataset == "imagenet":
-        assert twoD, "twoD must be True if using imagenet"
-
+    assert dataset in ["catsdogs"], "This training script only supports catsdogs"
+    
+    if dataset == "catsdogs":
+        from UCF_VIT.datasets.catsdogs import CatsDogsDataset as Dataset_
+        from UCF_VIT.datasets.catsdogs import CatsDogsCollate as collate_fn
+        assert twoD, "twoD must be True if using catsdogs"
 
     dict_root_dirs = conf['data']['dict_root_dirs']
-
-    dict_start_idx = conf['data']['dict_start_idx']
-
-    dict_end_idx = conf['data']['dict_end_idx']
-
-    dict_buffer_sizes = conf['data']['dict_buffer_sizes']
-
-    num_channels_used = conf['data']['num_channels_used']
 
     dict_in_variables = conf['data']['dict_in_variables']
 
@@ -153,79 +128,67 @@ def main(device, local_rank):
 
     pin_memory = conf['data']['pin_memory']
 
-    single_channel = conf['data']['single_channel']
-
-    tile_overlap = conf['data']['tile_overlap']
-
-    use_all_data = conf['data']['use_all_data']
-
-    #Datset specific options
-    if dataset == "imagenet":
-        imagenet_resize = conf['dataset_options']['imagenet_resize']
-    else:
-        imagenet_resize = None
+    num_classes = conf['data']['num_classes']
 
     tile_size_x = tile_size[0]
     tile_size_y = tile_size[1]
 
-    if dataset == "imagenet":
+    if dataset == "catsdogs":
         tile_size_z = None
     else:
         tile_size_z = tile_size[2]
     
     assert (tile_size_x%patch_size)==0, "tile_size_x % patch_size must be 0"
     assert (tile_size_y%patch_size)==0, "tile_size_y % patch_size must be 0"
-    if dataset != "imagenet":
+    if dataset != "catsdogs":
         assert (tile_size_z%patch_size)==0, "tile_size_z % patch_size must be 0"
 
-    auto_load_balancing = conf['load_balancing']['auto_load_balancing']
-    if auto_load_balancing:
-        batches_per_rank_epoch, dataset_group_list = calculate_load_balancing_on_the_fly(config_path, world_size, batch_size)
-    else:
-        batches_per_rank_epoch = conf['load_balancing']['batches_per_rank_epoch']
-        dataset_group_list = conf['load_balancing']['dataset_group_list']
+    if adaptive_patching:
+        x_p2 = is_power_of_two(tile_size_x)
+        assert x_p2, "tile_size_x must be a power of 2"
+        y_p2 = is_power_of_two(tile_size_y)
+        assert y_p2, "tile_size_y must be a power of 2"
+        if dataset != "catsdogs":
+            z_p2 = is_power_of_two(tile_size_z)
+            assert z_p2, "tile_size_z must be a power of 2"
+
+        if twoD:
+            assert fixed_length % 3 == 1 % 3, "Quadtree fixed length needs to be 3n+1, where n is some integer"
+        else:
+            sqrt_len=int(np.rint(math.pow(fixed_length,1/3)))
+            assert fixed_length % 7 == 1 % 7, "Octtree fixed length needs to be 7n+1, where n is some integer"
 
 #2. Initialize model, optimizer, and scheduler
 ##############################################################################################################
+
     if use_fused_attn():
         FusedAttn_option = FusedAttn.DEFAULT
     else:
         FusedAttn_option = FusedAttn.NONE
 
     #Find correct in_chans to use
-    if single_channel:
-        max_channels = 1
-    else:
-        max_channels = 1
-        for i,k in enumerate(num_channels_used):
-            if num_channels_used[k] > 1:
-                max_channels = num_channels_used[k]
+    in_channels = len(dict_in_variables["catsdogs"])
 
-    ddpm_scheduler = DDPM_Scheduler(num_time_steps=num_time_steps).to(device)
-    model = DiffusionVIT(
+    model = VIT(
         img_size=tile_size,
         patch_size=patch_size,
-        in_chans=max_channels,
+        num_classes=num_classes,
+        in_chans=in_channels,
         embed_dim=emb_dim,
         depth=depth,
         num_heads=num_heads,
-        decoder_depth=decoder_depth,
-        decoder_embed_dim=decoder_embed_dim, 
-        decoder_num_heads=decoder_num_heads,
         mlp_ratio=mlp_ratio,
         drop_path_rate=drop_path,
-        linear_decoder=linear_decoder,
+        drop_rate=drop_rate,
         twoD=twoD,
-        mlp_ratio_decoder=mlp_ratio_decoder,
+        weight_init='',
         default_vars=default_vars,
-        single_channel=single_channel,
+        #single_channel=single_channel,
         use_varemb=use_varemb,
         adaptive_patching=adaptive_patching,
         fixed_length=fixed_length,
         FusedAttn_option=FusedAttn_option,
-        time_steps=num_time_steps,
-        class_token=False,
-        weight_init='skip',
+        use_adaptive_pos_emb=use_adaptive_pos_emb,
     ).to(device)
 
     #model = DDP(model,device_ids=[local_rank],output_device=[local_rank])
@@ -261,92 +224,78 @@ def main(device, local_rank):
 
 #3. Initialize Dataloader
 ##############################################################################################################
-    data_module = NativePytorchDataModule(dict_root_dirs=dict_root_dirs,
-        dict_start_idx=dict_start_idx,
-        dict_end_idx=dict_end_idx,
-        dict_buffer_sizes=dict_buffer_sizes,
-        dict_in_variables=dict_in_variables,
-        num_channels_used = num_channels_used,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        patch_size = patch_size,
-        tile_size_x = tile_size_x,
-        tile_size_y = tile_size_y,
-        tile_size_z = tile_size_z,
-        twoD = twoD,
-        single_channel = single_channel,
-        return_label = False,
-        dataset_group_list = dataset_group_list,
-        batches_per_rank_epoch = batches_per_rank_epoch,
-        tile_overlap = tile_overlap,
-        use_all_data = use_all_data,
-        adaptive_patching = adaptive_patching,
-        fixed_length = fixed_length,
-        separate_channels = separate_channels,
-        data_par_size = dist.get_world_size(),
-        dataset = dataset,
-        imagenet_resize = imagenet_resize,
-    ).to(device)
+    dkey_train = list(dict_root_dirs)[0]
+    #dkey_test = list(dict_root_dirs_test)[0]
+    train_list = glob.glob(os.path.join(dict_root_dirs[dkey_train],'*.jpg'))
+    #test_list = glob.glob(os.path.join(dict_root_dirs_test[dkey_test], '*.jpg'))
 
-    data_module.setup()
+    train_data = Dataset_(train_list, dict_in_variables[dkey_train], tile_size, adaptive_patching=adaptive_patching, fixed_length=fixed_length, patch_size=patch_size, num_channels=len(dict_in_variables[dkey_train]), dataset=dataset)
+    #test_data = Dataset(test_list, transform=test_transforms, adaptive_patching=adaptive_patching, fixed_length=fixed_length, patch_size=patch_size, num_channels=num_channels, dataset=dataset)
 
-    train_dataloader = data_module.train_dataloader()
+
+
+    train_sampler = torch.utils.data.distributed.DistributedSampler(train_data, shuffle=True, num_replicas=dist.get_world_size(),rank=dist.get_rank())
+    #test_sampler = torch.utils.data.distributed.DistributedSampler(test_data, shuffle=True, num_replicas=dist.get_world_size(),rank=dist.get_rank())
+
+    train_loader = DataLoader(dataset = train_data, sampler=train_sampler,num_workers=num_workers, pin_memory=pin_memory, batch_size=batch_size, drop_last=True, collate_fn=lambda batch: collate_fn(batch, adaptive_patching=adaptive_patching))
+    #test_loader = DataLoader(dataset = test_data, sampler=test_sampler, num_workers=num_workers, pin_memory=pin_memory, batch_size=batch_size,drop_last=True, collate_fn=lambda batch: collate_fn(batch, adaptive_patching=adaptive_patching))
+
+    len_train_loader = torch.tensor(len(train_loader)).to(device)
+
 
 #4. Training Loop
 ##############################################################################################################
-    #Find max batches
-    iterations_per_epoch = 0
-    for i,k in enumerate(batches_per_rank_epoch):
-        if batches_per_rank_epoch[k] > iterations_per_epoch:
-            iterations_per_epoch = batches_per_rank_epoch[k]
 
     for epoch in range(epoch_start,max_epochs):
-        #Reset dataloader module every epoch to ensure all files get used
-        if epoch != epoch_start:
-            data_module.reset()
-            train_dataloader = data_module.train_dataloader()
 
-        #tell the model that we are in train mode. Matters because we have the dropout
+        train_loader_iter = iter(train_loader)
         model.train()
-        loss = 0.0
         epoch_loss = torch.tensor(0.0 , dtype=torch.float32, device=device)
+        epoch_accuracy = torch.tensor(0.0 , dtype=torch.float32, device=device)
         if world_rank==0:
             print("epoch ",epoch,flush=True)
+            
+        for it in range(len_train_loader):
 
-        counter = 0
-        with torch.autograd.set_detect_anomaly(False):
-            for batch_idx, batch in enumerate(train_dataloader):
-                counter = counter + 1
-                if counter > iterations_per_epoch:
-                    print("A GPU ran out of data, moving to next epoch", flush=True)
-                    break
+            if adaptive_patching:
+                data, seq, seq_size, seq_pos, label, variables = next(train_loader_iter)
+                seq = seq.to(device)
+                label = label.to(device)
+                seq_size = torch.squeeze(seq_size)
+                seq_size = seq_size.to(torch.float32)
+                seq_size = seq_size.to(device)
+                seq_pos = torch.squeeze(seq_pos)
+                seq_pos = seq_pos.to(torch.float32)
+                seq_pos = seq_pos.to(device)
+                seq_size = seq_size.unsqueeze(-1)
+                seq_ps = torch.concat([seq_size, seq_pos],dim=-1)
 
-                data, variables, _ = batch
+            else:
+                data, label, variables = next(train_loader_iter)
                 data = data.to(device)
-                t = torch.randint(0,num_time_steps,(batch_size,))
-                e = torch.randn_like(data, requires_grad=False)
-                if twoD:
-                    a = ddpm_scheduler.alpha[t].view(batch_size,1,1,1).to(device)
-                else:
-                    a = ddpm_scheduler.alpha[t].view(batch_size,1,1,1,1).to(device)
-                data = (torch.sqrt(a)*data) + (torch.sqrt(1-a)*e)
-                loss = training_step(data, variables, t, e, model, patch_size, twoD, loss_fn)
+                data = data.to(torch.float32)
+                label = label.to(device)
+                seq_ps = None
 
-                epoch_loss += loss.detach()
+            loss, output = training_step(data, variables, label, model, seq_ps)
+
+            acc = (output.argmax(dim=1) == label).float().mean()
+
+            epoch_accuracy += acc.detach()
+            epoch_loss += loss.detach()
     
-                if world_rank==0:
-                    print("epoch: ",epoch,"batch_idx",batch_idx,"world_rank",world_rank,"it_loss ",loss,flush=True)
+            if world_rank==0:
+                print("epoch: ",epoch, "batch_idx", it, "it_loss ",loss, "it_acc", acc, flush=True)
     
-                loss.backward()
-                optimizer.step()
-                optimizer.zero_grad()
-                scheduler.step()
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            scheduler.step()
         loss_list.append(epoch_loss)
 
 
         if world_rank==0:
-            print("epoch: ",epoch," epoch_loss ",epoch_loss, flush=True)
+            print("epoch: ",epoch," epoch_loss ",epoch_loss, "epoch_accuracy ", epoch_accuracy, flush=True)
 
         model_states = model.state_dict()
         optimizer_states = optimizer.state_dict()

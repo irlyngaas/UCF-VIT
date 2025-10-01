@@ -19,7 +19,7 @@ from .dataset import (
     ProcessChannels,
 )
 
-def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_channels, dataset, num_classes, num_labels, return_qdt):
+def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_channels, dataset, num_classes, num_labels, return_qdt, dict_key):
     if adaptive_patching:
         if return_label:
             if single_channel:
@@ -37,10 +37,7 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                         for i in range(len(batch)):
                             qdt_list.append(batch[i][6])
                 else:
-                    if num_labels == 1:
-                        label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][4],axis=0)) for i in range(len(batch))])
-                    else:
-                        label = torch.stack([torch.from_numpy(batch[i][4]) for i in range(len(batch))])
+                    label = torch.stack([torch.from_numpy(batch[i][4]) for i in range(len(batch))])
                     seq_label_list = []
                     for i in range(len(batch)):
                         if dataset == "basic_ct" or dataset == "s8d_2d_label":
@@ -51,7 +48,14 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                             seq_label_list.append([])
                             for j in range(num_labels):
                                 seq_label_list[i].append(torch.from_numpy(batch[i][5][j]))
-                    seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
+                    if dataset == "basic_ct":
+                        seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
+                    else:
+                        channel_list = []
+                        for i in range(len(batch)):
+                            channel_list.append(torch.stack([seq_label_list[i][j] for j in range(num_labels)]))
+                        seq_label = torch.stack([channel_list[i] for i in range(len(batch))])
+
                     variables = []
                     variables.append(batch[0][6])
                     if return_qdt:
@@ -78,10 +82,7 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                         for i in range(len(batch)):
                             qdt_list.append(batch[i][6])
                 else:
-                    if num_labels == 1:
-                        label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][4],axis=0)) for i in range(len(batch))])
-                    else:
-                        label = torch.stack([torch.from_numpy(batch[i][4]) for i in range(len(batch))])
+                    label = torch.stack([torch.from_numpy(batch[i][4]) for i in range(len(batch))])
                     seq_label_list = []
                     for i in range(len(batch)):
                         if dataset == "basic_ct" or dataset == "s8d_2d_label":
@@ -92,7 +93,14 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                             seq_label_list.append([])
                             for j in range(num_labels):
                                 seq_label_list[i].append(torch.from_numpy(batch[i][5][j]))
-                    seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
+                    if dataset == "basic_ct":
+                        seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
+                    else:
+                        channel_list = []
+                        for i in range(len(batch)):
+                            channel_list.append(torch.stack([seq_label_list[i][j] for j in range(num_labels)]))
+                        seq_label = torch.stack([channel_list[i] for i in range(len(batch))])
+
                     variables = batch[0][6]
                     if return_qdt:
                         qdt_list = []
@@ -100,14 +108,18 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                             qdt_list.append(batch[i][7])
             if dataset == "imagenet":                
                 if return_qdt:
-                    return (inp, seq, size, pos, label, variables, qdt_list)
+                    return (inp, seq, size, pos, label, variables, qdt_list, dict_key)
+                    #return (seq, label, variables, qdt_list, dict_key)
                 else:
-                    return (inp, seq, size, pos, label, variables)
+                    return (inp, seq, size, pos, label, variables, dict_key)
+                    #return (seq, label, variables, dict_key)
             else:
                 if return_qdt:
-                    return (inp, seq, size, pos, label, seq_label, variables, qdt_list)
+                    return (inp, seq, size, pos, label, seq_label, variables, qdt_list, dict_key)
+                    #return (seq, seq_label, variables, qdt_list, dict_key)
                 else:
-                    return (inp, seq, size, pos, label, seq_label, variables)
+                    return (inp, seq, size, pos, label, seq_label, variables, dict_key)
+                    #return (seq, seq_label, variables, dict_key)
         else:
             if single_channel:
                 inp = torch.stack([torch.from_numpy(np.expand_dims(batch[i][0],axis=0)) for i in range(len(batch))])
@@ -132,9 +144,11 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                 qdt_list = []
                 for i in range(len(batch)):
                     qdt_list.append(batch[i][5])
-                return (inp, seq, size, pos, variables, qdt_list)
+                return (inp, seq, size, pos, variables, qdt_list, dict_key)
+                #return (seq, variables, qdt_list, dict_key)
             else:
-                return (inp, seq, size, pos, variables)
+                return (inp, seq, size, pos, variables, dict_key)
+                #return (seq, variables, dict_key)
     else:
         if return_label:
             if single_channel:
@@ -159,7 +173,7 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                         label = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
                 variables = batch[0][2]
                 
-            return (inp, label, variables)
+            return (inp, label, variables, dict_key)
         else:
             if single_channel:
                 inp = torch.stack([torch.from_numpy(np.expand_dims(batch[i][0],axis=0)) for i in range(len(batch))])
@@ -169,7 +183,7 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                 inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
                 variables = batch[0][1]
 
-            return (inp, variables)
+            return (inp, variables, dict_key)
 
 class NativePytorchDataModule(torch.nn.Module):
     """Native pytorch data module for multi-source data.
@@ -180,7 +194,6 @@ class NativePytorchDataModule(torch.nn.Module):
         dict_end_idx (Dict): Dictionary of end indices ratio (between 0.0 and 1.0) for each source.
         dict_in_variables (Dict): Dictionary of input modality variables for each source
         dict_buffer_sizes (Dict): Dictionary of buffer sizes for each source.
-        num_channels_available (Dict): Dictionary of number of channels available for each source.
         num_channels_used (Dict): Dictionary of number of channels used from each source.
         batch_size (int, optional): Batch size.
         num_workers (int, optional): Number of workers.
@@ -204,7 +217,6 @@ class NativePytorchDataModule(torch.nn.Module):
         dict_end_idx: Dict = None,
         dict_buffer_sizes: Dict = None,
         dict_in_variables: Dict = None,
-        num_channels_available: Dict = None, 
         num_channels_used: Dict = None,
         batch_size: int = 64,
         num_workers: int = 0,
@@ -253,7 +265,6 @@ class NativePytorchDataModule(torch.nn.Module):
         self.dict_start_idx = dict_start_idx
         self.dict_end_idx = dict_end_idx
         self.dict_buffer_sizes = dict_buffer_sizes 
-        self.num_channels_available = num_channels_available
         self.num_channels_used = num_channels_used
         self.batch_size = batch_size
         self.num_workers = num_workers
@@ -280,7 +291,7 @@ class NativePytorchDataModule(torch.nn.Module):
         self.num_classes = num_classes
         if self.dataset == "basic_ct" or self.dataset == "s8d_2d_label":
             if return_label:
-                assert num_classes != None, "If using segmentation with basic_ct need to pass the number of classes"
+                assert num_classes != None, "If using segmentation with basic_ct or s8d_2d_label need to pass the number of classes"
 
         if self.dataset == "imagenet":
             self.imagenet_resize = imagenet_resize
@@ -288,10 +299,9 @@ class NativePytorchDataModule(torch.nn.Module):
         if self.dataset == "s8d_2d" or self.dataset == "s8d_3d":
             self.nx = nx
             self.ny = ny
-        if self.dataset == "s8d_3d":
-            self.nz = nz
 
         if self.dataset == "s8d_3d":
+            self.nz = nz
             self.num_samples_to_stitch = num_samples_to_stitch
             self.chunk_size = chunk_size
 
@@ -336,6 +346,7 @@ class NativePytorchDataModule(torch.nn.Module):
 
                     if num_data_roots > self.data_par_size-1:
                         break
+
         elif self.dataset == "s8d_2d":
             dict_lister_trains = {}
             for k, root_dir in self.dict_root_dirs.items():
@@ -404,7 +415,6 @@ class NativePytorchDataModule(torch.nn.Module):
             end_idx = self.dict_end_idx["imagenet"]
             buffer_size = self.dict_buffer_sizes["imagenet"]
             variables = self.dict_in_variables["imagenet"]
-            num_channels_available = self.num_channels_available["imagenet"]
             num_channels_used = self.num_channels_used["imagenet"]
             imagenet_resize = self.imagenet_resize["imagenet"]
         else:
@@ -412,7 +422,6 @@ class NativePytorchDataModule(torch.nn.Module):
             end_idx = self.dict_end_idx[k]
             buffer_size = self.dict_buffer_sizes[k]
             variables = self.dict_in_variables[k]
-            num_channels_available = self.num_channels_available[k]
             num_channels_used = self.num_channels_used[k]
         single_channel = self.single_channel
         return_label = self.return_label
@@ -422,7 +431,6 @@ class NativePytorchDataModule(torch.nn.Module):
                     ImageBlockDataIter_2D(
                             FileReader(
                                 lister_train,
-                                num_channels_available,
                                 gx = self.gx,
                                 start_idx=start_idx,
                                 end_idx=end_idx,
@@ -463,7 +471,6 @@ class NativePytorchDataModule(torch.nn.Module):
                     ImageBlockDataIter_2D(
                             FileReader(
                                 lister_train,
-                                num_channels_available,
                                 gx = self.gx,
                                 start_idx=start_idx,
                                 end_idx=end_idx,
@@ -506,7 +513,6 @@ class NativePytorchDataModule(torch.nn.Module):
             #        ImageBlockDataIter_3D(
             #                FileReader(
             #                    lister_train,
-            #                    num_channels_available,
             #                    gx = self.gx,
             #                    start_idx=start_idx,
             #                    end_idx=end_idx,
@@ -549,7 +555,6 @@ class NativePytorchDataModule(torch.nn.Module):
                     ImageBlockDataIter_3D_Memmap(
                             FileReader(
                                 lister_train,
-                                num_channels_available,
                                 gx = self.gx,
                                 start_idx=start_idx,
                                 end_idx=end_idx,
@@ -595,7 +600,6 @@ class NativePytorchDataModule(torch.nn.Module):
                     ImageBlockDataIter_3D(
                             FileReader(
                                 lister_train,
-                                num_channels_available,
                                 gx = self.gx,
                                 start_idx=start_idx,
                                 end_idx=end_idx,
@@ -769,6 +773,6 @@ class NativePytorchDataModule(torch.nn.Module):
             drop_last=True,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            collate_fn=lambda batch: collate_fn(batch, return_label=self.return_label, single_channel=self.single_channel, adaptive_patching = self.adaptive_patching, separate_channels=self.separate_channels, dataset=self.dataset, num_classes=self.num_classes, num_labels=num_labels, return_qdt=self.return_qdt),
+            collate_fn=lambda batch: collate_fn(batch, return_label=self.return_label, single_channel=self.single_channel, adaptive_patching = self.adaptive_patching, separate_channels=self.separate_channels, dataset=self.dataset, num_classes=self.num_classes, num_labels=num_labels, return_qdt=self.return_qdt, dict_key=k),
         )
 

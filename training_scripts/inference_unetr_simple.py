@@ -28,30 +28,22 @@ from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.utils.fused_attn import FusedAttn
 
 import einops
+from matplotlib import pyplot as plt
 
-
-
-def training_step(data, label, variables, net: UNETR, patch_size, twoD):
-
-    output = net.forward(data, variables)
-
-    criterion = DiceCELoss(to_onehot_y=True, softmax=True, squared_pred=True, smooth_nr=0.0, smooth_dr=1e-6)
-    loss = criterion(output,label)
-
-    return loss, output
-
-def training_step_adaptive(data, seq, label, variables, net: UNETR, patch_size, twoD, seq_ps, in_chans, sqrt_len):
+def test_step_adaptive(data, variables, net: UNETR, patch_size, twoD, seq_ps, in_chans, sqrt_len):
     if twoD:
-        seq = einops.rearrange(seq, 'b c (s1 s2) (ps1 ps2)-> b c (s1 ps1) (s2 ps2)', s1=sqrt_len, s2=sqrt_len, ps1=patch_size, ps2=patch_size, ps3=patch_size)
+        seq = einops.rearrange(seq, 'b c (s1 s2) (ps1 ps2)-> b c (s1 ps1) (s2 ps2)', s1=sqrt_len, s2=sqrt_len, ps1=patch_size, ps2=patch_size)
     else:
         seq = einops.rearrange(seq, 'b c (s1 s2 s3) (ps1 ps2 ps3)-> b c (s1 ps1) (s2 ps2) (s3 ps3)', s1=sqrt_len, s2=sqrt_len, s3=sqrt_len, ps1=patch_size, ps2=patch_size, ps3=patch_size)
 
     output = net.forward(data, variables, seq_ps, seq)
+    return output
 
-    criterion = DiceCELoss(to_onehot_y=True, softmax=True, squared_pred=True, smooth_nr=0.0, smooth_dr=1e-6)
-    loss = criterion(output,label)
+def test_step(data, label, variables, net: UNETR):
 
-    return loss, output
+    output = net.forward(data, variables)
+
+    return output
 
 def main(device, local_rank):
 #1. Load arguments from config file and setup parallelization
@@ -165,6 +157,7 @@ def main(device, local_rank):
     dict_in_variables = conf['data']['dict_in_variables']
 
     batch_size = conf['data']['batch_size']
+    batch_size = 1
 
     num_workers = conf['data']['num_workers']
 
@@ -391,113 +384,79 @@ def main(device, local_rank):
     post_pred = AsDiscrete(argmax=True, to_onehot=num_classes)
     dice_acc = DiceMetric(include_background=False, reduction=MetricReduction.MEAN, get_not_nans=True)
 
-    iterations_per_epoch = 0
-    for i,k in enumerate(batches_per_rank_epoch):
-        if batches_per_rank_epoch[k] > iterations_per_epoch:
-            iterations_per_epoch = batches_per_rank_epoch[k]
+    it_loader = iter(train_dataloader)
 
-    for epoch in range(epoch_start,max_epochs):
-        #Reset dataloader module every epoch to ensure all files get used
-        if epoch != epoch_start:
-            data_module.reset()
-            train_dataloader = data_module.train_dataloader()
-
-        #tell the model that we are in train mode. Matters because we have the dropout
-        model.train()
-        loss = 0.0
-        epoch_loss = torch.tensor(0.0 , dtype=torch.float32, device=device)
-        if world_rank==0:
-            print("epoch ",epoch,flush=True)
-        
-        counter = 0
-        for batch_idx, batch in enumerate(train_dataloader):
-            counter = counter + 1 
-            if counter > iterations_per_epoch:
-                print("A GPU ran out of data, moving to next epoch", flush=True)
-                break
-
-            if adaptive_patching:
-                data, seq, seq_size, seq_pos, label, seq_label, variables, _ = batch
-                data = data.to(device)
-                seq = seq.to(device)
-                label = label.to(device)
-                if separate_channels:
-                    #TODO: Move seq_size and seq_pos to a single channel
-                    seq_ps = None
-                else:
-                    seq_size = torch.squeeze(seq_size)
-                    seq_size = seq_size.to(torch.float32)
-                    seq_size = seq_size.to(device)
-                    seq_pos = torch.squeeze(seq_pos)
-                    seq_pos = seq_pos.to(torch.float32)
-                    seq_pos = seq_pos.to(device)
-                    seq_size = seq_size.unsqueeze(-1)
-                    seq_ps = torch.concat([seq_size, seq_pos],dim=-1)
-                loss, output = training_step_adaptive(data, seq, label, variables, model, patch_size, twoD, seq_ps, max_channels, sqrt_len)
+    #tell the model that we are in train mode. Matters because we have the dropout
+    model.eval()
+    num_samples = 1
+    for i in range(num_samples):
+        if adaptive_patching:
+            data, seq, seq_size, seq_pos, label, seq_label, variables, _ = next(it_loader)
+            data = data.to(device)
+            seq = seq.to(device)
+            label = label.to(device)
+            if separate_channels:
+                #TODO: Move seq_size and seq_pos to a single channel
+                seq_ps = None
             else:
-                data, label, variables, _ = batch
-                data = data.to(device)
-                label = label.to(device)
-                loss, output = training_step(data, label, variables, model, patch_size, twoD)
-            epoch_loss += loss.detach()
+                seq_size = torch.squeeze(seq_size)
+                seq_size = seq_size.to(torch.float32)
+                seq_size = seq_size.to(device)
+                seq_pos = torch.squeeze(seq_pos)
+                seq_pos = seq_pos.to(torch.float32)
+                seq_pos = seq_pos.to(device)
+                seq_size = seq_size.unsqueeze(-1)
+                seq_ps = torch.concat([seq_size, seq_pos],dim=-1)
+            output = test_step_adaptive(data, seq, label, variables, model, patch_size, twoD, seq_ps, max_channels, sqrt_len)
 
-            train_labels_list = decollate_batch(label)
-            train_labels_convert = [post_label(train_label_tensor) for train_label_tensor in train_labels_list]
-            train_outputs_list = decollate_batch(output)
-            train_output_convert = [post_pred(train_pred_tensor) for train_pred_tensor in train_outputs_list]
-            acc = dice_acc(y_pred=train_output_convert, y=train_labels_convert)
-    
-            if world_rank==0:
-                print("epoch: ",epoch,"batch_idx",batch_idx,"world_rank",world_rank,"it_loss ",loss, "acc", acc, flush=True)
-    
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
-            scheduler.step()
-        loss_list.append(epoch_loss)
+        else:
+            data, label, variables, _ = next(it_loader)
+            data = data.to(device)
+            label = label.to(device)
+            output = test_step(data, label, variables, model)
 
+        train_labels_list = decollate_batch(label)
+        train_labels_convert = [post_label(train_label_tensor) for train_label_tensor in train_labels_list]
+        train_outputs_list = decollate_batch(output)
+        train_output_convert = [post_pred(train_pred_tensor) for train_pred_tensor in train_outputs_list]
+        acc = dice_acc(y_pred=train_output_convert, y=train_labels_convert)
 
-        if world_rank==0:
-            print("epoch: ",epoch," epoch_loss ",epoch_loss, flush=True)
+        pred = torch.argmax(output, dim=1)
 
-        if world_rank ==0:    
-            # Check whether the specified checkpointing path exists or not
-            isExist = os.path.exists(checkpoint_path)
-            if not isExist:
-                # Create a new directory because it does not exist
-                os.makedirs(checkpoint_path,exist_ok=True)
-                print("The new checkpoint directory is created!")        
-
-
-        model_states = model.state_dict()
-        optimizer_states = optimizer.state_dict()
-        scheduler_states = scheduler.state_dict()
-
-
-        if world_rank == 0 and epoch % 2 == 0:
-     
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model_states,
-                'optimizer_state_dict': optimizer_states,
-                'scheduler_state_dict': scheduler_states,
-                'loss_list' : loss_list,
-                }, checkpoint_path+"/"+checkpoint_filename+"_even.ckpt")
-
-        if world_rank == 0 and epoch % 2 == 1:
-     
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model_states,
-                'optimizer_state_dict': optimizer_states,
-                'scheduler_state_dict': scheduler_states,
-                'loss_list' : loss_list,
-                }, checkpoint_path+"/"+checkpoint_filename+"_odd.ckpt")
-     
+        if dist.get_rank() == 0:
+            if not twoD:
+                for j in range(pred.shape[-1]):
+                    pred_filename = "pred_image"+str(i)+str(j)+".png"
+                    label_filename = "true_image"+str(i)+str(j)+".png"
+                    pred_img = pred[:,:,:,j].cpu().numpy().astype(np.uint8)
+                    label_img = label[:,:,:,:,j].cpu().numpy().astype(np.uint8)
+                    fig, ax = plt.subplots()
+                    im = ax.imshow(np.squeeze(pred_img), vmin=0, vmax=num_classes-1)
+                    cbar_ax = fig.add_axes([0.85, 0.15, 0.03, 0.7])
+                    fig.colorbar(im, cax=cbar_ax)
+                    plt.savefig(pred_filename, bbox_inches='tight', dpi=200)
+                    fig, ax = plt.subplots()
+                    im = ax.imshow(np.squeeze(label_img), vmin=0, vmax=num_classes-1)
+                    cbar_ax = fig.add_axes([0.85, 0.15, 0.03, 0.7])
+                    fig.colorbar(im, cax=cbar_ax)
+                    plt.savefig(label_filename, bbox_inches='tight', dpi=200)
+            else:
+                pred_filename = "pred_image"+str(i)+".png"
+                label_filename = "true_image"+str(i)+".png"
+                pred_img = pred.cpu().numpy().astype(np.uint8)
+                label_img = label.cpu().numpy().astype(np.uint8)
+                fig, ax = plt.subplots()
+                im = ax.imshow(np.squeeze(pred_img), vmin=0, vmax=num_classes-1)
+                cbar_ax = fig.add_axes([0.85, 0.15, 0.03, 0.7])
+                fig.colorbar(im, cax=cbar_ax)
+                plt.savefig(pred_filename, bbox_inches='tight', dpi=200)
+                fig, ax = plt.subplots()
+                im = ax.imshow(np.squeeze(label_img), vmin=0, vmax=num_classes-1)
+                cbar_ax = fig.add_axes([0.85, 0.15, 0.03, 0.7])
+                fig.colorbar(im, cax=cbar_ax)
+                plt.savefig(label_filename, bbox_inches='tight', dpi=200)
         dist.barrier()
-        del model_states
-        del optimizer_states
-        del scheduler_states
+    
     
 
 if __name__ == "__main__":
