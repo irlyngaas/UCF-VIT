@@ -17,8 +17,8 @@
 #ulimit -n 65536
 
 
-source /lustre/orion/proj-shared/stf006/irl1/conda/bin/activate
-conda activate /lustre/orion/stf006/proj-shared/irl1/vit-2.7
+eval "$(/lustre/orion/stf006/proj-shared/irl1/miniforge3/bin/conda shell.bash hook)"
+conda activate forge-vit
 
 module load PrgEnv-gnu
 module load gcc/12.2.0

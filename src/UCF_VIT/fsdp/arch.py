@@ -137,7 +137,7 @@ class VIT(nn.Module):
             tensor_par_size: int = 1,
             tensor_par_group: Optional[dist.ProcessGroup] = None,
             FusedAttn_option = FusedAttn.NONE,
-            use_adaptive_pos_emb: bool = False
+            use_adaptive_pos_emb: bool = False,
             sqrt_len_method: bool = False,
     ) -> None:
         """
@@ -205,9 +205,10 @@ class VIT(nn.Module):
         self.tensor_par_group = tensor_par_group
         self.FusedAttn_option = FusedAttn_option
         self.use_adaptive_pos_emb = use_adaptive_pos_emb
+        self.sqrt_len_method = sqrt_len_method
 
         #ASSUMES INPUT HAS ALREADY BEEN ADAPTIVELY PATCHED
-        if self.adaptive_patching:
+        if self.adaptive_patching and not self.sqrt_len_method:
             num_patches = self.fixed_length
             #TODO: throw error if using linear decoder in unetr
         else:

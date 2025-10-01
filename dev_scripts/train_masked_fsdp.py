@@ -11,6 +11,7 @@ import torch.distributed as dist
 from torchvision.utils import save_image
 import time
 import yaml
+import math
 from einops import rearrange
 from torch.nn import Sequential
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -30,35 +31,31 @@ from timm.layers import use_fused_attn
 from UCF_VIT.fsdp.arch import MAE
 from UCF_VIT.fsdp.building_blocks import Block
 from UCF_VIT.utils.metrics import masked_mse, adaptive_patching_mse
-from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, patchify, unpatchify, init_par_groups
+from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, patchify, unpatchify, init_par_groups, calculate_load_balancing_on_the_fly, is_power_of_two
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.utils.fused_attn import FusedAttn
 
 
 
-def training_step_adaptive(data, seq, size, pos, variables, net: MAE, patch_size, twoD, loss_fn):
+def training_step_adaptive(seq, variables, net: MAE, patch_size, twoD, loss_fn, seq_ps):
 
-    output, mask = net.forward(seq, variables)
-    if loss_fn == "realMSE": #Real Loss
-        criterion = adaptive_patching_mse
-        loss = criterion(output, data, size, pos, patch_size, twoD)
-    else: #Compression Loss
-        criterion = nn.MSELoss()
-        target = rearrange(seq, 'b c s p -> b s (p c)')
-        loss = criterion(output, target)
+    output, mask = net.forward(seq, variables, seq_ps)
+    criterion = nn.MSELoss()
+    target = rearrange(seq, 'b c s p -> b s (p c)')
+    loss = criterion(output, target)
 
     return loss
 
 def training_step(data, variables, net: MAE, patch_size, twoD, loss_fn):
 
     if loss_fn == "maskMSE":
-        output, mask = net.forward(data, variables)
+        output, mask = net.forward(data, variables, None)
         criterion = masked_mse
         target = patchify(data, patch_size, twoD)
         loss = criterion(output,target,mask)
 
     else: #Default use full MSE
-        output, _ = net.forward(data, variables)
+        output, _ = net.forward(data, variables, None)
         criterion = nn.MSELoss()
         target = patchify(data, patch_size, twoD)
         loss = criterion(output,target)
@@ -87,6 +84,8 @@ def main(device):
     max_epochs = conf['trainer']['max_epochs']
 
     data_type = conf['trainer']['data_type']
+
+    gpu_type = conf['trainer']['gpu_type']
 
     checkpoint_path = conf['trainer']['checkpoint_path']
   
@@ -161,15 +160,15 @@ def main(device):
     if adaptive_patching:
         fixed_length = conf['model']['net']['init_args']['fixed_length']
         separate_channels = conf['model']['net']['init_args']['separate_channels']
-
-        if not twoD:
-            assert not separate_channels, "Adaptive Patching in 3D with multiple channels (non-separated) is not currently implemented"
+        use_adaptive_pos_emb = conf['model']['net']['init_args']['use_adaptive_pos_emb']
+        if separate_channels:
+            assert not use_adaptive_pos_emb, "Capability to use separate channels and adaptive pos_emb not implemented yet"
     else:
         fixed_length = None
         separate_channels = None
+        use_adaptive_pos_emb = None
 
-    #use_scaler = conf['model']['net']['init_args']['use_scaler']
-    use_scaler = True
+    use_grad_scaler = conf['model']['use_grad_scaler']
 
     dataset = conf['data']['dataset']
     assert dataset in ["basic_ct", "imagenet", "s8d_2d", "s8d_3d"], "This training script only supports basic_ct, imagenet, s8d_2d, and s8d_3d datasets"
@@ -181,8 +180,6 @@ def main(device):
     dict_end_idx = conf['data']['dict_end_idx']
 
     dict_buffer_sizes = conf['data']['dict_buffer_sizes']
-
-    num_channels_available = conf['data']['num_channels_available']
 
     num_channels_used = conf['data']['num_channels_used']
 
@@ -199,10 +196,6 @@ def main(device):
     tile_overlap = conf['data']['tile_overlap']
 
     use_all_data = conf['data']['use_all_data']
-
-    batches_per_rank_epoch = conf['load_balancing']['batches_per_rank_epoch']
-
-    dataset_group_list = conf['load_balancing']['dataset_group_list']
 
     #Datset specific options
     if dataset == "imagenet":
@@ -249,10 +242,38 @@ def main(device):
     assert (num_heads % tensor_par_size) == 0, "model heads % tensor parallel size must be 0"
     assert (decoder_num_heads % tensor_par_size) == 0, "decoder model heads % tensor parallel size must be 0"
 
+    if adaptive_patching:
+        x_p2 = is_power_of_two(tile_size_x)
+        assert x_p2, "tile_size_x must be a power of 2"
+        y_p2 = is_power_of_two(tile_size_y)
+        assert y_p2, "tile_size_y must be a power of 2"
+        if dataset != "imagenet" and dataset != "s8d_2d":
+            z_p2 = is_power_of_two(tile_size_z)
+            assert z_p2, "tile_size_z must be a power of 2"
+
+        if twoD:
+            assert fixed_length % 3 == 1 % 3, "Quadtree fixed length needs to be 3n+1, where n is some integer"
+        else:
+            sqrt_len=int(np.rint(math.pow(fixed_length,1/3)))
+            assert fixed_length % 7 == 1 % 7, "Octtree fixed length needs to be 7n+1, where n is some integer"
+
+    auto_load_balancing = conf['load_balancing']['auto_load_balancing']
+    if auto_load_balancing:
+        batches_per_rank_epoch, dataset_group_list = calculate_load_balancing_on_the_fly(config_path, data_par_size, batch_size)
+    else:
+        batches_per_rank_epoch = conf['load_balancing']['batches_per_rank_epoch']
+        dataset_group_list = conf['load_balancing']['dataset_group_list']
+
 #2. Initialize model, optimizer, and scheduler
 ##############################################################################################################
     if data_type == "bfloat16":
-        FusedAttn_option = FusedAttn.CK
+        if gpu_type == "amd":
+            FusedAttn_option = FusedAttn.CK
+        elif gpu_type == "nvidia":
+            FusedAttn_option = FusedAttn.FLASH
+        else:
+            print("Invalid gpu_type used, reverting to using default FMHA")
+            FusedAttn_option = FusedAttn.DEFAULT
     else:
         if use_fused_attn():
             FusedAttn_option = FusedAttn.DEFAULT
@@ -294,6 +315,7 @@ def main(device):
         tensor_par_size=tensor_par_size,
         tensor_par_group=tensor_par_group,
         FusedAttn_option=FusedAttn_option,
+        use_adaptive_pos_emb=use_adaptive_pos_emb,
         class_token=False,
         weight_init='skip',
     ).to(device)
@@ -412,58 +434,57 @@ def main(device):
         #map_location = 'cuda:'+str(device)
         map_location = 'cpu'
 
-        if tensor_par_size > 1:
-            checkpoint = torch.load(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(src_rank)+".ckpt",map_location=map_location)
+        checkpoint = torch.load(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(src_rank)+".ckpt",map_location=map_location)
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         epoch_start = checkpoint['epoch'] + 1
         del checkpoint
 
-    if use_scaler:
+    if use_grad_scaler:
         scaler = ShardedGradScaler(init_scale=8192, growth_interval=100)
         min_scale= 128
 
 
 #3. Initialize Dataloader
 ##############################################################################################################
-    data_module = NativePytorchDataModule(dict_root_dirs=dict_root_dirs,
-        dict_start_idx=dict_start_idx,
-        dict_end_idx=dict_end_idx,
-        dict_buffer_sizes=dict_buffer_sizes,
-        dict_in_variables=dict_in_variables,
-        num_channels_available = num_channels_available,
-        num_channels_used = num_channels_used,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        patch_size = patch_size,
-        tile_size_x = tile_size_x,
-        tile_size_y = tile_size_y,
-        tile_size_z = tile_size_z,
-        twoD = twoD,
-        single_channel = single_channel,
-        return_label = False,
-        dataset_group_list = dataset_group_list,
-        batches_per_rank_epoch = batches_per_rank_epoch,
-        tile_overlap = tile_overlap,
-        use_all_data = use_all_data,
-        adaptive_patching = adaptive_patching,
-        fixed_length = fixed_length,
-        separate_channels = separate_channels,
-        data_par_size = data_par_size,
-        ddp_group = ddp_group,
-        dataset = dataset,
-        imagenet_resize = imagenet_resize,
-        nx = nx,
-        ny = ny,
-        nz = nz,
-        chunk_size = chunk_size,
-        num_samples_to_stitch = num_samples_to_stitch,
-    ).to(device)
+    if dist.get_rank(tensor_par_group) == 0:
+        data_module = NativePytorchDataModule(dict_root_dirs=dict_root_dirs,
+            dict_start_idx=dict_start_idx,
+            dict_end_idx=dict_end_idx,
+            dict_buffer_sizes=dict_buffer_sizes,
+            dict_in_variables=dict_in_variables,
+            num_channels_used = num_channels_used,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            patch_size = patch_size,
+            tile_size_x = tile_size_x,
+            tile_size_y = tile_size_y,
+            tile_size_z = tile_size_z,
+            twoD = twoD,
+            single_channel = single_channel,
+            return_label = False,
+            dataset_group_list = dataset_group_list,
+            batches_per_rank_epoch = batches_per_rank_epoch,
+            tile_overlap = tile_overlap,
+            use_all_data = use_all_data,
+            adaptive_patching = adaptive_patching,
+            fixed_length = fixed_length,
+            separate_channels = separate_channels,
+            data_par_size = data_par_size,
+            ddp_group = ddp_group,
+            dataset = dataset,
+            imagenet_resize = imagenet_resize,
+            nx = nx,
+            ny = ny,
+            nz = nz,
+            chunk_size = chunk_size,
+            num_samples_to_stitch = num_samples_to_stitch,
+        ).to(device)
 
-    data_module.setup()
+        data_module.setup()
 
-    train_dataloader = data_module.train_dataloader()
+        train_dataloader = data_module.train_dataloader()
 
 #4. Training Loop
 ##############################################################################################################
@@ -476,8 +497,9 @@ def main(device):
     for epoch in range(epoch_start,max_epochs):
         #Reset dataloader module every epoch to ensure all files get used
         if epoch != epoch_start:
-            data_module.reset()
-            train_dataloader = data_module.train_dataloader()
+            if dist.get_rank(tensor_par_group) == 0:
+                data_module.reset()
+                train_dataloader = data_module.train_dataloader()
 
         #tell the model that we are in train mode. Matters because we have the dropout
         model.train()
@@ -486,33 +508,129 @@ def main(device):
         if world_rank==0:
             print("epoch ",epoch,flush=True)
 
+        if dist.get_rank(tensor_par_group) == 0:
+            it_loader = iter(train_dataloader)
+
         counter = 0
-        for batch_idx, batch in enumerate(train_dataloader):
+        while counter < iterations_per_epoch: 
             start_time = time.time()            
             counter = counter + 1
-            if counter > iterations_per_epoch:
-                print("A GPU ran out of data, moving to next epoch", flush=True)
-                break
-
             if adaptive_patching:
-                data, seq, size, pos, variables = batch
-                seq = seq.to(precision_dt)
-                seq = seq.to(device)
-                loss = training_step_adaptive(data, seq, size, pos, variables, model, patch_size, twoD, loss_fn)
+                if tensor_par_size > 1:
+                    if dist.get_rank(tensor_par_group) == 0:
+                        data, seq, seq_size, seq_pos, variables, dict_key = next(it_loader)
+                        seq = seq.to(precision_dt)
+                        seq = seq.to(device)
+                        if dataset != "imagenet":
+                            dict_key_len = torch.tensor(len(dict_key)).to(device)
+                        else:
+                            dict_key = "imagenet"
+                    else:
+                        if dataset != "imagenet":
+                            dict_key_len = torch.tensor(0).to(device)
+                        else: 
+                            dict_key = "imagenet"
+
+                    if dataset != "imagenet":
+                        dist.broadcast(dict_key_len, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group = tensor_par_group)
+                        if dist.get_rank(tensor_par_group) != 0:
+                            dict_key = [None] * dict_key_len.item()
+                        dist.broadcast_object_list(dict_key, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+
+                        if dist.get_rank(tensor_par_group) != 0:
+                            dict_key = ''.join(dict_key)
+
+                    if dist.get_rank(tensor_par_group) != 0:
+                        if twoD:
+                            seq = torch.zeros(batch_size, num_channels_used[dict_key], fixed_length, patch_size*patch_size, dtype=precision_dt).to(device)
+                            if separate_channels:
+                                seq_size = torch.zeros(batch_size, num_channels_used[dict_key], fixed_length, dtype=precision_dt).to(device)
+                                seq_pos = torch.zeros(batch_size, num_channels_used[dict_key], fixed_length, 2, dtype=precision_dt).to(device)
+                            else:
+                                seq_size = torch.zeros(batch_size, 1, fixed_length, 1, dtype=precision_dt).to(device)
+                                seq_pos = torch.zeros(batch_size, 1, fixed_length, 1, 1, dtype=precision_dt).to(device)
+                        else:
+                            seq = torch.zeros(batch_size, num_channels_used[dict_key], fixed_length, patch_size*patch_size*patch_size, dtype=precision_dt).to(device)
+                            if separate_channels:
+                                seq_size = torch.zeros(batch_size, num_channels_used[dict_key], fixed_length, dtype=precision_dt).to(device)
+                                seq_pos = torch.zeros(batch_size, num_channels_used[dict_key], fixed_length, 3, dtype=precision_dt).to(device)
+                            else:
+                                seq_size = torch.zeros(batch_size, 1, fixed_length, 1, dtype=precision_dt).to(device)
+                                seq_pos = torch.zeros(batch_size, 1, fixed_length, 1, 1, 1, dtype=precision_dt).to(device)
+                        variables = [None] * num_channels_used[dict_key]
+                    dist.broadcast(seq, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+                    dist.broadcast(seq_size, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+                    dist.broadcast(seq_pos, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+                    dist.broadcast_object_list(variables, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+                else: #Avoid unnecesary broadcasts if not using tensor parallelism
+                    data, seq, seq_size, seq_pos, variables, _ = next(it_loader)
+                    seq = seq.to(precision_dt)
+                    seq = seq.to(device)
+
+                if separate_channels:
+                    #TODO: Move seq_size and seq_pos to a single channel
+                    seq_ps = None
+                else:
+                    seq_size = torch.squeeze(seq_size)
+                    seq_size = seq_size.to(torch.float32)
+                    seq_size = seq_size.to(device)
+                    seq_pos = torch.squeeze(seq_pos)
+                    seq_pos = seq_pos.to(torch.float32)
+                    seq_pos = seq_pos.to(device)
+                    seq_size = seq_size.unsqueeze(-1)
+                    seq_ps = torch.concat([seq_size, seq_pos],dim=-1)
+
+                #loss = training_step_adaptive(data, seq, size, pos, variables, model, patch_size, twoD, loss_fn)
+                loss = training_step_adaptive(seq, variables, model, patch_size, twoD, loss_fn, seq_ps)
 
             else:
-                data, variables = batch
-                data = data.to(precision_dt)
-                data = data.to(device)
+                if tensor_par_size > 1:
+                    if dist.get_rank(tensor_par_group) == 0:
+                        data, variables, dict_key = next(it_loader)
+                        data = data.to(precision_dt)
+                        data = data.to(device)
+                        if dataset != "imagenet":
+                            dict_key_len = torch.tensor(len(dict_key)).to(device)
+                        else:
+                            dict_key = "imagenet"
+                    else:
+                        if dataset != "imagenet":
+                            dict_key_len = torch.tensor(0).to(device)
+                        else:
+                            dict_key = "imagenet"
+                    if dataset != "imagenet":
+                        dist.broadcast(dict_key_len, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group = tensor_par_group)
+
+                        if dist.get_rank(tensor_par_group) != 0:
+                            dict_key = [None] * dict_key_len.item()
+                        dist.broadcast_object_list(dict_key, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+
+                        if dist.get_rank(tensor_par_group) != 0:
+                            dict_key = ''.join(dict_key)
+
+                    if dist.get_rank(tensor_par_group) != 0:
+                        if twoD:
+                            data = torch.zeros(batch_size, num_channels_used[dict_key], tile_size_x, tile_size_y, dtype=precision_dt).to(device)
+                        else:
+                            data = torch.zeros(batch_size, num_channels_used[dict_key], tile_size_x, tile_size_y, tile_size_z, dtype=precision_dt).to(device)
+                        variables = [None] * num_channels_used[dict_key]
+                    dist.broadcast(data, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+                    dist.broadcast_object_list(variables, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+                
+                else: #Avoid unnecesary broadcasts if not using tensor parallelism
+                    data, variables, _ = next(it_loader)
+                    data = data.to(precision_dt)
+                    data = data.to(device)
+
                 loss = training_step(data, variables, model, patch_size, twoD, loss_fn)
 
             epoch_loss += loss.detach()
     
             if world_rank==0:
-                print("epoch: ",epoch,"batch_idx",batch_idx,"world_rank",world_rank,"it_loss ",loss,flush=True)
+                print("epoch: ",epoch,"batch_idx",counter,"world_rank",world_rank,"it_loss ",loss,flush=True)
     
 
-            if use_scaler:
+            if use_grad_scaler:
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()

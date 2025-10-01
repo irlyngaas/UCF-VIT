@@ -19,20 +19,29 @@ from timm.layers import use_fused_attn
 
 from UCF_VIT.simple.arch import SAP, MAE
 from UCF_VIT.utils.metrics import DiceBLoss
-from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, interpolate_pos_embed_adaptive
+from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, interpolate_pos_embed_adaptive, calculate_load_balancing_on_the_fly, is_power_of_two
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.utils.fused_attn import FusedAttn
 
+import einops
+
 #TODO: Add qdt_list back for visualization
-def training_step_adaptive(data, seq, label, seq_label, size, pos, variables, net: SAP, patch_size, twoD, num_classes, sqrt_len):
+def training_step_adaptive(data, seq, label, seq_label, variables, net: SAP, patch_size, twoD, num_classes, sqrt_len, seq_ps):
+
+    if twoD:
+        seq = einops.rearrange(seq, 'b c (s1 s2) (ps1 ps2)-> b c (s1 ps1) (s2 ps2)', s1=sqrt_len, s2=sqrt_len, ps1=patch_size, ps2=patch_size)
+        seq_label = einops.rearrange(seq_label, 'b c (ps1 ps2) (s1 s2)-> b c (s1 ps1) (s2 ps2)', s1=sqrt_len, s2=sqrt_len, ps1=patch_size, ps2=patch_size)
+    else:
+        seq = einops.rearrange(seq, 'b c (s1 s2 s3) (ps1 ps2 ps3)-> b c (s1 ps1) (s2 ps2) (s3 ps3)', s1=sqrt_len, s2=sqrt_len, s3=sqrt_len, ps1=patch_size, ps2=patch_size, ps3=patch_size)
+        seq_label = einops.rearrange(seq_label, 'b c (ps1 ps2 ps3) (s1 s2 s3)-> b c (s1 ps1) (s2 ps2) (s3 ps3)', s1=sqrt_len, s2=sqrt_len, s3=sqrt_len, ps1=patch_size, ps2=patch_size, ps3=patch_size)
 
     #seq = torch.reshape(seq, shape=(-1,1,patch_size*sqrt_len, patch_size*sqrt_len))
-    if twoD:
-        seq_label = torch.reshape(seq_label, shape=(-1,num_classes,patch_size*sqrt_len, patch_size*sqrt_len))
-    else:
-        seq_label = torch.reshape(seq_label, shape=(-1,num_classes,patch_size*sqrt_len, patch_size*sqrt_len, patch_size*sqrt_len))
+    #if twoD:
+    #    seq_label = torch.reshape(seq_label, shape=(-1,num_classes,patch_size*sqrt_len, patch_size*sqrt_len))
+    #else:
+    #    seq_label = torch.reshape(seq_label, shape=(-1,num_classes,patch_size*sqrt_len, patch_size*sqrt_len, patch_size*sqrt_len))
         
-    output = net.forward(seq, variables)
+    output = net.forward(seq, variables, seq_ps)
     criterion = DiceBLoss(num_class=num_classes)
     loss = criterion(output,seq_label)
     return loss
@@ -116,10 +125,12 @@ def main(device):
     assert adaptive_patching, "SAP requires adaptive_patching"
 
     fixed_length = conf['model']['net']['init_args']['fixed_length']
+    use_adaptive_pos_emb = conf['model']['net']['init_args']['use_adaptive_pos_emb']
     separate_channels = conf['model']['net']['init_args']['separate_channels']
 
-    if not twoD:
-        assert not separate_channels, "Adaptive Patching in 3D with multiple channels (non-separated) is not currently implemented"
+    if separate_channels:
+        assert not use_adaptive_pos_emb, "Capability to use separate channels and adaptive pos_emb not implemented yet"
+    sqrt_len_method = True
 
     dataset = conf['data']['dataset']
     assert dataset in ["basic_ct", "s8d_2d_label"], "This training script only supports basic_ct and s8d_2d_label dataloader for now"
@@ -131,8 +142,6 @@ def main(device):
     dict_end_idx = conf['data']['dict_end_idx']
 
     dict_buffer_sizes = conf['data']['dict_buffer_sizes']
-
-    num_channels_available = conf['data']['num_channels_available']
 
     num_channels_used = conf['data']['num_channels_used']
 
@@ -151,10 +160,6 @@ def main(device):
     tile_overlap = conf['data']['tile_overlap']
 
     use_all_data = conf['data']['use_all_data']
-
-    batches_per_rank_epoch = conf['load_balancing']['batches_per_rank_epoch']
-
-    dataset_group_list = conf['load_balancing']['dataset_group_list']
 
     #These configs need only for finetuning with pre-trained MAE model
     decoder_embed_dim = conf['model']['net']['init_args']['decoder_embed_dim']
@@ -177,6 +182,31 @@ def main(device):
     assert (tile_size_y%patch_size)==0, "tile_size_y % patch_size must be 0"
     if dataset != "s8d_2d_label":
         assert (tile_size_z%patch_size)==0, "tile_size_z % patch_size must be 0"
+
+    if adaptive_patching:
+        x_p2 = is_power_of_two(tile_size_x)
+        assert x_p2, "tile_size_x must be a power of 2"
+        y_p2 = is_power_of_two(tile_size_y)
+        assert y_p2, "tile_size_y must be a power of 2"
+
+        if twoD:
+            assert math.sqrt(fixed_length) % 1 == 0, "sqrt of fixed length needs to be a whole number"
+            sqrt_len=int(math.sqrt(fixed_length))
+            assert fixed_length % 3 == 1 % 3, "Quadtree fixed length needs to be 3n+1, where n is some integer"
+        else:
+            z_p2 = is_power_of_two(tile_size_z)
+            assert z_p2, "tile_size_z must be a power of 2"
+
+            assert np.abs(np.rint(math.pow(fixed_length,1/3)) - math.pow(fixed_length, 1/3)) < 0.0001, "cube root of fixed length needs to be a whole number"
+            sqrt_len=int(np.rint(math.pow(fixed_length,1/3)))
+            assert fixed_length % 7 == 1 % 7, "Octtree fixed length needs to be 7n+1, where n is some integer"
+
+    auto_load_balancing = conf['load_balancing']['auto_load_balancing']
+    if auto_load_balancing:
+        batches_per_rank_epoch, dataset_group_list = calculate_load_balancing_on_the_fly(config_path, world_size, batch_size)
+    else:
+        batches_per_rank_epoch = conf['load_balancing']['batches_per_rank_epoch']
+        dataset_group_list = conf['load_balancing']['dataset_group_list']
 
 #2. Initialize model, optimizer, and scheduler
 ##############################################################################################################
@@ -223,6 +253,8 @@ def main(device):
         fixed_length=fixed_length,
         sqrt_len=sqrt_len,
         FusedAttn_option=FusedAttn_option,
+        use_adaptive_pos_emb=use_adaptive_pos_emb,
+        sqrt_len_method=sqrt_len_method,
         class_token=False,
         weight_init='skip',
     ).to(device)
@@ -277,6 +309,7 @@ def main(device):
                 use_varemb=use_varemb,
                 adaptive_patching=adaptive_patching,
                 fixed_length=fixed_length,
+                use_adaptive_pos_emb=use_adaptive_pos_emb,
             ).to(device)
             #mae_model = DDP(mae_model,device_ids=[local_rank],output_device=[local_rank],find_unused_parameters=True)
             #dist.barrier()
@@ -331,7 +364,6 @@ def main(device):
         dict_end_idx=dict_end_idx,
         dict_buffer_sizes=dict_buffer_sizes,
         dict_in_variables=dict_in_variables,
-        num_channels_available = num_channels_available,
         num_channels_used = num_channels_used,
         batch_size=batch_size,
         num_workers=num_workers,
@@ -389,10 +421,22 @@ def main(device):
 
             #TODO: Add qdt_list back for visualization
             #data, seq, size, pos, label, seq_label, variables, qdt_list = batch
-            data, seq, size, pos, label, seq_label, variables = batch
+            data, seq, seq_size, seq_pos, label, seq_label, variables, _ = batch
             seq = seq.to(device)
             seq_label = seq_label.to(device)
-            loss = training_step_adaptive(data, seq, label, seq_label, size, pos, variables, model, patch_size, twoD, num_classes, sqrt_len)
+            if separate_channels:
+                #TODO: Move seq_size and seq_pos to a single channel
+                seq_ps = None
+            else:
+                seq_size = torch.squeeze(seq_size)
+                seq_size = seq_size.to(torch.float32)
+                seq_size = seq_size.to(device)
+                seq_pos = torch.squeeze(seq_pos)
+                seq_pos = seq_pos.to(torch.float32)
+                seq_pos = seq_pos.to(device)
+                seq_size = seq_size.unsqueeze(-1)
+                seq_ps = torch.concat([seq_size, seq_pos],dim=-1)
+            loss = training_step_adaptive(data, seq, label, seq_label, variables, model, patch_size, twoD, num_classes, sqrt_len, seq_ps)
 
             epoch_loss += loss.detach()
     

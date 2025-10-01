@@ -237,7 +237,7 @@ def init_par_groups(world_rank, data_par_size, tensor_par_size, seq_par_size, fs
 
     return seq_par_group, ddp_group, tensor_par_group, data_seq_ort_group, fsdp_group, simple_ddp_group
 
-def process_root_dirs(dataset, dict_root_dirs, data_par_size):
+def process_root_dirs(dataset, dict_root_dirs, data_par_size, nx, ny, nz, chunk_size, num_samples_to_stitch):
     if dataset == "imagenet":
         dict_lister_trains = {}
         for k, root_dir in dict_root_dirs.items():
@@ -264,15 +264,92 @@ def process_root_dirs(dataset, dict_root_dirs, data_par_size):
 
                 if num_data_roots > data_par_size-1:
                     break
+    elif dataset == "s8d_2d":
+        dict_lister_trains = {}
+        for k, root_dir in dict_root_dirs.items():
+            samples = sorted(os.listdir(root_dir))
+            img_list = []
+            for sample in samples: 
+                sample_dir = os.path.join(root_dir, sample)
+                for img_path in glob.glob(os.path.join(sample_dir,"*.raw")):
+                    img_list.append(img_path)
+            
+            img_dict = {k: img_list}
+            dict_lister_trains.update(img_dict)
+            
+    elif dataset == "s8d_2d_label":
+        dict_lister_trains = {}
+        for k, root_dir in dict_root_dirs.items():
+            img_list = []
+            for img_path in glob.glob(os.path.join(root_dir,"*.npy")):
+                img_list.append(img_path)
+            
+            img_dict = {k: img_list}
+            dict_lister_trains.update(img_dict)
+
+    elif dataset == "s8d_3d":
+        dict_lister_trains = {}
+        dict_chunk_trains = {}
+        for k, root_dir in dict_root_dirs.items():
+            num_chunks_x = int(nx[k]/chunk_size[k][0])
+            num_chunks_y = int(ny[k]/chunk_size[k][1])
+            num_chunks_z = int(nz[k]/chunk_size[k][2])
+            samples = sorted(os.listdir(root_dir))
+            #In 3D rather than passing individual files pass list of files with corresponding connected samples
+            img_list = []
+            chunk_list = []
+
+            #Number of samples to stitch
+            num_3d_samples = int(len(samples) / num_samples_to_stitch[k])
+
+            for i in range(num_3d_samples):
+                img_sample_list = []
+                for sample in samples[i*num_samples_to_stitch[k]:i*num_samples_to_stitch[k]+num_samples_to_stitch[k]]:
+                    sample_dir = os.path.join(root_dir, sample)
+                    for img_path in sorted(glob.glob(os.path.join(sample_dir,"*.raw"))):
+                        img_sample_list.append(img_path)
+
+                for x_chunk in range(num_chunks_x):
+                    for y_chunk in range(num_chunks_y):
+                        for z_chunk in range(num_chunks_z):
+                            img_list.append(img_sample_list)
+                            chunk_list.append([x_chunk,y_chunk,z_chunk])
+            
+            img_dict = {k: img_list}
+            dict_lister_trains.update(img_dict)
+            chunk_dict = {k: chunk_list}
+            dict_chunk_trains.update(chunk_dict)
     else:
         dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in dict_root_dirs.items() }
-    return dict_lister_trains
 
-def read_process_file(dataset, path, imagenet_resize):
+    if dataset != "s8d_3d":
+        dict_chunk_trains = None
+    return dict_lister_trains, dict_chunk_trains
+
+def read_process_file(dataset, path, imagenet_resize, nx, ny, chunk_size):
     if dataset == "imagenet":
         data = Image.open(path).convert("RGB")
         data = np.array(data) 
         data = cv.resize(data, dsize=[imagenet_resize["imagenet"][0],imagenet_resize["imagenet"][1]])
+    elif dataset == "s8d_2d":
+        data = np.fromfile(path, dtype=np.uint16).reshape([nx,ny])
+    elif dataset == "s8d_2d_label":
+        data = np.load(path)
+        data = np.moveaxis(data,0,-1)
+    elif dataset == "s8d_3d":
+        #data_list = []
+        #for idx in range(len(keys[0])):
+        #    chunk_idx = chunks[0]
+        #    
+        #    data = np.fromfile(keys[0][idx], dtype=np.uint16).reshape(nx[k],ny[k])
+        #    data = (data[chunk_idx[0]*chunk_size[k][0]:(chunk_idx[0]+1)*chunk_size[k][0], chunk_idx[1]*chunk_size[k][1]:(chunk_idx[1]+1)*chunk_size[k][1]])
+        #    data_list.append(data)
+        #data = np.stack([data_list[idx] for idx in range(len(data_list))])
+        ##z stacked on first dimension, so move to last dimension
+        #data = np.moveaxis(data, 0, -1)
+
+        #Use this alternative to not need to load from files which is time consuming
+        data = np.zeros(shape=(chunk_size[0],chunk_size[1],chunk_size[2]))
     else:
         data = nib.load(path)
         data = np.array(data.dataobj).astype(np.float32)
@@ -300,12 +377,28 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
     else:
         imagenet_resize = None
 
+    if dataset == "s8d_2d" or dataset == "s8d_3d":
+        nx = conf['dataset_options']['nx']
+        ny = conf['dataset_options']['ny']
+    else:
+        nx = None
+        ny = None
+
+    if dataset == "s8d_3d":
+        nz = conf['dataset_options']['nz']
+        chunk_size = conf['dataset_options']['chunk_size']
+        num_samples_to_stitch = conf['dataset_options']['num_samples_to_stitch']
+    else:
+        nz = None
+        chunk_size = None
+        num_samples_to_stitch = None
+
     tile_size_x = int(tile_size[0])
     tile_size_y = int(tile_size[1])
-    if dataset != "imagenet":
+    if dataset != "imagenet" and dataset != "s8d_2d":
         tile_size_z = int(tile_size[2])
 
-    dict_lister_trains = process_root_dirs(dataset, dict_root_dirs, num_total_ddp_ranks)
+    dict_lister_trains, dict_chunk_trains = process_root_dirs(dataset, dict_root_dirs, num_total_ddp_ranks, nx, ny, nz, chunk_size, num_samples_to_stitch)
 
     num_total_tiles = []
     num_total_images = []
@@ -324,7 +417,14 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
 
         #Assume all channels have the same data size
         data_path = keys[0]
-        data = read_process_file(dataset, data_path, imagenet_resize)
+        if chunk_size != None:
+            data = read_process_file(dataset, data_path, imagenet_resize, nx[k], ny[k], chunk_size[k])
+
+        else:
+            if nx != None:
+                data = read_process_file(dataset, data_path, imagenet_resize, nx[k], ny[k], chunk_size)
+            else:
+                data = read_process_file(dataset, data_path, imagenet_resize, nx, ny, chunk_size)
 
         tile_overlap_size_x = int(tile_size_x*tile_overlap)
         tile_overlap_size_y = int(tile_size_y*tile_overlap)
@@ -342,7 +442,7 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
             OTP2_y = int(tile_size_y/tile_overlap_size_y)
             
         #USE THIS IF RAW FILES ARE 2D
-        if dataset == "imagenet":
+        if dataset == "imagenet" or dataset == "s8d_2d":
             #Total Tiles Evenly Spaced
             TTE_x = data.shape[0]//tile_size_x
             TTE_y = data.shape[1]//tile_size_y
@@ -366,7 +466,10 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
                 print("KEY", k, "DATA_SHAPE", data.shape,"NUM_BLOCKS:", num_blocks_x, num_blocks_y, flush=True)
 
             tiles_per_image.append(num_blocks_x*num_blocks_y)
-            num_channels_per_dataset.append(num_channels_used["imagenet"])
+            if dataset == "imagenet":
+                num_channels_per_dataset.append(num_channels_used["imagenet"])
+            else:
+                num_channels_per_dataset.append(num_channels_used[k])
         #USE THIS IF RAW FILES ARE 3D
         else:
             tile_overlap_size_z = int(tile_size_z*tile_overlap)
@@ -375,6 +478,7 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
                 tile_overlap_size_z = tile_size_z
             else:
                 OTP2_z = int(tile_size_z/tile_overlap_size_z)
+
             #Total Tiles Evenly Spaced
             TTE_x = data.shape[0]//tile_size_x
             TTE_y = data.shape[1]//tile_size_y

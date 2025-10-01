@@ -46,6 +46,7 @@ model:
       adaptive_patching: True
       fixed_length: 4096
       separate_channels: False
+      use_adaptive_pos_emb: True
 
       decoder_embed_dim: 576
       decoder_depth: 8
@@ -93,15 +94,6 @@ data:
     '50': 100,
     '40': 100,
   }
-  num_channels_available: {
-    '100': 1,
-    '90': 1,
-    '80': 1,
-    '70': 1,
-    '60': 1,
-    '50': 1,
-    '40': 1,
-  }
   num_channels_used: {
     '100': 1,
     '90': 1,
@@ -144,6 +136,7 @@ data:
 
 # ---------------------------- LOAD BALANCING -------------------------------------------
 load_balancing:
+  auto_load_balancing: True
   batches_per_rank_epoch: {
   '100': 220,
   '90': 210,

@@ -2,6 +2,7 @@
 trainer:
   max_epochs: 600
   data_type: "float32"
+  gpu_type: "amd"
   checkpoint_path: "../../checkpoint/s8d_3d/mae/base"
   checkpoint_filename: "multi_last"
   checkpoint_filename_for_loading: "multi_last_odd" #multi_last_odd or multi_last_even
@@ -27,6 +28,7 @@ model:
   warmup_start_lr: 1e-8
   eta_min: 1e-8
   loss_fn: "MSE"
+  use_grad_scaler: True
 
   net:
     init_args:
@@ -52,6 +54,7 @@ model:
       adaptive_patching: True
       fixed_length: 4096
       separate_channels: False
+      use_adaptive_pos_emb: True
 
 # ---------------------------- DATA -------------------------------------------
 data:
@@ -71,10 +74,6 @@ data:
   dict_buffer_sizes: {
     'No_000': 100,
     'No_001': 100,
-  }
-  num_channels_available: {
-    'No_000': 1,
-    'No_001': 1,
   }
   num_channels_used: {
     'No_000': 1,
@@ -120,6 +119,7 @@ dataset_options:
 
 # ---------------------------- LOAD BALANCING -------------------------------------------
 load_balancing:
+  auto_load_balancing: True
   batches_per_rank_epoch: {
   'No_000': 5120,
   'No_001': 5120,
