@@ -42,7 +42,7 @@ def training_step(data, label, variables, net: UNETR, patch_size, twoD):
 
 def training_step_adaptive(data, seq, label, variables, net: UNETR, patch_size, twoD, seq_ps, in_chans, sqrt_len):
     if twoD:
-        seq = einops.rearrange(seq, 'b c (s1 s2) (ps1 ps2)-> b c (s1 ps1) (s2 ps2)', s1=sqrt_len, s2=sqrt_len, ps1=patch_size, ps2=patch_size, ps3=patch_size)
+        seq = einops.rearrange(seq, 'b c (s1 s2) (ps1 ps2)-> b c (s1 ps1) (s2 ps2)', s1=sqrt_len, s2=sqrt_len, ps1=patch_size, ps2=patch_size)
     else:
         seq = einops.rearrange(seq, 'b c (s1 s2 s3) (ps1 ps2 ps3)-> b c (s1 ps1) (s2 ps2) (s3 ps3)', s1=sqrt_len, s2=sqrt_len, s3=sqrt_len, ps1=patch_size, ps2=patch_size, ps3=patch_size)
 
@@ -209,10 +209,16 @@ def main(device, local_rank):
             assert z_p2, "tile_size_z must be a power of 2"
 
         if twoD:
+            assert math.sqrt(fixed_length) % 1 == 0, "sqrt of fixed length needs to be a whole number"
+            sqrt_len=int(math.sqrt(fixed_length))
             assert fixed_length % 3 == 1 % 3, "Quadtree fixed length needs to be 3n+1, where n is some integer"
         else:
+            assert np.abs(np.rint(math.pow(fixed_length,1/3)) - math.pow(fixed_length, 1/3)) < 0.0001, "cube root of fixed length needs to be a whole number"
             sqrt_len=int(np.rint(math.pow(fixed_length,1/3)))
             assert fixed_length % 7 == 1 % 7, "Octtree fixed length needs to be 7n+1, where n is some integer"
+    else:
+        sqrt_len = None
+        
 
     auto_load_balancing = conf['load_balancing']['auto_load_balancing']
     if auto_load_balancing:
