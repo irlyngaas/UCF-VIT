@@ -308,6 +308,9 @@ def main(device, local_rank):
                 use_varemb=use_varemb,
                 class_token=False,
                 weight_init='skip',
+                adaptive_patching=adaptive_patching,
+                fixed_length=fixed_length,
+                use_adaptive_pos_emb=use_adaptive_pos_emb,
             ).to(device)
             #mae_model = DDP(mae_model,device_ids=[local_rank],output_device=[local_rank])
             #find_unused_parameters=True is needed when single_channel=True since var_embed for each channel not always used
