@@ -2,7 +2,7 @@
 trainer:
   max_epochs: 600
   data_type: "float32"
-  checkpoint_path: "../../checkpoint/basic_ct/unetr/base"
+  checkpoint_path: "../../checkpoint/basic_ct/unetr/base_test"
   checkpoint_filename: "multi_last"
   checkpoint_filename_for_loading: "multi_last_odd" #multi_last_odd or multi_last_even
 
@@ -41,10 +41,14 @@ model:
       mlp_ratio: 4
       drop_path: 0.0
       linear_decoder: False
-      twoD: True
+      twoD: False
       use_varemb: False
+      adaptive_patching: True
+      fixed_length: 729
+      separate_channels: False
+      use_adaptive_pos_emb: True
       feature_size: 16
-      skip_connection: False
+      skip_connection: True
 
       decoder_embed_dim: 576
       decoder_depth: 8
