@@ -218,10 +218,12 @@ def main(device):
 
     if dataset == "s8d_3d":
         chunk_size = conf['dataset_options']['chunk_size']
-        num_samples_to_stitch = conf['dataset_options']['num_samples_to_stitch']
+        num_samples = conf['dataset_options']['num_samples']
+        num_slices_per_sample = conf['dataset_options']['num_slices_per_sample']
     else:
         chunk_size = None
-        num_samples_to_stitch = None
+        num_samples = None
+        num_slices_per_sample = None
 
     tile_size_x = tile_size[0]
     tile_size_y = tile_size[1]
@@ -479,7 +481,8 @@ def main(device):
             ny = ny,
             nz = nz,
             chunk_size = chunk_size,
-            num_samples_to_stitch = num_samples_to_stitch,
+            num_samples = num_samples,
+            num_slices_per_sample = num_slices_per_sample,
         ).to(device)
 
         data_module.setup()

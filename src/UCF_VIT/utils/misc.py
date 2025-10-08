@@ -237,7 +237,7 @@ def init_par_groups(world_rank, data_par_size, tensor_par_size, seq_par_size, fs
 
     return seq_par_group, ddp_group, tensor_par_group, data_seq_ort_group, fsdp_group, simple_ddp_group
 
-def process_root_dirs(dataset, dict_root_dirs, data_par_size, nx, ny, nz, chunk_size, num_samples_to_stitch):
+def process_root_dirs(dataset, dict_root_dirs, data_par_size, nx, ny, nz, chunk_size, num_samples, num_slices_per_sample):
     if dataset == "imagenet":
         dict_lister_trains = {}
         for k, root_dir in dict_root_dirs.items():
@@ -299,21 +299,30 @@ def process_root_dirs(dataset, dict_root_dirs, data_par_size, nx, ny, nz, chunk_
             img_list = []
             chunk_list = []
 
-            #Number of samples to stitch
-            num_3d_samples = int(len(samples) / num_samples_to_stitch[k])
-
-            for i in range(num_3d_samples):
+            sample_iterator = 0
+            slice_iterator = 0
+            for i in range(num_chunks_z):
                 img_sample_list = []
-                for sample in samples[i*num_samples_to_stitch[k]:i*num_samples_to_stitch[k]+num_samples_to_stitch[k]]:
-                    sample_dir = os.path.join(root_dir, sample)
-                    for img_path in sorted(glob.glob(os.path.join(sample_dir,"*.raw"))):
-                        img_sample_list.append(img_path)
-
-                for x_chunk in range(num_chunks_x):
-                    for y_chunk in range(num_chunks_y):
-                        for z_chunk in range(num_chunks_z):
-                            img_list.append(img_sample_list)
-                            chunk_list.append([x_chunk,y_chunk,z_chunk])
+                while sample_iterator < num_samples[k]:
+                    sample_dir = os.path.join(root_dir, samples[sample_iterator])
+                    img_paths = sorted(glob.glob(os.path.join(sample_dir,"*.raw")))
+                    while slice_iterator < num_slices_per_sample[k]: 
+                        if len(img_sample_list) < chunk_size[k][2]:
+                            img_sample_list.append(img_paths[slice_iterator])
+                            slice_iterator = slice_iterator + 1
+                            
+                        if len(img_sample_list) == chunk_size[k][2]:
+                            break
+                        
+                    if len(img_sample_list) == chunk_size[k][2]:
+                        for x_chunk in range(num_chunks_x):
+                            for y_chunk in range(num_chunks_y):
+                                img_list.append(img_sample_list)
+                                chunk_list.append([x_chunk,y_chunk,0])
+                        break
+                    else:
+                        slice_iterator = 0
+                        sample_iterator = sample_iterator + 1
             
             img_dict = {k: img_list}
             dict_lister_trains.update(img_dict)
@@ -349,7 +358,7 @@ def read_process_file(dataset, path, imagenet_resize, nx, ny, chunk_size):
         #data = np.moveaxis(data, 0, -1)
 
         #Use this alternative to not need to load from files which is time consuming
-        data = np.zeros(shape=(chunk_size[0],chunk_size[1],chunk_size[2]))
+        data = np.zeros(shape=(chunk_size[0],chunk_size[1],chunk_size[2]), dtype=np.uint8)
     else:
         data = nib.load(path)
         data = np.array(data.dataobj).astype(np.float32)
@@ -387,18 +396,20 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
     if dataset == "s8d_3d":
         nz = conf['dataset_options']['nz']
         chunk_size = conf['dataset_options']['chunk_size']
-        num_samples_to_stitch = conf['dataset_options']['num_samples_to_stitch']
+        num_samples = conf['dataset_options']['num_samples']
+        num_slices_per_sample = conf['dataset_options']['num_slices_per_sample']
     else:
         nz = None
         chunk_size = None
-        num_samples_to_stitch = None
+        num_samples = None
+        num_slices_per_sample = None
 
     tile_size_x = int(tile_size[0])
     tile_size_y = int(tile_size[1])
     if dataset != "imagenet" and dataset != "s8d_2d":
         tile_size_z = int(tile_size[2])
 
-    dict_lister_trains, dict_chunk_trains = process_root_dirs(dataset, dict_root_dirs, num_total_ddp_ranks, nx, ny, nz, chunk_size, num_samples_to_stitch)
+    dict_lister_trains, dict_chunk_trains = process_root_dirs(dataset, dict_root_dirs, num_total_ddp_ranks, nx, ny, nz, chunk_size, num_samples, num_slices_per_sample)
 
     num_total_tiles = []
     num_total_images = []
@@ -416,7 +427,11 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
         num_total_images.append(len(keys))
 
         #Assume all channels have the same data size
-        data_path = keys[0]
+        if dataset == "s8d_3d":
+            data_path = None
+        else:
+            data_path = keys[0]
+       
         if chunk_size != None:
             data = read_process_file(dataset, data_path, imagenet_resize, nx[k], ny[k], chunk_size[k])
 

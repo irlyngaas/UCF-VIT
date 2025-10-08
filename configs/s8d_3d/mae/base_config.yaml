@@ -35,7 +35,6 @@ model:
       default_vars: [
         "ct_res1",
       ]
-      #tile_size: [8192,8192]
       tile_size: [128,128,128]
       patch_size: 8
       embed_dim: 768
@@ -105,12 +104,16 @@ dataset_options:
     'No_001': 8192,
   }
   nz: {
-    'No_000': 128,
-    'No_001': 128,
+    'No_000': 7488,
+    'No_001': 17600,
   }
-  num_samples_to_stitch: {
-    'No_000': 1,
-    'No_001': 1,
+  num_slices_per_sample: {
+    'No_000': 144, #52 = 7488
+    'No_001': 176, #100 = 17600
+  }
+  num_samples: {
+    'No_000': 52, #144 = 7488
+    'No_001': 100, #176 = 17600
   }
   chunk_size: {
     'No_000': [128,128,128],

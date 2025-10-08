@@ -245,7 +245,8 @@ class NativePytorchDataModule(torch.nn.Module):
         ny: Optional[Dict] = None,
         nz: Optional[Dict] = None,
         chunk_size: Optional[Dict] = None,
-        num_samples_to_stitch: Optional[Dict] = None,
+        num_samples: Optional[Dict] = None,
+        num_slices_per_sample: Optional[Dict] = None,
     ):
         super().__init__()
         if num_workers > 1:
@@ -302,7 +303,8 @@ class NativePytorchDataModule(torch.nn.Module):
 
         if self.dataset == "s8d_3d":
             self.nz = nz
-            self.num_samples_to_stitch = num_samples_to_stitch
+            self.num_samples = num_samples
+            self.num_slices_per_sample = num_slices_per_sample
             self.chunk_size = chunk_size
 
         in_variables = {}
@@ -381,23 +383,31 @@ class NativePytorchDataModule(torch.nn.Module):
                 #In 3D rather than passing individual files pass list of files with corresponding connected samples
                 img_list = []
                 chunk_list = []
-
-                #Number of samples to stitch
-                num_3d_samples = int(len(samples) / self.num_samples_to_stitch[k])
-
-                for i in range(num_3d_samples):
+                sample_iterator = 0
+                slice_iterator = 0
+                for i in range(num_chunks_z):
                     img_sample_list = []
-                    for sample in samples[i*self.num_samples_to_stitch[k]:i*self.num_samples_to_stitch[k]+self.num_samples_to_stitch[k]]:
-                        sample_dir = os.path.join(root_dir, sample)
-                        for img_path in sorted(glob.glob(os.path.join(sample_dir,"*.raw"))):
-                            img_sample_list.append(img_path)
+                    while sample_iterator < self.num_samples[k]:
+                        sample_dir = os.path.join(root_dir, samples[sample_iterator])
+                        img_paths = sorted(glob.glob(os.path.join(sample_dir,"*.raw")))
+                        while slice_iterator < self.num_slices_per_sample[k]: 
+                            if len(img_sample_list) < self.chunk_size[k][2]:
+                                img_sample_list.append(img_paths[slice_iterator])
+                                slice_iterator = slice_iterator + 1
+                                
+                            if len(img_sample_list) == self.chunk_size[k][2]:
+                                break
+                            
+                        if len(img_sample_list) == self.chunk_size[k][2]:
+                            for x_chunk in range(num_chunks_x):
+                                for y_chunk in range(num_chunks_y):
+                                    img_list.append(img_sample_list)
+                                    chunk_list.append([x_chunk,y_chunk,0])
+                            break
+                        else:
+                            slice_iterator = 0
+                            sample_iterator = sample_iterator + 1
 
-                    for x_chunk in range(num_chunks_x):
-                        for y_chunk in range(num_chunks_y):
-                            for z_chunk in range(num_chunks_z):
-                                img_list.append(img_sample_list)
-                                chunk_list.append([x_chunk,y_chunk,z_chunk])
-                
                 img_dict = {k: img_list}
                 dict_lister_trains.update(img_dict)
                 chunk_dict = {k: chunk_list}

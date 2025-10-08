@@ -2,7 +2,8 @@
 trainer:
   max_epochs: 600
   data_type: "float32"
-  checkpoint_path: "../../checkpoint/s8d_2d/mae/base"
+  gpu_type: "amd"
+  checkpoint_path: "../../checkpoint/s8d_3d/mae/multidata"
   checkpoint_filename: "multi_last"
   checkpoint_filename_for_loading: "multi_last_odd" #multi_last_odd or multi_last_even
 
@@ -10,8 +11,8 @@ trainer:
 
 # ---------------------------- PARALLELISM -------------------------------------
 parallelism:
-  fsdp_size: 2
-  simple_ddp_size: 24
+  fsdp_size: 1
+  simple_ddp_size: 64
   tensor_par_size: 1
   seq_par_size: 1
   cpu_offloading: False
@@ -27,13 +28,15 @@ model:
   warmup_start_lr: 1e-8
   eta_min: 1e-8
   loss_fn: "MSE"
+  use_grad_scaler: True
 
   net:
     init_args:
       default_vars: [
         "ct_res1",
       ]
-      tile_size: [128,128,128]
+      #tile_size: [8192,8192,4096] #MAXIMUM TILE SIZE
+      tile_size: [2048,2048,2048]
       patch_size: 8
       embed_dim: 768
       depth: 12
@@ -51,57 +54,58 @@ model:
       adaptive_patching: True
       fixed_length: 4096
       separate_channels: False
+      use_adaptive_pos_emb: True
 
 # ---------------------------- DATA -------------------------------------------
 data:
   dataset: "s8d_3d"
   dict_root_dirs: {
-    'No_000': '/lustre/orion/lrn075/world-shared/8192_output_1/No_000',
-    'No_001': '/lustre/orion/lrn075/world-shared/8192_output_1/No_001',
-    'No_002': '/lustre/orion/lrn075/world-shared/8192_output_2/No_002',
-    'No_003': '/lustre/orion/lrn075/world-shared/8192_output_2/No_003',
-    'No_004': '/lustre/orion/lrn075/world-shared/8192_output_2/No_004',
-    'No_005': '/lustre/orion/lrn075/world-shared/8192_output_2/No_005',
-    'No_006': '/lustre/orion/lrn075/world-shared/8192_output_2/No_006',
-    'No_007': '/lustre/orion/lrn075/world-shared/8192_output_2/No_007',
-    'No_008': '/lustre/orion/lrn075/world-shared/8192_output_2/No_008',
-    #'No_009': '/lustre/orion/lrn075/world-shared/8192_output_2/No_009',
-    'No_010': '/lustre/orion/lrn075/world-shared/8192_output_2/No_010',
-    'No_011': '/lustre/orion/lrn075/world-shared/8192_output_2/No_011',
-    'No_012': '/lustre/orion/lrn075/world-shared/8192_output_2/No_012',
-    'No_013': '/lustre/orion/lrn075/world-shared/8192_output_2/No_013',
-    'No_014': '/lustre/orion/lrn075/world-shared/8192_output_2/No_014',
-    'No_015': '/lustre/orion/lrn075/world-shared/8192_output_2/No_015',
-    'No_016': '/lustre/orion/lrn075/world-shared/8192_output_2/No_016',
-    'No_017': '/lustre/orion/lrn075/world-shared/8192_output_2/No_017',
-    'No_018': '/lustre/orion/lrn075/world-shared/8192_output_2/No_018',
-    'No_019': '/lustre/orion/lrn075/world-shared/8192_output_2/No_019',
-    'No_020': '/lustre/orion/lrn075/world-shared/8192_output_2/No_020',
-    'No_021': '/lustre/orion/lrn075/world-shared/8192_output_3/No_021',
-    'No_022': '/lustre/orion/lrn075/world-shared/8192_output_3/No_022',
-    'No_023': '/lustre/orion/lrn075/world-shared/8192_output_3/No_023',
-    'No_024': '/lustre/orion/lrn075/world-shared/8192_output_3/No_024',
-    'No_025': '/lustre/orion/lrn075/world-shared/8192_output_3/No_025',
-    'No_026': '/lustre/orion/lrn075/world-shared/8192_output_3/No_026',
-    'No_027': '/lustre/orion/lrn075/world-shared/8192_output_3/No_027',
-    'No_028': '/lustre/orion/lrn075/world-shared/8192_output_3/No_028',
-    'No_029': '/lustre/orion/lrn075/world-shared/8192_output_3/No_029',
-    'No_030': '/lustre/orion/lrn075/world-shared/8192_output_3/No_030',
-    'No_031': '/lustre/orion/lrn075/world-shared/8192_output_3/No_031',
-    'No_032': '/lustre/orion/lrn075/world-shared/8192_output_3/No_032',
-    'No_033': '/lustre/orion/lrn075/world-shared/8192_output_3/No_033',
-    'No_034': '/lustre/orion/lrn075/world-shared/8192_output_3/No_034',
-    'No_035': '/lustre/orion/lrn075/world-shared/8192_output_3/No_035',
-    'No_036': '/lustre/orion/lrn075/world-shared/8192_output_3/No_036',
-    'No_037': '/lustre/orion/lrn075/world-shared/8192_output_3/No_037',
-    'No_038': '/lustre/orion/lrn075/world-shared/8192_output_3/No_038',
-    'No_039': '/lustre/orion/lrn075/world-shared/8192_output_3/No_039',
-    'No_040': '/lustre/orion/lrn075/world-shared/8192_output_3/No_040',
-    'No_041': '/lustre/orion/lrn075/world-shared/8192_output_3/No_041',
-    'No_042': '/lustre/orion/lrn075/world-shared/8192_output_3/No_042',
-    'No_043': '/lustre/orion/lrn075/world-shared/8192_output_3/No_043',
-    'No_044': '/lustre/orion/lrn075/world-shared/8192_output_3/No_044',
-    'No_045': '/lustre/orion/lrn075/world-shared/8192_output_3/No_045',
+    'No_000': '/lustre/orion/lrn075/world-shared/8192_output_1/No_000', #52
+    'No_001': '/lustre/orion/lrn075/world-shared/8192_output_1/No_001', #100
+    'No_002': '/lustre/orion/lrn075/world-shared/8192_output_2/No_002', #100
+    'No_003': '/lustre/orion/lrn075/world-shared/8192_output_2/No_003', #100
+    'No_004': '/lustre/orion/lrn075/world-shared/8192_output_2/No_004', #100
+    'No_005': '/lustre/orion/lrn075/world-shared/8192_output_2/No_005', #100
+    'No_006': '/lustre/orion/lrn075/world-shared/8192_output_2/No_006', #100
+    'No_007': '/lustre/orion/lrn075/world-shared/8192_output_2/No_007', #62
+    'No_008': '/lustre/orion/lrn075/world-shared/8192_output_2/No_008', #90
+    #'No_009': '/lustre/orion/lrn075/world-shared/8192_output_2/No_009', #12
+    'No_010': '/lustre/orion/lrn075/world-shared/8192_output_2/No_010', #50
+    'No_011': '/lustre/orion/lrn075/world-shared/8192_output_2/No_011', #50
+    'No_012': '/lustre/orion/lrn075/world-shared/8192_output_2/No_012', #120
+    'No_013': '/lustre/orion/lrn075/world-shared/8192_output_2/No_013', #60
+    'No_014': '/lustre/orion/lrn075/world-shared/8192_output_2/No_014', #130
+    'No_015': '/lustre/orion/lrn075/world-shared/8192_output_2/No_015', #130
+    'No_016': '/lustre/orion/lrn075/world-shared/8192_output_2/No_016', #130
+    'No_017': '/lustre/orion/lrn075/world-shared/8192_output_2/No_017', #130
+    'No_018': '/lustre/orion/lrn075/world-shared/8192_output_2/No_018', #130
+    'No_019': '/lustre/orion/lrn075/world-shared/8192_output_2/No_019', #130
+    'No_020': '/lustre/orion/lrn075/world-shared/8192_output_2/No_020', #180
+    'No_021': '/lustre/orion/lrn075/world-shared/8192_output_3/No_021', #52
+    'No_022': '/lustre/orion/lrn075/world-shared/8192_output_3/No_022', #52
+    'No_023': '/lustre/orion/lrn075/world-shared/8192_output_3/No_023', #52
+    'No_024': '/lustre/orion/lrn075/world-shared/8192_output_3/No_024', #52
+    'No_025': '/lustre/orion/lrn075/world-shared/8192_output_3/No_025', #52
+    'No_026': '/lustre/orion/lrn075/world-shared/8192_output_3/No_026', #52
+    'No_027': '/lustre/orion/lrn075/world-shared/8192_output_3/No_027', #52
+    'No_028': '/lustre/orion/lrn075/world-shared/8192_output_3/No_028', #52
+    'No_029': '/lustre/orion/lrn075/world-shared/8192_output_3/No_029', #52
+    'No_030': '/lustre/orion/lrn075/world-shared/8192_output_3/No_030', #52
+    'No_031': '/lustre/orion/lrn075/world-shared/8192_output_3/No_031', #52
+    'No_032': '/lustre/orion/lrn075/world-shared/8192_output_3/No_032', #52
+    'No_033': '/lustre/orion/lrn075/world-shared/8192_output_3/No_033', #52
+    'No_034': '/lustre/orion/lrn075/world-shared/8192_output_3/No_034', #52
+    'No_035': '/lustre/orion/lrn075/world-shared/8192_output_3/No_035', #52
+    'No_036': '/lustre/orion/lrn075/world-shared/8192_output_3/No_036', #52
+    'No_037': '/lustre/orion/lrn075/world-shared/8192_output_3/No_037', #52
+    'No_038': '/lustre/orion/lrn075/world-shared/8192_output_3/No_038', #52
+    'No_039': '/lustre/orion/lrn075/world-shared/8192_output_3/No_039', #52
+    'No_040': '/lustre/orion/lrn075/world-shared/8192_output_3/No_040', #52
+    'No_041': '/lustre/orion/lrn075/world-shared/8192_output_3/No_041', #52
+    'No_042': '/lustre/orion/lrn075/world-shared/8192_output_3/No_042', #52
+    'No_043': '/lustre/orion/lrn075/world-shared/8192_output_3/No_043', #52
+    'No_044': '/lustre/orion/lrn075/world-shared/8192_output_3/No_044', #52
+    'No_045': '/lustre/orion/lrn075/world-shared/8192_output_3/No_045', #52
   }
   dict_start_idx: {
     'No_000': 0,
@@ -200,52 +204,52 @@ data:
     'No_045': 1,
   }
   dict_buffer_sizes: {
-    'No_000': 100,
-    'No_001': 100,
-    'No_002': 100,
-    'No_003': 100,
-    'No_004': 100,
-    'No_005': 100,
-    'No_006': 100,
-    'No_007': 100,
-    'No_008': 100,
+    'No_000': 10,
+    'No_001': 10,
+    'No_002': 10,
+    'No_003': 10,
+    'No_004': 10,
+    'No_005': 10,
+    'No_006': 10,
+    'No_007': 10,
+    'No_008': 10,
     #'No_009': 100,
-    'No_010': 100,
-    'No_011': 100,
-    'No_012': 100,
-    'No_013': 100,
-    'No_014': 100,
-    'No_015': 100,
-    'No_016': 100,
-    'No_017': 100,
-    'No_018': 100,
-    'No_019': 100,
-    'No_020': 100,
-    'No_021': 100,
-    'No_022': 100,
-    'No_023': 100,
-    'No_024': 100,
-    'No_025': 100,
-    'No_026': 100,
-    'No_027': 100,
-    'No_028': 100,
-    'No_029': 100,
-    'No_030': 100,
-    'No_031': 100,
-    'No_032': 100,
-    'No_033': 100,
-    'No_034': 100,
-    'No_035': 100,
-    'No_036': 100,
-    'No_037': 100,
-    'No_038': 100,
-    'No_039': 100,
-    'No_040': 100,
-    'No_041': 100,
-    'No_042': 100,
-    'No_043': 100,
-    'No_044': 100,
-    'No_045': 100,
+    'No_010': 10,
+    'No_011': 10,
+    'No_012': 10,
+    'No_013': 10,
+    'No_014': 10,
+    'No_015': 10,
+    'No_016': 10,
+    'No_017': 10,
+    'No_018': 10,
+    'No_019': 10,
+    'No_020': 10,
+    'No_021': 10,
+    'No_022': 10,
+    'No_023': 10,
+    'No_024': 10,
+    'No_025': 10,
+    'No_026': 10,
+    'No_027': 10,
+    'No_028': 10,
+    'No_029': 10,
+    'No_030': 10,
+    'No_031': 10,
+    'No_032': 10,
+    'No_033': 10,
+    'No_034': 10,
+    'No_035': 10,
+    'No_036': 10,
+    'No_037': 10,
+    'No_038': 10,
+    'No_039': 10,
+    'No_040': 10,
+    'No_041': 10,
+    'No_042': 10,
+    'No_043': 10,
+    'No_044': 10,
+    'No_045': 10,
   }
   num_channels_available: {
     'No_000': 1,
@@ -589,151 +593,201 @@ dataset_options:
     'No_045': 8192,
   }
   nz: {
-    'No_000': 144,
-    'No_001': 176,
-    'No_002': 176,
-    'No_003': 176,
-    'No_004': 176,
-    'No_005': 176,
-    'No_006': 176,
-    'No_007': 176,
-    'No_008': 176,
-    'No_010': 152,
-    'No_011': 152,
-    'No_012': 152,
-    'No_013': 152,
-    'No_014': 152,
-    'No_015': 152,
-    'No_016': 152,
-    'No_017': 152,
-    'No_018': 160,
-    'No_019': 160,
-    'No_020': 160,
-    'No_021': 144,
-    'No_022': 144,
-    'No_023': 144,
-    'No_024': 144,
-    'No_025': 144,
-    'No_026': 144,
-    'No_027': 144,
-    'No_028': 144,
-    'No_029': 144,
-    'No_030': 144,
-    'No_031': 144,
-    'No_032': 144,
-    'No_033': 144,
-    'No_034': 144,
-    'No_035': 144,
-    'No_036': 144,
-    'No_037': 144,
-    'No_038': 152,
-    'No_039': 152,
-    'No_040': 152,
-    'No_041': 152,
-    'No_042': 152,
-    'No_043': 152,
-    'No_044': 152,
-    'No_045': 152,
+    'No_000': 7488,
+    'No_001': 17600,
+    'No_002': 17600,
+    'No_003': 17600,
+    'No_004': 17600,
+    'No_005': 17600,
+    'No_006': 17600,
+    'No_007': 10912,
+    'No_008': 15840,
+    #'No_009': 152  #12 = 1824
+    'No_010': 7600,
+    'No_011': 7600,
+    'No_012': 18240,
+    'No_013': 9120,
+    'No_014': 19760,
+    'No_015': 19760,
+    'No_016': 19760,
+    'No_017': 19760,
+    'No_018': 20800,
+    'No_019': 20800,
+    'No_020': 28800,
+    'No_021': 7488,
+    'No_022': 7488,
+    'No_023': 7488,
+    'No_024': 7488,
+    'No_025': 7488,
+    'No_026': 7488,
+    'No_027': 7488,
+    'No_028': 7488,
+    'No_029': 7488,
+    'No_030': 7488,
+    'No_031': 7488,
+    'No_032': 7488,
+    'No_033': 7488,
+    'No_034': 7488,
+    'No_035': 7488,
+    'No_036': 7488,
+    'No_037': 7488,
+    'No_038': 7488,
+    'No_039': 7488,
+    'No_040': 7488,
+    'No_041': 7488,
+    'No_042': 7488,
+    'No_043': 7488,
+    'No_044': 7488,
+    'No_045': 7488,
   }
-  num_samples_to_stitch: {
-    'No_000': 1,
-    'No_001': 1,
-    'No_002': 1,
-    'No_003': 1,
-    'No_004': 1,
-    'No_005': 1,
-    'No_006': 1,
-    'No_007': 1,
-    'No_008': 1,
-    #'No_009': 1,
-    'No_010': 1,
-    'No_011': 1,
-    'No_012': 1,
-    'No_013': 1,
-    'No_014': 1,
-    'No_015': 1,
-    'No_016': 1,
-    'No_017': 1,
-    'No_018': 1,
-    'No_019': 1,
-    'No_020': 1,
-    'No_021': 1,
-    'No_022': 1,
-    'No_023': 1,
-    'No_024': 1,
-    'No_025': 1,
-    'No_026': 1,
-    'No_027': 1,
-    'No_028': 1,
-    'No_029': 1,
-    'No_030': 1,
-    'No_031': 1,
-    'No_032': 1,
-    'No_033': 1,
-    'No_034': 1,
-    'No_035': 1,
-    'No_036': 1,
-    'No_037': 1,
-    'No_038': 1,
-    'No_039': 1,
-    'No_040': 1,
-    'No_041': 1,
-    'No_042': 1,
-    'No_043': 1,
-    'No_044': 1,
-    'No_045': 1,
+  num_slices_per_sample: {
+    'No_000': 144, #52 = 7488
+    'No_001': 176, #100 = 17600
+    'No_002': 176, #100 = 17600
+    'No_003': 176, #100 = 17600
+    'No_004': 176, #100 = 17600
+    'No_005': 176, #100 = 17600
+    'No_006': 176, #100 = 17600
+    'No_007': 176, #62 = 10912
+    'No_008': 176, #90 = 15840
+    #'No_009': 152  #12 = 1824
+    'No_010': 152, #50 = 7600
+    'No_011': 152, #50 = 7600
+    'No_012': 152, #120 = 18240
+    'No_013': 152, #60 = 9120
+    'No_014': 152, #130 = 19760
+    'No_015': 152, #130 = 19760
+    'No_016': 152, #130 = 19760
+    'No_017': 152, #130 = 19760
+    'No_018': 160, #130 = 20800
+    'No_019': 160, #130 = 20800
+    'No_020': 160, #180 = 28800
+    'No_021': 144, #52 = 7488
+    'No_022': 144, #52 = 7488
+    'No_023': 144, #52 = 7488
+    'No_024': 144, #52 = 7488
+    'No_025': 144, #52 = 7488
+    'No_026': 144, #52 = 7488
+    'No_027': 144, #52 = 7488
+    'No_028': 144, #52 = 7488
+    'No_029': 144, #52 = 7488
+    'No_030': 144, #52 = 7488
+    'No_031': 144, #52 = 7488
+    'No_032': 144, #52 = 7488
+    'No_033': 144, #52 = 7488
+    'No_034': 144, #52 = 7488
+    'No_035': 144, #52 = 7488
+    'No_036': 144, #52 = 7488
+    'No_037': 144, #52 = 7488
+    'No_038': 152, #52 = 7488
+    'No_039': 152, #52 = 7488
+    'No_040': 152, #52 = 7488
+    'No_041': 152, #52 = 7488
+    'No_042': 152, #52 = 7488
+    'No_043': 152, #52 = 7488
+    'No_044': 152, #52 = 7488
+    'No_045': 152, #52 = 7488
+  }
+  num_samples: {
+    'No_000': 52, #144 = 7488
+    'No_001': 100, #176 = 17600
+    'No_002': 100, #176 = 17600
+    'No_003': 100, #176 = 17600
+    'No_004': 100, #176 = 17600
+    'No_005': 100, #176 = 17600
+    'No_006': 100, #176 = 17600
+    'No_007': 62, #176 = 10912
+    'No_008': 90, #176 = 15840
+    #'No_009': 152  #12 = 1824
+    'No_010': 50, #152 = 7600
+    'No_011': 50, #152 = 7600
+    'No_012': 120, #152 = 18240
+    'No_013': 60, #152 = 9120
+    'No_014': 130, #152 = 19760
+    'No_015': 130, #152 = 19760
+    'No_016': 130, #152 = 19760
+    'No_017': 130, #152 = 19760
+    'No_018': 130, #160 = 20800
+    'No_019': 130, #160 = 20800
+    'No_020': 180, #160 = 28800
+    'No_021': 52, #144 = 7488
+    'No_022': 52, #144 = 7488
+    'No_023': 52, #144 = 7488
+    'No_024': 52, #144 = 7488
+    'No_025': 52, #144 = 7488
+    'No_026': 52, #144 = 7488
+    'No_027': 52, #144 = 7488
+    'No_028': 52, #144 = 7488
+    'No_029': 52, #144 = 7488
+    'No_030': 52, #144 = 7488
+    'No_031': 52, #144 = 7488
+    'No_032': 52, #144 = 7488
+    'No_033': 52, #144 = 7488
+    'No_034': 52, #144 = 7488
+    'No_035': 52, #144 = 7488
+    'No_036': 52, #144 = 7488
+    'No_037': 52, #144 = 7488
+    'No_038': 52, #152 = 7904
+    'No_039': 52, #152 = 7904
+    'No_040': 52, #152 = 7904
+    'No_041': 52, #152 = 7904
+    'No_042': 52, #152 = 7904
+    'No_043': 52, #152 = 7904
+    'No_044': 52, #152 = 7904
+    'No_045': 52, #152 = 7904
   }
   chunk_size: {
-    'No_000': [128,128,128],
-    'No_001': [128,128,128],
-    'No_002': [128,128,128],
-    'No_003': [128,128,128],
-    'No_004': [128,128,128],
-    'No_005': [128,128,128],
-    'No_006': [128,128,128],
-    'No_007': [128,128,128],
-    'No_008': [128,128,128],
+    'No_000': [8192,8192,4096],
+    'No_001': [8192,8192,4096],
+    'No_002': [8192,8192,4096],
+    'No_003': [8192,8192,4096],
+    'No_004': [8192,8192,4096],
+    'No_005': [8192,8192,4096],
+    'No_006': [8192,8192,4096],
+    'No_007': [8192,8192,4096],
+    'No_008': [8192,8192,4096],
     #'No_009': [128,128,128],
-    'No_010': [128,128,128],
-    'No_011': [128,128,128],
-    'No_012': [128,128,128],
-    'No_013': [128,128,128],
-    'No_014': [128,128,128],
-    'No_015': [128,128,128],
-    'No_016': [128,128,128],
-    'No_017': [128,128,128],
-    'No_018': [128,128,128],
-    'No_019': [128,128,128],
-    'No_020': [128,128,128],
-    'No_021': [128,128,128],
-    'No_022': [128,128,128],
-    'No_023': [128,128,128],
-    'No_024': [128,128,128],
-    'No_025': [128,128,128],
-    'No_026': [128,128,128],
-    'No_027': [128,128,128],
-    'No_028': [128,128,128],
-    'No_029': [128,128,128],
-    'No_030': [128,128,128],
-    'No_031': [128,128,128],
-    'No_032': [128,128,128],
-    'No_033': [128,128,128],
-    'No_034': [128,128,128],
-    'No_035': [128,128,128],
-    'No_036': [128,128,128],
-    'No_037': [128,128,128],
-    'No_038': [128,128,128],
-    'No_039': [128,128,128],
-    'No_040': [128,128,128],
-    'No_041': [128,128,128],
-    'No_042': [128,128,128],
-    'No_043': [128,128,128],
-    'No_044': [128,128,128],
-    'No_045': [128,128,128],
+    'No_010': [8192,8192,4096],
+    'No_011': [8192,8192,4096],
+    'No_012': [8192,8192,4096],
+    'No_013': [8192,8192,4096],
+    'No_014': [8192,8192,4096],
+    'No_015': [8192,8192,4096],
+    'No_016': [8192,8192,4096],
+    'No_017': [8192,8192,4096],
+    'No_018': [8192,8192,4096],
+    'No_019': [8192,8192,4096],
+    'No_020': [8192,8192,4096],
+    'No_021': [8192,8192,4096],
+    'No_022': [8192,8192,4096],
+    'No_023': [8192,8192,4096],
+    'No_024': [8192,8192,4096],
+    'No_025': [8192,8192,4096],
+    'No_026': [8192,8192,4096],
+    'No_027': [8192,8192,4096],
+    'No_028': [8192,8192,4096],
+    'No_029': [8192,8192,4096],
+    'No_030': [8192,8192,4096],
+    'No_031': [8192,8192,4096],
+    'No_032': [8192,8192,4096],
+    'No_033': [8192,8192,4096],
+    'No_034': [8192,8192,4096],
+    'No_035': [8192,8192,4096],
+    'No_036': [8192,8192,4096],
+    'No_037': [8192,8192,4096],
+    'No_038': [8192,8192,4096],
+    'No_039': [8192,8192,4096],
+    'No_040': [8192,8192,4096],
+    'No_041': [8192,8192,4096],
+    'No_042': [8192,8192,4096],
+    'No_043': [8192,8192,4096],
+    'No_044': [8192,8192,4096],
+    'No_045': [8192,8192,4096],
   }
 
 # ---------------------------- LOAD BALANCING -------------------------------------------
 load_balancing:
+  auto_load_balancing: True
   batches_per_rank_epoch: {
   'No_000': 106496,
   'No_001': 204800,

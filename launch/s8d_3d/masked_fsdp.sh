@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH -A stf006
 #SBATCH -J masked_fsdp
-#SBATCH --nodes=1
+#SBATCH --nodes=8
 #SBATCH --gres=gpu:8
 #SBATCH --ntasks-per-node=8
 #SBATCH --cpus-per-task=7
-#SBATCH -t 00:20:00
+#SBATCH -t 00:45:00
 #SBATCH -p batch
 #SBATCH -o masked_fsdp-%j.out
 #SBATCH -e masked_fsdp-%j.out
@@ -35,4 +35,5 @@ export OMP_NUM_THREADS=7
 export PYTHONPATH=$PWD:$PYTHONPATH
 
 time srun -n $((SLURM_JOB_NUM_NODES*8)) \
-python ../../dev_scripts/train_masked_fsdp.py ../../configs/s8d_3d/mae/base_config.yaml
+python ../../dev_scripts/train_masked_fsdp.py ../../configs/s8d_3d/mae/multidata_config.yaml
+#python ../../dev_scripts/train_masked_fsdp.py ../../configs/s8d_3d/mae/base_config.yaml
