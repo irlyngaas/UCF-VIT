@@ -36,7 +36,7 @@ model:
         "ct_res1",
       ]
       #tile_size: [8192,8192,4096] #MAXIMUM TILE SIZE
-      tile_size: [2048,2048,2048]
+      tile_size: [1024,1024,1024]
       patch_size: 8
       embed_dim: 768
       depth: 12
