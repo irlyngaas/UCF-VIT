@@ -1,0 +1,116 @@
+# ---------------------------- TRAINER -------------------------------------------
+trainer:
+  max_epochs: 600
+  data_type: "float32"
+  checkpoint_path: "../../checkpoint/imagenet/classification/quanto_1bit"
+  checkpoint_filename: "multi_last"
+  checkpoint_filename_for_loading: "multi_last_odd" #multi_last_odd or multi_last_even
+
+  resume_from_checkpoint: False
+
+# ---------------------------- PARALLELISM -------------------------------------
+parallelism:
+  fsdp_size: 1
+  simple_ddp_size: 8
+  tensor_par_size: 1
+  seq_par_size: 1
+
+# ---------------------------- MODEL -------------------------------------------
+model:
+  lr: 0.0001
+  beta_1: 0.9
+  beta_2: 0.95
+  weight_decay: 1e-5
+  warmup_steps: 1000
+  max_steps: 20000
+  warmup_start_lr: 1e-8
+  eta_min: 1e-8
+
+  net:
+    init_args:
+      default_vars: [
+        "red",
+        "green",
+        "blue",
+      ]
+      tile_size: [256, 256]
+      patch_size: 16
+      embed_dim: 768
+      depth: 12
+      num_heads: 12
+      mlp_ratio: 4
+      drop_path: 0.0
+      drop_rate: 0.0
+      twoD: True
+      use_varemb: False
+      adaptive_patching: True
+      fixed_length: 196
+      separate_channels: False
+      use_adaptive_pos_emb: True
+
+# ---------------------------- DATA -------------------------------------------
+data:
+  dataset: "imagenet"
+  dict_root_dirs: {
+    'imagenet': '/lustre/orion/nro108/world-shared/enzhi/dataset/imagenet/train',
+  }
+  dict_start_idx: {
+    'imagenet': 0,
+  }
+  dict_end_idx: {
+    'imagenet': 1,
+  }
+  dict_buffer_sizes: {
+    'imagenet': 100,
+  }
+  num_channels_used: {
+    'imagenet': 3,
+  }
+  dict_in_variables: {
+    'imagenet': [
+     "red", 
+     "green", 
+     "blue", 
+    ],
+  }
+  batch_size: 32
+  num_workers: 1
+  pin_memory: False
+  single_channel: False
+  tile_overlap: 0.0
+  use_all_data: False
+  num_classes: 1000
+
+# ---------------------------- DATASET SPECIFIC OPTIONS -------------------------------------------
+dataset_options:
+
+  imagenet_resize: {
+      'imagenet': [256,256],
+    }
+
+# ---------------------------- QUANTO QUANTIZATION -------------------------------------------
+# 🚀 QUANTO 1-BIT QUANTIZATION CONFIG FOR GORDON BELL PRIZE 🚀
+quantization:
+  enabled: true  # 🎯 ENABLE QUANTO 1-BIT QUANTIZATION!
+  bits: 1         # Ultimate compression (93.75% memory reduction)
+  quantize_weights: true
+  quantize_activations: true
+  calibration_samples: 10000  # More samples needed for 1-bit
+  quantize_layers: ["linear", "conv"]  # Target main parameter layers
+  exclude_layers: ["cls_token", "pos_embed"]  # Preserve critical embeddings
+  
+  # Frontier supercomputer specific optimizations
+  rocm_optimizations: true   # Enable ROCm optimizations
+  mi250x_kernels: true      # Use MI250X specialized kernels
+  
+  # Performance tuning for Gordon Bell Prize submission
+  performance_mode: "gordon_bell"  # Ultimate optimizations
+  profile_quantization: true       # Detailed profiling
+
+# ---------------------------- LOAD BALANCING -------------------------------------------
+load_balancing:
+  auto_load_balancing: True
+  batches_per_rank_epoch: {
+    'imagenet': 4935,
+  }
+  dataset_group_list: '1:1:1:1:1:1:1:1'
