@@ -19,6 +19,7 @@ from UCF_VIT.simple.arch import VIT
 from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, calculate_load_balancing_on_the_fly, is_power_of_two
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.utils.fused_attn import FusedAttn
+from UCF_VIT.utils.quantization import setup_quantization, log_quantization_info
 
 
 def training_step(data, variables, label, net: VIT, seq_ps):
@@ -224,6 +225,29 @@ def main(device, local_rank):
         FusedAttn_option=FusedAttn_option,
         use_adaptive_pos_emb=use_adaptive_pos_emb,
     ).to(device)
+
+    # 🚀 EXTREME-SCALE QUANTIZATION INTEGRATION 🚀
+    # Apply quantization before DDP wrapping for Frontier supercomputer
+    quantization_config = conf.get('quantization', {})
+    if quantization_config.get('enabled', False):
+        if world_rank == 0:
+            print("=" * 80, flush=True)
+            print("🚀 APPLYING EXTREME-SCALE QUANTIZATION 🚀", flush=True)
+            print(f"Target: {quantization_config.get('bits', 8)}-bit on Frontier/ROCm", flush=True)
+            print("=" * 80, flush=True)
+            
+        # Apply quantization
+        model = setup_quantization(model, quantization_config)
+        
+        # Log quantization information
+        if world_rank == 0:
+            log_quantization_info(model, quantization_config)
+            
+        # Ensure model is still on correct device after quantization
+        model = model.to(device)
+        
+        if world_rank == 0:
+            print("✅ Quantization setup complete!", flush=True)
 
     #model = DDP(model,device_ids=[local_rank],output_device=[local_rank])
     #find_unused_parameters=True is needed under these circumstances

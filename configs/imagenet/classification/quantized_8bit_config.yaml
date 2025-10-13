@@ -2,7 +2,7 @@
 trainer:
   max_epochs: 600
   data_type: "float32"
-  checkpoint_path: "../../checkpoint/imagenet/classification/base"
+  checkpoint_path: "../../checkpoint/imagenet/classification/quantized_8bit"
   checkpoint_filename: "multi_last"
   checkpoint_filename_for_loading: "multi_last_odd" #multi_last_odd or multi_last_even
 
@@ -89,29 +89,30 @@ dataset_options:
     }
 
 # ---------------------------- QUANTIZATION -------------------------------------------
+# 🚀 8-BIT QUANTIZATION CONFIG FOR EXTREME-SCALE TRAINING 🚀
 quantization:
-  enabled: false  # Set to true to enable quantization
-  method: "qat"   # qat (Quantization Aware Training) or ptq (Post Training Quantization)
-  backend: "qnnpack"  # qnnpack for AMD/ROCm, fbgemm for NVIDIA
-  bits: 8         # 8, 4, or 1 bit quantization
-  calibration_samples: 1000  # Number of samples for calibration (PTQ only)
-  quantize_layers: ["linear", "conv"]  # Layer types to quantize
-  exclude_layers: ["cls_token", "pos_embed"]  # Layers to exclude from quantization
+  enabled: true  # 🎯 ENABLE 8-BIT QUANTIZATION!
+  method: "qat"   # Quantization Aware Training for best accuracy
+  backend: "qnnpack"  # ROCm/AMD optimized backend for Frontier
+  bits: 8         # Start with 8-bit (50% memory reduction)
+  calibration_samples: 1000
+  quantize_layers: ["linear", "conv"]  # Target main parameter layers
+  exclude_layers: ["cls_token", "pos_embed"]  # Preserve critical embeddings
   
   # Frontier supercomputer specific optimizations
-  rocm_optimizations: true
-  mi250x_kernels: true
+  rocm_optimizations: true   # Enable ROCm optimizations
+  mi250x_kernels: true      # Use MI250X specialized kernels
   
-  # QAT specific settings
+  # QAT specific settings for accuracy preservation
   qat:
     fake_quantize: true
-    observer_type: "minmax"  # minmax, moving_average_minmax
+    observer_type: "minmax"  # Stable observer for initial testing
     quant_min: 0
-    quant_max: 255  # For 8-bit: 0-255, 4-bit: 0-15, 1-bit: 0-1
+    quant_max: 255  # 8-bit range
     
-  # Performance tuning for Gordon Bell submission
-  performance_mode: "gordon_bell"  # enables all optimizations
-  profile_quantization: true  # detailed performance profiling
+  # Performance tuning for extreme-scale deployment
+  performance_mode: "extreme_scale"  # Max optimizations
+  profile_quantization: true       # Detailed profiling
 
 # ---------------------------- LOAD BALANCING -------------------------------------------
 load_balancing:
