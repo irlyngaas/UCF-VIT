@@ -1,6 +1,6 @@
 # ---------------------------- TRAINER -------------------------------------------
 trainer:
-  max_epochs: 100  # 빠른 테스트를 위해 에포크 수 감소
+  max_epochs: 100  # Reduced epochs for fast testing
   data_type: "float32"
   checkpoint_path: "../../checkpoint/catsdogs/classification/quanto_4bit"
   checkpoint_filename: "multi_last"
@@ -21,8 +21,8 @@ model:
   beta_1: 0.9
   beta_2: 0.95
   weight_decay: 1e-5
-  warmup_steps: 100  # 빠른 테스트를 위해 감소
-  max_steps: 2000    # 빠른 테스트를 위해 감소
+  warmup_steps: 100  # Reduced for fast testing
+  max_steps: 2000    # Reduced for fast testing
   warmup_start_lr: 1e-8
   eta_min: 1e-8
 
@@ -61,19 +61,19 @@ data:
      "blue", 
     ],
   }
-  batch_size: 64  # 테스트를 위해 배치 사이즈 증가
+  batch_size: 64  # Increased batch size for testing
   num_workers: 1
   pin_memory: False
   num_classes: 2
 
 # ---------------------------- QUANTO QUANTIZATION -------------------------------------------
-# 🚀 QUANTO 4-BIT QUANTIZATION CONFIG FOR CATSDOGS TESTING 🚀
+# QUANTO 4-BIT QUANTIZATION CONFIG FOR CATSDOGS TESTING
 quantization:
-  enabled: true  # 🎯 ENABLE QUANTO 4-BIT QUANTIZATION!
+  enabled: true  # ENABLE QUANTO 4-BIT QUANTIZATION
   bits: 4         # 4-bit (75% memory reduction)
   quantize_weights: true
   quantize_activations: true
-  calibration_samples: 100  # 작은 데이터셋이므로 감소
+  calibration_samples: 100  # Reduced for small dataset
   quantize_layers: ["linear", "conv"]  # Target main parameter layers
   exclude_layers: ["cls_token", "pos_embed"]  # Preserve critical embeddings
   

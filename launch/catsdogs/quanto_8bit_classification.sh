@@ -5,19 +5,19 @@
 #SBATCH --gres=gpu:8
 #SBATCH --ntasks-per-node=8
 #SBATCH --cpus-per-task=7
-#SBATCH -t 00:30:00  # 빠른 테스트를 위해 30분으로 설정
+#SBATCH -t 00:30:00  # 30 minutes for fast testing
 #SBATCH -p batch
 #SBATCH -o quanto_8bit_catsdogs-%j.out
 #SBATCH -e quanto_8bit_catsdogs-%j.out
 
-# 🚀 QUANTO 8-BIT QUANTIZED CATSDOGS TESTING 🚀
+# QUANTO 8-BIT QUANTIZED CATSDOGS TESTING
 # Frontier Supercomputer - AMD MI250X Optimized
 # Target: Fast testing with quanto 8-bit quantization
 
 [ -z $JOBID ] && JOBID=$SLURM_JOB_ID
 [ -z $JOBSIZE ] && JOBSIZE=$SLURM_JOB_NUM_NODES
 
-echo "🎯 Quanto 8-bit Quantized CatsDogs Testing Starting..."
+echo "Quanto 8-bit Quantized CatsDogs Testing Starting..."
 echo "Job ID: $JOBID"
 echo "Nodes: $JOBSIZE"
 echo "Total GPUs: $((JOBSIZE*8))"
@@ -50,7 +50,7 @@ export HSA_ENABLE_SDMA=1
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 export TORCH_CUDNN_V8_API_ENABLED=1
 
-echo "🔥 Environment loaded - ROCm quanto optimizations enabled"
+echo "Environment loaded - ROCm quanto optimizations enabled"
 echo "Starting Quanto 8-bit quantized CatsDogs testing on $((SLURM_JOB_NUM_NODES*8)) GPUs..."
 
 # Launch quanto quantized training with testing configuration
@@ -64,5 +64,5 @@ python ../../training_scripts/train_class_simple.py \
 --performance-mode extreme_scale \
 ../../configs/catsdogs/classification/quanto_8bit_config.yaml
 
-echo "✅ Quanto 8-bit quantized CatsDogs testing completed!"
+echo "Quanto 8-bit quantized CatsDogs testing completed!"
 echo "Next: Try 4-bit quantization for even more compression!"
