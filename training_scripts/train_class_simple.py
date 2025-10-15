@@ -243,12 +243,12 @@ def main(device, local_rank):
         use_adaptive_pos_emb=use_adaptive_pos_emb,
     ).to(device)
 
-    # 🚀 QUANTO QUANTIZATION INTEGRATION 🚀
+    # QUANTO QUANTIZATION INTEGRATION
     # Apply quanto quantization before DDP wrapping
     if quantization_config.get('enabled', False):
         if world_rank == 0:
             print("=" * 80, flush=True)
-            print("🚀 APPLYING QUANTO QUANTIZATION 🚀", flush=True)
+            print("APPLYING QUANTO QUANTIZATION", flush=True)
             print(f"Target: {quantization_config.get('bits', 8)}-bit with quanto", flush=True)
             print("=" * 80, flush=True)
             
@@ -256,7 +256,7 @@ def main(device, local_rank):
         model = setup_quanto_quantization(model, quantization_config)
         
         if world_rank == 0:
-            print("✅ Quanto quantization setup complete!", flush=True)
+            print("Quanto quantization setup complete!", flush=True)
 
     #model = DDP(model,device_ids=[local_rank],output_device=[local_rank])
     #find_unused_parameters=True is needed under these circumstances
