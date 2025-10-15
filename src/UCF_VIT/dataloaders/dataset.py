@@ -172,13 +172,14 @@ class FileReader(IterableDataset):
                     ddp_rank = torch.distributed.get_rank(group=self.ddp_group)
 
             num_workers_per_ddp = worker_info.num_workers
-            assert num_workers_per_ddp == 1
+            #assert num_workers_per_ddp == 1
             if self.multi_dataset_training:
                 group_list = list(map(lambda x: int(x), self.gx.split(":")))
                 group_id = np.where(np.cumsum(group_list) > ddp_rank)[0][0]
                 group_size = group_list[group_id]
                 group_rank = ddp_rank - ([0] + np.cumsum(group_list).tolist())[group_id]
-                num_shards = group_size
+                #num_shards = group_size
+                num_shards = group_size * num_workers_per_ddp
                 rank = group_rank
             else:
                 num_shards = num_workers_per_ddp * self.data_par_size
@@ -712,7 +713,7 @@ class ImageBlockDataIter_3D_Memmap(IterableDataset):
                                 LTOP_z += 1
                         else: #>0
                             #if self.nz % tile_overlap_size_z != 0:
-                            if self.chun_size[2] % tile_overlap_size_z != 0:
+                            if self.chunk_size[2] % tile_overlap_size_z != 0:
                                 LTOP_z += 1
                         num_blocks_z = int(num_blocks_z + LTOP_z)
 
@@ -1048,9 +1049,10 @@ class ImageBlockDataIter_3D_Memmap(IterableDataset):
                                     for zz in range(z_step_size):
                                         #data_cube = data[cc][kk*z_step_size:(self.tile_size_z*self.nz_skip)+kk*z_step_size:self.nz_skip, jj*y_step_size:(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip,ii*x_step_size:(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
                                         data_cube = data[chunk_offset_z+zz][chunk_offset_x+ii*x_step_size:chunk_offset_x+(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip, chunk_offset_y+jj*y_step_size:chunk_offset_y+(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip]
-                                        data_cube = data_cube.copy()
-                                        data_cube = data_cube/255
-                                        datalist.append(data_cube.astype(np.uint8))
+                                        #data_cube = data_cube.copy()
+                                        #data_cube = data_cube/255
+                                        #datalist.append(data_cube.astype(np.uint8))
+                                        datalist.append(data_cube.copy())
                                     yield np.expand_dims(np.moveaxis(np.stack(datalist, axis=0), 0, -1), axis=0), variables
                                     #yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
                                 else:
@@ -1300,11 +1302,16 @@ class ProcessChannels(IterableDataset):
                                     else:
                                         yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_label_list[i].pop(), yield_var_list[i].pop()
                                 else:
-                                    if self._dataset == "basic_ct" or self._dataset == "s8d_2d_label":
+                                    if self._dataset == "basic_ct":
                                         if self.return_qdt:
                                             yield np_image, seq_image, seq_size, seq_pos, np.asarray(np_label,dtype=np.uint8), seq_label_list, yield_var_list[i].pop(), qdt
                                         else:
                                             yield np_image, seq_image, seq_size, seq_pos, np.asarray(np_label,dtype=np.uint8), seq_label_list, yield_var_list[i].pop()
+                                    elif self._dataset == "s8d_2d_label":
+                                        if self.return_qdt:
+                                            yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, np.asarray(np_label,dtype=np.uint8), seq_label_list, yield_var_list[i].pop(), qdt
+                                        else:
+                                            yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, np.asarray(np_label,dtype=np.uint8), seq_label_list, yield_var_list[i].pop()
                                     else:
                                         if self.return_qdt:
                                             yield np_image, seq_image, seq_size, seq_pos, np_label, seq_label_list, yield_var_list[i].pop(), qdt
@@ -1341,7 +1348,7 @@ class ProcessChannels(IterableDataset):
 
                                     else:
                                         seq_image, seq_size, seq_pos, _ = self.patchify(np.moveaxis(np_image,0,-1))
-                                if self._dataset == "imagenet":
+                                if self._dataset == "imagenet" or self._dataset == "s8d_2d_label":
                                     if self.return_qdt:
                                         yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_var_list[i].pop(), qdt
                                     else:
@@ -1352,7 +1359,7 @@ class ProcessChannels(IterableDataset):
                                     else:
                                         yield np_image, seq_image, seq_size, seq_pos, yield_var_list[i].pop()
                             else:
-                                if self._dataset == "imagenet":
+                                if self._dataset == "imagenet" or self._dataset == "s8d_2d_label":
                                     np_image = yield_x_list[i].pop()
                                     yield np.asarray(np_image,dtype=np.float32), yield_var_list[i].pop()
                                 else:

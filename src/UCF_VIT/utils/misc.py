@@ -291,6 +291,7 @@ def process_root_dirs(dataset, dict_root_dirs, data_par_size, nx, ny, nz, chunk_
         dict_lister_trains = {}
         dict_chunk_trains = {}
         for k, root_dir in dict_root_dirs.items():
+            print(root_dir)
             num_chunks_x = int(nx[k]/chunk_size[k][0])
             num_chunks_y = int(ny[k]/chunk_size[k][1])
             num_chunks_z = int(nz[k]/chunk_size[k][2])
@@ -380,6 +381,7 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
     use_all_data = conf['data']['use_all_data']
     patch_size =  conf['model']['net']['init_args']['patch_size']
     dataset = conf['data']['dataset']
+    num_workers = conf['data']['num_workers']
 
     if dataset == "imagenet":
         imagenet_resize = conf['dataset_options']['imagenet_resize']
@@ -424,7 +426,8 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
             start_idx = int(dict_start_idx[k] * len(lister_train))
             end_idx = int(dict_end_idx[k] * len(lister_train))
         keys = lister_train[start_idx:end_idx]
-        num_total_images.append(len(keys))
+        assert math.floor(len(keys)/num_workers) > 0, "Need at least one file per worker"
+        num_total_images.append(math.floor(len(keys)/num_workers)*num_workers)
 
         #Assume all channels have the same data size
         if dataset == "s8d_3d":
