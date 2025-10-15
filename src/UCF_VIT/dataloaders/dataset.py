@@ -1049,11 +1049,10 @@ class ImageBlockDataIter_3D_Memmap(IterableDataset):
                                     for zz in range(z_step_size):
                                         #data_cube = data[cc][kk*z_step_size:(self.tile_size_z*self.nz_skip)+kk*z_step_size:self.nz_skip, jj*y_step_size:(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip,ii*x_step_size:(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
                                         data_cube = data[chunk_offset_z+zz][chunk_offset_x+ii*x_step_size:chunk_offset_x+(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip, chunk_offset_y+jj*y_step_size:chunk_offset_y+(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip]
-                                        #data_cube = data_cube.copy()
-                                        #data_cube = data_cube/255
-                                        #datalist.append(data_cube.astype(np.uint8))
                                         datalist.append(data_cube.copy())
-                                    yield np.expand_dims(np.moveaxis(np.stack(datalist, axis=0), 0, -1), axis=0), variables
+                                    datalist = np.stack(datalist,axis=0)
+                                    datalist = (datalist - np.min(datalist)) / ((np.max(datalist) - np.min(datalist)) + 1e-8).astype(np.float32)
+                                    yield np.expand_dims(np.moveaxis(datalist, 0, -1), axis=0), variables
                                     #yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
                                 else:
                                     if (self.tile_size_x*self.nx_skip)+ii*x_step_size > (datalen_x-1):
