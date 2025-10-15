@@ -3,6 +3,7 @@ import glob
 import os
 import sys
 import random
+import argparse
 from datetime import timedelta
 import numpy as np
 import torch
@@ -18,6 +19,11 @@ from timm.layers import use_fused_attn
 from UCF_VIT.simple.arch import VIT
 from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, is_power_of_two
 from UCF_VIT.utils.fused_attn import FusedAttn
+from UCF_VIT.utils.quanto_quantization import (
+    setup_quanto_quantization, 
+    add_quantization_args, 
+    create_quantization_config_from_args
+)
 
 from torch.utils.data import DataLoader
 
@@ -39,12 +45,22 @@ def main(device, local_rank):
     world_size = dist.get_world_size()
     world_rank = dist.get_rank()
 
-    config_path = sys.argv[1]
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='UCF-VIT Training with Quanto Quantization')
+    parser.add_argument('config', help='Path to config file')
+    parser = add_quantization_args(parser)
+    args = parser.parse_args()
+
+    config_path = args.config
 
     if world_rank==0:
         print("config_path ",config_path,flush=True)
 
     conf = yaml.load(open(config_path,'r'),Loader=yaml.FullLoader)
+    
+    # Create quantization config from command line arguments
+    quantization_config = create_quantization_config_from_args(args)
+    conf['quantization'] = quantization_config
 
     if world_rank==0: 
         print(conf,flush=True)
@@ -190,6 +206,21 @@ def main(device, local_rank):
         FusedAttn_option=FusedAttn_option,
         use_adaptive_pos_emb=use_adaptive_pos_emb,
     ).to(device)
+
+    # QUANTO QUANTIZATION INTEGRATION
+    # Apply quanto quantization before DDP wrapping
+    if quantization_config.get('enabled', False):
+        if world_rank == 0:
+            print("=" * 80, flush=True)
+            print("APPLYING QUANTO QUANTIZATION", flush=True)
+            print(f"Target: {quantization_config.get('bits', 8)}-bit with quanto", flush=True)
+            print("=" * 80, flush=True)
+            
+        # Apply quanto quantization
+        model = setup_quanto_quantization(model, quantization_config)
+        
+        if world_rank == 0:
+            print("Quanto quantization setup complete!", flush=True)
 
     #model = DDP(model,device_ids=[local_rank],output_device=[local_rank])
     #find_unused_parameters=True is needed under these circumstances

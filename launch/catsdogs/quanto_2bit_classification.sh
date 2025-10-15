@@ -58,7 +58,7 @@ echo "Testing extreme compression: 87.5% memory reduction!"
 
 # Launch quanto quantized training with testing configuration
 time srun -n $((SLURM_JOB_NUM_NODES*8)) \
-python ../../training_scripts/train_class_simple.py \
+python ../../training_scripts/train_class_simple_torchDataloader.py \
 --quantization \
 --quantization-bits 2 \
 --quantize-weights \
