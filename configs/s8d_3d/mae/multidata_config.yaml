@@ -489,7 +489,7 @@ data:
   }
   batch_size: 2
   num_workers: 7
-  pin_memory: True
+  pin_memory: False
   single_channel: True
   tile_overlap: 0.0
   use_all_data: False
