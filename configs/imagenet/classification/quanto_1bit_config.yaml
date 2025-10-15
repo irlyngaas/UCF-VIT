@@ -104,7 +104,7 @@ quantization:
   mi250x_kernels: true      # Use MI250X specialized kernels
   
   # Performance tuning for Gordon Bell Prize submission
-  performance_mode: "gordon_bell"  # Ultimate optimizations
+  performance_mode: "maximum"  # Ultimate optimizations
   profile_quantization: true       # Detailed profiling
 
 # ---------------------------- LOAD BALANCING -------------------------------------------

@@ -110,7 +110,7 @@ quantization:
     quant_max: 255  # For 8-bit: 0-255, 4-bit: 0-15, 1-bit: 0-1
     
   # Performance tuning for Gordon Bell submission
-  performance_mode: "gordon_bell"  # enables all optimizations
+  performance_mode: "maximum"  # enables all optimizations
   profile_quantization: true  # detailed performance profiling
 
 # ---------------------------- LOAD BALANCING -------------------------------------------

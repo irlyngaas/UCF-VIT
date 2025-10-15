@@ -100,7 +100,7 @@ class QuantoQuantizer:
             freeze(model)
             
             # Apply performance optimizations
-            if self.config.performance_mode in ["extreme_scale", "gordon_bell"]:
+            if self.config.performance_mode in ["extreme_scale", "maximum"]:
                 self._apply_extreme_scale_optimizations(model)
             
             logger.info(f"Successfully applied {self.config.bits}-bit quanto quantization")
@@ -260,7 +260,7 @@ def add_quantization_args(parser):
     parser.add_argument('--rocm-optimizations', action='store_true', default=True,
                        help='Enable ROCm optimizations for Frontier/AMD')
     parser.add_argument('--performance-mode', type=str, 
-                       choices=['normal', 'extreme_scale', 'gordon_bell'], 
+                       choices=['normal', 'extreme_scale', 'maximum'], 
                        default='extreme_scale',
                        help='Performance optimization mode')
     return parser

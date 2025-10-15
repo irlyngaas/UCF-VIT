@@ -60,7 +60,7 @@ class QuantizationConfig:
         self.quant_max = qat_config.get('quant_max', self._get_quant_max())
         
         # Performance tuning
-        self.performance_mode = config_dict.get('performance_mode', 'gordon_bell')
+        self.performance_mode = config_dict.get('performance_mode', 'maximum')
         self.profile_quantization = config_dict.get('profile_quantization', True)
         
     def _get_quant_max(self) -> int:
@@ -209,7 +209,7 @@ class FrontierQuantizer:
         quantized_model = convert(model, inplace=False)
         
         # Apply final optimizations for extreme-scale deployment
-        if self.config.performance_mode in ["gordon_bell", "extreme_scale"]:
+        if self.config.performance_mode in ["maximum", "extreme_scale"]:
             self._apply_extreme_scale_optimizations(quantized_model)
             
         return quantized_model

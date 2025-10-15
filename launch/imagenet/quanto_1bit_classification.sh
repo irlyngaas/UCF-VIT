@@ -62,7 +62,7 @@ python ../../training_scripts/train_class_simple.py \
 --quantize-weights \
 --quantize-activations \
 --rocm-optimizations \
---performance-mode gordon_bell \
+--performance-mode maximum \
 ../../configs/imagenet/classification/quanto_1bit_config.yaml
 
 echo "✅ Quanto 1-bit quantized training completed!"
