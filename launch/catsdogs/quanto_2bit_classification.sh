@@ -61,7 +61,7 @@ python ../../training_scripts/train_class_simple_torchDataloader.py \
 --quantization-bits 2 \
 --quantize-weights \
 --rocm-optimizations \
---performance-mode fast \
+--performance-mode normal \
 ../../configs/catsdogs/classification/quanto_2bit_config.yaml 2> >(grep -v "MIOpen(HIP): Warning" >&2)
 
 echo "Quanto 2-bit quantized CatsDogs testing completed!"

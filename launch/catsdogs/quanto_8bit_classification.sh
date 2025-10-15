@@ -59,7 +59,7 @@ python ../../training_scripts/train_class_simple_torchDataloader.py \
 --quantization-bits 8 \
 --quantize-weights \
 --rocm-optimizations \
---performance-mode fast \
+--performance-mode normal \
 ../../configs/catsdogs/classification/quanto_8bit_config.yaml 2> >(grep -v "MIOpen(HIP): Warning" >&2)
 
 echo "Quanto 8-bit quantized CatsDogs testing completed!"
