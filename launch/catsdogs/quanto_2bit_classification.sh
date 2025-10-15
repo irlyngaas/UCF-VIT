@@ -33,24 +33,14 @@ module load PrgEnv-gnu
 module load gcc/12.2.0
 module load rocm/6.2.4
 
-# ROCm optimizations for quanto quantization
+# ROCm optimizations (same as classification_simple.sh)
 export MIOPEN_DISABLE_CACHE=1
 export NCCL_PROTO=Simple
 export MIOPEN_USER_DB_PATH=/tmp/$JOBID
 mkdir -p $MIOPEN_USER_DB_PATH
 
-# Performance optimizations for testing
 export OMP_NUM_THREADS=7
 export PYTHONPATH=$PWD:$PYTHONPATH
-
-# Enable ROCm quanto optimizations
-export ROCM_QUANTIZATION_ENABLED=1
-export HIP_LAUNCH_BLOCKING=0
-export HSA_ENABLE_SDMA=1
-
-# Memory optimizations for extreme compression testing
-export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:1024
-export TORCH_CUDNN_V8_API_ENABLED=1
 
 echo "Environment loaded - ROCm quanto optimizations enabled"
 echo "Starting Quanto 2-bit quantized CatsDogs testing on $((SLURM_JOB_NUM_NODES*8)) GPUs..."
