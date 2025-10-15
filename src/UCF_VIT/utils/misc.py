@@ -291,7 +291,6 @@ def process_root_dirs(dataset, dict_root_dirs, data_par_size, nx, ny, nz, chunk_
         dict_lister_trains = {}
         dict_chunk_trains = {}
         for k, root_dir in dict_root_dirs.items():
-            print(root_dir)
             num_chunks_x = int(nx[k]/chunk_size[k][0])
             num_chunks_y = int(ny[k]/chunk_size[k][1])
             num_chunks_z = int(nz[k]/chunk_size[k][2])
