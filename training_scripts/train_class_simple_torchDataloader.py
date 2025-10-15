@@ -24,6 +24,11 @@ from UCF_VIT.utils.quanto_quantization import (
     add_quantization_args, 
     create_quantization_config_from_args
 )
+from UCF_VIT.utils.torchao_quantization import (
+    setup_torchao_quantization,
+    add_torchao_quantization_args,
+    create_torchao_config_from_args
+)
 
 from torch.utils.data import DataLoader
 
@@ -46,9 +51,10 @@ def main(device, local_rank):
     world_rank = dist.get_rank()
 
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description='UCF-VIT Training with Quanto Quantization')
+    parser = argparse.ArgumentParser(description='UCF-VIT Training with Quantization Support')
     parser.add_argument('config', help='Path to config file')
     parser = add_quantization_args(parser)
+    parser = add_torchao_quantization_args(parser)
     args = parser.parse_args()
 
     config_path = args.config
@@ -58,9 +64,11 @@ def main(device, local_rank):
 
     conf = yaml.load(open(config_path,'r'),Loader=yaml.FullLoader)
     
-    # Create quantization config from command line arguments
+    # Create quantization configs from command line arguments
     quantization_config = create_quantization_config_from_args(args)
+    torchao_config = create_torchao_config_from_args(args)
     conf['quantization'] = quantization_config
+    conf['torchao_quantization'] = torchao_config
 
     if world_rank==0: 
         print(conf,flush=True)
@@ -211,8 +219,8 @@ def main(device, local_rank):
     #find_unused_parameters=True is needed under these circumstances
     model = DDP(model,device_ids=[local_rank],output_device=[local_rank],find_unused_parameters=True)
 
-    # QUANTO QUANTIZATION INTEGRATION
-    # Apply quanto quantization after DDP wrapping
+    # QUANTIZATION INTEGRATION
+    # Apply quantization after DDP wrapping
     if quantization_config.get('enabled', False):
         if world_rank == 0:
             print("=" * 80, flush=True)
@@ -225,6 +233,20 @@ def main(device, local_rank):
         
         if world_rank == 0:
             print("Quanto quantization setup complete!", flush=True)
+    
+    elif torchao_config.get('enabled', False):
+        if world_rank == 0:
+            print("=" * 80, flush=True)
+            print("APPLYING TORCH.AO QUANTIZATION", flush=True)
+            print(f"Target: {torchao_config.get('bits', 8)}-bit with torch.ao", flush=True)
+            print(f"Method: {torchao_config.get('method', 'dynamic')}", flush=True)
+            print("=" * 80, flush=True)
+            
+        # Apply torch.ao quantization to the DDP-wrapped model
+        model = setup_torchao_quantization(model, torchao_config)
+        
+        if world_rank == 0:
+            print("Torch.ao quantization setup complete!", flush=True)
  
     optimizer = configure_optimizer(model,lr,beta_1,beta_2,weight_decay)
     scheduler = configure_scheduler(optimizer,warmup_steps,max_steps,warmup_start_lr,eta_min)
