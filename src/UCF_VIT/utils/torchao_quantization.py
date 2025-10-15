@@ -95,12 +95,19 @@ class TorchAOQuantizer:
         """Apply dynamic quantization (weights only)"""
         logger.info("Applying dynamic quantization...")
         
+        # Move model to CPU for quantization (ROCm doesn't support quantized ops)
+        original_device = next(model.parameters()).device
+        model_cpu = model.cpu()
+        
         # Dynamic quantization only quantizes weights
         quantized_model = quantize_dynamic(
-            model,
+            model_cpu,
             {nn.Linear, nn.Conv2d},  # Only quantize these layer types
             dtype=torch.qint8
         )
+        
+        # Move back to original device
+        quantized_model = quantized_model.to(original_device)
         
         return quantized_model
     
@@ -197,14 +204,25 @@ def setup_torchao_quantization(model: nn.Module, config_dict: Dict) -> nn.Module
         logger.info("Torch.ao quantization disabled")
         return model
     
-    quantizer = TorchAOQuantizer(config)
-    quantized_model = quantizer.quantize_model(model)
+    # Check if ROCm environment (torch.ao quantized ops not supported)
+    if torch.cuda.is_available() and hasattr(torch.backends, 'cuda') and torch.backends.cuda.is_built():
+        logger.warning("Torch.ao quantization not supported on ROCm/AMD GPU")
+        logger.warning("Falling back to unquantized model")
+        return model
     
-    # Log statistics
-    stats = quantizer.get_quantization_stats(quantized_model)
-    logger.info(f"Torch.ao quantization stats: {stats}")
-    
-    return quantized_model
+    try:
+        quantizer = TorchAOQuantizer(config)
+        quantized_model = quantizer.quantize_model(model)
+        
+        # Log statistics
+        stats = quantizer.get_quantization_stats(quantized_model)
+        logger.info(f"Torch.ao quantization stats: {stats}")
+        
+        return quantized_model
+    except Exception as e:
+        logger.error(f"Torch.ao quantization failed: {e}")
+        logger.warning("Falling back to unquantized model")
+        return model
 
 def add_torchao_quantization_args(parser):
     """Add torch.ao quantization command line arguments"""
