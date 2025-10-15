@@ -6,16 +6,16 @@ Compatible with CatsDogs dataset and Frontier supercomputer
 import torch
 import torch.nn as nn
 from torch.ao.quantization import (
-    quantize_dynamic, 
-    quantize_static,
+    quantize_dynamic,
     prepare_qat,
     convert,
     get_default_qconfig,
     QConfigMapping,
     default_dynamic_qconfig,
-    default_static_qconfig,
     default_qat_qconfig
 )
+from torch.ao.quantization.quantize import quantize_static
+from torch.ao.quantization.qconfig import default_static_qconfig
 from torch.ao.quantization.quantize_fx import prepare_fx, convert_fx
 from torch.ao.quantization.qconfig import QConfig
 from torch.ao.quantization.observer import MinMaxObserver, MovingAverageMinMaxObserver
@@ -113,7 +113,8 @@ class TorchAOQuantizer:
         model.qconfig = self.config.get_qconfig()
         
         # Prepare model for quantization
-        prepared_model = prepare_static(model)
+        from torch.ao.quantization.quantize import prepare
+        prepared_model = prepare(model)
         
         # Calibrate with dummy data
         self._calibrate_model(prepared_model)
