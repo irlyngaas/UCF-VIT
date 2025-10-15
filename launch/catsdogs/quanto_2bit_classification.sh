@@ -39,6 +39,13 @@ export NCCL_PROTO=Simple
 export MIOPEN_USER_DB_PATH=/tmp/$JOBID
 mkdir -p $MIOPEN_USER_DB_PATH
 
+# Suppress MIOpen warnings completely
+export MIOPEN_LOG_LEVEL=0
+export MIOPEN_ENABLE_LOGGING=0
+export MIOPEN_DISABLE_LOGGING=1
+export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export HIP_LAUNCH_BLOCKING=0
+
 export OMP_NUM_THREADS=7
 export PYTHONPATH=$PWD:$PYTHONPATH
 
@@ -47,15 +54,15 @@ echo "Starting Quanto 2-bit quantized CatsDogs testing on $((SLURM_JOB_NUM_NODES
 echo "Testing extreme compression: 87.5% memory reduction!"
 
 # Launch quanto quantized training with testing configuration
+# Redirect MIOpen warnings to /dev/null
 time srun -n $((SLURM_JOB_NUM_NODES*8)) \
 python ../../training_scripts/train_class_simple_torchDataloader.py \
 --quantization \
 --quantization-bits 2 \
 --quantize-weights \
---quantize-activations \
 --rocm-optimizations \
---performance-mode extreme_scale \
-../../configs/catsdogs/classification/quanto_2bit_config.yaml
+--performance-mode fast \
+../../configs/catsdogs/classification/quanto_2bit_config.yaml 2> >(grep -v "MIOpen(HIP): Warning" >&2)
 
 echo "Quanto 2-bit quantized CatsDogs testing completed!"
 echo "Extreme compression achieved: 87.5% memory reduction!"

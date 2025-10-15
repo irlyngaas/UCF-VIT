@@ -38,8 +38,12 @@ export NCCL_PROTO=Simple
 export MIOPEN_USER_DB_PATH=/tmp/$JOBID
 mkdir -p $MIOPEN_USER_DB_PATH
 
-# Suppress MIOpen warnings
+# Suppress MIOpen warnings completely
 export MIOPEN_LOG_LEVEL=0
+export MIOPEN_ENABLE_LOGGING=0
+export MIOPEN_DISABLE_LOGGING=1
+export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export HIP_LAUNCH_BLOCKING=0
 
 export OMP_NUM_THREADS=7
 export PYTHONPATH=$PWD:$PYTHONPATH
@@ -48,15 +52,15 @@ echo "Environment loaded - ROCm quanto optimizations enabled"
 echo "Starting Quanto 8-bit quantized CatsDogs testing on $((SLURM_JOB_NUM_NODES*8)) GPUs..."
 
 # Launch quanto quantized training with testing configuration
+# Redirect MIOpen warnings to /dev/null
 time srun -n $((SLURM_JOB_NUM_NODES*8)) \
 python ../../training_scripts/train_class_simple_torchDataloader.py \
 --quantization \
 --quantization-bits 8 \
 --quantize-weights \
---quantize-activations \
 --rocm-optimizations \
---performance-mode extreme_scale \
-../../configs/catsdogs/classification/quanto_8bit_config.yaml
+--performance-mode fast \
+../../configs/catsdogs/classification/quanto_8bit_config.yaml 2> >(grep -v "MIOpen(HIP): Warning" >&2)
 
 echo "Quanto 8-bit quantized CatsDogs testing completed!"
 echo "Next: Try 4-bit quantization for even more compression!"
