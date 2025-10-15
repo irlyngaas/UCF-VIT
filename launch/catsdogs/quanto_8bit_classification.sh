@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH -A stf006
+#SBATCH -A lrn075
 #SBATCH -J quanto_8bit_catsdogs
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:8
 #SBATCH --ntasks-per-node=8
 #SBATCH --cpus-per-task=7
 #SBATCH -t 00:30:00  # 30 minutes for fast testing
-#SBATCH -p batch
+#SBATCH -q debug
 #SBATCH -o quanto_8bit_catsdogs-%j.out
 #SBATCH -e quanto_8bit_catsdogs-%j.out
 
@@ -24,8 +24,9 @@ echo "Total GPUs: $((JOBSIZE*8))"
 echo "Target: Fast testing with quanto 8-bit on $(($JOBSIZE*8)) AMD MI250X GPUs"
 
 # Load Frontier environment optimized for quanto quantization
-eval "$(/lustre/orion/stf006/proj-shared/irl1/miniforge3/bin/conda shell.bash hook)"
-conda activate forge-vit
+#eval "$(/lustre/orion/stf006/proj-shared/irl1/miniforge3/bin/conda shell.bash hook)"
+#conda activate forge-vit
+. ~/.bashrc_075
 
 module load PrgEnv-gnu
 module load gcc/12.2.0
