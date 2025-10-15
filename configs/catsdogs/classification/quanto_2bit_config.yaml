@@ -72,15 +72,13 @@ quantization:
   enabled: true  # ENABLE QUANTO 2-BIT QUANTIZATION
   bits: 2         # 2-bit (87.5% memory reduction)
   quantize_weights: true
-  quantize_activations: true
-  calibration_samples: 100  # Reduced for small dataset
-  quantize_layers: ["linear", "conv"]  # Target main parameter layers
+  quantize_activations: false  # Disable for speed - only quantize weights
+  calibration_samples: 10      # Minimal calibration for speed
+  quantize_layers: ["linear"]  # Only quantize linear layers for speed
   exclude_layers: ["cls_token", "pos_embed"]  # Preserve critical embeddings
   
-  # Frontier supercomputer specific optimizations
-  rocm_optimizations: true   # Enable ROCm optimizations
-  mi250x_kernels: true      # Use MI250X specialized kernels
-  
-  # Performance tuning for testing
-  performance_mode: "extreme_scale"  # Max optimizations
-  profile_quantization: true       # Detailed profiling
+  # Performance optimizations
+  rocm_optimizations: false   # Disable for speed
+  mi250x_kernels: false      # Disable for speed
+  performance_mode: "fast"    # Fast mode instead of extreme_scale
+  profile_quantization: false # Disable profiling for speed

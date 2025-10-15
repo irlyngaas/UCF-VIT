@@ -38,6 +38,9 @@ export NCCL_PROTO=Simple
 export MIOPEN_USER_DB_PATH=/tmp/$JOBID
 mkdir -p $MIOPEN_USER_DB_PATH
 
+# Suppress MIOpen warnings
+export MIOPEN_LOG_LEVEL=0
+
 export OMP_NUM_THREADS=7
 export PYTHONPATH=$PWD:$PYTHONPATH
 
