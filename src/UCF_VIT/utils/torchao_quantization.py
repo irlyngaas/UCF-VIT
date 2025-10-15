@@ -14,7 +14,6 @@ from torch.ao.quantization import (
     default_dynamic_qconfig,
     default_qat_qconfig
 )
-from torch.ao.quantization.quantize import quantize_static
 from torch.ao.quantization.qconfig import default_static_qconfig
 from torch.ao.quantization.quantize_fx import prepare_fx, convert_fx
 from torch.ao.quantization.qconfig import QConfig
@@ -82,7 +81,9 @@ class TorchAOQuantizer:
             if self.config.method == 'dynamic':
                 return self._quantize_dynamic(model)
             elif self.config.method == 'static':
-                return self._quantize_static(model)
+                # Static quantization not available, fallback to dynamic
+                logger.warning("Static quantization not available, falling back to dynamic")
+                return self._quantize_dynamic(model)
             elif self.config.method == 'qat':
                 return self._quantize_qat(model)
             else:
