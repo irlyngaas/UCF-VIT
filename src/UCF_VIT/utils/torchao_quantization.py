@@ -14,7 +14,7 @@ from torch.ao.quantization import (
     default_dynamic_qconfig,
     default_qat_qconfig
 )
-from torch.ao.quantization.qconfig import default_static_qconfig
+# from torch.ao.quantization.qconfig import default_static_qconfig  # Not available in this PyTorch version
 from torch.ao.quantization.quantize_fx import prepare_fx, convert_fx
 from torch.ao.quantization.qconfig import QConfig
 from torch.ao.quantization.observer import MinMaxObserver, MovingAverageMinMaxObserver
@@ -45,9 +45,7 @@ class TorchAOQuantizationConfig:
         if self.bits == 8:
             if self.method == 'qat':
                 return default_qat_qconfig
-            elif self.method == 'static':
-                return default_static_qconfig
-            else:  # dynamic
+            else:  # dynamic (static not available)
                 return default_dynamic_qconfig
         else:
             # For 4-bit, use custom qconfig
