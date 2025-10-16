@@ -426,7 +426,8 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
             end_idx = int(dict_end_idx[k] * len(lister_train))
         keys = lister_train[start_idx:end_idx]
         assert math.floor(len(keys)/num_workers) > 0, "Need at least one file per worker"
-        num_total_images.append(math.floor(len(keys)/num_workers)*num_workers)
+        #num_total_images.append(math.floor(len(keys)/num_workers)*num_workers)
+        num_total_images.append(len(keys))
 
         #Assume all channels have the same data size
         if dataset == "s8d_3d":
@@ -628,19 +629,34 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
         assert ddp_rank_ratio[i] > 0, "All Datasets need at least one GPU. Add more GPUs to the training to resolve this issue, or consider removing datasets with small amounts of data"
 
     num_images_per_rank = []
+    num_images_per_rank_worker = []
+    actual_num_images_per_rank = []
+    #num_images_per_shard = []
     for i in range(len(num_total_tiles)):
         num_images_per_rank.append(int(math.floor(num_total_images[i] / float(ddp_rank_ratio[i]))))
-    #print("Num Images Per Rank", num_images_per_rank)
+        num_images_per_rank_worker.append(int(math.floor(num_images_per_rank[i] / float(num_workers))))
+        actual_num_images_per_rank.append(num_images_per_rank_worker[i]*num_workers)
+        #num_images_per_shard.append(int(math.floor(num_total_images[i] / float(ddp_rank_ratio[i]*num_workers))))
+    if VERBOSE:
+        print("Num Images Per Rank", num_images_per_rank)
+        print("Num Images Per Worker", num_images_per_rank_worker)
+        print("Actual Num Images Per Rank", actual_num_images_per_rank)
+        #print("Num Images Per Shard", num_images_per_shard)
     assert min(num_images_per_rank) >= 1.0, "Decrease number of GPUs, not all GPUs have their own image"
+    assert min(num_images_per_rank_worker) >= 1.0, "Decrease number of GPUs, not all dataloader workers have their own image"
 
     batches_per_rank = []
     tiles_per_rank = []
+    tiles_per_worker = []
     for i in range(len(num_total_tiles)):
         if single_channel:
-            batches_per_rank.append(np.floor(num_images_per_rank[i])*tiles_per_image[i]*num_channels_per_dataset[i]/batch_size)
+            #batches_per_rank.append(np.floor(num_images_per_rank[i])*tiles_per_image[i]*num_channels_per_dataset[i]/batch_size)
+            batches_per_rank.append(np.floor(actual_num_images_per_rank[i])*tiles_per_image[i]*num_channels_per_dataset[i]/batch_size)
         else:
-            batches_per_rank.append(np.floor(num_images_per_rank[i])*tiles_per_image[i]/batch_size)
-        tiles_per_rank.append(np.floor(num_images_per_rank[i])*tiles_per_image[i])
+            #batches_per_rank.append(np.floor(num_images_per_rank[i])*tiles_per_image[i]/batch_size)
+            batches_per_rank.append(np.floor(actual_num_images_per_rank[i])*tiles_per_image[i]/batch_size)
+        #tiles_per_rank.append(np.floor(num_images_per_rank[i])*tiles_per_image[i])
+        tiles_per_rank.append(np.floor(actual_num_images_per_rank[i])*tiles_per_image[i])
     if VERBOSE:
         print("Tiles Per Rank", tiles_per_rank)
         print("USE BELOW IN CONFIG FILE")
