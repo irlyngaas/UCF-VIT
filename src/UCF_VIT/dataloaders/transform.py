@@ -75,53 +75,90 @@ class Patchify_3D(torch.nn.Module):
 
     def forward(self, img):  # we assume inputs are always structured like this
 
-        self.smooth_factor = random.choice(self.sths)
-        c = random.choice(self.cannys)
-        self.canny = [c, c+50]
-        grey_img = gaussian_filter(img, sigma=(self.smooth_factor,self.smooth_factor,self.smooth_factor,0))
 
-        gradient_magnitude = np.zeros_like(grey_img[:,:,:,0])
-        gradient_direction = np.zeros_like(grey_img[:,:,:,0])
-        for i in range(grey_img.shape[0]):
-            for j in range(self.num_channels):
-                if j == 0:
-                    sobelx = cv.Sobel(grey_img[i, :, :, j], cv.CV_64F, 1, 0, ksize=5)
-                    sobely = cv.Sobel(grey_img[i, :, :, j], cv.CV_64F, 0, 1, ksize=5)
-                    g_mag = np.sqrt(sobelx**2 + sobely**2)
-                else:
-                    sx = cv.Sobel(grey_img[i, :, :, j], cv.CV_64F, 1, 0, ksize=5)
-                    sy = cv.Sobel(grey_img[i, :, :, j], cv.CV_64F, 0, 1, ksize=5)
-                    if np.mean(np.sqrt(sx**2 + sy**2)) > np.mean(g_mag):
-                        sobelx = sx
-                    if np.mean(sy) > np.mean(sobely):
-                        sobely = sy
-            gradient_magnitude[i, :, :] = g_mag
-            gradient_direction[i, :, :] = np.arctan2(sobely, sobelx)
-        edges_combined = np.zeros_like(grey_img[:,:,:,0], dtype=bool)
-        edges_combined_counter = np.zeros_like(grey_img[:,:,:,0], dtype=np.uint8)
+        # ## added by nafi for test purposes
+        # # img = img[..., -1]      # edge data
+        # # img = np.expand_dims(img, axis=-1)
+        # print('image size', img.shape, flush=True)
+        # img = img[..., :-1]    # actual data
+        # self.num_channels = 4
 
-        for i in range(grey_img.shape[0]):
-            for j in range(self.num_channels):
-                if j == 0:
-                    canny_edges = cv.Canny((grey_img[i, :, :, j]*255).astype(np.uint8), self.canny[0], self.canny[1])
-                    cond1 = canny_edges >0
-                    edges_combined_counter[i,:,:] = edges_combined_counter[i,:,:] + cond1.astype(np.uint8)
-                else:
-                    canny = cv.Canny((grey_img[i, :, :, j]*255).astype(np.uint8), self.canny[0], self.canny[1])
-                    canny_edges = canny_edges + canny
-                    cond1 = canny >0
-                    edges_combined_counter[i,:,:] = edges_combined_counter[i,:,:] + cond1.astype(np.uint8)
-            edges_combined[i, :, :] = (canny_edges > 0)
+        # #################################
 
-        edge_direction_data = np.zeros_like(gradient_direction)
-        edge_direction_data[edges_combined] = gradient_direction[edges_combined]
+        # self.smooth_factor = random.choice(self.sths)
+        # c = random.choice(self.cannys)
+        # self.canny = [c, c+50]
+        # grey_img = gaussian_filter(img, sigma=(self.smooth_factor,self.smooth_factor,self.smooth_factor,0))
+
+        # print('grey_img', grey_img.shape, flush=True)
+
+        # gradient_magnitude = np.zeros_like(grey_img[:,:,:,0])
+        # gradient_direction = np.zeros_like(grey_img[:,:,:,0])
+        # for i in range(grey_img.shape[0]):
+        #     for j in range(self.num_channels):
+        #         if j == 0:
+        #             sobelx = cv.Sobel(grey_img[i, :, :, j], cv.CV_64F, 1, 0, ksize=5)
+        #             sobely = cv.Sobel(grey_img[i, :, :, j], cv.CV_64F, 0, 1, ksize=5)
+        #             g_mag = np.sqrt(sobelx**2 + sobely**2)
+        #         else:
+        #             sx = cv.Sobel(grey_img[i, :, :, j], cv.CV_64F, 1, 0, ksize=5)
+        #             sy = cv.Sobel(grey_img[i, :, :, j], cv.CV_64F, 0, 1, ksize=5)
+        #             if np.mean(np.sqrt(sx**2 + sy**2)) > np.mean(g_mag):
+        #                 sobelx = sx
+        #             if np.mean(sy) > np.mean(sobely):
+        #                 sobely = sy
+        #     gradient_magnitude[i, :, :] = g_mag
+        #     gradient_direction[i, :, :] = np.arctan2(sobely, sobelx)
+        # edges_combined = np.zeros_like(grey_img[:,:,:,0], dtype=bool)
+        # edges_combined_counter = np.zeros_like(grey_img[:,:,:,0], dtype=np.uint8)
+
+        # for i in range(grey_img.shape[0]):
+        #     for j in range(self.num_channels):
+        #         if j == 0:
+        #             canny_edges = cv.Canny((grey_img[i, :, :, j]*255).astype(np.uint8), self.canny[0], self.canny[1])
+        #             cond1 = canny_edges >0
+        #             edges_combined_counter[i,:,:] = edges_combined_counter[i,:,:] + cond1.astype(np.uint8)
+        #         else:
+        #             canny = cv.Canny((grey_img[i, :, :, j]*255).astype(np.uint8), self.canny[0], self.canny[1])
+        #             canny_edges = canny_edges + canny
+        #             cond1 = canny >0
+        #             edges_combined_counter[i,:,:] = edges_combined_counter[i,:,:] + cond1.astype(np.uint8)
+        #     edges_combined[i, :, :] = (canny_edges > 0)
+
+        # edge_direction_data = np.zeros_like(gradient_direction)
+        # edge_direction_data[edges_combined] = gradient_direction[edges_combined]
         
-        edge_data_normalized = (edge_direction_data - edge_direction_data.min()) / (edge_direction_data.max() - edge_direction_data.min())
-        #TODO: Add parameter for this threshold
-        threshold = 0.5
-        norm_factor = int(255/self.num_channels)
-        binary_edges = (edge_data_normalized > threshold).astype(np.uint8) * (edges_combined_counter*norm_factor)
-        edges = binary_edges
+        # edge_data_normalized = (edge_direction_data - edge_direction_data.min()) / (edge_direction_data.max() - edge_direction_data.min())
+        # #TODO: Add parameter for this threshold
+        # threshold = 0.2
+        # norm_factor = int(255/self.num_channels)
+        # binary_edges = (edge_data_normalized > threshold).astype(np.uint8) * (edges_combined_counter*norm_factor)
+        # edges = binary_edges
+
+
+        # ### reassigning the data
+        # # img = data
+        # # self.num_channels = 4
+
+        
+        # print('initial img shape', img.shape, flush=True)
+        edges = img[..., -1]
+        img = img[..., :-1]
+        # print('edges shape', edges.shape, flush=True)
+        # print('img shape', img.shape, flush=True)
+        # print('num channel', self.num_channels, flush=True)
+
+
+        threshold = np.percentile(edges, 70, axis=None)
+        edges = (edges > threshold).astype(int)
+        norm_factor = int(1)
+
+
+        # p70 = np.percentile(edges, 70, axis=None)
+        # p20 = np.percentile(edges, 20, axis=None)
+        # edges = np.where((edges > p70) | (edges < p20), 1, 0)
+        # norm_factor = int(1)
+
 
         octtree = FixedOctTree(domain=edges, fixed_length=self.fixed_length, norm_factor=norm_factor)
 

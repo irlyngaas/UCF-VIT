@@ -157,6 +157,7 @@ class FileReader(IterableDataset):
                 group_size = group_list[group_id]
                 group_rank = ddp_rank - ([0] + np.cumsum(group_list).tolist())[group_id]
                 num_shards = group_size
+                # num_shards = group_size * num_workers_per_ddp
                 rank = group_rank
             else:
                 num_shards = num_workers_per_ddp * self.data_par_size
@@ -1265,9 +1266,26 @@ class ProcessChannels(IterableDataset):
                                                     seq_label = np.asarray(seq_label)
                                                     seq_label = np.reshape(seq_label, [-1, self.patch_size*self.patch_size*self.patch_size])
                                                 else:
+                                                    # print('np_label', np_label[j].shape, flush=True)
+                                                    # shapes = [np.shape(x) for x in np_label[j]]
+                                                    # unique_shapes = set(shapes)
+                                                    # print('unique_shapes np_label', unique_shapes, flush=True)
+                                                    # print('expanded np_label', np.expand_dims(np_label[j],axis=-1).shape, flush=True)
                                                     seq_label, _, _ = qdt_.serialize(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,self.patch_size,1))
+                                                    # seq_label, _, _ = qdt_.serialize(np_label[j], size=(self.patch_size,self.patch_size,self.patch_size))
+                                        
+                                                    # lengths_of_sublists = [len(sublist) for sublist in seq_label]
+                                                    # print('seq_label len', lengths_of_sublists, flush=True)
+                                                    # print('seq_label first', seq_label[0], flush=True)
+
+                                                    # shapes = [np.shape(x) for x in seq_label]
+                                                    # unique_shapes = set(shapes)
+                                                    # print('unique_shapes', unique_shapes, flush=True)
+                                                    # print('all shapes', shapes, flush=True)
+
                                                     seq_label = np.asarray(seq_label, dtype=np.float32)
                                                     seq_label = np.reshape(seq_label, [-1, self.patch_size*self.patch_size*self.patch_size])
+                                                    
                                                     #assert self.num_channels <=1, "num_channels >1 not implemented for 3D yet"
                                                     #if self.num_channels > 1:
                                                     #    seq_label = np.reshape(seq_label, [self.num_channels, -1, self.patch_size*self.patch_size*self.patch_size])

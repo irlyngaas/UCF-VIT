@@ -263,10 +263,10 @@ class NativePytorchDataModule(torch.nn.Module):
         chunk_size: Optional[Dict] = None,
     ):
         super().__init__()
-        if num_workers > 1:
-            raise NotImplementedError(
-                "num_workers > 1 is not supported yet. Performance will likely degrage too with larger num_workers."
-            )
+        # if num_workers > 1:
+        #     raise NotImplementedError(
+        #         "num_workers > 1 is not supported yet. Performance will likely degrage too with larger num_workers."
+        #     )
 
         assert len(dict_root_dirs) <= data_par_size, "the number of data parallel GPUs (data_par_size) needs to be at least equal to the number of datasets. Try to increase data_par_size"
 
@@ -385,7 +385,8 @@ class NativePytorchDataModule(torch.nn.Module):
                 main_keys = []
                 for j in range(len(list_)):
                     data_path = Path(list_[j])
-                    if data_path.stem != 'global':
+                    # if data_path.stem != 'global':
+                    if 'hypercubes' not in list_[j]:
                         base_path_prefix, timestamp = get_file_prefix(list_[j])
                         key = os.path.join(base_path_prefix, timestamp)
                         main_keys.append(key)

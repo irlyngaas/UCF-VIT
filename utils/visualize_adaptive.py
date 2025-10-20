@@ -146,9 +146,9 @@ def main():
     canny2 = 100
 
     if twoD:
-        patchify = Patchify(sths=smooth_factor,cannys=[canny1,canny2],fixed_length=fixed_length, patch_size=patch_size, num_channels=len(variables[dict_key]), dataset=dataset, return_edges = True)
+        patchify = Patchify(sths=smooth_factor,cannys=[canny1,canny2],fixed_length=fixed_length, patch_size=patch_size, num_channels=len(variables[dict_key])-1, dataset=dataset, return_edges = True)
     else:
-        patchify = Patchify_3D(sths=smooth_factor,cannys=[canny1,canny2],fixed_length=fixed_length, patch_size=patch_size, num_channels=len(variables[dict_key]), dataset=dataset, return_edges = True)
+        patchify = Patchify_3D(sths=smooth_factor,cannys=[canny1,canny2],fixed_length=fixed_length, patch_size=patch_size, num_channels=len(variables[dict_key])-1, dataset=dataset, return_edges = True)
 
     seq_image, seq_size, seq_pos, qdt, edges = patchify(np.moveaxis(np_image,0,-1))
     print(seq_size)

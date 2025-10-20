@@ -1131,6 +1131,7 @@ class UNETR(VIT):
     def forward(self, x: torch.Tensor, variables, seq_ps=None, x_seq = None) -> torch.Tensor:
         if self.adaptive_patching:
             if self.skip_connection:
+                x = x[:,:-1,...]
                 enc1 = self.encoder1(x)
                 x, intermediates = self.forward_intermediates(x_seq, variables, seq_ps, indices=self.skip_indices)
                 x = self.forward_head(x, intermediates, enc1)

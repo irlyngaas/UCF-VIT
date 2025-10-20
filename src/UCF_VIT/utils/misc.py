@@ -301,7 +301,8 @@ def process_root_dirs(dataset, dict_root_dirs, data_par_size, nx, ny, nz, chunk_
             main_keys = []
             for j in range(len(list_)):
                 data_path = Path(list_[j])
-                if data_path.stem != 'global':
+                # if data_path.stem != 'global':
+                if 'hypercubes' not in list_[j]:
                     base_path_prefix, timestamp = get_file_prefix(list_[j])
                     key = os.path.join(base_path_prefix, timestamp)
                     main_keys.append(key)
@@ -354,6 +355,7 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
     use_all_data = conf['data']['use_all_data']
     patch_size =  conf['model']['net']['init_args']['patch_size']
     dataset = conf['data']['dataset']
+    num_workers = conf['data']['num_workers']
 
     if dataset == "imagenet":
         imagenet_resize = conf['dataset_options']['imagenet_resize']
@@ -403,6 +405,9 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
             end_idx = int(dict_end_idx[k] * len(lister_train))
         keys = lister_train[start_idx:end_idx]
         num_total_images.append(len(keys))
+        # assert math.floor(len(keys)/num_workers) > 0, "Need at least one file per worker"
+        # num_total_images.append(math.floor(len(keys)/num_workers)*num_workers)
+        # num_total_images.append(len(keys))
 
         #Assume all channels have the same data size
         data_path = keys[0]
