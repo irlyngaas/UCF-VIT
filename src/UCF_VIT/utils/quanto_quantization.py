@@ -32,6 +32,9 @@ class QuantoQuantizationConfig:
         self.performance_mode = config_dict.get('performance_mode', 'extreme_scale')
         self.profile_quantization = config_dict.get('profile_quantization', True)
         
+        # Training vs Inference
+        self.freeze_for_inference = config_dict.get('freeze_for_inference', False)
+        
         # ROCm/Frontier specific
         self.rocm_optimizations = config_dict.get('rocm_optimizations', True)
         self.mi250x_kernels = config_dict.get('mi250x_kernels', True)
@@ -96,8 +99,12 @@ class QuantoQuantizer:
                     activations=self.quantization_bits if self.config.quantize_activations else None
                 )
             
-            # Freeze quantization
-            freeze(model)
+            # Only freeze for inference, not for training
+            if self.config.freeze_for_inference:
+                freeze(model)
+                logger.info("Model frozen for inference mode")
+            else:
+                logger.info("Model kept unfrozen for training mode")
             
             # Apply performance optimizations
             if self.config.performance_mode in ["extreme_scale", "maximum"]:
@@ -278,5 +285,6 @@ def create_quantization_config_from_args(args) -> Dict:
         'profile_quantization': True,
         'calibration_samples': 1000,
         'quantize_layers': ['linear', 'conv'],
-        'exclude_layers': ['cls_token', 'pos_embed']
+        'exclude_layers': ['cls_token', 'pos_embed'],
+        'freeze_for_inference': False  # Keep unfrozen for training
     }
