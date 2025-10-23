@@ -61,7 +61,7 @@ data:
      "blue", 
     ],
   }
-  batch_size: 64  # Increased batch size for testing
+  batch_size: 32  # Same as base config for fair comparison
   num_workers: 1
   pin_memory: False
   num_classes: 2

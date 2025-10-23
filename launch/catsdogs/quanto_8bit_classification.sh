@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:8
 #SBATCH --ntasks-per-node=8
 #SBATCH --cpus-per-task=7
-#SBATCH -t 00:30:00  # 30 minutes for fast testing
+#SBATCH -t 00:20:00  # Same as base config for fair comparison
 #SBATCH -q debug
 #SBATCH -o quanto_8bit_catsdogs-%j.out
 #SBATCH -e quanto_8bit_catsdogs-%j.out
