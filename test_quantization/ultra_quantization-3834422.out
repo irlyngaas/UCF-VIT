@@ -1,0 +1,83 @@
+=== ULTRA QUANTIZATION SUITE ===
+Job ID: 3834422
+Node: 0
+GPU: 1 AMD MI250X
+Testing: INT4/2/1 using proven 12.8% vectorized register unpacking
+Goal: Complete unified AMD quantization framework
+
+Lmod is automatically replacing "cce/18.0.1" with "gcc-native/14.2".
+
+
+Lmod is automatically replacing "PrgEnv-cray/8.6.0" with "PrgEnv-gnu/8.6.0".
+
+
+Inactive Modules:
+  1) darshan-runtime
+
+Due to MODULEPATH changes, the following have been reloaded:
+  1) cray-libsci/24.11.0     2) cray-mpich/8.1.31
+
+
+Lmod is automatically replacing "gcc-native/14.2" with "gcc/12.2.0".
+
+
+The following have been reloaded with a version change:
+  1) cray-libsci/24.11.0 => cray-libsci/23.09.1.1
+  2) cray-mpich/8.1.31 => cray-mpich/8.1.27
+  3) libfabric/1.22.0 => libfabric/1.20.1
+
+
+Lmod is automatically replacing "gcc/12.2.0" with "gcc-native/14.2".
+
+
+The following have been reloaded with a version change:
+  1) cray-libsci/23.09.1.1 => cray-libsci/24.11.0
+  2) cray-mpich/8.1.27 => cray-mpich/8.1.31
+
+
+Lmod is automatically replacing "gcc-native/14.2" with "gcc/12.2.0".
+
+
+The following have been reloaded with a version change:
+  1) cray-libsci/24.11.0 => cray-libsci/23.09.1.1
+  2) cray-mpich/8.1.31 => cray-mpich/8.1.27
+
+Environment loaded - ROCm path: /opt/rocm-6.2.4
+
+Building ultra quantization suite...
+rm -f rocblas_int8_test rocblas_int4_test rocblas_int4_gpu_unpack rocblas_int4_ultra_optimized rocblas_extreme_quantization systematic_vectorization_analysis corrected_vectorization_analysis
+Building ULTRA quantization suite...
+ROCm path: /opt/rocm-6.2.4
+rocblas_ultra_quantization.cpp:364:39: error: no member named 'setw' in namespace 'std'
+  364 |             std::cout << "| " << std::setw(9) << name 
+      |                                  ~~~~~^
+rocblas_ultra_quantization.cpp:365:40: error: no member named 'setw' in namespace 'std'
+  365 |                       << " | " << std::setw(8) << std::fixed << std::setprecision(3) << time_ms
+      |                                   ~~~~~^
+rocblas_ultra_quantization.cpp:365:70: error: no member named 'setprecision' in namespace 'std'
+  365 |                       << " | " << std::setw(8) << std::fixed << std::setprecision(3) << time_ms
+      |                                                                 ~~~~~^
+rocblas_ultra_quantization.cpp:366:40: error: no member named 'setw' in namespace 'std'
+  366 |                       << " | " << std::setw(6) << std::fixed << std::setprecision(1) << gflops
+      |                                   ~~~~~^
+rocblas_ultra_quantization.cpp:366:70: error: no member named 'setprecision' in namespace 'std'
+  366 |                       << " | " << std::setw(6) << std::fixed << std::setprecision(1) << gflops
+      |                                                                 ~~~~~^
+rocblas_ultra_quantization.cpp:367:40: error: no member named 'setw' in namespace 'std'
+  367 |                       << " | " << std::setw(7) << std::fixed << std::setprecision(1) << overhead << "%"
+      |                                   ~~~~~^
+rocblas_ultra_quantization.cpp:367:70: error: no member named 'setprecision' in namespace 'std'
+  367 |                       << " | " << std::setw(7) << std::fixed << std::setprecision(1) << overhead << "%"
+      |                                                                 ~~~~~^
+rocblas_ultra_quantization.cpp:368:40: error: no member named 'setw' in namespace 'std'
+  368 |                       << " | " << std::setw(10) << compression << "x"
+      |                                   ~~~~~^
+rocblas_ultra_quantization.cpp:369:40: error: no member named 'setw' in namespace 'std'
+  369 |                       << " | " << std::setw(13) << (compression * 4) << "x |" << std::endl;
+      |                                   ~~~~~^
+/usr/lib64/gcc/x86_64-suse-linux/13/../../../../include/c++/13/iostream:63:18: note: host variable declared here
+   63 |   extern ostream cout;          ///< Linked to standard output
+      |                  ^
+9 errors generated when compiling for gfx90a.
+failed to execute:/opt/rocm-6.2.4/lib/llvm/bin/clang++  --offload-arch=gfx90a --offload-arch=gfx90a --offload-arch=gfx90a --offload-arch=gfx90a --offload-arch=gfx90a --offload-arch=gfx90a --offload-arch=gfx90a --offload-arch=gfx90a --driver-mode=g++ -L/opt/rocm-6.2.4/lib --hip-link  -std=c++17 -O3 -DNDEBUG -I/opt/rocm-6.2.4/include -o "rocblas_ultra_quantization" -x hip rocblas_ultra_quantization.cpp -L/opt/rocm-6.2.4/lib -lrocblas
+Build failed!

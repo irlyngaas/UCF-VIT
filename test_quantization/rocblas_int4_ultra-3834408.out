@@ -1,0 +1,137 @@
+INT4 Ultra-Optimized Test Starting...
+Job ID: 3834408
+Node: 0
+GPU: 1 AMD MI250X
+Target: <10% overhead vs INT8 baseline
+
+Lmod is automatically replacing "cce/18.0.1" with "gcc-native/14.2".
+
+
+Lmod is automatically replacing "PrgEnv-cray/8.6.0" with "PrgEnv-gnu/8.6.0".
+
+
+Inactive Modules:
+  1) darshan-runtime
+
+Due to MODULEPATH changes, the following have been reloaded:
+  1) cray-libsci/24.11.0     2) cray-mpich/8.1.31
+
+
+Lmod is automatically replacing "gcc-native/14.2" with "gcc/12.2.0".
+
+
+The following have been reloaded with a version change:
+  1) cray-libsci/24.11.0 => cray-libsci/23.09.1.1
+  2) cray-mpich/8.1.31 => cray-mpich/8.1.27
+  3) libfabric/1.22.0 => libfabric/1.20.1
+
+
+Lmod is automatically replacing "gcc/12.2.0" with "gcc-native/14.2".
+
+
+The following have been reloaded with a version change:
+  1) cray-libsci/23.09.1.1 => cray-libsci/24.11.0
+  2) cray-mpich/8.1.27 => cray-mpich/8.1.31
+
+
+Lmod is automatically replacing "gcc-native/14.2" with "gcc/12.2.0".
+
+
+The following have been reloaded with a version change:
+  1) cray-libsci/24.11.0 => cray-libsci/23.09.1.1
+  2) cray-mpich/8.1.31 => cray-mpich/8.1.27
+
+Environment loaded - ROCm path: /opt/rocm-6.2.4
+Building INT4 ultra-optimized test...
+rm -f rocblas_int8_test rocblas_int4_test rocblas_int4_gpu_unpack rocblas_int4_ultra_optimized rocblas_extreme_quantization systematic_vectorization_analysis corrected_vectorization_analysis
+Building rocBLAS INT4 ULTRA optimized test...
+ROCm path: /opt/rocm-6.2.4
+/opt/rocm-6.2.4/bin/hipcc -std=c++17 -O3 -DNDEBUG -I/opt/rocm-6.2.4/include -o rocblas_int4_ultra_optimized rocblas_int4_ultra_optimized.cpp -L/opt/rocm-6.2.4/lib -lrocblas
+rocblas_int4_ultra_optimized.cpp:174:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  174 |         hipStreamDestroy(stream);
+      |         ^~~~~~~~~~~~~~~~ ~~~~~~
+rocblas_int4_ultra_optimized.cpp:437:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  437 |         hipFree(d_A_packed);
+      |         ^~~~~~~ ~~~~~~~~~~
+rocblas_int4_ultra_optimized.cpp:438:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  438 |         hipFree(d_B_packed);
+      |         ^~~~~~~ ~~~~~~~~~~
+rocblas_int4_ultra_optimized.cpp:439:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  439 |         hipFree(d_A_unpacked);
+      |         ^~~~~~~ ~~~~~~~~~~~~
+rocblas_int4_ultra_optimized.cpp:440:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  440 |         hipFree(d_B_unpacked);
+      |         ^~~~~~~ ~~~~~~~~~~~~
+rocblas_int4_ultra_optimized.cpp:441:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  441 |         hipFree(d_A_int8);
+      |         ^~~~~~~ ~~~~~~~~
+rocblas_int4_ultra_optimized.cpp:442:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  442 |         hipFree(d_B_int8);
+      |         ^~~~~~~ ~~~~~~~~
+rocblas_int4_ultra_optimized.cpp:443:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  443 |         hipFree(d_C);
+      |         ^~~~~~~ ~~~
+8 warnings generated when compiling for gfx90a.
+rocblas_int4_ultra_optimized.cpp:174:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  174 |         hipStreamDestroy(stream);
+      |         ^~~~~~~~~~~~~~~~ ~~~~~~
+rocblas_int4_ultra_optimized.cpp:437:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  437 |         hipFree(d_A_packed);
+      |         ^~~~~~~ ~~~~~~~~~~
+rocblas_int4_ultra_optimized.cpp:438:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  438 |         hipFree(d_B_packed);
+      |         ^~~~~~~ ~~~~~~~~~~
+rocblas_int4_ultra_optimized.cpp:439:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  439 |         hipFree(d_A_unpacked);
+      |         ^~~~~~~ ~~~~~~~~~~~~
+rocblas_int4_ultra_optimized.cpp:440:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  440 |         hipFree(d_B_unpacked);
+      |         ^~~~~~~ ~~~~~~~~~~~~
+rocblas_int4_ultra_optimized.cpp:441:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  441 |         hipFree(d_A_int8);
+      |         ^~~~~~~ ~~~~~~~~
+rocblas_int4_ultra_optimized.cpp:442:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  442 |         hipFree(d_B_int8);
+      |         ^~~~~~~ ~~~~~~~~
+rocblas_int4_ultra_optimized.cpp:443:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  443 |         hipFree(d_C);
+      |         ^~~~~~~ ~~~
+8 warnings generated when compiling for host.
+Build complete: rocblas_int4_ultra_optimized
+Build successful! Running INT4 ultra-optimized test...
+
+Testing 3 optimization techniques:
+1. Vectorized register unpacking (128-bit loads)
+2. Warp-cooperative unpacking (shared memory)
+3. Template-based compile-time optimization
+
+=== ULTRA-OPTIMIZED INT4 GEMM TEST ===
+Target: Reduce overhead from 30% to <10%
+Techniques: Vectorized loads, warp cooperation, template optimization
+
+Found 1 HIP devices
+GPU: AMD Instinct MI250X
+Memory: 63 GB
+Max Shared Memory: 64 KB
+Warp Size: 64
+
+=== ULTRA-OPTIMIZED INT4 GEMM: 1024x768 @ 768x3072 ===
+
+--- ULTRA-OPTIMIZATION RESULTS ---
+INT8 baseline: 0.05459 ms (88511.4 GFLOPS)
+Vectorized Register Unpack: 0.06159 ms (78451.7 GFLOPS, 12.8229% overhead)
+Warp Cooperative Unpack: 0.19093 ms (25306.9 GFLOPS, 249.753% overhead)
+Template Optimized Unpack: 0.1492 ms (32385 GFLOPS, 173.31% overhead)
+
+Best kernel: Vectorized Register Unpack
+Target: <10% overhead | Achieved: 12.8229%
+Status: CLOSE ⚠️
+
+=== ULTRA-OPTIMIZATION TEST COMPLETED ===
+
+real	0m1.608s
+user	0m0.382s
+sys	0m0.755s
+
+INT4 ultra-optimization test completed!
+Success criteria: Any kernel with <10% overhead

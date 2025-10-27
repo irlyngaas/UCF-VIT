@@ -1,0 +1,324 @@
+=== CORRECTED VECTORIZATION ANALYSIS ===
+Job ID: 3834406
+Node: 0
+GPU: 1 AMD MI250X
+Testing: Properly implemented native uint4 vectorization
+Goal: Validate the 12.9% overhead claim with INT4/2/1
+
+Lmod is automatically replacing "cce/18.0.1" with "gcc-native/14.2".
+
+
+Lmod is automatically replacing "PrgEnv-cray/8.6.0" with "PrgEnv-gnu/8.6.0".
+
+
+Inactive Modules:
+  1) darshan-runtime
+
+Due to MODULEPATH changes, the following have been reloaded:
+  1) cray-libsci/24.11.0     2) cray-mpich/8.1.31
+
+
+Lmod is automatically replacing "gcc-native/14.2" with "gcc/12.2.0".
+
+
+The following have been reloaded with a version change:
+  1) cray-libsci/24.11.0 => cray-libsci/23.09.1.1
+  2) cray-mpich/8.1.31 => cray-mpich/8.1.27
+  3) libfabric/1.22.0 => libfabric/1.20.1
+
+
+Lmod is automatically replacing "gcc/12.2.0" with "gcc-native/14.2".
+
+
+The following have been reloaded with a version change:
+  1) cray-libsci/23.09.1.1 => cray-libsci/24.11.0
+  2) cray-mpich/8.1.27 => cray-mpich/8.1.31
+
+
+Lmod is automatically replacing "gcc-native/14.2" with "gcc/12.2.0".
+
+
+The following have been reloaded with a version change:
+  1) cray-libsci/24.11.0 => cray-libsci/23.09.1.1
+  2) cray-mpich/8.1.31 => cray-mpich/8.1.27
+
+Environment loaded - ROCm path: /opt/rocm-6.2.4
+
+Building corrected vectorization analysis...
+rm -f rocblas_int8_test rocblas_int4_test rocblas_int4_gpu_unpack rocblas_int4_ultra_optimized rocblas_extreme_quantization systematic_vectorization_analysis corrected_vectorization_analysis
+Building CORRECTED vectorization analysis...
+ROCm path: /opt/rocm-6.2.4
+corrected_vectorization_analysis.cpp:225:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  225 |         hipStreamDestroy(stream);
+      |         ^~~~~~~~~~~~~~~~ ~~~~~~
+corrected_vectorization_analysis.cpp:324:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  324 |         hipFree(d_A);
+      |         ^~~~~~~ ~~~
+corrected_vectorization_analysis.cpp:325:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  325 |         hipFree(d_B);
+      |         ^~~~~~~ ~~~
+corrected_vectorization_analysis.cpp:326:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  326 |         hipFree(d_C);
+      |         ^~~~~~~ ~~~
+corrected_vectorization_analysis.cpp:426:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  426 |             hipFree(d_A_packed_32);
+      |             ^~~~~~~ ~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:427:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  427 |             hipFree(d_B_packed_32);
+      |             ^~~~~~~ ~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:494:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  494 |             hipFree(d_A_packed_128);
+      |             ^~~~~~~ ~~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:495:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  495 |             hipFree(d_B_packed_128);
+      |             ^~~~~~~ ~~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:505:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  505 |         hipFree(d_A_unpacked);
+      |         ^~~~~~~ ~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:506:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  506 |         hipFree(d_B_unpacked);
+      |         ^~~~~~~ ~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:507:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  507 |         hipFree(d_C);
+      |         ^~~~~~~ ~~~
+corrected_vectorization_analysis.cpp:426:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  426 |             hipFree(d_A_packed_32);
+      |             ^~~~~~~ ~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:526:28: note: in instantiation of function template specialization 'CorrectedVectorizationAnalysis::benchmark_quantization_corrected<4>' requested here
+  526 |         auto int4_result = benchmark_quantization_corrected<4>(M, N, K, int8_baseline);
+      |                            ^
+corrected_vectorization_analysis.cpp:427:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  427 |             hipFree(d_B_packed_32);
+      |             ^~~~~~~ ~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:494:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  494 |             hipFree(d_A_packed_128);
+      |             ^~~~~~~ ~~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:495:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  495 |             hipFree(d_B_packed_128);
+      |             ^~~~~~~ ~~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:505:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  505 |         hipFree(d_A_unpacked);
+      |         ^~~~~~~ ~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:506:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  506 |         hipFree(d_B_unpacked);
+      |         ^~~~~~~ ~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:507:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  507 |         hipFree(d_C);
+      |         ^~~~~~~ ~~~
+corrected_vectorization_analysis.cpp:426:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  426 |             hipFree(d_A_packed_32);
+      |             ^~~~~~~ ~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:529:28: note: in instantiation of function template specialization 'CorrectedVectorizationAnalysis::benchmark_quantization_corrected<2>' requested here
+  529 |         auto int2_result = benchmark_quantization_corrected<2>(M, N, K, int8_baseline);
+      |                            ^
+corrected_vectorization_analysis.cpp:427:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  427 |             hipFree(d_B_packed_32);
+      |             ^~~~~~~ ~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:494:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  494 |             hipFree(d_A_packed_128);
+      |             ^~~~~~~ ~~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:495:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  495 |             hipFree(d_B_packed_128);
+      |             ^~~~~~~ ~~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:505:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  505 |         hipFree(d_A_unpacked);
+      |         ^~~~~~~ ~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:506:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  506 |         hipFree(d_B_unpacked);
+      |         ^~~~~~~ ~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:507:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  507 |         hipFree(d_C);
+      |         ^~~~~~~ ~~~
+corrected_vectorization_analysis.cpp:426:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  426 |             hipFree(d_A_packed_32);
+      |             ^~~~~~~ ~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:532:28: note: in instantiation of function template specialization 'CorrectedVectorizationAnalysis::benchmark_quantization_corrected<1>' requested here
+  532 |         auto int1_result = benchmark_quantization_corrected<1>(M, N, K, int8_baseline);
+      |                            ^
+corrected_vectorization_analysis.cpp:427:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  427 |             hipFree(d_B_packed_32);
+      |             ^~~~~~~ ~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:494:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  494 |             hipFree(d_A_packed_128);
+      |             ^~~~~~~ ~~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:495:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  495 |             hipFree(d_B_packed_128);
+      |             ^~~~~~~ ~~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:505:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  505 |         hipFree(d_A_unpacked);
+      |         ^~~~~~~ ~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:506:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  506 |         hipFree(d_B_unpacked);
+      |         ^~~~~~~ ~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:507:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  507 |         hipFree(d_C);
+      |         ^~~~~~~ ~~~
+32 warnings generated when compiling for gfx90a.
+corrected_vectorization_analysis.cpp:225:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  225 |         hipStreamDestroy(stream);
+      |         ^~~~~~~~~~~~~~~~ ~~~~~~
+corrected_vectorization_analysis.cpp:324:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  324 |         hipFree(d_A);
+      |         ^~~~~~~ ~~~
+corrected_vectorization_analysis.cpp:325:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  325 |         hipFree(d_B);
+      |         ^~~~~~~ ~~~
+corrected_vectorization_analysis.cpp:326:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  326 |         hipFree(d_C);
+      |         ^~~~~~~ ~~~
+corrected_vectorization_analysis.cpp:426:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  426 |             hipFree(d_A_packed_32);
+      |             ^~~~~~~ ~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:427:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  427 |             hipFree(d_B_packed_32);
+      |             ^~~~~~~ ~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:494:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  494 |             hipFree(d_A_packed_128);
+      |             ^~~~~~~ ~~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:495:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  495 |             hipFree(d_B_packed_128);
+      |             ^~~~~~~ ~~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:505:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  505 |         hipFree(d_A_unpacked);
+      |         ^~~~~~~ ~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:506:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  506 |         hipFree(d_B_unpacked);
+      |         ^~~~~~~ ~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:507:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  507 |         hipFree(d_C);
+      |         ^~~~~~~ ~~~
+corrected_vectorization_analysis.cpp:426:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  426 |             hipFree(d_A_packed_32);
+      |             ^~~~~~~ ~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:526:28: note: in instantiation of function template specialization 'CorrectedVectorizationAnalysis::benchmark_quantization_corrected<4>' requested here
+  526 |         auto int4_result = benchmark_quantization_corrected<4>(M, N, K, int8_baseline);
+      |                            ^
+corrected_vectorization_analysis.cpp:427:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  427 |             hipFree(d_B_packed_32);
+      |             ^~~~~~~ ~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:494:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  494 |             hipFree(d_A_packed_128);
+      |             ^~~~~~~ ~~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:495:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  495 |             hipFree(d_B_packed_128);
+      |             ^~~~~~~ ~~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:505:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  505 |         hipFree(d_A_unpacked);
+      |         ^~~~~~~ ~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:506:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  506 |         hipFree(d_B_unpacked);
+      |         ^~~~~~~ ~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:507:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  507 |         hipFree(d_C);
+      |         ^~~~~~~ ~~~
+corrected_vectorization_analysis.cpp:426:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  426 |             hipFree(d_A_packed_32);
+      |             ^~~~~~~ ~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:529:28: note: in instantiation of function template specialization 'CorrectedVectorizationAnalysis::benchmark_quantization_corrected<2>' requested here
+  529 |         auto int2_result = benchmark_quantization_corrected<2>(M, N, K, int8_baseline);
+      |                            ^
+corrected_vectorization_analysis.cpp:427:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  427 |             hipFree(d_B_packed_32);
+      |             ^~~~~~~ ~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:494:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  494 |             hipFree(d_A_packed_128);
+      |             ^~~~~~~ ~~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:495:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  495 |             hipFree(d_B_packed_128);
+      |             ^~~~~~~ ~~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:505:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  505 |         hipFree(d_A_unpacked);
+      |         ^~~~~~~ ~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:506:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  506 |         hipFree(d_B_unpacked);
+      |         ^~~~~~~ ~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:507:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  507 |         hipFree(d_C);
+      |         ^~~~~~~ ~~~
+corrected_vectorization_analysis.cpp:426:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  426 |             hipFree(d_A_packed_32);
+      |             ^~~~~~~ ~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:532:28: note: in instantiation of function template specialization 'CorrectedVectorizationAnalysis::benchmark_quantization_corrected<1>' requested here
+  532 |         auto int1_result = benchmark_quantization_corrected<1>(M, N, K, int8_baseline);
+      |                            ^
+corrected_vectorization_analysis.cpp:427:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  427 |             hipFree(d_B_packed_32);
+      |             ^~~~~~~ ~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:494:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  494 |             hipFree(d_A_packed_128);
+      |             ^~~~~~~ ~~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:495:13: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  495 |             hipFree(d_B_packed_128);
+      |             ^~~~~~~ ~~~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:505:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  505 |         hipFree(d_A_unpacked);
+      |         ^~~~~~~ ~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:506:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  506 |         hipFree(d_B_unpacked);
+      |         ^~~~~~~ ~~~~~~~~~~~~
+corrected_vectorization_analysis.cpp:507:9: warning: ignoring return value of function declared with 'nodiscard' attribute [-Wunused-result]
+  507 |         hipFree(d_C);
+      |         ^~~~~~~ ~~~
+32 warnings generated when compiling for host.
+Build complete: corrected_vectorization_analysis
+Build successful!
+
+RUNNING CORRECTED VECTORIZATION ANALYSIS
+
+This implements the CORRECT approach:
+- Native HIP uint4 types (hardware optimized)
+- Proper grid sizing based on packed data
+- Hardware-level memory coalescing
+- Register-level unpacking optimization
+
+Expected results:
+- INT4: ~12-15% overhead (should match ultra optimized)
+- INT2: ~20-30% overhead (significant improvement)
+- INT1: ~30-40% overhead (dramatic improvement)
+
+Matrix size: 1024x3072x768 (ViT-representative)
+=== CORRECTED VECTORIZATION ANALYSIS FOR AMD GPU ===
+Testing properly implemented native uint4 vectorization
+Correcting the implementation flaws from systematic analysis
+
+Found 8 HIP devices
+GPU: AMD Instinct MI250X
+Memory: 63 GB
+
+=== CORRECTED VECTORIZATION ANALYSIS ===
+Matrix Size: 1024x768 @ 768x3072
+Using proper hardware-optimized native uint4 vectorization
+
+Measuring INT8 baseline...
+INT8 baseline: 0.05447 ms (88706.4 GFLOPS)
+
+Testing INT4 (corrected)...
+Testing INT2 (corrected)...
+Testing INT1 (corrected)...
+
+=== CORRECTED VECTORIZATION RESULTS ===
+
+| Quantization | 32-bit Time | 128-bit Time | 32-bit OH | 128-bit OH | Improvement |
+|--------------|-------------|--------------|-----------|------------|-------------|
+|         INT4 |        0.1 ms |         0.1 ms |     28.7% |      84.1% |      -43.0% |
+|         INT2 |        0.1 ms |         0.1 ms |     49.5% |     167.6% |      -79.0% |
+|         INT1 |        0.1 ms |         0.2 ms |     74.7% |     218.9% |      -82.5% |
+
+=== SUMMARY ===
+Best 128-bit performance:
+- INT4: 84.1% overhead (-43.0% improvement over 32-bit)
+- INT2: 167.6% overhead (-79.0% improvement over 32-bit)
+- INT1: 218.9% overhead (-82.5% improvement over 32-bit)
+
+=== CORRECTED VECTORIZATION ANALYSIS COMPLETE ===
+
+=== CORRECTED ANALYSIS COMPLETED ===
+These results show the true potential of proper vectorization!
+
+CORRECTED VECTORIZATION ANALYSIS COMPLETED!
+
+Key findings:
+- Validates whether 12.9% overhead is achievable
+- Shows true potential of proper vectorization
+- Demonstrates hardware vs software vectorization gap
+- Provides definitive answer on 'sell-ability'

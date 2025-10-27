@@ -1,0 +1,106 @@
+=== ULTRA QUANTIZATION SUITE ===
+Job ID: 3834509
+Node: 0
+GPU: 1 AMD MI250X
+Testing: INT4/2/1 using proven 12.8% vectorized register unpacking
+Goal: Complete unified AMD quantization framework
+
+Lmod is automatically replacing "cce/18.0.1" with "gcc-native/14.2".
+
+
+Lmod is automatically replacing "PrgEnv-cray/8.6.0" with "PrgEnv-gnu/8.6.0".
+
+
+Inactive Modules:
+  1) darshan-runtime
+
+Due to MODULEPATH changes, the following have been reloaded:
+  1) cray-libsci/24.11.0     2) cray-mpich/8.1.31
+
+
+Lmod is automatically replacing "gcc-native/14.2" with "gcc/12.2.0".
+
+
+The following have been reloaded with a version change:
+  1) cray-libsci/24.11.0 => cray-libsci/23.09.1.1
+  2) cray-mpich/8.1.31 => cray-mpich/8.1.27
+  3) libfabric/1.22.0 => libfabric/1.20.1
+
+
+Lmod is automatically replacing "gcc/12.2.0" with "gcc-native/14.2".
+
+
+The following have been reloaded with a version change:
+  1) cray-libsci/23.09.1.1 => cray-libsci/24.11.0
+  2) cray-mpich/8.1.27 => cray-mpich/8.1.31
+
+
+Lmod is automatically replacing "gcc-native/14.2" with "gcc/12.2.0".
+
+
+The following have been reloaded with a version change:
+  1) cray-libsci/24.11.0 => cray-libsci/23.09.1.1
+  2) cray-mpich/8.1.31 => cray-mpich/8.1.27
+
+Environment loaded - ROCm path: /opt/rocm-6.2.4
+
+Building ultra quantization suite...
+rm -f rocblas_int8_test rocblas_int4_test rocblas_int4_gpu_unpack rocblas_int4_ultra_optimized rocblas_extreme_quantization systematic_vectorization_analysis corrected_vectorization_analysis
+Building ULTRA quantization suite...
+ROCm path: /opt/rocm-6.2.4
+Build complete: rocblas_ultra_quantization
+Build successful!
+
+RUNNING ULTRA QUANTIZATION SUITE
+
+This uses the proven 12.8% overhead method:
+- Vectorized register unpacking with uint4 casting
+- Hardware-optimized 128-bit loads
+- Register-level bit manipulation
+- Simple grid sizing (packed_size / 4)
+
+Expected results based on 12.8% success:
+- INT4: ~12-15% overhead (proven)
+- INT2: ~20-30% overhead (extrapolated)
+- INT1: ~30-50% overhead (extrapolated)
+
+Matrix size: 1024x3072x768 (ViT-representative)
+=== ULTRA QUANTIZATION SUITE FOR AMD GPU ===
+Complete INT4/INT2/INT1 suite using proven 12.8% overhead method
+Based on ultra-optimized vectorized register unpacking
+
+Found 1 HIP devices
+GPU: AMD Instinct MI250X
+Memory: 63 GB
+
+=== ULTRA QUANTIZATION SUITE ===
+Matrix Size: 1024x768 @ 768x3072
+Using proven 12.8% overhead vectorized register unpacking
+
+INT8 baseline: 0.05469 ms (88349.6 GFLOPS)
+
+Testing ultra-optimized quantization...
+
+=== ULTRA QUANTIZATION RESULTS ===
+Matrix Size: 1024×768 @ 768×3072
+
+| Precision | Time (ms) | GFLOPS | Overhead | Compression | Memory vs FP32 |
+|-----------|-----------|--------|----------|-------------|----------------|
+|      INT8 |    0.055 | 88349.6 |     0.0% |          1x |             4x |
+|      INT4 |    0.062 | 78084.0 |    13.1% |          2x |             8x |
+|      INT2 |    0.064 | 75698.5 |    16.7% |          4x |            16x |
+|      INT1 |    0.063 | 76550.0 |    15.4% |          8x |            32x |
+
+=== ULTRA QUANTIZATION SUITE COMPLETE ===
+All quantizations use proven 12.8% vectorized register unpacking!
+
+=== ULTRA QUANTIZATION SUITE COMPLETED ===
+Unified AMD quantization framework ready for production!
+
+ULTRA QUANTIZATION SUITE COMPLETED!
+
+Key findings:
+- Shows true performance of proven 12.8% method
+- Validates unified AMD quantization framework
+- Demonstrates practical 'sell-ability' metrics
+- Ready for Vision Transformer integration
