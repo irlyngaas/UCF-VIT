@@ -193,7 +193,9 @@ def main(device, local_rank):
 
     #model = DDP(model,device_ids=[local_rank],output_device=[local_rank])
     #find_unused_parameters=True is needed under these circumstances
-    model = DDP(model,device_ids=[local_rank],output_device=[local_rank],find_unused_parameters=True)
+    model = DDP(model,device_ids=[local_rank],output_device=[local_rank])
+
+
  
     optimizer = configure_optimizer(model,lr,beta_1,beta_2,weight_decay)
     scheduler = configure_scheduler(optimizer,warmup_steps,max_steps,warmup_start_lr,eta_min)
