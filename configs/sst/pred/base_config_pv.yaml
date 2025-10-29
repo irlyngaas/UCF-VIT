@@ -1,6 +1,6 @@
 # ---------------------------- TRAINER -------------------------------------------
 trainer:
-  max_epochs: 600
+  max_epochs: 200
   data_type: "float32"
   checkpoint_path: "../../checkpoint/sst/pred/base-adaptive"
   checkpoint_filename: "multi_last"
@@ -90,7 +90,7 @@ data:
     ],
   }
   batch_size: 2
-  num_workers: 1
+  num_workers: 3
   pin_memory: False
   single_channel: False
   tile_overlap: 0.0

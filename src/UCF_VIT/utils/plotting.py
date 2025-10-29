@@ -43,8 +43,8 @@ def plot_contour_box(x, y, z, datacube, gravity):
     # Get meshgrid and set cmap
     X, Y, Z = np.meshgrid(x,y,z, indexing='ij')
     nxsl, nysl, nzsl = X.shape
-    clevels = np.linspace(datacube.min()*0.5, datacube.max()*0.5, 101)
-    # clevels = np.linspace(-0.2, 0.2, 101) # For P1F4R32 pressure
+    # clevels = np.linspace(datacube.min()*0.5, datacube.max()*0.5, 101)
+    clevels = np.linspace(-0.2, 0.2, 101) # For P1F4R32 pressure
     kw = {
         'vmin': clevels.min(),
         'vmax': clevels.max(),
@@ -104,9 +104,9 @@ def plot_contour_box(x, y, z, datacube, gravity):
             datacube[-1, :, :], Z[-1, :, :], Y[-1, :, :],
             zdir='x', offset=X.max(), **kw
         )
-        # Plot edges
+        # Plot edges 
         ax.plot([xmax, xmax], [zmin, zmax], ymin, **edges_kw)
-        ax.plot([xmax, xmax], [zmin, zmax], ymax, **edges_kw)
+        ax.plot([xmax, xmax], [zmin, zmax], ymax, **edges_kw) 
         ax.plot([xmin, xmax], [zmin, zmin], ymin, **edges_kw)
         ax.plot([xmin, xmax], [zmin, zmin], ymax, **edges_kw)
         ax.plot([xmax, xmax], [zmin, zmin], [ymin, ymax], **edges_kw)
@@ -122,7 +122,7 @@ def plot_contour_box(x, y, z, datacube, gravity):
     else:
         raise Exception("Invalide gravity. Choose 'y' or 'z'")
     
-    # cbar = fig.colorbar(A, ax=ax, orientation='horizontal', pad=-0.1, fraction=0.04)
+    cbar = fig.colorbar(A, ax=ax, orientation='horizontal', pad=-0.1, fraction=0.04)
     # cbar.set_label(r"$d\rho_t/dy$")  # or whatever label is appropriate
     # Set zoom and angle view
     ax.view_init(20, -45)

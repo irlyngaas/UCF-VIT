@@ -148,7 +148,7 @@ class Patchify_3D(torch.nn.Module):
         # print('img shape', img.shape, flush=True)
         # print('num channel', self.num_channels, flush=True)
 
-
+        edges = np.abs(edges)
         threshold = np.percentile(edges, 70, axis=None)
         edges = (edges > threshold).astype(int)
         norm_factor = int(1)

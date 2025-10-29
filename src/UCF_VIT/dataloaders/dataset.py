@@ -150,14 +150,14 @@ class FileReader(IterableDataset):
                     ddp_rank = torch.distributed.get_rank(group=self.ddp_group)
 
             num_workers_per_ddp = worker_info.num_workers
-            assert num_workers_per_ddp == 1
+            # assert num_workers_per_ddp == 1
             if self.multi_dataset_training:
                 group_list = list(map(lambda x: int(x), self.gx.split(":")))
                 group_id = np.where(np.cumsum(group_list) > ddp_rank)[0][0]
                 group_size = group_list[group_id]
                 group_rank = ddp_rank - ([0] + np.cumsum(group_list).tolist())[group_id]
-                num_shards = group_size
-                # num_shards = group_size * num_workers_per_ddp
+                # num_shards = group_size
+                num_shards = group_size * num_workers_per_ddp
                 rank = group_rank
             else:
                 num_shards = num_workers_per_ddp * self.data_par_size
