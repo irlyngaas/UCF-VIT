@@ -287,17 +287,24 @@ def main(device, local_rank):
             epoch_loss += loss.detach()
     
             if world_rank==0:
-                print("epoch: ",epoch, "batch_idx", it, "it_loss ",loss, "it_acc", acc, flush=True)
+                print("epoch: ",epoch, "batch_idx", it, "it_loss ",loss, "it_acc", acc,"scheduler.get_lr()",scheduler.get_lr(), flush=True)
     
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
-            scheduler.step()
-        loss_list.append(epoch_loss)
 
+
+
+        loss_list.append(epoch_loss)
 
         if world_rank==0:
             print("epoch: ",epoch," epoch_loss ",epoch_loss, "epoch_accuracy ", epoch_accuracy, flush=True)
+
+
+
+        scheduler.step()
+
+
 
         model_states = model.state_dict()
         optimizer_states = optimizer.state_dict()
