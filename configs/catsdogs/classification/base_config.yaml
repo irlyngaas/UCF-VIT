@@ -13,7 +13,6 @@ parallelism:
   fsdp_size: 1
   simple_ddp_size: 8
   tensor_par_size: 1
-  seq_par_size: 1
 
 # ---------------------------- MODEL -------------------------------------------
 model:
