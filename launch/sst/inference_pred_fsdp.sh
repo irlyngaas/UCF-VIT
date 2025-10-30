@@ -1,14 +1,15 @@
 #!/bin/bash
-#SBATCH -A stf006
+#SBATCH -A CFD135
 #SBATCH -J inference_pred
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=1
-#SBATCH -t 00:10:00
+#SBATCH -t 00:30:00
 #SBATCH -p batch
-#SBATCH -o inference_pred-%j.out
-#SBATCH -e inference_pred-%j.out
+##SBATCH -p extended
+#SBATCH -o logs/inference_pred-%j.out
+#SBATCH -e logs/inference_pred-%j.out
 
 [ -z $JOBID ] && JOBID=$SLURM_JOB_ID
 [ -z $JOBSIZE ] && JOBSIZE=$SLURM_JOB_NUM_NODES
@@ -17,7 +18,7 @@
 #ulimit -n 65536
 
 
-eval "$(/lustre/orion/stf006/proj-shared/irl1/miniforge3/bin/conda shell.bash hook)"
+eval "$(/lustre/orion/stf006/proj-shared/nafi/miniforge3/bin/conda shell.bash hook)"
 conda activate forge-vit
 
 module load PrgEnv-gnu
@@ -34,4 +35,5 @@ mkdir -p $MIOPEN_USER_DB_PATH
 export OMP_NUM_THREADS=7
 export PYTHONPATH=$PWD:$PYTHONPATH
 
-srun python ../../dev_scripts/inference_pred_fsdp.py ../../configs/sst/pred/base_config.yaml 28.040000 z
+# srun python ../../dev_scripts/inference_pred_fsdp.py ../../configs/sst/pred/base_config.yaml 28.040000 z
+srun python ../../dev_scripts/inference_pred_fsdp.py ../../configs/sst/pred/base_config_pv.yaml 15.000000 z
