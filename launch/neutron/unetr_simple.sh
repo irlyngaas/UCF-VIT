@@ -35,4 +35,4 @@ export OMP_NUM_THREADS=7
 export PYTHONPATH=$PWD:$PYTHONPATH
 
 time srun -n $((SLURM_JOB_NUM_NODES*8)) \
-python ../../dev_scripts/train_unetr_simple.py ../../configs/neutron/unetr/base_config_t5.yaml
+python ../../dev_scripts/train_unetr_simple.py ../../configs/neutron/unetr/base_config.yaml
