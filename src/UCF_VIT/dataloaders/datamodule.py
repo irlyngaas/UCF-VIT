@@ -331,6 +331,15 @@ class NativePytorchDataModule(torch.nn.Module):
 
                     if num_data_roots > self.data_par_size-1:
                         break
+        elif self.dataset == "neutron":
+            dict_lister_trains = {}
+            for k, root_dir in self.dict_root_dirs.items():
+                samples = os.listdir(root_dir)
+                img_list = []
+                for sample in samples:
+                    img_list.append(os.path.join(root_dir, sample))
+                img_dict = {k: img_list}
+                dict_lister_trains.update(img_dict)
         else:
             dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in self.dict_root_dirs.items() }
         return dict_lister_trains
@@ -376,6 +385,44 @@ class NativePytorchDataModule(torch.nn.Module):
                         tile_overlap = self.tile_overlap,
                         use_all_data = self.use_all_data,
                         classification = True,
+                    ),
+                    buffer_size
+                ),
+                num_channels_used,
+                single_channel,
+                self.batch_size,
+                return_label,
+                self.adaptive_patching,
+                self.separate_channels,
+                self.patch_size,
+                self.fixed_length,
+                self.twoD,
+                self.dataset,
+                self.return_qdt,
+            )
+        elif self.dataset == "neutron":
+            dict_data_train[k] = ProcessChannels(
+                ShuffleIterableDataset(
+                    ImageBlockDataIter_2D(
+                            FileReader(
+                                lister_train,
+                                gx = self.gx,
+                                start_idx=start_idx,
+                                end_idx=end_idx,
+                                variables=variables,
+                                multi_dataset_training=True,
+                                data_par_size=self.data_par_size,
+                                return_label=return_label,
+                                keys_to_add=keys_to_add,
+                                ddp_group=self.ddp_group,
+                                dataset=self.dataset,
+                            ),
+                        self.tile_size_x,
+                        self.tile_size_y,
+                        self.tile_size_z,
+                        return_label = return_label,
+                        tile_overlap = self.tile_overlap,
+                        use_all_data = self.use_all_data,
                     ),
                     buffer_size
                 ),

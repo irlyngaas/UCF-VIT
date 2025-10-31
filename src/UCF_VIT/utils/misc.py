@@ -264,6 +264,15 @@ def process_root_dirs(dataset, dict_root_dirs, data_par_size):
 
                 if num_data_roots > data_par_size-1:
                     break
+    elif dataset == "neutron":
+        dict_lister_trains = {}
+        for k, root_dir in dict_root_dirs.items():
+            samples = os.listdir(root_dir)
+            img_list = []
+            for sample in samples:
+                img_list.append(os.path.join(root_dir, sample))
+            img_dict = {k: img_list}
+            dict_lister_trains.update(img_dict)
     else:
         dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in dict_root_dirs.items() }
     return dict_lister_trains
@@ -273,6 +282,13 @@ def read_process_file(dataset, path, imagenet_resize):
         data = Image.open(path).convert("RGB")
         data = np.array(data) 
         data = cv.resize(data, dsize=[imagenet_resize["imagenet"][0],imagenet_resize["imagenet"][1]])
+    elif dataset == "neutron":
+        data = np.load(os.path.join(path,"with_res.npy"))
+        new_shape = (data.shape[0]+1, data.shape[1])
+        new_array = np.zeros(new_shape,dtype=data.dtype)
+        new_array[:data.shape[0], :data.shape[1]] = data
+        data = new_array.astype(np.float32)
+        return data
     else:
         data = nib.load(path)
         data = np.array(data.dataobj).astype(np.float32)
@@ -302,7 +318,7 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
 
     tile_size_x = int(tile_size[0])
     tile_size_y = int(tile_size[1])
-    if dataset != "imagenet":
+    if dataset != "imagenet" and dataset != "neutron":
         tile_size_z = int(tile_size[2])
 
     dict_lister_trains = process_root_dirs(dataset, dict_root_dirs, num_total_ddp_ranks)
@@ -342,7 +358,7 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
             OTP2_y = int(tile_size_y/tile_overlap_size_y)
             
         #USE THIS IF RAW FILES ARE 2D
-        if dataset == "imagenet":
+        if dataset == "imagenet" or dataset == "neutron":
             #Total Tiles Evenly Spaced
             TTE_x = data.shape[0]//tile_size_x
             TTE_y = data.shape[1]//tile_size_y
@@ -366,7 +382,10 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
                 print("KEY", k, "DATA_SHAPE", data.shape,"NUM_BLOCKS:", num_blocks_x, num_blocks_y, flush=True)
 
             tiles_per_image.append(num_blocks_x*num_blocks_y)
-            num_channels_per_dataset.append(num_channels_used["imagenet"])
+            if dataset == "imagenet":
+                num_channels_per_dataset.append(num_channels_used["imagenet"])
+            else:
+                num_channels_per_dataset.append(num_channels_used[k])
         #USE THIS IF RAW FILES ARE 3D
         else:
             tile_overlap_size_z = int(tile_size_z*tile_overlap)

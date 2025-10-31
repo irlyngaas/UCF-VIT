@@ -96,6 +96,29 @@ class FileReader(IterableDataset):
                 else:
                     return data
 
+        elif self.dataset == "neutron":
+            data = np.load(os.path.join(path,"with_res.npy"))
+            new_shape = (data.shape[0]+1, data.shape[1])
+            new_array = np.zeros(new_shape,dtype=data.dtype)
+            new_array[:data.shape[0], :data.shape[1]] = data
+            data = new_array.astype(np.float32)
+            if self.return_label:
+                label = np.load(os.path.join(path,"no_res.npy"))
+                new_shape = (label.shape[0]+1, label.shape[1])
+                new_array = np.zeros(new_shape,dtype=label.dtype)
+                new_array[:label.shape[0], :label.shape[1]] = label
+                label = new_array.astype(np.float32)
+            if self.num_channels_available == 1:
+                if self.return_label:
+                    return np.expand_dims(data,axis=0), label
+                else:
+                    return np.expand_dims(data,axis=0)
+            else:
+                if self.return_label:
+                    return data, label
+                else:
+                    return data
+
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is None:
