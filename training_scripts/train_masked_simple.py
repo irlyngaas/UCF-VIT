@@ -258,9 +258,9 @@ def main(device, local_rank):
         weight_init='skip',
     ).to(device)
 
-    #model = DDP(model,device_ids=[local_rank],output_device=[local_rank])
+    model = DDP(model,device_ids=[local_rank],output_device=[local_rank])
     #find_unused_parameters=True is needed under these circumstances
-    model = DDP(model,device_ids=[local_rank],output_device=[local_rank],find_unused_parameters=True)
+    #model = DDP(model,device_ids=[local_rank],output_device=[local_rank],find_unused_parameters=True)
  
     optimizer = configure_optimizer(model,lr,beta_1,beta_2,weight_decay)
     scheduler = configure_scheduler(optimizer,warmup_steps,max_steps,warmup_start_lr,eta_min)
@@ -382,7 +382,8 @@ def main(device, local_rank):
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
-            scheduler.step()
+        
+        scheduler.step()
         loss_list.append(epoch_loss)
 
 
