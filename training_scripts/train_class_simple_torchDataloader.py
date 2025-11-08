@@ -193,7 +193,9 @@ def main(device, local_rank):
 
     #model = DDP(model,device_ids=[local_rank],output_device=[local_rank])
     #find_unused_parameters=True is needed under these circumstances
-    model = DDP(model,device_ids=[local_rank],output_device=[local_rank],find_unused_parameters=True)
+    model = DDP(model,device_ids=[local_rank],output_device=[local_rank])
+
+
  
     optimizer = configure_optimizer(model,lr,beta_1,beta_2,weight_decay)
     scheduler = configure_scheduler(optimizer,warmup_steps,max_steps,warmup_start_lr,eta_min)
@@ -285,17 +287,24 @@ def main(device, local_rank):
             epoch_loss += loss.detach()
     
             if world_rank==0:
-                print("epoch: ",epoch, "batch_idx", it, "it_loss ",loss, "it_acc", acc, flush=True)
+                print("epoch: ",epoch, "batch_idx", it, "it_loss ",loss, "it_acc", acc,"scheduler.get_lr()",scheduler.get_lr(), flush=True)
     
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
-            scheduler.step()
-        loss_list.append(epoch_loss)
 
+
+
+        loss_list.append(epoch_loss)
 
         if world_rank==0:
             print("epoch: ",epoch," epoch_loss ",epoch_loss, "epoch_accuracy ", epoch_accuracy, flush=True)
+
+
+
+        scheduler.step()
+
+
 
         model_states = model.state_dict()
         optimizer_states = optimizer.state_dict()
