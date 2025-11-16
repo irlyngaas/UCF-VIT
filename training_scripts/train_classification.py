@@ -90,6 +90,19 @@ def parse_config(config_path):
         "eta_min": float(conf['model']['eta_min']),
     }
 
+# ---------------------------- GRAD SCALER ---------------------------------------
+    try:
+        use_grad_scaler = conf["grad_scaler"]["use_grad_scaler"]
+        grad_scaler_conf = {
+            "use_grad_scaler": use_grad_scaler,
+            "init_scale": conf["grad_scaler"]["init_scale"] if use_grad_scaler else None,
+            "min_scale": conf["grad_scaler"]["min_scale"] if use_grad_scaler else None,
+            "growth_interval": conf["grad_scaler"]["growth_interval"] if use_grad_scaler else None,
+    except KeyError:
+        if dist.get_rank() == 0:
+            print("Since no grad_scaler_conf was given in the config file, defaulting to not using a grad_scaler ")
+        grad_scaler_conf = {"use_grad_scaler": False, "init_scale": None, "min_scale": None, "growth_interval": None}
+
 # ---------------------------- MODEL -------------------------------------------
     model_conf = {
         "emb_dim": conf['model']['embed_dim'],
@@ -390,6 +403,8 @@ def main(device, local_rank):
     config_path = sys.argv[1]
 
     conf = parse_config(config_path)
+    #TODO: Add function parse dataset specific options separately
+    #TODO: Add function to parse model options separately, adding capability for different architecutres
     batches_per_rank_epoch, dataset_group_list = calculate_load_balancing_on_the_fly(conf)
 
 #2. Initialize model, optimizer, and scheduler
@@ -404,6 +419,7 @@ def main(device, local_rank):
     optimizer = configure_optimizer(model,conf["optimizer"]["lr"],conf["optimizer"]["beta_1"],conf["optimizer"]["beta_2"],conf["optimizer"]["weight_decay"])
     scheduler = configure_scheduler(optimizer,conf["scheduler"]["warmup_epochs"],conf["trainer"]["max_epoch"],conf["scheduler"]["warmup_start_lr"],conf["scheduler"]["eta_min"])
 
+    #TODO: Add function for loading optimizer and scheduler from checkpoint
     if conf["trainer"]["resume_from_checkpoint"]:
 
         print("optimizer resume from checkpoint was set to True",flush=True)
@@ -416,86 +432,66 @@ def main(device, local_rank):
         checkpoint = torch.load(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(src_rank)+".ckpt",map_location=map_location)
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        #TODO: Load loss_list and epoch_start in create_model loading from checkpoint rather than here
         loss_list = checkpoint['loss_list']
         epoch_start = checkpoint['epoch'] + 1
         del checkpoint
 
-
-    #model = DDP(model,device_ids=[local_rank],output_device=[local_rank])
-    #find_unused_parameters=True is needed under these circumstances
-    model = DDP(model,device_ids=[local_rank],output_device=[local_rank],find_unused_parameters=True)
- 
-    optimizer = configure_optimizer(model,lr,beta_1,beta_2,weight_decay)
-    scheduler = configure_scheduler(optimizer,warmup_steps,max_steps,warmup_start_lr,eta_min)
-
-    if not resume_from_checkpoint:
-        epoch_start = 0
-        isExist = os.path.exists(checkpoint_path)
-        if not isExist:
-            # Create a new directory because it does not exist
-            os.makedirs(checkpoint_path,exist_ok=True)
-            print("The new checkpoint directory is created!")        
-        loss_list = []
-    else:
-        dist.barrier()
-        map_location = 'cpu'
-        #map_location = 'cuda:'+str(device)
-        checkpoint = torch.load(checkpoint_path+"/"+checkpoint_filename,map_location=map_location)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        epoch_start = checkpoint['epoch']
-        epoch_start += 1
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        loss_list = checkpoint['loss_list']
-        del checkpoint
-
-
-    dist.barrier()
+    if conf["grad_scaler"]["use_grad_scaler"]:
+        scaler = ShardedGradScaler(init_scale=conf["grad_scaler"]["init_scale"], growth_interval=conf["grad_scaler"]["growth_interval"]
+        min_scale = conf["grad_scaler"]["min_scale"]
 
 #3. Initialize Dataloader
 ##############################################################################################################
-    data_module = NativePytorchDataModule(dict_root_dirs=dict_root_dirs,
-        dict_start_idx=dict_start_idx,
-        dict_end_idx=dict_end_idx,
-        dict_buffer_sizes=dict_buffer_sizes,
-        dict_in_variables=dict_in_variables,
-        num_channels_used = num_channels_used,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        patch_size = patch_size,
-        tile_size_x = tile_size_x,
-        tile_size_y = tile_size_y,
-        tile_size_z = tile_size_z,
-        twoD = twoD,
-        single_channel = single_channel,
-        return_label = True,
-        dataset_group_list = dataset_group_list,
-        batches_per_rank_epoch = batches_per_rank_epoch,
-        tile_overlap = tile_overlap,
-        use_all_data = use_all_data,
-        adaptive_patching = adaptive_patching,
-        fixed_length = fixed_length,
-        separate_channels = separate_channels,
-        data_par_size = dist.get_world_size(),
-        dataset = dataset,
-        imagenet_resize = imagenet_resize,
-    ).to(device)
+    if conf["dataloader"]["type"] == "iterative":
+        data_module = NativePytorchDataModule(dict_root_dirs=conf["data"]dict_root_dirs,
+            dict_start_idx = conf["dataloader"]["dict_start_idx"],
+            dict_end_idx = conf["dataloader"]["dict_end_idx"],
+            dict_buffer_sizes = conf["dataloader"]["dict_buffer_sizes"],
+            dict_in_variables = conf["data"]["dict_in_variables"],
+            num_channels_used = conf["data"]["num_channels"],
+            batch_size = conf["dataloader"]["batch_size"],
+            num_workers = conf["dataloader"]["num_workers"],
+            pin_memory = conf["dataloader"]["pin_memory"],
+            patch_size = conf["data"]["patch_size"],
+            tile_size_x = conf["data"]["tile_size"][0], #TODO: move tile_size into one variable
+            tile_size_y = conf["data"]["tile_size"][1],
+            tile_size_z = conf["data"]["tile_size"][2] if len(conf["data"]["tile_size"]) == 3 else None,
+            twoD = conf["data"]["twoD"],
+            single_channel = False, #TODO: Take out single_channel option altogether
+            return_label = True, #TODO: Add to config
+            dataset_group_list = dataset_group_list,
+            batches_per_rank_epoch = batches_per_rank_epoch,
+            tile_overlap = conf["tiling"]["tile_overlap"],
+            use_all_data = conf["tiling"]["use_all_data"],
+            adaptive_patching = conf["ap"]["do_ap"],
+            fixed_length = conf["ap"]["fixed_length"],
+            separate_channels = conf["ap"]["separate_channels"],
+            data_par_size = conf["parallelism"]["data_par"],
+            dataset = conf["data"]["dataset"],
+            imagenet_resize = conf["dataset_option"]["imagenet_resize"],
+        ).to(device)
 
-    data_module.setup()
+        data_module.setup()
 
-    train_dataloader = data_module.train_dataloader()
+        train_dataloader = data_module.train_dataloader()
+    #TODO: elif conf["dataloader"]["type"] == "standard":
 
 #4. Training Loop
 ##############################################################################################################
 
-    #Find max batches
-    iterations_per_epoch = 0
-    for i,k in enumerate(batches_per_rank_epoch):
-        if batches_per_rank_epoch[k] > iterations_per_epoch:
-            iterations_per_epoch = batches_per_rank_epoch[k]
+    #Find iterations per epoch
+    if conf["dataloader"]["type"] == "iterative":
+        iterations_per_epoch = 0
+        for i,k in enumerate(batches_per_rank_epoch):
+            if batches_per_rank_epoch[k] > iterations_per_epoch:
+                iterations_per_epoch = batches_per_rank_epoch[k]
+    #TODO: elif conf["dataloader"]["type"] == "standard":
 
-    for epoch in range(epoch_start,max_epochs):
+
+    #TODO: Move to training loop function
+
+    for epoch in range(epoch_start,conf["trainer"]["max_epochs"]):
         #Reset dataloader module every epoch to ensure all files get used
         if epoch != epoch_start:
             data_module.reset()
