@@ -11,8 +11,10 @@ import torch.distributed as dist
 import time
 import yaml
 import math
-from einops import rearrange
-from torch.nn import Sequential
+import functools
+
+from timm.layers import use_fused_attn
+
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import (
    size_based_auto_wrap_policy, wrap, transformer_auto_wrap_policy,
@@ -23,16 +25,18 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
    CheckpointImpl,
    apply_activation_checkpointing,
 )
-import functools
 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
-from timm.layers import use_fused_attn
+
+from torch.nn import Sequential
+from UCF_VIT.fsdp.building_blocks import Block
 
 from UCF_VIT.fsdp.arch import MAE
-from UCF_VIT.fsdp.building_blocks import Block
 from UCF_VIT.utils.metrics import masked_mse
-from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, patchify, unpatchify, init_par_groups, calculate_load_balancing_on_the_fly, is_power_of_two
+from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, init_par_groups, calculate_load_balancing_on_the_fly, is_power_of_two, patchify, unpatchify
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.utils.fused_attn import FusedAttn
+
+from einops import rearrange
 
 
 
