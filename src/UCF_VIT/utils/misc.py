@@ -278,22 +278,20 @@ def read_process_file(dataset, path, imagenet_resize):
         data = np.array(data.dataobj).astype(np.float32)
     return data
 
-def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VERBOSE=False):
-    conf = yaml.load(open(yaml_file,'r'),Loader=yaml.FullLoader)
-    num_total_ddp_ranks = data_par_size
+def calculate_load_balancing_on_the_fly(conf, VERBOSE=False):
 
-    dict_root_dirs = conf['data']['dict_root_dirs']
-    dict_start_idx = conf['data']['dict_start_idx']
-    dict_end_idx = conf['data']['dict_end_idx']
-    tile_size =  conf['model']['net']['init_args']['tile_size']
-    twoD = conf['model']['net']['init_args']['twoD']
-    num_channels_used = conf['data']['num_channels_used']
-    single_channel = conf['data']['single_channel']
-    batch_size = conf['data']['batch_size']
-    tile_overlap = conf['data']['tile_overlap']
-    use_all_data = conf['data']['use_all_data']
-    patch_size =  conf['model']['net']['init_args']['patch_size']
+    dict_root_dirs = conf['dataloader']['dict_root_dirs']
+    dict_start_idx = conf['dataloader']['dict_start_idx']
+    dict_end_idx = conf['dataloader']['dict_end_idx']
+    tile_size =  conf['data']['tile_size']
+    twoD = conf['data']['twoD']
+    batch_size = conf['dataloader']['batch_size']
+    tile_overlap = conf['tiling']['tile_overlap']
+    use_all_data = conf['tiling']['use_all_data']
+    patch_size =  conf['data']['patch_size']
     dataset = conf['data']['dataset']
+    data_par_size = conf['parallelism']['data_par_size']
+    num_total_ddp_ranks = data_par_size
 
     if dataset == "imagenet":
         imagenet_resize = conf['dataset_options']['imagenet_resize']
@@ -305,12 +303,11 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
     if dataset != "imagenet":
         tile_size_z = int(tile_size[2])
 
-    dict_lister_trains = process_root_dirs(dataset, dict_root_dirs, num_total_ddp_ranks)
+    dict_lister_trains = process_root_dirs(dataset, dict_root_dirs, data_par_size)
 
     num_total_tiles = []
     num_total_images = []
     tiles_per_image = []
-    num_channels_per_dataset = []
     for i, k in enumerate(dict_lister_trains.keys()):
         lister_train = dict_lister_trains[k]
         if dataset == "imagenet":
@@ -322,7 +319,7 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
         keys = lister_train[start_idx:end_idx]
         num_total_images.append(len(keys))
 
-        #Assume all channels have the same data size
+        #Assume all data has the same data size
         data_path = keys[0]
         data = read_process_file(dataset, data_path, imagenet_resize)
 
@@ -366,7 +363,6 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
                 print("KEY", k, "DATA_SHAPE", data.shape,"NUM_BLOCKS:", num_blocks_x, num_blocks_y, flush=True)
 
             tiles_per_image.append(num_blocks_x*num_blocks_y)
-            num_channels_per_dataset.append(num_channels_used["imagenet"])
         #USE THIS IF RAW FILES ARE 3D
         else:
             tile_overlap_size_z = int(tile_size_z*tile_overlap)
@@ -423,12 +419,7 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
             else:
                 tiles_per_image.append(num_blocks_x*num_blocks_y*num_blocks_z)
             
-            num_channels_per_dataset.append(num_channels_used[k])
-
-        if single_channel:
-            num_total_tiles.append(tiles_per_image[i] * num_channels_per_dataset[i] * num_total_images[i])
-        else:
-            num_total_tiles.append(tiles_per_image[i] * num_total_images[i])
+        num_total_tiles.append(tiles_per_image[i] * num_total_images[i])
 
     if VERBOSE:
         print("Total Images", num_total_images)
@@ -515,10 +506,7 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
     batches_per_rank = []
     tiles_per_rank = []
     for i in range(len(num_total_tiles)):
-        if single_channel:
-            batches_per_rank.append(np.floor(num_images_per_rank[i])*tiles_per_image[i]*num_channels_per_dataset[i]/batch_size)
-        else:
-            batches_per_rank.append(np.floor(num_images_per_rank[i])*tiles_per_image[i]/batch_size)
+        batches_per_rank.append(np.floor(num_images_per_rank[i])*tiles_per_image[i]/batch_size)
         tiles_per_rank.append(np.floor(num_images_per_rank[i])*tiles_per_image[i])
     if VERBOSE:
         print("Tiles Per Rank", tiles_per_rank)
