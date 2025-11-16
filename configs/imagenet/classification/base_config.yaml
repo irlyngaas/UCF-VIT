@@ -27,6 +27,13 @@ scheduler:
   warmup_start_lr: 1e-8
   eta_min: 1e-8
 
+# ---------------------------- GRAD SCALER ---------------------------------------
+grad_scaler:
+  use_grad_scaler: True
+  init_scale: 8192
+  min_scale: 128
+  growth_interval: 100
+
 # ---------------------------- MODEL ---------------------------------------------
 model:
   embed_dim: 768
