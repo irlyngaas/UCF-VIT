@@ -6,6 +6,12 @@ trainer:
   checkpoint_path: "../../checkpoint/imagenet/classification/base"
   resume_from_checkpoint: False
   checkpoint_filename: "multi_last_odd"
+  use_pretrained_model: False
+  pretrained_checkpoint_filename:
+
+# ---------------------------- PRE-TRAINED MODEL ---------------------------------
+  use_pretrained_mae_model: False
+  pretrained_checkpoint_filename:
 
 # ---------------------------- PARALLELISM ---------------------------------------
 parallelism:
@@ -36,6 +42,7 @@ grad_scaler:
 
 # ---------------------------- MODEL ---------------------------------------------
 model:
+  type: "VIT"
   embed_dim: 768
   depth: 12
   num_heads: 12
@@ -109,7 +116,7 @@ data:
 
 # ---------------------------- DATALOADER ----------------------------------------
 dataloader:
-  type: "iterative"
+  type: "iterative_dataloader"
   dict_start_idx: {
     'imagenet': 0,
   }
