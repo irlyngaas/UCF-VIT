@@ -88,6 +88,28 @@ docker pull irlyngaas/ucf-vit:25.05
 
 Various example scripts for launching jobs are in the launch folder. Those identified with `_dgx` in the filename are for running with a Docker container
 
+### nvidia -dgx machine
+
+conda create -n vit python=3.11 -y
+conda activate vit
+
+pip install --index-url "https://download.pytorch.org/whl/${CU_TAG}" torch==2.6.0+cu124 torchvision==0.21.0+cu124 torchaudio==2.6.0
+
+pip install --index-url "https://download.pytorch.org/whl/${CU_TAG}" xformers==0.0.29.post3
+
+pip install \
+  timm \
+  monai \
+  nibabel \
+  torchdata==0.9.0 \
+  einops \
+  opencv-python-headless \
+  matplotlib \
+  scipy
+
+conda install -c conda-forge tifffile
+
+
 # Innovations
 In this codebase, we provide various Advanced Parallelism & Efficient Computing techniques that we have used to explore larger model and input sizes with VITs than has been previously possible. These techniques range from novel methods to the utilization of several techniques provided by external libraries that are integrated with these novel techniques.
 
