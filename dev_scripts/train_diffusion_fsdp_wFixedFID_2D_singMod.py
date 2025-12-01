@@ -29,6 +29,7 @@ from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from timm.layers import use_fused_attn
 
 # sys.path.insert(0, '/home/ziabariak/git/UCF-VIT/src')
+sys.path.append(os.path.expanduser('~/git/UCF-VIT/src'))
 
 from UCF_VIT.fsdp.arch import DiffusionVIT
 from UCF_VIT.fsdp.building_blocks import Block
