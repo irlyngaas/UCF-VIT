@@ -465,7 +465,7 @@ class VIT(nn.Module):
                 var_embed = var_embed.unsqueeze(2) # 1, V=1, D -> 1, V=1, L=1, D
                 x = x + var_embed.squeeze(1)  # 1, V=1, L=1, D -> 1, L=1, D
         else:
-            if self.adaptive_patching or not self.sqrt_len_method:
+            if self.adaptive_patching and not self.sqrt_len_method:
                 x = rearrange(x, 'b c s p -> b s (p c)')
                 x = self.token_embeds(x)
             else:
@@ -493,7 +493,7 @@ class VIT(nn.Module):
     def forward_head(self, x: torch.Tensor) -> torch.Tensor:
         x = self.pool(x)
         x = self.head_drop(x)
-        return x
+        return self.head(x)
 
     def forward(self, x: torch.Tensor, variables, seq_ps=None) -> torch.Tensor:
         x = self.forward_features(x, variables, seq_ps)
@@ -555,7 +555,7 @@ class MAE(VIT):
         self.decoder_depth = kwargs.pop('decoder_depth', '')
         self.decoder_embed_dim = kwargs.pop('decoder_embed_dim', '')
         self.decoder_num_heads = kwargs.pop('decoder_num_heads', '')
-        self.mlp_ratio_decoder = kwargs.pop('mlp_ratio_decoder', '')
+        self.decoder_mlp_ratio = kwargs.pop('decoder_mlp_ratio', '')
         super().__init__(*args, **kwargs)
         #Remove decoder from VIT
         self.head = None 
@@ -584,7 +584,7 @@ class MAE(VIT):
                     dim=self.decoder_embed_dim,
                     num_heads=self.decoder_num_heads,
                     fused_attn=self.FusedAttn_option,
-                    mlp_ratio=self.mlp_ratio_decoder,
+                    mlp_ratio=self.decoder_mlp_ratio,
                     qkv_bias=self.qkv_bias,
                     qk_norm=self.qk_norm,
                     init_values=self.init_values,
@@ -977,11 +977,17 @@ class UNETR(VIT):
             self.out = UnetOutBlock(spatial_dims=spatial_dims, in_channels=self.feature_size, out_channels=self.num_classes)
 
             if self.feat_size[0]*16 != self.img_size[0]:
-                self.upsample = nn.Upsample(size=self.img_size,mode='trilinear',align_corners=True)
+                if self.twoD:
+                    self.upsample = nn.Upsample(size=self.img_size,mode='bilinear',align_corners=True)
+                else:
+                    self.upsample = nn.Upsample(size=self.img_size,mode='trilinear',align_corners=True)
 
         else: #Use Linear Decoder
             self.mlp_head = nn.Linear(self.embed_dim, self.num_classes) 
-            self.upsample = nn.Upsample(scale_factor=self.patch_size,mode='trilinear',align_corners=True)
+            if self.twoD:
+                self.upsample = nn.Upsample(scale_factor=self.patch_size,mode='bilinear',align_corners=True)
+            else:
+                self.upsample = nn.Upsample(scale_factor=self.patch_size,mode='trilinear',align_corners=True)
 
         self.init_weights('')
 
@@ -1011,6 +1017,8 @@ class UNETR(VIT):
                 dec2 = self.decoder4(dec3)
                 dec1 = self.decoder3(dec2)
                 out = self.decoder2(dec1)
+                if self.feat_size[0]*16 != self.img_size[0]:
+                    out = self.upsample(out)
                 x = self.out(out)
         else:
             int_len = len(intermediates)
@@ -1021,6 +1029,8 @@ class UNETR(VIT):
             dec2 = self.decoder4(dec3, enc3)
             enc2 = self.encoder2(self.proj_feat(intermediates[int_len-3], self.embed_dim, self.feat_size))
             dec1 = self.decoder3(dec2, enc2)
+            if self.feat_size[0]*16 != self.img_size[0]:
+                dec1 = self.upsample(dec1)
             out = self.decoder2(dec1, enc1)
             x = self.out(out)
         return x
@@ -1164,7 +1174,7 @@ class DiffusionVIT(VIT):
         self.decoder_depth = kwargs.pop('decoder_depth', '')
         self.decoder_embed_dim = kwargs.pop('decoder_embed_dim', '')
         self.decoder_num_heads = kwargs.pop('decoder_num_heads', '')
-        self.mlp_ratio_decoder = kwargs.pop('mlp_ratio_decoder', '')
+        self.decoder_mlp_ratio = kwargs.pop('decoder_mlp_ratio', '')
         self.time_steps = kwargs.pop('time_steps', '')
         super().__init__(*args, **kwargs)
         #Remove decoder from VIT
@@ -1192,7 +1202,7 @@ class DiffusionVIT(VIT):
                     dim=self.decoder_embed_dim,
                     num_heads=self.decoder_num_heads,
                     fused_attn=self.FusedAttn_option,
-                    mlp_ratio=self.mlp_ratio_decoder,
+                    mlp_ratio=self.decoder_mlp_ratio,
                     qkv_bias=self.qkv_bias,
                     qk_norm=self.qk_norm,
                     init_values=self.init_values,
@@ -1303,7 +1313,7 @@ class DiffusionVIT(VIT):
             else:
                 x = self.token_embeds(x)
                
-        x = self._pos_embed(x)
+        x = self._pos_embed(x, None)
         x = self.patch_drop(x)
         time_emb = self.temporalEmbeddings(x,t)
         time_emb = self.timeEmbeddingMap(time_emb.to(x.dtype))[:,None,:]

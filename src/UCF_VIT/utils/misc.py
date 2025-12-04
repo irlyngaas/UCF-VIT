@@ -280,7 +280,7 @@ def read_process_file(dataset, path, imagenet_resize):
 
 def calculate_load_balancing_on_the_fly(conf, VERBOSE=False):
 
-    dict_root_dirs = conf['dataloader']['dict_root_dirs']
+    dict_root_dirs = conf['data']['dict_root_dirs']
     dict_start_idx = conf['dataloader']['dict_start_idx']
     dict_end_idx = conf['dataloader']['dict_end_idx']
     tile_size =  conf['data']['tile_size']

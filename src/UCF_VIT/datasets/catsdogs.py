@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from UCF_VIT.dataloaders.transform import Patchify, Patchify_3D
 
-def CatsDogsCollate(batch, adaptive_patching):
+def CatsDogsCollate(batch, adaptive_patching, return_label):
     if adaptive_patching:
         inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
         seq = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
@@ -14,12 +14,20 @@ def CatsDogsCollate(batch, adaptive_patching):
         pos = torch.stack([torch.from_numpy(np.expand_dims(batch[i][3],axis=0)) for i in range(len(batch))])
         label = torch.stack([torch.tensor(batch[i][4]) for i in range(len(batch))])
         variables = batch[0][5]
-        return (inp, seq, size, pos, label, variables)
+        dict_key = batch[0][6]
+        if return_label:
+            return (inp, seq, size, pos, label, variables, dict_key)
+        else:
+            return (inp, seq, size, pos, variables, dict_key)
     else:
         inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
         label = torch.stack([torch.tensor(batch[i][1]) for i in range(len(batch))])
         variables = batch[0][2]
-        return (inp, label, variables)
+        dict_key = batch[0][3]
+        if return_label:
+            return (inp, label, variables, dict_key)
+        else:
+            return (inp, variables, dict_key)
 
 
 class CatsDogsDataset(Dataset):
@@ -55,6 +63,6 @@ class CatsDogsDataset(Dataset):
 
         if self.adaptive_patching:
             seq_img, seq_size, seq_pos, qdt = self.patchify(img)
-            return np.moveaxis(img,-1,0), seq_img, seq_size, seq_pos, label, self.variables
+            return np.moveaxis(img,-1,0), seq_img, seq_size, seq_pos, label, self.variables, self.dataset
         else:
-            return np.moveaxis(img,-1,0), label, self.variables
+            return np.moveaxis(img,-1,0), label, self.variables, self.dataset

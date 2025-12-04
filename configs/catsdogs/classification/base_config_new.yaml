@@ -3,7 +3,7 @@ trainer:
   max_epochs: 100
   data_type: "float32" #float 32 or bfloat16
   gpu_type: "amd" #amd or nvidia
-  checkpoint_path: "../../checkpoint/imagenet/classification/base"
+  checkpoint_path: "../../checkpoint/catsdogs/classification/base"
   resume_from_checkpoint: False
   checkpoint_filename: "epoch_0"
   use_pretrained_model: False
@@ -47,7 +47,7 @@ model:
   drop_rate: 0.0
   use_channel_aggregation: False
 
-  num_classes: 1000
+  num_classes: 2
   
 # ---------------------------- TILING --------------------------------------------
 tiling:
@@ -66,18 +66,18 @@ ap:
   
 # ---------------------------- DATA ----------------------------------------------
 data:
-  dataset: "imagenet"
+  dataset: "catsdogs"
   img_size: [256, 256] #Can be 2D or 3D, on todo list create capability where this isn't required, but can be read determined base on the reading the raw data.
   twoD: True #If true when img_size is 3D, dataloader slices on the z dimension. If data is 2D, this variable will be ignored and default to True
   patch_size: 16 #If non-adaptive patching this will change sequence length, if adaptive patching this will determine the common representation across all adaptive patches
   dict_root_dirs: {
-    'imagenet': '/lustre/orion/nro108/world-shared/enzhi/dataset/imagenet/train',
+    'catsdogs': '/lustre/orion/stf006/world-shared/irl1/CatsDogs/train',
   }
   num_channels: {
-    'imagenet': 3,
+    'catsdogs': 3,
   } #Important to define because not all datasets need to have the same channels or amount of channels when using variable aggregation depending on the training task chosen
   dict_in_variables: {
-    'imagenet': [
+    'catsdogs': [
      "red", 
      "green", 
      "blue", 
@@ -86,31 +86,8 @@ data:
   
 # ---------------------------- DATALOADER ----------------------------------------
 dataloader:
-  type: "iterative_dataloader"
-  dict_start_idx: {
-    'imagenet': 0,
-  }
-  dict_end_idx: {
-    'imagenet': 1,
-  }
-  dict_buffer_sizes: {
-    'imagenet': 100,
-  }
+  type: "dataloader"
   batch_size: 32
   num_workers: 1
   pin_memory: False
 
-# ---------------------------- DATASET SPECIFIC OPTIONS -------------------------------------------
-dataset_options:
-
-  imagenet_resize: {
-      'imagenet': [256,256],
-    }
-
-# ---------------------------- LOAD BALANCING -------------------------------------------
-load_balancing:
-  auto_load_balancing: True
-  batches_per_rank_epoch: {
-    'imagenet': 4935,
-  }
-  dataset_group_list: '1:1:1:1:1:1:1:1'

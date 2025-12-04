@@ -3,7 +3,7 @@ trainer:
   max_epochs: 100
   data_type: "float32" #float 32 or bfloat16
   gpu_type: "amd" #amd or nvidia
-  checkpoint_path: "../../checkpoint/imagenet/classification/base"
+  checkpoint_path: "../../checkpoint/imagenet/mae/base"
   resume_from_checkpoint: False
   checkpoint_filename: "epoch_0"
   use_pretrained_model: False
@@ -38,7 +38,7 @@ grad_scaler:
 
 # ---------------------------- MODEL ---------------------------------------------
 model:
-  type: "VIT"
+  type: "MAE"
   embed_dim: 768
   depth: 12
   num_heads: 12
@@ -47,7 +47,13 @@ model:
   drop_rate: 0.0
   use_channel_aggregation: False
 
-  num_classes: 1000
+  loss_fn: "MSE"
+  mask_ratio: 0.75
+  linear_decoder: False
+  decoder_embed_dim: 512
+  decoder_depth: 8
+  decoder_num_heads: 16
+  decoder_mlp_ratio: 4
   
 # ---------------------------- TILING --------------------------------------------
 tiling:
@@ -106,11 +112,3 @@ dataset_options:
   imagenet_resize: {
       'imagenet': [256,256],
     }
-
-# ---------------------------- LOAD BALANCING -------------------------------------------
-load_balancing:
-  auto_load_balancing: True
-  batches_per_rank_epoch: {
-    'imagenet': 4935,
-  }
-  dataset_group_list: '1:1:1:1:1:1:1:1'

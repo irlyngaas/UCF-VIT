@@ -63,7 +63,12 @@ def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_
                             qdt_list.append(batch[i][7])
             else:
                 inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
-                seq = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
+
+                #TODO: Generalize this 
+                if dataset == "basic_ct":
+                    seq = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
+                else:
+                    seq = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
 
                 #TODO: Finish and Test separate_channels implementation
                 if separate_channels:
