@@ -119,6 +119,31 @@ class FileReader(IterableDataset):
                 else:
                     return data
 
+        elif self.dataset == "neutron_upsample":
+            data = np.load(os.path.join(path,"with_res.npy")).astype(np.float32)
+            data = np.nan_to_num(data)
+            #new_shape = (data.shape[0]+1, data.shape[1])
+            #new_array = np.zeros(new_shape,dtype=data.dtype)
+            #new_array[:data.shape[0], :data.shape[1]] = data
+            #data = new_array.astype(np.float32)
+            if self.return_label:
+                label = np.load(os.path.join(path,"no_res.npy")).astype(np.float32)
+                label = np.nan_to_num(label)
+                #new_shape = (label.shape[0]+1, label.shape[1])
+                #new_array = np.zeros(new_shape,dtype=label.dtype)
+                #new_array[:label.shape[0], :label.shape[1]] = label
+                #label = new_array.astype(np.float32)
+            if self.num_channels_available == 1:
+                if self.return_label:
+                    return np.expand_dims(data,axis=0), label
+                else:
+                    return np.expand_dims(data,axis=0)
+            else:
+                if self.return_label:
+                    return data, label
+                else:
+                    return data
+
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is None:
@@ -175,17 +200,21 @@ class FileReader(IterableDataset):
 
 class ImageBlockDataIter_2D(IterableDataset):
     def __init__(
-        self, dataset: FileReader, tile_size_x: int = 64, tile_size_y: int = 64, tile_size_z: int = None, return_label: bool = False, tile_overlap: float = 0.0, use_all_data: bool = False, classification: bool = False,
+        self, dataset: FileReader, tile_size_x: int = 64, tile_size_y: int = 64, tile_size_z: int = None, return_label: bool = False, tile_overlap: float = 0.0, use_all_data: bool = False, classification: bool = False, upsample: int = 1,
     ) -> None:
         super().__init__()
         self.dataset = dataset
         self.tile_size_x = tile_size_x
         self.tile_size_y = tile_size_y
         self.tile_size_z = tile_size_z
+        self.tile_size_x_upsample = tile_size_x*upsample
+        self.tile_size_y_upsample = tile_size_y*upsample
+
         self.return_label = return_label
         self.tile_overlap = tile_overlap
         self.use_all_data = use_all_data
         self.classification = classification
+        self.upsample = upsample
 
     def __iter__(self):
         tile_overlap_size_x = int(self.tile_size_x*self.tile_overlap)
@@ -234,13 +263,15 @@ class ImageBlockDataIter_2D(IterableDataset):
 
                 x_step_size = self.tile_size_x-tile_overlap_size_x
                 y_step_size = self.tile_size_y-tile_overlap_size_y
+                x_step_size_upsample = x_step_size * self.upsample
+                y_step_size_upsample = y_step_size * self.upsample
                 for ii in range(num_blocks_x):
                     for jj in range(num_blocks_y):
                         if not self.use_all_data:
                             if self.classification:
                                 yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size], label, variables
                             else:
-                                yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size], variables
+                                yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size], label[ii*x_step_size_upsample:self.tile_size_x_upsample+ii*x_step_size_upsample, jj*y_step_size_upsample:self.tile_size_y_upsample+jj*y_step_size_upsample], variables
                         else:
                             if self.tile_size_x+ii*x_step_size > (datalen_x-1):
                                 if self.tile_size_y+jj*y_step_size > (datalen_y-1):

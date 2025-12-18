@@ -240,6 +240,8 @@ class NativePytorchDataModule(torch.nn.Module):
         ddp_group: Optional[dist.ProcessGroup] = None,
         num_classes: Optional[int] = None,
         imagenet_resize: Optional[Dict] = None,
+        superres_mag: Optional[int] = None,
+        upsample: Optional[int] = None,
     ):
         super().__init__()
         if num_workers > 1:
@@ -290,6 +292,11 @@ class NativePytorchDataModule(torch.nn.Module):
         if self.dataset == "imagenet":
             self.imagenet_resize = imagenet_resize
 
+        if self.dataset == "neutron_upsample":
+            self.upsample = upsample
+        else:
+            self.upsample = 1
+
         in_variables = {}
         for k, list_out in dict_in_variables.items():
             if list_out is not None:
@@ -331,7 +338,7 @@ class NativePytorchDataModule(torch.nn.Module):
 
                     if num_data_roots > self.data_par_size-1:
                         break
-        elif self.dataset == "neutron":
+        elif self.dataset in ["neutron", "neutron_upsample"]:
             dict_lister_trains = {}
             for k, root_dir in self.dict_root_dirs.items():
                 samples = os.listdir(root_dir)
@@ -400,7 +407,7 @@ class NativePytorchDataModule(torch.nn.Module):
                 self.dataset,
                 self.return_qdt,
             )
-        elif self.dataset == "neutron":
+        elif self.dataset in ["neutron", "neutron_upsample"]:
             dict_data_train[k] = ProcessChannels(
                 ShuffleIterableDataset(
                     ImageBlockDataIter_2D(
@@ -423,6 +430,7 @@ class NativePytorchDataModule(torch.nn.Module):
                         return_label = return_label,
                         tile_overlap = self.tile_overlap,
                         use_all_data = self.use_all_data,
+                        upsample = self.upsample,
                     ),
                     buffer_size
                 ),

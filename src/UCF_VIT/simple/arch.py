@@ -1284,3 +1284,64 @@ class DiffusionVIT(VIT):
         x = self.forward_features(x, t, variables)
         x = self.forward_head(x)
         return x
+
+class ResSlimVIT(VIT):
+    def __init__(self, *args, **kwargs):
+        self.superres_mag = kwargs.pop('superres_mag', '')
+        self.decoder_depth = kwargs.pop('decoder_depth', '')
+        self.cnn_ratio = kwargs.pop('cnn_ratio', '')
+        super().__init__(*args, **kwargs)
+
+        #Remove decoder from VIT
+        self.head = None 
+
+        #skip connection path
+        self.path2 = nn.ModuleList()
+        self.path2.append(nn.Conv2d(in_channels=1, out_channels=self.cnn_ratio*self.superres_mag*self.superres_mag, kernel_size=(3, 3), stride=1, padding=1)) 
+        self.path2.append(nn.GELU())
+        self.path2.append(nn.PixelShuffle(self.superres_mag))
+        self.path2.append(nn.Conv2d(in_channels=self.cnn_ratio, out_channels=1, kernel_size=(3, 3), stride=1, padding=1)) 
+        self.path2 = nn.Sequential(*self.path2)
+
+
+        self.head = nn.ModuleList()
+        for _ in range(self.decoder_depth):
+            self.head.append(nn.Linear(self.embed_dim, self.embed_dim))
+            self.head.append(nn.GELU())
+        self.head.append(nn.Linear(self.embed_dim,1 * (self.superres_mag*self.patch_size)**2))
+        self.head = nn.Sequential(*self.head)
+       
+        self.conv_out = nn.Conv2d(in_channels=1, out_channels=1, kernel_size=(3, 3), stride=1, padding=1) 
+
+    def unpatchify(self, x: torch.Tensor, scaling =1, out_channels=1):
+        """
+        x: (B, L, V * patch_size**2)
+        return imgs: (B, V, H, W)
+        """
+        p = self.patch_size
+        c = out_channels
+        h = self.img_size[0] * scaling // p
+        w = self.img_size[1] * scaling // p
+        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
+        x = torch.einsum("nhwpqc->nchpwq", x)
+        imgs = x.reshape(shape=(x.shape[0], c, h * p, w * p))
+        return imgs
+
+    def forward(self, x: torch.Tensor, variables, seq_ps=None):
+
+        path2_result = self.path2(x)     
+
+        x = self.forward_features(x, variables, seq_ps)
+
+        #decoder
+        x = self.head(x)
+
+        # x.shape = [B,num_patches,out_channels*patch_size*patch_size]
+        x = self.unpatchify(x, scaling=self.superres_mag, out_channels=1)
+        # x.shape = [B,out_channels,h*patch_size, w*patch_size]
+        x = self.conv_out(x) 
+
+        preds = x + path2_result
+
+        return preds
+
