@@ -12,6 +12,8 @@ import nibabel as nib
 from .transform import Patchify, Patchify_3D
 from PIL import Image
 import cv2 as cv
+from astropy.io import fits
+
 
 class FileReader(IterableDataset):
     def __init__(
@@ -96,6 +98,29 @@ class FileReader(IterableDataset):
                 else:
                     return data
 
+        elif self.dataset == "solar":
+            root_path = Path(path)
+            parent = root_path.parent
+            stem = path.split('/')[-1]
+            data_list = []
+            for i in range(len(self.variables)):
+                channel_path = os.path.join(parent, self.variables[i]+stem)
+                #data_memmap = np.memmap(channel_path, dtype=np.float32, mode='r', shape=(self.nz, self.ny, self.nx+2))
+                data_memmap = fits.open(channel_path, memmap=True)
+
+                data_list.append(data_memmap)
+
+            if self.return_label:
+                label_list = []
+                for i in range(len(self.variables_out)):
+                    channel_path = os.path.join(parent, self.variables_out[i]+stem)
+                    #label_memmap = np.memmap(channel_path, dtype=np.float32, mode='r', shape=(self.nz, self.ny, self.nx+2))
+                    data_memmap = fits.open(channel_path, memmap=True)
+                    label_list.append(label_memmap)
+                return data_list, label_list
+            else:
+                return data_list
+
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is None:
@@ -145,10 +170,16 @@ class FileReader(IterableDataset):
             for idx in range(start_it, end_it):
                 if self.return_label:
                     data, label = self.read_process_file(self.file_list[idx])
-                    yield data, label, self.variables
+                    if self.dataset == "solar":
+                        yield data, label, self.variables, self.chunk_list[idx]
+                    else:
+                        yield data, label, self.variables
                 else:
                     data = self.read_process_file(self.file_list[idx])
-                    yield data, self.variables
+                    if self.dataset == "solar":
+                        yield data, self.variables, self.chunk_list[idx]
+                    else:
+                        yield data, self.variables
 
 class ImageBlockDataIter_2D(IterableDataset):
     def __init__(
