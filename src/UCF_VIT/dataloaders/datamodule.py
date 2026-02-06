@@ -338,7 +338,7 @@ class NativePytorchDataModule(torch.nn.Module):
 
                     if num_data_roots > self.data_par_size-1:
                         break
-        elif self.dataset in ["neutron", "neutron_upsample"]:
+        elif self.dataset in ["neutron", "neutron_upsample", "magnon-phonon"]:
             dict_lister_trains = {}
             for k, root_dir in self.dict_root_dirs.items():
                 samples = os.listdir(root_dir)
@@ -407,7 +407,7 @@ class NativePytorchDataModule(torch.nn.Module):
                 self.dataset,
                 self.return_qdt,
             )
-        elif self.dataset in ["neutron", "neutron_upsample"]:
+        elif self.dataset in ["neutron", "neutron_upsample", "magnon-phonon"]:
             dict_data_train[k] = ProcessChannels(
                 ShuffleIterableDataset(
                     ImageBlockDataIter_2D(

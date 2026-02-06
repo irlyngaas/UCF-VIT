@@ -144,6 +144,30 @@ class FileReader(IterableDataset):
                 else:
                     return data
 
+        elif self.dataset == "magnon-phonon":
+            magnon = np.load(os.path.join(path,"magnon.npy")).astype(np.float32)
+            magnon[:,0:8] = np.nan
+            phonon = np.load(os.path.join(path,"phonon.npy")).astype(np.float32)
+            phonon[:,0:8] = np.nan
+            data = magnon + phonon
+            fraction = magnon/data
+            fraction = np.nan_to_num(fraction, nan=0.0, posinf=0.0, neginf=0.0)
+            data = np.nan_to_num(data)
+            data = np.log(1.0+data)
+            if self.return_label:
+                label = fraction
+
+            if self.num_channels_available == 1:
+                if self.return_label:
+                    return np.expand_dims(data,axis=0), label
+                else:
+                    return np.expand_dims(data,axis=0)
+            else:
+                if self.return_label:
+                    return data, label
+                else:
+                    return data
+
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is None:

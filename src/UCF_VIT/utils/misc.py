@@ -264,7 +264,7 @@ def process_root_dirs(dataset, dict_root_dirs, data_par_size):
 
                 if num_data_roots > data_par_size-1:
                     break
-    elif dataset in ["neutron", "neutron_upsample"]:
+    elif dataset in ["neutron", "neutron_upsample", "magnon-phonon"]:
         dict_lister_trains = {}
         for k, root_dir in dict_root_dirs.items():
             samples = os.listdir(root_dir)
@@ -292,6 +292,12 @@ def read_process_file(dataset, path, imagenet_resize):
     elif dataset == "neutron_upsample":
         data = np.load(os.path.join(path,"with_res.npy")).astype(np.float32)
         data = np.nan_to_num(data)
+    elif dataset == "magnon-phonon":
+        magnon = np.load(os.path.join(path,"magnon.npy")).astype(np.float32)
+        magnon = np.nan_to_num(magnon)
+        phonon = np.load(os.path.join(path,"phonon.npy")).astype(np.float32)
+        phonon = np.nan_to_num(phonon)
+        data = magnon + phonon
     else:
         data = nib.load(path)
         data = np.array(data.dataobj).astype(np.float32)
@@ -321,7 +327,7 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
 
     tile_size_x = int(tile_size[0])
     tile_size_y = int(tile_size[1])
-    if dataset != "imagenet" and dataset != "neutron" and dataset != "neutron_upsample":
+    if dataset != "imagenet" and dataset != "neutron" and dataset != "neutron_upsample" and dataset != "magnon-phonon":
         tile_size_z = int(tile_size[2])
 
     dict_lister_trains = process_root_dirs(dataset, dict_root_dirs, num_total_ddp_ranks)
@@ -361,7 +367,7 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
             OTP2_y = int(tile_size_y/tile_overlap_size_y)
             
         #USE THIS IF RAW FILES ARE 2D
-        if dataset in ["imagenet", "neutron", "neutron_upsample"]:
+        if dataset in ["imagenet", "neutron", "neutron_upsample", "magnon-phonon"]:
             #Total Tiles Evenly Spaced
             TTE_x = data.shape[0]//tile_size_x
             TTE_y = data.shape[1]//tile_size_y
