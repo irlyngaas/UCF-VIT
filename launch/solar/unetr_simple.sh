@@ -18,7 +18,7 @@
 
 
 eval "$(/lustre/orion/stf006/proj-shared/irl1/miniforge3/bin/conda shell.bash hook)"
-conda activate forge-vit
+conda activate solar
 
 module load PrgEnv-gnu
 module load gcc/12.2.0
@@ -35,4 +35,4 @@ export OMP_NUM_THREADS=7
 export PYTHONPATH=$PWD:$PYTHONPATH
 
 time srun -n $((SLURM_JOB_NUM_NODES*8)) \
-python ../../training_scripts/train_unetr_simple.py ../../configs/solar/unetr/base_config.yaml
+python ../../dev_scripts/train_pred_fsdp.py ../../configs/solar/unetr/base_config.yaml

@@ -14,6 +14,7 @@ from .dataset import (
     FileReader,
     ImageBlockDataIter_2D,
     ImageBlockDataIter_3D,
+    ImageBlockDataIter_2D_Memmap,
     ShuffleIterableDataset,
     ProcessChannels,
 )
@@ -243,6 +244,8 @@ class NativePytorchDataModule(torch.nn.Module):
         nx: Optional[Dict] = None,
         ny: Optional[Dict] = None,
         nt: Optional[Dict] = None,
+        nx_skip: Optional[Dict] = None,
+        ny_skip: Optional[Dict] = None,
         dict_out_variables: Optional[Dict] = None,
         chunk_size: Optional[Dict] = None,
     ):
@@ -299,7 +302,10 @@ class NativePytorchDataModule(torch.nn.Module):
             self.nx = nx
             self.ny = ny
             self.nt = nt
+            self.nx_skip = nx_skip
+            self.ny_skip = ny_skip
             self.chunk_size = chunk_size
+
             out_variables = {}
             for k, list_out in dict_out_variables.items():
                 if list_out is not None:
@@ -318,7 +324,7 @@ class NativePytorchDataModule(torch.nn.Module):
             in_variables[k] = [ x for x in in_variables[k] ]
         self.dict_in_variables = in_variables
 
-        self.dict_lister_trains = self.process_root_dirs()
+        self.dict_lister_trains, self.dict_chunk_trains = self.process_root_dirs()
            
 
         self.dict_data_train: Optional[Dict] = None
@@ -356,8 +362,6 @@ class NativePytorchDataModule(torch.nn.Module):
             for k,root_dirs in self.dict_root_dirs.items():
                 listy = []
                 listy.append(os.path.join(root_dirs,".fits"))
-                #for i in os.listdir(root_dirs):
-                #    listy.append(os.path.join(root_dirs,i))
                 list_dict = {k: listy}
                 lister.update(list_dict)
             dict_lister_trains = {}
@@ -365,17 +369,9 @@ class NativePytorchDataModule(torch.nn.Module):
             for i,k in enumerate(lister.keys()):
                 list_ = lister[k]
                 main_keys = []
-                main_keys.append(list_)
-                #for j in range(len(list_)):
-                #    data_path = Path(list_[j])
-                #    main_keys.append(j)
-                #    if data_path.stem != 'README':
-                #        base_path_prefix, timestamp = get_file_prefix(list_[j])
-                #        key = os.path.join(base_path_prefix, timestamp)
-                #        main_keys.append(key)
-                used = set()
-                ##Find all unique keys, since different channels are in separate files
-                unique_keys = [x for x in main_keys if x not in used and (used.add(x) or True)]
+                for j in range(len(list_)):
+                    main_keys.append(str(list_[j]))
+                unique_keys = main_keys
                 num_chunks_x = self.nx[k] // self.chunk_size[k][0]
                 num_chunks_y = self.ny[k] // self.chunk_size[k][1]
                 num_chunks_t = self.nt[k]
@@ -475,10 +471,13 @@ class NativePytorchDataModule(torch.nn.Module):
                                 variables_out = self.dict_out_variables[k],
                                 chunk_list = chunk_train,
                             ),
-                        self.tile_size_x,
-                        self.tile_size_y,
+                        self.tile_size_x*self.nx_skip[k],
+                        self.tile_size_y*self.ny_skip[k],
                         self.tile_size_z,
-                        self.twoD,
+                        nx = self.nx[k],
+                        ny = self.ny[k],
+                        nx_skip = self.nx_skip[k],
+                        ny_skip = self.ny_skip[k],
                         return_label = return_label,
                         tile_overlap = self.tile_overlap,
                         use_all_data = self.use_all_data,

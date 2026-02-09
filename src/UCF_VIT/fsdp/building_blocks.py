@@ -49,6 +49,7 @@ class PatchEmbed(nn.Module):
     ):
         super().__init__()
         self.twoD = twoD
+        self.sqrt_len_method = sqrt_len_method
         if self.twoD:
             self.patch_size = to_2tuple(patch_size)
         else:

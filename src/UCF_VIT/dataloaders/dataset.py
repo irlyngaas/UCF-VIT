@@ -31,6 +31,8 @@ class FileReader(IterableDataset):
         keys_to_add: int = 1,
         dataset: str = "imagenet",
         imagenet_resize: Optional[list] = [256,256],
+        variables_out: Optional[list] = None,
+        chunk_list: Optional[list] = None,
     ) -> None:
         super().__init__()
         self.num_channels_available = len(variables)
@@ -51,6 +53,10 @@ class FileReader(IterableDataset):
         #Optional Inputs
         if self.dataset == "imagenet":
             self.imagenet_resize = imagenet_resize
+        if self.dataset == "solar":
+           self.variables_out = variables_out
+           chunk_list = chunk_list[start_idx:end_idx]
+           self.chunk_list = chunk_list
 
     def read_process_file(self, path):
         if self.dataset == "imagenet":
@@ -115,7 +121,7 @@ class FileReader(IterableDataset):
                 for i in range(len(self.variables_out)):
                     channel_path = os.path.join(parent, self.variables_out[i]+stem)
                     #label_memmap = np.memmap(channel_path, dtype=np.float32, mode='r', shape=(self.nz, self.ny, self.nx+2))
-                    data_memmap = fits.open(channel_path, memmap=True)
+                    label_memmap = fits.open(channel_path, memmap=True)
                     label_list.append(label_memmap)
                 return data_list, label_list
             else:
@@ -579,7 +585,168 @@ class ImageBlockDataIter_3D(IterableDataset):
                                         yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, datalen_z-self.tile_size_z:datalen_z], variables
                                     else:
                                         yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
-            
+
+class ImageBlockDataIter_2D_Memmap(IterableDataset):
+    def __init__(
+        self, dataset: FileReader, tile_size_x: int = 64, tile_size_y: int = 64, tile_size_z: int = None, return_label: bool = False, tile_overlap: float = 0.0, use_all_data: bool = False, nx: int = 512, ny: int = 512, nx_skip: int = 1, ny_skip: int = 1, chunk_size: list = None
+    ) -> None:
+        super().__init__()
+        self.dataset = dataset
+        self.tile_size_x = tile_size_x
+        self.tile_size_y = tile_size_y
+        self.tile_size_z = tile_size_z
+        self.return_label = return_label
+        self.tile_overlap = tile_overlap
+        self.use_all_data = use_all_data
+        self.nx = nx
+        self.ny = ny
+        self.nx_skip = nx_skip
+        self.ny_skip = ny_skip
+        self.chunk_size = chunk_size
+
+    #TODO: Fix Logic so that it can use nx_skip, ny_skip, and nz_skip > 1 
+    def __iter__(self):
+        tile_overlap_size_x = int(self.tile_size_x*self.tile_overlap)
+        tile_overlap_size_y = int(self.tile_size_y*self.tile_overlap)
+        if tile_overlap_size_x == 0.0:
+            OTP2_x = 1
+            tile_overlap_size_x = 0
+        else:
+            OTP2_x = int(self.tile_size_x/tile_overlap_size_x)
+        if tile_overlap_size_y == 0.0:
+            OTP2_y = 1
+            tile_overlap_size_y = 0
+        else:
+            OTP2_y = int(self.tile_size_y/tile_overlap_size_y)
+
+        if self.return_label:
+            for (data,label,variables, chunk_idx) in self.dataset:
+                #Total Tiles Evenly Spaced
+                #TTE_x = self.nx//self.tile_size_x
+                TTE_x = self.chunk_size[0]//self.tile_size_x
+                #TTE_y = self.ny//self.tile_size_y
+                TTE_y = self.chunk_size[1]//self.tile_size_y
+                num_blocks_x = (TTE_x-1)*OTP2_x + 1
+                num_blocks_y = (TTE_y-1)*OTP2_y + 1
+                if self.use_all_data:
+                    #Total Tiles
+                    #TT_x = self.nx/(self.tile_size_x)
+                    TT_x = self.chunk_size[0]/(self.tile_size_x)
+                    #TT_y = self.ny/(self.tile_size_y)
+                    TT_y = self.chunk_size[1]/(self.tile_size_y)
+                    # Number of leftover overlap patches for last tile
+                    LTOP_x = np.floor((TT_x-TTE_x)*OTP2_x)
+                    LTOP_y = np.floor((TT_y-TTE_y)*OTP2_y)
+                    if tile_overlap_size_x == 0:
+                        #if self.nx % self.tile_size_x != 0:
+                        if self.chunk_size[0] % self.tile_size_x != 0:
+                            LTOP_x += 1
+                    else: #>0
+                        #if self.nx % tile_overlap_size_x != 0:
+                        if self.chunk_size[0] % tile_overlap_size_x != 0:
+                            LTOP_x += 1
+                    if tile_overlap_size_y == 0:
+                        #if self.ny % self.tile_size_y != 0:
+                        if self.chunk_size[1] % self.tile_size_y != 0:
+                            LTOP_y += 1
+                    else: #>0
+                        #if self.ny % tile_overlap_size_y != 0:
+                        if self.chunk_size[1] % tile_overlap_size_y != 0:
+                            LTOP_y += 1
+                    num_blocks_x = int(num_blocks_x + LTOP_x)
+                    num_blocks_y = int(num_blocks_y + LTOP_y)
+
+                datalen_x = self.chunk_size[0]
+                datalen_y = self.chunk_size[1]
+                datalen_t = self.chunk_size[2]
+
+                x_step_size = self.tile_size_x-tile_overlap_size_x
+                y_step_size = self.tile_size_y-tile_overlap_size_y
+
+                chunk_offset_x = chunk_idx[0]*self.chunk_size[0]
+                chunk_offset_y = chunk_idx[1]*self.chunk_size[1]
+                #chunk_offset_t = chunk_idx[2]*self.chunk_size[2] #If we wanted to skip times we could?
+                chunk_offset_t = chunk_idx[2]
+
+                for ii in range(num_blocks_x):
+                    for jj in range(num_blocks_y):
+                        if not self.use_all_data:
+                            datalist = []
+                            for cc in range(len(data)):
+                                data_cube = data[cc][0].data[chunk_offset_t, chunk_offset_y+jj*y_step_size:chunk_offset_y+(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip, chunk_offset_x+ii*x_step_size:chunk_offset_x+(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
+                                #Min-Max Normalization
+                                data_cube = (data_cube - data_cube.min())/(data_cube.max() - data_cube.min())
+                                datalist.append(data_cube.copy().transpose(1,0))
+                            labellist = []
+                            for cc in range(len(label)):
+                                label_cube = label[cc][0].data[chunk_offset_t, chunk_offset_y+jj*y_step_size:chunk_offset_y+(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip, chunk_offset_x+ii*x_step_size:chunk_offset_x+(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
+                                #Min-Max Normalization
+                                label_cube = (label_cube - label_cube.min())/(label_cube.max() - label_cube.min())
+                                labellist.append(label_cube.copy().transpose(1,0))
+                            yield np.stack(datalist, axis=0), np.stack(labellist, axis=0), variables
+
+        else:
+            for (data,variables,chunk_idx) in self.dataset:
+                #Total Tiles Evenly Spaced
+                #TTE_x = self.nx//self.tile_size_x
+                TTE_x = self.chunk_size[0]//self.tile_size_x
+                #TTE_y = self.ny//self.tile_size_y
+                TTE_y = self.chunk_size[1]//self.tile_size_y
+                num_blocks_x = (TTE_x-1)*OTP2_x + 1
+                num_blocks_y = (TTE_y-1)*OTP2_y + 1
+                if self.use_all_data:
+                    #Total Tiles
+                    #TT_x = self.nx/(self.tile_size_x)
+                    TT_x = self.chunk_size[0]/(self.tile_size_x)
+                    #TT_y = self.ny/(self.tile_size_y)
+                    TT_y = self.chunk_size[1]/(self.tile_size_y)
+                    # Number of leftover overlap patches for last tile
+                    LTOP_x = np.floor((TT_x-TTE_x)*OTP2_x)
+                    LTOP_y = np.floor((TT_y-TTE_y)*OTP2_y)
+                    if tile_overlap_size_x == 0:
+                        #if self.nx % self.tile_size_x != 0:
+                        if self.chunk_size[0] % self.tile_size_x != 0:
+                            LTOP_x += 1
+                    else: #>0
+                        #if self.nx % tile_overlap_size_x != 0:
+                        if self.chunk_size[0] % tile_overlap_size_x != 0:
+                            LTOP_x += 1
+                    if tile_overlap_size_y == 0:
+                        #if self.ny % self.tile_size_y != 0:
+                        if self.chunk_size[1] % self.tile_size_y != 0:
+                            LTOP_y += 1
+                    else: #>0
+                        #if self.ny % tile_overlap_size_y != 0:
+                        if self.chunk_size[1] % tile_overlap_size_y != 0:
+                            LTOP_y += 1
+                    num_blocks_x = int(num_blocks_x + LTOP_x)
+                    num_blocks_y = int(num_blocks_y + LTOP_y)
+
+                #datalen_x = self.nx
+                datalen_x = self.chunk_size[0]
+                #datalen_y = self.ny
+                datalen_y = self.chunk_size[1]
+                #datalen_z = self.nz
+                datalen_z = self.chunk_size[2]
+                #channels, datalen_x, datalen_y, datalen_z = data.shape
+
+                x_step_size = self.tile_size_x-tile_overlap_size_x
+                y_step_size = self.tile_size_y-tile_overlap_size_y
+
+                chunk_offset_x = chunk_idx[0]*self.chunk_size[0]
+                chunk_offset_y = chunk_idx[1]*self.chunk_size[1]
+                #chunk_offset_t = chunk_idx[2]*self.chunk_size[2] #If we wanted to skip times we could?
+                chunk_offset_t = chunk_idx[2]
+
+                for ii in range(num_blocks_x):
+                    for jj in range(num_blocks_y):
+                        if not self.use_all_data:
+                            datalist = []
+                            for cc in range(len(data)):
+                                data_cube = data[cc][0].data[chunk_offset_t, chunk_offset_y+jj*y_step_size:chunk_offset_y+(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip, chunk_offset_x+ii*x_step_size:chunk_offset_x+(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
+                                datalist.append(data_cube.copy().transpose(1,0))
+                                yield np.stack(datalist, axis=0), variables
+
 class ShuffleIterableDataset(IterableDataset):
     def __init__(self, dataset, buffer_size: int) -> None:
         super().__init__()

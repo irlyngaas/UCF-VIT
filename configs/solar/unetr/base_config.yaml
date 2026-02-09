@@ -31,10 +31,13 @@ model:
   net:
     init_args:
       default_vars: [
-        "ct_res1",
+         "intensity", 
+         "bx", 
+         "by", 
+         "bz", 
       ]
       tile_size: [64, 64] #Up to chunk_size
-      patch_size: 4
+      patch_size: 16
       embed_dim: 768
       depth: 12
       num_heads: 12
@@ -43,7 +46,7 @@ model:
       linear_decoder: False
       twoD: True
       use_varemb: False
-      adaptive_patching: True
+      adaptive_patching: False
       fixed_length: 729
       separate_channels: False
       use_adaptive_pos_emb: True
@@ -72,7 +75,7 @@ data:
     'ct1': 100,
   }
   num_channels_used: {
-    'ct1': 1,
+    'ct1': 4,
   }
   dict_in_variables: {
     'ct1': [
@@ -85,10 +88,10 @@ data:
   batch_size: 2
   num_workers: 1
   pin_memory: False
-  single_channel: True
+  single_channel: False
   tile_overlap: 0.0
   use_all_data: False
-  num_classes: 4
+  num_classes: 1
 
 # ---------------------------- DATASET SPECIFIC OPTIONS -------------------------------------------
 dataset_options:
@@ -101,6 +104,12 @@ dataset_options:
   }
   nt: {
     'ct1': 651,
+  }
+  nx_skip: {
+    'ct1': 1,
+  }
+  ny_skip: {
+    'ct1': 1,
   }
   dict_out_variables: {
     'ct1': [

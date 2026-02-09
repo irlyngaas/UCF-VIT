@@ -237,7 +237,7 @@ def init_par_groups(world_rank, data_par_size, tensor_par_size, seq_par_size, fs
 
     return seq_par_group, ddp_group, tensor_par_group, data_seq_ort_group, fsdp_group, simple_ddp_group
 
-def process_root_dirs(dataset, dict_root_dirs, data_par_size):
+def process_root_dirs(dataset, dict_root_dirs, data_par_size, nx, ny, nt, chunk_size):
     if dataset == "imagenet":
         dict_lister_trains = {}
         for k, root_dir in dict_root_dirs.items():
@@ -264,6 +264,39 @@ def process_root_dirs(dataset, dict_root_dirs, data_par_size):
 
                 if num_data_roots > data_par_size-1:
                     break
+    elif dataset == "solar":
+        lister = {}
+        for k,root_dirs in dict_root_dirs.items():
+            listy = []
+            listy.append(os.path.join(root_dirs,".fits"))
+            #for i in os.listdir(root_dirs):
+            #    listy.append(os.path.join(root_dirs,i))
+            list_dict = {k: listy}
+            lister.update(list_dict)
+        dict_lister_trains = {}
+        dict_chunk_trains = {}
+        for i,k in enumerate(lister.keys()):
+            list_ = lister[k]
+            main_keys = []
+            for j in range(len(list_)):
+                main_keys.append(str(list_[j]))
+            unique_keys = main_keys
+            num_chunks_x = nx[k] // chunk_size[k][0]
+            num_chunks_y = ny[k] // chunk_size[k][1]
+            num_chunks_t = nt[k]
+
+            img_list = []
+            chunk_list = []
+            for tt in range(num_chunks_t):
+                for xx in range(num_chunks_x):
+                    for yy in range(num_chunks_y):
+                        img_list.extend(unique_keys)
+                        chunk_list.append([xx,yy,tt])
+            img_dict = {k: img_list}
+            dict_lister_trains.update(img_dict)
+            chunk_dict = {k: chunk_list}
+            dict_chunk_trains.update(chunk_dict)
+
     else:
         dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in dict_root_dirs.items() }
     return dict_lister_trains
@@ -300,12 +333,27 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
     else:
         imagenet_resize = None
 
+    if dataset == "solar":
+        nx = conf['dataset_options']['nx']
+        ny = conf['dataset_options']['ny']
+        nt = conf['dataset_options']['nt']
+        nx_skip = conf['dataset_options']['nx_skip']
+        ny_skip = conf['dataset_options']['ny_skip']
+        chunk_size = conf['dataset_options']['chunk_size']
+    else:
+        nx = None
+        ny = None
+        nt = None
+        nx_skip = None
+        ny_skip = None
+        chunk_size = None
+
     tile_size_x = int(tile_size[0])
     tile_size_y = int(tile_size[1])
-    if dataset != "imagenet":
+    if dataset != "imagenet" and dataset != "solar":
         tile_size_z = int(tile_size[2])
 
-    dict_lister_trains = process_root_dirs(dataset, dict_root_dirs, num_total_ddp_ranks)
+    dict_lister_trains = process_root_dirs(dataset, dict_root_dirs, num_total_ddp_ranks, nx, ny, nt, chunk_size)
 
     num_total_tiles = []
     num_total_images = []
@@ -313,6 +361,10 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
     num_channels_per_dataset = []
     for i, k in enumerate(dict_lister_trains.keys()):
         lister_train = dict_lister_trains[k]
+        if dataset == "solar":
+            tile_size_x = int(tile_size[0]*nx_skip[k])
+            tile_size_y = int(tile_size[1]*ny_skip[k])
+
         if dataset == "imagenet":
             start_idx = int(dict_start_idx["imagenet"] * len(lister_train))
             end_idx = int(dict_end_idx["imagenet"] * len(lister_train))
@@ -324,7 +376,8 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
 
         #Assume all channels have the same data size
         data_path = keys[0]
-        data = read_process_file(dataset, data_path, imagenet_resize)
+        if dataset != "solar":
+            data = read_process_file(dataset, data_path, imagenet_resize)
 
         tile_overlap_size_x = int(tile_size_x*tile_overlap)
         tile_overlap_size_y = int(tile_size_y*tile_overlap)
@@ -342,31 +395,50 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
             OTP2_y = int(tile_size_y/tile_overlap_size_y)
             
         #USE THIS IF RAW FILES ARE 2D
-        if dataset == "imagenet":
+        if dataset in ["imagenet", "solar"]:
             #Total Tiles Evenly Spaced
-            TTE_x = data.shape[0]//tile_size_x
-            TTE_y = data.shape[1]//tile_size_y
+            if dataset == "solar":
+                TTE_x = chunk_size[k][0]//tile_size_x
+                TTE_y = chunk_size[k][1]//tile_size_y
+            else:
+                TTE_x = data.shape[0]//tile_size_x
+                TTE_y = data.shape[1]//tile_size_y
             num_blocks_x = (TTE_x-1)*OTP2_x + 1
             num_blocks_y = (TTE_y-1)*OTP2_y + 1
             if use_all_data:
                 #Total Tiles
-                TT_x = data.shape[0]/(tile_size_x)
-                TT_y = data.shape[1]/(tile_size_y)
+                if dataset == "solar":
+                    TT_x = chunk_size[k][0]/(tile_size_x)
+                    TT_y = chunk_size[k][1]/(tile_size_y)
+                else:
+                    TT_x = data.shape[0]/(tile_size_x)
+                    TT_y = data.shape[1]/(tile_size_y)
                 # Number of leftover overlap patches for last tile
                 LTOP_x = np.floor((TT_x-TTE_x)*OTP2_x)
                 LTOP_y = np.floor((TT_y-TTE_y)*OTP2_y)
-                if data.shape[0] % tile_overlap_size_x != 0:
-                    LTOP_x += 1
-                if data.shape[1] % tile_overlap_size_y != 0:
-                    LTOP_y += 1
+                if dataset == "solar":
+                    if chunk_size[k][0] % tile_overlap_size_x != 0:
+                        LTOP_x += 1
+                else:
+                    if data.shape[0] % tile_overlap_size_x != 0:
+                        LTOP_x += 1
+                if dataset == "solar":
+                    if chunk_size[k][1] % tile_overlap_size_y != 0:
+                        LTOP_y += 1
+                else:
+                    if data.shape[1] % tile_overlap_size_y != 0:
+                        LTOP_y += 1
                 num_blocks_x = int(num_blocks_x + LTOP_x)
                 num_blocks_y = int(num_blocks_y + LTOP_y)
 
             if VERBOSE:
-                print("KEY", k, "DATA_SHAPE", data.shape,"NUM_BLOCKS:", num_blocks_x, num_blocks_y, flush=True)
+                if dataset == "solar":
+                    print("KEY", k, "DATA_SHAPE", chunk_size[k][0], chunk_size[k][1],"NUM_BLOCKS:", num_blocks_x, num_blocks_y, flush=True)
+                else:
+                    print("KEY", k, "DATA_SHAPE", data.shape,"NUM_BLOCKS:", num_blocks_x, num_blocks_y, flush=True)
 
             tiles_per_image.append(num_blocks_x*num_blocks_y)
-            num_channels_per_dataset.append(num_channels_used["imagenet"])
+            num_channels_per_dataset.append(num_channels_used["ct1"])
         #USE THIS IF RAW FILES ARE 3D
         else:
             tile_overlap_size_z = int(tile_size_z*tile_overlap)
