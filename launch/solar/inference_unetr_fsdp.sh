@@ -1,14 +1,14 @@
 #!/bin/bash
 #SBATCH -A stf006
-#SBATCH -J unetr_simple
+#SBATCH -J inference_unetr_fsdp
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:8
 #SBATCH --ntasks-per-node=8
 #SBATCH --cpus-per-task=7
 #SBATCH -t 00:10:00
 #SBATCH -p batch
-#SBATCH -o unetr_simple-%j.out
-#SBATCH -e unetr_simple-%j.out
+#SBATCH -o inference_unetr_fsdp-%j.out
+#SBATCH -e inference_unetr_fsdp-%j.out
 
 [ -z $JOBID ] && JOBID=$SLURM_JOB_ID
 [ -z $JOBSIZE ] && JOBSIZE=$SLURM_JOB_NUM_NODES
@@ -35,4 +35,4 @@ export OMP_NUM_THREADS=7
 export PYTHONPATH=$PWD:$PYTHONPATH
 
 time srun -n $((SLURM_JOB_NUM_NODES*8)) \
-python ../../dev_scripts/train_pred_fsdp.py ../../configs/solar/unetr/base_config.yaml
+python ../../dev_scripts/inference_pred_fsdp.py ../../configs/solar/unetr/base_config.yaml
