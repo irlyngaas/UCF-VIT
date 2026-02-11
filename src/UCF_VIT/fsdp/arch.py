@@ -977,11 +977,17 @@ class UNETR(VIT):
             self.out = UnetOutBlock(spatial_dims=spatial_dims, in_channels=self.feature_size, out_channels=self.num_classes)
 
             if self.feat_size[0]*16 != self.img_size[0]:
-                self.upsample = nn.Upsample(size=self.img_size,mode='trilinear',align_corners=True)
+                if self.twoD:
+                    self.upsample = nn.Upsample(size=self.img_size,mode='bilinear',align_corners=True)
+                else:
+                    self.upsample = nn.Upsample(size=self.img_size,mode='trilinear',align_corners=True)
 
         else: #Use Linear Decoder
             self.mlp_head = nn.Linear(self.embed_dim, self.num_classes) 
-            self.upsample = nn.Upsample(scale_factor=self.patch_size,mode='trilinear',align_corners=True)
+            if self.twoD:
+                self.upsample = nn.Upsample(scale_factor=self.patch_size,mode='bilinear',align_corners=True)
+            else:
+                self.upsample = nn.Upsample(scale_factor=self.patch_size,mode='trilinear',align_corners=True)
 
         self.init_weights('')
 
@@ -1011,6 +1017,8 @@ class UNETR(VIT):
                 dec2 = self.decoder4(dec3)
                 dec1 = self.decoder3(dec2)
                 out = self.decoder2(dec1)
+                if self.feat_size[0]*16 != self.img_size[0]:
+                    out = self.upsample(out)
                 x = self.out(out)
         else:
             int_len = len(intermediates)
@@ -1021,6 +1029,8 @@ class UNETR(VIT):
             dec2 = self.decoder4(dec3, enc3)
             enc2 = self.encoder2(self.proj_feat(intermediates[int_len-3], self.embed_dim, self.feat_size))
             dec1 = self.decoder3(dec2, enc2)
+            if self.feat_size[0]*16 != self.img_size[0]:
+                dec1 = self.upsample(dec1)
             out = self.decoder2(dec1, enc1)
             x = self.out(out)
         return x
