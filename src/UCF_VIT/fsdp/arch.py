@@ -975,6 +975,7 @@ class UNETR(VIT):
                     res_block=True,
                 )
             self.out = UnetOutBlock(spatial_dims=spatial_dims, in_channels=self.feature_size, out_channels=self.num_classes)
+            # self.final_act = nn.Tanh() # nn.Sigmoid()  nn.Tanh()  nn.LeakyReLU()  nn.Identity()
 
             if self.feat_size[0]*16 != self.img_size[0]:
                 if self.twoD:
@@ -1033,6 +1034,7 @@ class UNETR(VIT):
                 dec1 = self.upsample(dec1)
             out = self.decoder2(dec1, enc1)
             x = self.out(out)
+            # x = self.final_act(x) # trying different output activation funcs to match normalized o/p
         return x
 
     def forward_intermediates(
