@@ -620,7 +620,13 @@ class ImageBlockDataIter_2D_Memmap(IterableDataset):
             OTP2_y = int(self.tile_size_y/tile_overlap_size_y)
 
         if self.return_label:
+            # MGM: Load normalization file here
             for (data,label,variables, chunk_idx) in self.dataset:
+                # MGM: chunk_idx[2] is time index
+                # data - dict_in
+                # lable - dict_out
+                # TODO: Load normalization factors from file
+
                 #Total Tiles Evenly Spaced
                 #TTE_x = self.nx//self.tile_size_x
                 TTE_x = self.chunk_size[0]//self.tile_size_x
@@ -674,14 +680,24 @@ class ImageBlockDataIter_2D_Memmap(IterableDataset):
                             datalist = []
                             for cc in range(len(data)):
                                 data_cube = data[cc][0].data[chunk_offset_t, chunk_offset_y+jj*y_step_size:chunk_offset_y+(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip, chunk_offset_x+ii*x_step_size:chunk_offset_x+(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
-                                #Min-Max Normalization
+                                # Normalization or standardization (local within the data_cube)
                                 data_cube = (data_cube - data_cube.min())/(data_cube.max() - data_cube.min())
+                                # if cc > 0: # for magnetic fields
+                                #     # data_cube = np.clip(data_cube, -5*data_cube.std(), 5*data_cube.std()) # clip std to a value [-5,5]
+                                #     # data_cube = (data_cube - data_cube.mean())/ data_cube.std() # mean=0, std=1
+                                #     data_cube = -1 + (2*(data_cube - data_cube.min())) / (data_cube.max() - data_cube.min()) # [-1,1]
+                                # else: # for intensity
+                                #     # data_cube = (data_cube - data_cube.mean())/ data_cube.std()
+                                #     data_cube = (data_cube - data_cube.min()) / (data_cube.max() - data_cube.min())
+                                #     # data_cube = 0.5 + (0.5*(data_cube - data_cube.min())) / (data_cube.max() - data_cube.min())
                                 datalist.append(data_cube.copy().transpose(1,0))
                             labellist = []
                             for cc in range(len(label)):
                                 label_cube = label[cc][0].data[chunk_offset_t, chunk_offset_y+jj*y_step_size:chunk_offset_y+(self.tile_size_y*self.ny_skip)+jj*y_step_size:self.ny_skip, chunk_offset_x+ii*x_step_size:chunk_offset_x+(self.tile_size_x*self.nx_skip)+ii*x_step_size:self.nx_skip]
-                                #Min-Max Normalization
+                                # Normalization or standardization (local within the label_cube)
                                 label_cube = (label_cube - label_cube.min())/(label_cube.max() - label_cube.min())
+                                # label_cube = (label_cube - label_cube.mean())/ label_cube.std()
+                                # label_cube = -1 + (2*(label_cube - label_cube.min())) / (label_cube.max() - label_cube.min())
                                 labellist.append(label_cube.copy().transpose(1,0))
                             yield np.stack(datalist, axis=0), np.stack(labellist, axis=0), variables
 
