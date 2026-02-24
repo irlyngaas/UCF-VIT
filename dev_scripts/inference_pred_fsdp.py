@@ -695,22 +695,150 @@ def main(device, local_rank):
                     fig.colorbar(im, cax=cbar_ax)
                     plt.savefig(label_filename, bbox_inches='tight', dpi=200)
             else:
-                pred_img = pred.detach().cpu().numpy()
-                label_img = label.detach().cpu().numpy()
-                pred_filename = "pred_image"+str(i)+".png"
-                label_filename = "true_image"+str(i)+".png"
+                # pred_img = pred.detach().cpu().numpy()
+                # label_img = label.detach().cpu().numpy()
+                # pred_filename = checkpoint_path+"/pred_image"+str(i)+".png"
+                # label_filename = checkpoint_path+"/true_image"+str(i)+".png"
 
-                fig, ax = plt.subplots()
-                im = ax.imshow(np.squeeze(pred_img))
-                cbar_ax = fig.add_axes([0.85, 0.15, 0.03, 0.7])
-                fig.colorbar(im, cax=cbar_ax)
+                # fig, ax = plt.subplots()
+                # im = ax.imshow(np.squeeze(pred_img))
+                # cbar_ax = fig.add_axes([0.85, 0.15, 0.03, 0.7])
+                # fig.colorbar(im, cax=cbar_ax)
+                # plt.savefig(pred_filename, bbox_inches='tight', dpi=200)
+
+                # fig, ax = plt.subplots()
+                # im = ax.imshow(np.squeeze(label_img), vmax=1.0, vmin=0.0)
+                # cbar_ax = fig.add_axes([0.85, 0.15, 0.03, 0.7])
+                # fig.colorbar(im, cax=cbar_ax)
+                # plt.savefig(label_filename, bbox_inches='tight', dpi=200)
+
+                # ===== Comparison Plot =====
+                # print(f"DEBUG: shapes - pred_img = {pred_img.shape}; label_img={label_img.shape}; input_img={input_img.shape}")
+                pred_img  = pred.detach().cpu().numpy()[0]
+                label_img = label.detach().cpu().numpy()[0]
+                input_img = data.detach().cpu().numpy()[0]
+
+                C_in  = input_img.shape[0]
+                C_out = pred_img.shape[0]
+
+                n_cols = max(C_in, C_out)
+
+                in_names  = dict_in_variables['ct1']
+                out_names = dict_out_variables['ct1']
+
+                fig, axes = plt.subplots(3, n_cols,
+                                        figsize=(4*n_cols, 10),
+                                        squeeze=False)
+
+                # ---------------- INPUT ----------------
+                for j in range(n_cols):
+                    if j < C_in:
+                        im = axes[0, j].imshow(input_img[j], origin='lower', cmap='viridis')
+                        axes[0, j].set_title(f'Input: {in_names[j]}')
+                        plt.colorbar(im, ax=axes[0, j], fraction=0.046, pad=0.04)
+                    else:
+                        axes[0, j].axis('off')
+
+                # ---------------- PRED ----------------
+                for j in range(n_cols):
+                    if j < C_out:
+                        vmin = min(pred_img[j].min(), label_img[j].min())
+                        vmax = max(pred_img[j].max(), label_img[j].max())
+
+                        im = axes[1, j].imshow(np.squeeze(pred_img[j]),
+                                            origin='lower',
+                                            cmap='viridis',
+                                            vmin=vmin,
+                                            vmax=vmax)
+                        axes[1, j].set_title(f'Pred: {out_names[j]}')
+                        plt.colorbar(im, ax=axes[1, j], fraction=0.046, pad=0.04)
+                    else:
+                        axes[1, j].axis('off')
+
+                # ---------------- TRUTH ----------------
+                for j in range(n_cols):
+                    if j < C_out:
+                        vmin = min(pred_img[j].min(), label_img[j].min())
+                        vmax = max(pred_img[j].max(), label_img[j].max())
+
+                        im = axes[2, j].imshow(np.squeeze(label_img[j]),
+                                            origin='lower',
+                                            cmap='viridis',
+                                            vmin=vmin,
+                                            vmax=vmax)
+                        axes[2, j].set_title(f'True: {out_names[j]}')
+                        plt.colorbar(im, ax=axes[2, j], fraction=0.046, pad=0.04)
+                    else:
+                        axes[2, j].axis('off')
+
+                plt.tight_layout()
+                plt.savefig(checkpoint_path + "/comparison_" + str(i) + ".png",
+                            bbox_inches='tight', dpi=200)
+                plt.close(fig)
+                print(f"Saved comparison plot...")
+
+                # ===== Individual Images =====
+                pred_filename = checkpoint_path + "/pred_image" + str(i) + ".png"
+                label_filename = checkpoint_path + "/true_image" + str(i) + ".png"
+                n_channels = pred_img.shape[0]
+                var_names = dict_out_variables['ct1']
+                # ---------------- PREDICTION ----------------
+                fig, axes = plt.subplots(1, n_channels,
+                                        figsize=(4*n_channels, 4))
+                if n_channels == 1:
+                    axes = [axes]
+                for j in range(n_channels):
+                    vmin = min(pred_img[j].min(), label_img[j].min())
+                    vmax = max(pred_img[j].max(), label_img[j].max())
+                    im = axes[j].imshow(np.squeeze(pred_img[j]), 
+                                        origin='lower', 
+                                        cmap='viridis')
+                                        # vmin=vmin,
+                                        # vmax=vmax)
+                    axes[j].set_title(f'{var_names[j]}')
+                    plt.colorbar(im, ax=axes[j], fraction=0.046, pad=0.04)
+                plt.tight_layout()
                 plt.savefig(pred_filename, bbox_inches='tight', dpi=200)
-
-                fig, ax = plt.subplots()
-                im = ax.imshow(np.squeeze(label_img), vmax=1.0, vmin=0.0)
-                cbar_ax = fig.add_axes([0.85, 0.15, 0.03, 0.7])
-                fig.colorbar(im, cax=cbar_ax)
+                plt.close(fig)
+                print(f"Saved individual image - prediction...")
+                # ---------------- GROUND TRUTH ----------------
+                fig, axes = plt.subplots(1, n_channels,
+                                        figsize=(4*n_channels, 4))
+                if n_channels == 1:
+                    axes = [axes]
+                for j in range(n_channels):
+                    vmin = min(pred_img[j].min(), label_img[j].min())
+                    vmax = max(pred_img[j].max(), label_img[j].max())
+                    im = axes[j].imshow(np.squeeze(label_img[j]),
+                                        origin='lower',
+                                        cmap='viridis')
+                                        # vmin=vmin,
+                                        # vmax=vmax)
+                    axes[j].set_title(f'{var_names[j]}')
+                    plt.colorbar(im, ax=axes[j], fraction=0.046, pad=0.04)
+                plt.tight_layout()
                 plt.savefig(label_filename, bbox_inches='tight', dpi=200)
+                plt.close(fig)
+                print(f"Saved individual image - truth...")
+                # ------------------- INPUT --------------------
+                input_filename = checkpoint_path + "/input_image" + str(i) + ".png"
+                n_channels = input_img.shape[0]
+                var_names = dict_in_variables['ct1']
+                fig, axes = plt.subplots(1, n_channels,
+                                        figsize=(4*n_channels, 4))
+                if n_channels == 1:
+                    axes = [axes]
+                for j in range(n_channels):
+                    im = axes[j].imshow(input_img[j], 
+                                        origin='lower', 
+                                        cmap='viridis')
+                    axes[j].set_title(var_names[j])
+                    plt.colorbar(im, ax=axes[j], fraction=0.046, pad=0.04)
+                plt.tight_layout()
+                plt.savefig(input_filename, bbox_inches='tight', dpi=200)
+                plt.close(fig)
+                print(f"Saved individual image - input...")
+
         dist.barrier()
 
 if __name__ == "__main__":
