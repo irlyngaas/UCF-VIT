@@ -53,6 +53,26 @@ def training_step(data, label, variables, net: UNETR, patch_size, twoD):
     criterion = nn.MSELoss()
     loss = criterion(output,label)
 
+    # # --- Weighted MSE Loss ---
+    # # data shape assumed: (B, C, H, W) where channels are [intensity, bx, by, bz]
+    # # Extract Bz channel (index 3) - strongest indicator of magnetic activity
+    # bz = data[:, 3:4, :, :]  # keep dim: (B, 1, H, W)
+
+    # # Compute spatially varying weight map
+    # # Weight = 1 everywhere (quiet sun baseline) + extra weight where |Bz| is large
+    # B_magnitude = torch.sqrt(data[:, 1:2, :, :]**2 +   # bx
+    #                          data[:, 2:3, :, :]**2 +   # by
+    #                          bz**2)                     # bz
+
+    # alpha = 5.0  # tunable: how much to upweight active region (try 2-10)
+    # weight = 1.0 + alpha * (B_magnitude / (B_magnitude.amax(dim=(-2,-1), keepdim=True) + 1e-8))
+    # weight = weight.detach()  # don't backprop through weights
+
+    # # Weighted MSE: mean over pixels, weighted by spatial map
+    # squared_error = (output - label) ** 2          # (B, C_out, H, W)
+    # # Broadcast weight (B,1,H,W) across all output velocity channels
+    # loss = (squared_error * weight).mean()
+
     return loss, output
 
 def training_step_adaptive(data, seq, label, variables, net: UNETR, patch_size, twoD, seq_ps, in_chans, sqrt_len):
