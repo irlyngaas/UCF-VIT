@@ -14,7 +14,7 @@ from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from torch.utils.data import DataLoader
 
 from UCF_VIT.parse import parse_config, parse_pretrained_config
-from UCF_VIT.model import create_model
+from UCF_VIT.model.utils import get_model
 from UCF_VIT.training import load_optimizer_scheduler_from_checkpoint, train_epoch
 from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, init_par_groups, calculate_load_balancing_on_the_fly
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
@@ -107,7 +107,7 @@ def main():
 
 #2. Initialize model, optimizer, and scheduler
 ##############################################################################################################
-    model, epoch_start, loss_list = create_model(conf, pretrained_conf, device, local_rank, fsdp_group, simple_ddp_group, tensor_par_group)
+    model, epoch_start, loss_list = get_model(conf, pretrained_conf, device, local_rank, fsdp_group, simple_ddp_group, tensor_par_group)
 
     optimizer = configure_optimizer(model,conf["optimizer"]["lr"],conf["optimizer"]["beta_1"],conf["optimizer"]["beta_2"],conf["optimizer"]["weight_decay"])
     scheduler = configure_scheduler(optimizer,conf["scheduler"]["warmup_epochs"],conf["trainer"]["max_epochs"],conf["scheduler"]["warmup_start_lr"],conf["scheduler"]["eta_min"])

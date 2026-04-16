@@ -1,14 +1,14 @@
 #!/bin/bash
 #SBATCH -A lrn036
-#SBATCH -J mae
+#SBATCH -J diffusion
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:8
 #SBATCH --ntasks-per-node=8
 #SBATCH --cpus-per-task=7
 #SBATCH -t 00:05:00
 #SBATCH -p batch
-#SBATCH -o mae-%j.out
-#SBATCH -e mae-%j.out
+#SBATCH -o diffusion-%j.out
+#SBATCH -e diffusion-%j.out
 
 [ -z $JOBID ] && JOBID=$SLURM_JOB_ID
 [ -z $JOBSIZE ] && JOBSIZE=$SLURM_JOB_NUM_NODES
@@ -35,4 +35,4 @@ export OMP_NUM_THREADS=7
 export PYTHONPATH=$PWD:$PYTHONPATH
 
 time srun -n $((SLURM_JOB_NUM_NODES*8)) \
-python ../../training_scripts/train.py ../../configs/catsdogs/mae/base_config.yaml
+python ../../training_scripts/train.py ../../configs/catsdogs/diffusion/base_config.yaml

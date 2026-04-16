@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -A lrn075
+#SBATCH -A lrn036
 #SBATCH -J classification
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:8

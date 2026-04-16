@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -A lrn075
+#SBATCH -A lrn036
 #SBATCH -J mae
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:8
@@ -35,4 +35,4 @@ export OMP_NUM_THREADS=7
 export PYTHONPATH=$PWD:$PYTHONPATH
 
 time srun -n $((SLURM_JOB_NUM_NODES*8)) \
-python ../../training_scripts/train.py ../../configs/imagenet/mae/base_config_new.yaml
+python ../../training_scripts/train.py ../../configs/imagenet/mae/base_config.yaml
