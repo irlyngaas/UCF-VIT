@@ -571,15 +571,10 @@ class ShuffleIterableDataset(IterableDataset):
             yield buf.pop()
 
 class ProcessChannels(IterableDataset):
-    def __init__(self, dataset, num_channels: int, single_channel: bool, batch_size: int, return_label: bool, adaptive_patching: bool, separate_channels: bool, patch_size: int, fixed_length: int, twoD: bool, _dataset: str, return_qdt: bool) -> None:
+    def __init__(self, dataset, num_channels: int, batch_size: int, return_label: bool, adaptive_patching: bool, separate_channels: bool, patch_size: int, fixed_length: int, twoD: bool, _dataset: str, return_qdt: bool) -> None:
         super().__init__()
         self.dataset = dataset
         self.num_channels = num_channels
-        self.single_channel = single_channel
-        if self.single_channel:
-            self.num_buffers = num_channels
-        else:
-            self.num_buffers = 1
         self.batch_size = batch_size
         self.return_label = return_label
         self.adaptive_patching = adaptive_patching
@@ -589,199 +584,147 @@ class ProcessChannels(IterableDataset):
         self._dataset = _dataset
         self.return_qdt = return_qdt
         if self.adaptive_patching:
-            if self.single_channel:
+            if self.separate_channels:
                 if self.twoD:
                     self.patchify = Patchify(fixed_length=fixed_length, patch_size=patch_size, num_channels=1, dataset=self._dataset)
                 else:
                     self.patchify = Patchify_3D(fixed_length=fixed_length, patch_size=patch_size, num_channels=1, dataset=self._dataset)
             else:
-                if self.separate_channels:
-                    if self.twoD:
-                        self.patchify = Patchify(fixed_length=fixed_length, patch_size=patch_size, num_channels=1, dataset=self._dataset)
-                    else:
-                        self.patchify = Patchify_3D(fixed_length=fixed_length, patch_size=patch_size, num_channels=1, dataset=self._dataset)
+                if self.twoD:
+                    self.patchify = Patchify(fixed_length=fixed_length, patch_size=patch_size, num_channels=num_channels, dataset=self._dataset)
                 else:
-                    if self.twoD:
-                        self.patchify = Patchify(fixed_length=fixed_length, patch_size=patch_size, num_channels=num_channels, dataset=self._dataset)
-                    else:
-                        self.patchify = Patchify_3D(fixed_length=fixed_length, patch_size=patch_size, num_channels=num_channels, dataset=self._dataset)
+                    self.patchify = Patchify_3D(fixed_length=fixed_length, patch_size=patch_size, num_channels=num_channels, dataset=self._dataset)
 
     def __iter__(self):
         yield_x_list = []
         yield_var_list = []
         if self.return_label:
             yield_label_list = []
-        #Make a buffer for each channel
-        for i in range(self.num_buffers):
-            yield_x_list.append([])
-            yield_var_list.append([])
-            if self.return_label:
-                yield_label_list.append([])
 
         for x in self.dataset:
-            for i in range(self.num_buffers):
-                if self.single_channel:
+            if self.return_label:
+                yield_x_list.append(x[0])
+                yield_label_list.append(x[1])
+                yield_var_list.append(x[2])
+            else:
+                yield_x_list.append(x[0])
+                yield_var_list.append(x[1])
+            #TODO: Don't need these lists anymore
+              
+            if len(yield_x_list) == self.batch_size:
+                while yield_x_list:
                     if self.return_label:
-                        yield_x_list[i].append(x[0][i])
-                        yield_label_list[i].append(x[1])
-                        yield_var_list[i].append(x[2][i])
-                    else:
-                        yield_x_list[i].append(x[0][i])
-                        yield_var_list[i].append(x[1][i])
-                else:
-                    if self.return_label:
-                        yield_x_list[i].append(x[0])
-                        yield_label_list[i].append(x[1])
-                        yield_var_list[i].append(x[2])
-                    else:
-                        yield_x_list[i].append(x[0])
-                        yield_var_list[i].append(x[1])
-                  
-                if len(yield_x_list[i]) == self.batch_size:
-                    while yield_x_list[i]:
-                        if self.return_label:
-                            if self.adaptive_patching:
-                                np_image = yield_x_list[i].pop()
-                                if self.single_channel:
-                                    seq_image, seq_size, seq_pos, qdt = self.patchify(np.expand_dims(np_image,axis=-1))
-                                    if self._dataset != "imagenet":
-                                        np_label = yield_label_list[i].pop()
-                                        if self._dataset == "basic_ct":
-                                            np_label = np.expand_dims(np_label,axis=0)
-                                        seq_label_list = []
-                                        for j in range(np_label.shape[0]):
-                                            if self.twoD:
-                                                if self._dataset == "basic_ct":
-                                                    seq_label, _, _ = qdt.serialize_labels(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,1))
-                                                    seq_label = np.asarray(seq_label)
-                                                    seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size, -1, 1])
-                                                else:
-                                                    seq_label, _, _ = qdt.serialize(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,1))
-                                                    seq_label = np.asarray(seq_label, dtype=np.float32)
-                                                    seq_label = np.reshape(seq_label, [-1, self.patch_size*self.patch_size])
-                                            else:
-                                                if self._dataset == "basic_ct":
-                                                    seq_label, _, _ = qdt.serialize_labels(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,self.patch_size,1))
-                                                    seq_label = np.asarray(seq_label)
-                                                    seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size*self.patch_size, -1, 1])
-                                                else:
-                                                    seq_label, _, _ = qdt.serialize(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,self.patch_size,1))
-                                                    seq_label = np.asarray(seq_label, dtype=np.float32)
-                                                    seq_label = np.reshape(seq_label, [-1, self.patch_size*self.patch_size*self.patch_size])
-                                            seq_label_list.append(seq_label)
-                                else:
-                                    if self.separate_channels:
-                                        seq_image_list = []
-                                        seq_size_list = []
-                                        seq_pos_list = []
-                                        qdt_list = []
-                                        for j in range(self.num_channels):
-                                            seq_image, seq_size, seq_pos, qdt = self.patchify(np.expand_dims(np_image[j],axis=-1))
-                                            seq_image_list.append(seq_image)
-                                            seq_size_list.append(seq_size)
-                                            seq_pos_list.append(seq_pos)
-                                            qdt_list.append(qdt)
-                                        seq_image = np.stack([seq_image_list[k] for k in range(len(seq_image_list))])
-                                        seq_size = np.stack([seq_size_list[k] for k in range(len(seq_size_list))])
-                                        seq_pos = np.stack([seq_pos_list[k] for k in range(len(seq_pos_list))])
-                                        qdt = qdt_list
+                        if self.adaptive_patching:
+                            np_image = yield_x_list.pop()
+                            if self.separate_channels:
+                                seq_image_list = []
+                                seq_size_list = []
+                                seq_pos_list = []
+                                qdt_list = []
+                                for j in range(self.num_channels):
+                                    seq_image, seq_size, seq_pos, qdt = self.patchify(np.expand_dims(np_image[j],axis=-1))
+                                    seq_image_list.append(seq_image)
+                                    seq_size_list.append(seq_size)
+                                    seq_pos_list.append(seq_pos)
+                                    qdt_list.append(qdt)
+                                seq_image = np.stack([seq_image_list[k] for k in range(len(seq_image_list))])
+                                seq_size = np.stack([seq_size_list[k] for k in range(len(seq_size_list))])
+                                seq_pos = np.stack([seq_pos_list[k] for k in range(len(seq_pos_list))])
+                                qdt = qdt_list
 
-                                    else:
-                                        seq_image, seq_size, seq_pos, qdt = self.patchify(np.moveaxis(np_image,0,-1))
-
-                                    if self._dataset != "imagenet":
-                                        np_label = yield_label_list[i].pop()
-                                        if self._dataset == "basic_ct":
-                                            np_label = np.expand_dims(np_label,axis=0)
-
-                                        #TODO: If separate_channel=True, which qdt from qdt_list to use? Default to using the first in the list for now
-                                        if self.separate_channels:
-                                            qdt_ = qdt[0]
-                                        else:
-                                            qdt_ = qdt
-
-                                        seq_label_list = []
-                                        for j in range(np_label.shape[0]):
-                                            if self.twoD:
-                                                if self._dataset == "basic_ct":
-                                                    seq_label, _, _ = qdt_.serialize_labels(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,1))
-                                                    seq_label = np.asarray(seq_label)
-                                                    seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size, -1, 1])
-                                                else:
-                                                    seq_label, _, _ = qdt_.serialize(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,1))
-                                                    seq_label = np.asarray(seq_label, dtype=np.float32)
-                                                    seq_label = np.reshape(seq_label, [-1, self.patch_size*self.patch_size])
-                                            else:
-                                                if self._dataset == "basic_ct":
-                                                    seq_label, _, _ = qdt_.serialize_labels(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,self.patch_size, 1))
-                                                    seq_label = np.asarray(seq_label)
-                                                    seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size*self.patch_size, -1, 1])
-                                                else:
-                                                    seq_label, _, _ = qdt_.serialize(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,self.patch_size, 1))
-                                                    seq_label = np.asarray(seq_label, dtype=np.float32)
-                                                    seq_label = np.reshape(seq_label, [-1, self.patch_size*self.patch_size*self.patch_size])
-                                            seq_label_list.append(seq_label)
-
-                                if self._dataset == "imagenet":
-                                    if self.return_qdt:
-                                        yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_label_list[i].pop(), yield_var_list[i].pop(), qdt
-                                    else:
-                                        yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_label_list[i].pop(), yield_var_list[i].pop()
-                                else:
-                                    if self._dataset == "basic_ct":
-                                        if self.return_qdt:
-                                            yield np_image, seq_image, seq_size, seq_pos, np.asarray(np_label,dtype=np.uint8), seq_label_list, yield_var_list[i].pop(), qdt
-                                        else:
-                                            yield np_image, seq_image, seq_size, seq_pos, np.asarray(np_label,dtype=np.uint8), seq_label_list, yield_var_list[i].pop()
-                                    else:
-                                        if self.return_qdt:
-                                            yield np_image, seq_image, seq_size, seq_pos, np_label, seq_label_list, yield_var_list[i].pop(), qdt
-                                        else:
-                                            yield np_image, seq_image, seq_size, seq_pos, np_label, seq_label_list, yield_var_list[i].pop()
                             else:
-                                if self._dataset == "imagenet":
-                                    np_image = yield_x_list[i].pop()
-                                    yield np.asarray(np_image,dtype=np.float32), yield_label_list[i].pop(), yield_var_list[i].pop()
-                                else:
-                                    yield yield_x_list[i].pop(), yield_label_list[i].pop(), yield_var_list[i].pop()
+                                seq_image, seq_size, seq_pos, qdt = self.patchify(np.moveaxis(np_image,0,-1))
 
+                            if self._dataset != "imagenet":
+                                np_label = yield_label_list.pop()
+                                if self._dataset == "basic_ct":
+                                    np_label = np.expand_dims(np_label,axis=0)
+
+                                #TODO: If separate_channel=True, which qdt from qdt_list to use? Default to using the first in the list for now
+                                if self.separate_channels:
+                                    qdt_ = qdt[0]
+                                else:
+                                    qdt_ = qdt
+
+                                seq_label_list = []
+                                for j in range(np_label.shape[0]):
+                                    if self.twoD:
+                                        if self._dataset == "basic_ct":
+                                            seq_label, _, _ = qdt_.serialize_labels(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,1))
+                                            seq_label = np.asarray(seq_label)
+                                            seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size, -1, 1])
+                                        else:
+                                            seq_label, _, _ = qdt_.serialize(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,1))
+                                            seq_label = np.asarray(seq_label, dtype=np.float32)
+                                            seq_label = np.reshape(seq_label, [-1, self.patch_size*self.patch_size])
+                                    else:
+                                        if self._dataset == "basic_ct":
+                                            seq_label, _, _ = qdt_.serialize_labels(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,self.patch_size, 1))
+                                            seq_label = np.asarray(seq_label)
+                                            seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size*self.patch_size, -1, 1])
+                                        else:
+                                            seq_label, _, _ = qdt_.serialize(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,self.patch_size, 1))
+                                            seq_label = np.asarray(seq_label, dtype=np.float32)
+                                            seq_label = np.reshape(seq_label, [-1, self.patch_size*self.patch_size*self.patch_size])
+                                    seq_label_list.append(seq_label)
+
+                            if self._dataset == "imagenet":
+                                if self.return_qdt:
+                                    yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_label_list.pop(), yield_var_list.pop(), qdt
+                                else:
+                                    yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_label_list.pop(), yield_var_list.pop()
+                            else:
+                                if self._dataset == "basic_ct":
+                                    if self.return_qdt:
+                                        yield np_image, seq_image, seq_size, seq_pos, np.asarray(np_label,dtype=np.uint8), seq_label_list, yield_var_list.pop(), qdt
+                                    else:
+                                        yield np_image, seq_image, seq_size, seq_pos, np.asarray(np_label,dtype=np.uint8), seq_label_list, yield_var_list.pop()
+                                else:
+                                    if self.return_qdt:
+                                        yield np_image, seq_image, seq_size, seq_pos, np_label, seq_label_list, yield_var_list.pop(), qdt
+                                    else:
+                                        yield np_image, seq_image, seq_size, seq_pos, np_label, seq_label_list, yield_var_list.pop()
                         else:
-                            if self.adaptive_patching:
-                                np_image = yield_x_list[i].pop()
-                                if self.single_channel:
-                                    seq_image, seq_size, seq_pos, _ = self.patchify(np.expand_dims(np_image,axis=-1))
-                                else:
-                                    if self.separate_channels:
-                                        seq_image_list = []
-                                        seq_size_list = []
-                                        seq_pos_list = []
-                                        qdt_list = []
-                                        for j in range(self.num_channels):
-                                            seq_image, seq_size, seq_pos, _ = self.patchify(np.expand_dims(np_image[j],axis=-1))
-                                            seq_image_list.append(seq_image)
-                                            seq_size_list.append(seq_size)
-                                            seq_pos_list.append(seq_pos)
-                                            qdt_list.append(qdt)
-                                        seq_image = np.stack([seq_image_list[k] for k in range(len(seq_image_list))])
-                                        seq_size = np.stack([seq_size_list[k] for k in range(len(seq_size_list))])
-                                        seq_pos = np.stack([seq_pos_list[k] for k in range(len(seq_pos_list))])
-                                        qdt = qdt_list
-
-                                    else:
-                                        seq_image, seq_size, seq_pos, _ = self.patchify(np.moveaxis(np_image,0,-1))
-                                if self._dataset == "imagenet":
-                                    if self.return_qdt:
-                                        yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_var_list[i].pop(), qdt
-                                    else:
-                                        yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_var_list[i].pop()
-                                else:
-                                    if self.return_qdt:
-                                        yield np_image, seq_image, seq_size, seq_pos, yield_var_list[i].pop(), qdt 
-                                    else:
-                                        yield np_image, seq_image, seq_size, seq_pos, yield_var_list[i].pop()
+                            if self._dataset == "imagenet":
+                                np_image = yield_x_list.pop()
+                                yield np.asarray(np_image,dtype=np.float32), yield_label_list.pop(), yield_var_list.pop()
                             else:
-                                if self._dataset == "imagenet":
-                                    np_image = yield_x_list[i].pop()
-                                    yield np.asarray(np_image,dtype=np.float32), yield_var_list[i].pop()
+                                yield yield_x_list.pop(), yield_label_list.pop(), yield_var_list.pop()
+
+                    else:
+                        if self.adaptive_patching:
+                            np_image = yield_x_list.pop()
+                            if self.separate_channels:
+                                seq_image_list = []
+                                seq_size_list = []
+                                seq_pos_list = []
+                                qdt_list = []
+                                for j in range(self.num_channels):
+                                    seq_image, seq_size, seq_pos, _ = self.patchify(np.expand_dims(np_image[j],axis=-1))
+                                    seq_image_list.append(seq_image)
+                                    seq_size_list.append(seq_size)
+                                    seq_pos_list.append(seq_pos)
+                                    qdt_list.append(qdt)
+                                seq_image = np.stack([seq_image_list[k] for k in range(len(seq_image_list))])
+                                seq_size = np.stack([seq_size_list[k] for k in range(len(seq_size_list))])
+                                seq_pos = np.stack([seq_pos_list[k] for k in range(len(seq_pos_list))])
+                                qdt = qdt_list
+
+                            else:
+                                seq_image, seq_size, seq_pos, _ = self.patchify(np.moveaxis(np_image,0,-1))
+                            if self._dataset == "imagenet":
+                                if self.return_qdt:
+                                    yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_var_list.pop(), qdt
                                 else:
-                                    yield yield_x_list[i].pop(), yield_var_list[i].pop()
+                                    yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_var_list.pop()
+                            else:
+                                if self.return_qdt:
+                                    yield np_image, seq_image, seq_size, seq_pos, yield_var_list.pop(), qdt 
+                                else:
+                                    yield np_image, seq_image, seq_size, seq_pos, yield_var_list.pop()
+                        else:
+                            if self._dataset == "imagenet":
+                                np_image = yield_x_list.pop()
+                                yield np.asarray(np_image,dtype=np.float32), yield_var_list.pop()
+                            else:
+                                yield yield_x_list.pop(), yield_var_list.pop()

@@ -18,174 +18,103 @@ from .dataset import (
     ProcessChannels,
 )
 
-def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_channels, dataset, num_classes, num_labels, return_qdt, dict_key):
+def collate_fn(batch, return_label, adaptive_patching, separate_channels, dataset, num_classes, num_labels, return_qdt, dict_key):
     if adaptive_patching:
         if return_label:
-            if single_channel:
-                inp = torch.stack([torch.from_numpy(np.expand_dims(batch[i][0],axis=0)) for i in range(len(batch))])
-                seq = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
+            inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
 
+            #TODO: Generalize this 
+            if dataset == "basic_ct":
+                seq = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
+            else:
+                seq = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
+
+            #TODO: Finish and Test separate_channels implementation
+            if separate_channels:
+                size = torch.stack([torch.from_numpy(batch[i][2]) for i in range(len(batch))])
+                pos = torch.stack([torch.from_numpy(batch[i][3]) for i in range(len(batch))])
+            else:
                 size = torch.stack([torch.from_numpy(np.expand_dims(batch[i][2],axis=0)) for i in range(len(batch))])
                 pos = torch.stack([torch.from_numpy(np.expand_dims(batch[i][3],axis=0)) for i in range(len(batch))])
-                if dataset == "imagenet":
-                    label = torch.stack([torch.tensor(batch[i][4]) for i in range(len(batch))])
-                    variables = []
-                    variables.append(batch[0][5])
-                    if return_qdt:
-                        qdt_list = []
-                        for i in range(len(batch)):
-                            qdt_list.append(batch[i][6])
-                else:
-                    label = torch.stack([torch.from_numpy(batch[i][4]) for i in range(len(batch))])
-                    seq_label_list = []
-                    for i in range(len(batch)):
-                        if dataset == "basic_ct":
-                            seq_mask = torch.from_numpy(batch[i][5][0]).long()
-                            seq_mask = F.one_hot(seq_mask.squeeze(-1), num_classes=num_classes)
-                            seq_label_list.append(seq_mask.permute(2, 0, 1).float())
-                        else:
-                            seq_label_list.append([])
-                            for j in range(num_labels):
-                                seq_label_list[i].append(torch.from_numpy(batch[i][5][j]))
-                    if dataset == "basic_ct":
-                        seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
-                    else:
-                        channel_list = []
-                        for i in range(len(batch)):
-                            channel_list.append(torch.stack([seq_label_list[i][j] for j in range(num_labels)]))
-                        seq_label = torch.stack([channel_list[i] for i in range(len(batch))])
 
-                    variables = []
-                    variables.append(batch[0][6])
-                    if return_qdt:
-                        qdt_list = []
-                        for i in range(len(batch)):
-                            qdt_list.append(batch[i][7])
+            if dataset == "imagenet":
+                label = torch.stack([torch.tensor(batch[i][4]) for i in range(len(batch))])
+                variables = batch[0][5]
+                if return_qdt:
+                    qdt_list = []
+                    for i in range(len(batch)):
+                        qdt_list.append(batch[i][6])
             else:
-                inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
-
-                #TODO: Generalize this 
-                if dataset == "basic_ct":
-                    seq = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
-                else:
-                    seq = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
-
-                #TODO: Finish and Test separate_channels implementation
-                if separate_channels:
-                    size = torch.stack([torch.from_numpy(batch[i][2]) for i in range(len(batch))])
-                    pos = torch.stack([torch.from_numpy(batch[i][3]) for i in range(len(batch))])
-                else:
-                    size = torch.stack([torch.from_numpy(np.expand_dims(batch[i][2],axis=0)) for i in range(len(batch))])
-                    pos = torch.stack([torch.from_numpy(np.expand_dims(batch[i][3],axis=0)) for i in range(len(batch))])
-
-                if dataset == "imagenet":
-                    label = torch.stack([torch.tensor(batch[i][4]) for i in range(len(batch))])
-                    variables = batch[0][5]
-                    if return_qdt:
-                        qdt_list = []
-                        for i in range(len(batch)):
-                            qdt_list.append(batch[i][6])
-                else:
-                    label = torch.stack([torch.from_numpy(batch[i][4]) for i in range(len(batch))])
-                    seq_label_list = []
-                    for i in range(len(batch)):
-                        if dataset == "basic_ct":
-                            seq_mask = torch.from_numpy(batch[i][5][0]).long()
-                            seq_mask = F.one_hot(seq_mask.squeeze(-1), num_classes=num_classes)
-                            seq_label_list.append(seq_mask.permute(2, 0, 1).float())
-                        else:
-                            seq_label_list.append([])
-                            for j in range(num_labels):
-                                seq_label_list[i].append(torch.from_numpy(batch[i][5][j]))
+                label = torch.stack([torch.from_numpy(batch[i][4]) for i in range(len(batch))])
+                seq_label_list = []
+                for i in range(len(batch)):
                     if dataset == "basic_ct":
-                        seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
+                        seq_mask = torch.from_numpy(batch[i][5][0]).long()
+                        seq_mask = F.one_hot(seq_mask.squeeze(-1), num_classes=num_classes)
+                        seq_label_list.append(seq_mask.permute(2, 0, 1).float())
                     else:
-                        channel_list = []
-                        for i in range(len(batch)):
-                            channel_list.append(torch.stack([seq_label_list[i][j] for j in range(num_labels)]))
-                        seq_label = torch.stack([channel_list[i] for i in range(len(batch))])
+                        seq_label_list.append([])
+                        for j in range(num_labels):
+                            seq_label_list[i].append(torch.from_numpy(batch[i][5][j]))
+                if dataset == "basic_ct":
+                    seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
+                else:
+                    channel_list = []
+                    for i in range(len(batch)):
+                        channel_list.append(torch.stack([seq_label_list[i][j] for j in range(num_labels)]))
+                    seq_label = torch.stack([channel_list[i] for i in range(len(batch))])
 
-                    variables = batch[0][6]
-                    if return_qdt:
-                        qdt_list = []
-                        for i in range(len(batch)):
-                            qdt_list.append(batch[i][7])
+                variables = batch[0][6]
+                if return_qdt:
+                    qdt_list = []
+                    for i in range(len(batch)):
+                        qdt_list.append(batch[i][7])
+
             if dataset == "imagenet":                
                 if return_qdt:
                     return (inp, seq, size, pos, label, variables, qdt_list, dict_key)
-                    #return (seq, label, variables, qdt_list, dict_key)
                 else:
                     return (inp, seq, size, pos, label, variables, dict_key)
-                    #return (seq, label, variables, dict_key)
             else:
                 if return_qdt:
                     return (inp, seq, size, pos, label, seq_label, variables, qdt_list, dict_key)
-                    #return (seq, seq_label, variables, qdt_list, dict_key)
                 else:
                     return (inp, seq, size, pos, label, seq_label, variables, dict_key)
-                    #return (seq, seq_label, variables, dict_key)
         else:
-            if single_channel:
-                inp = torch.stack([torch.from_numpy(np.expand_dims(batch[i][0],axis=0)) for i in range(len(batch))])
-                seq = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
+            inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
+            seq = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
+            #TODO: Finish and Test separate_channels implementation
+            if separate_channels:
+                size = torch.stack([torch.from_numpy(batch[i][2]) for i in range(len(batch))])
+                pos = torch.stack([torch.from_numpy(batch[i][3]) for i in range(len(batch))])
+            else:
                 size = torch.stack([torch.from_numpy(np.expand_dims(batch[i][2],axis=0)) for i in range(len(batch))])
                 pos = torch.stack([torch.from_numpy(np.expand_dims(batch[i][3],axis=0)) for i in range(len(batch))])
-                variables = []
-                variables.append(batch[0][4])
-            else:
-                inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
-                seq = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
-                #TODO: Finish and Test separate_channels implementation
-                if separate_channels:
-                    size = torch.stack([torch.from_numpy(batch[i][2]) for i in range(len(batch))])
-                    pos = torch.stack([torch.from_numpy(batch[i][3]) for i in range(len(batch))])
-                else:
-                    size = torch.stack([torch.from_numpy(np.expand_dims(batch[i][2],axis=0)) for i in range(len(batch))])
-                    pos = torch.stack([torch.from_numpy(np.expand_dims(batch[i][3],axis=0)) for i in range(len(batch))])
-                variables = batch[0][4]
+            variables = batch[0][4]
 
             if return_qdt:
                 qdt_list = []
                 for i in range(len(batch)):
                     qdt_list.append(batch[i][5])
                 return (inp, seq, size, pos, variables, qdt_list, dict_key)
-                #return (seq, variables, qdt_list, dict_key)
             else:
                 return (inp, seq, size, pos, variables, dict_key)
-                #return (seq, variables, dict_key)
     else:
         if return_label:
-            if single_channel:
-                inp = torch.stack([torch.from_numpy(np.expand_dims(batch[i][0],axis=0)) for i in range(len(batch))])
-                if dataset == "imagenet":
-                    label = torch.stack([torch.tensor(batch[i][1]) for i in range(len(batch))])
-                else:
-                    if num_labels == 1:
-                        label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
-                    else:
-                        label = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
-                variables = []
-                variables.append(batch[0][2])
+            inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
+            if dataset == "imagenet":
+                label = torch.stack([torch.tensor(batch[i][1]) for i in range(len(batch))])
             else:
-                inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
-                if dataset == "imagenet":
-                    label = torch.stack([torch.tensor(batch[i][1]) for i in range(len(batch))])
+                if num_labels == 1:
+                    label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
                 else:
-                    if num_labels == 1:
-                        label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
-                    else:
-                        label = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
-                variables = batch[0][2]
+                    label = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
+            variables = batch[0][2]
                 
             return (inp, label, variables, dict_key)
         else:
-            if single_channel:
-                inp = torch.stack([torch.from_numpy(np.expand_dims(batch[i][0],axis=0)) for i in range(len(batch))])
-                variables = []
-                variables.append(batch[0][1])
-            else:
-                inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
-                variables = batch[0][1]
+            inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
+            variables = batch[0][1]
 
             return (inp, variables, dict_key)
 
@@ -208,7 +137,6 @@ class NativePytorchDataModule(torch.nn.Module):
         tile_size_z (int, optional): the tile size in the z dimension
         twoD (bool, optional): Variable for indicating two or three dimensionsal input, if False, three dimensional input.
         return_label (bool, optional): Whether or not the dataloader returns segmentation labels 
-        single_channel (bool, optional): Variable for indicating that multiple modalities will be used, but the model will be fed with modalities separated into batches only containing a single modality
         dataset_group_list (string, optional): How to split available GPUs amongst the available datasets, run "python utils/preprocess_load_balancing.py CONFIG_FILE NUM_GPUS" to obtain
         tile_overlap (float, optional): Amount of tile overlapping to use, takes decimal values, multiples tile_size by tile_overlap to determine step size. Use 0.0 for no overlapping
         use_all_data (bool, optional): Whether or not to use all data in dataloading. Including if tile size doesn't evenly split images. If tile size splits an image unevenly on last tile of a dimension go from last pixel backwards to get a full tile
@@ -230,7 +158,6 @@ class NativePytorchDataModule(torch.nn.Module):
         tile_size_y: int = 64,
         tile_size_z: int = None,
         twoD: bool = True,
-        single_channel: bool = False,
         dataset_group_list: str = '',
         batches_per_rank_epoch: Dict = None,
         tile_overlap: float = 0.0,
@@ -273,7 +200,6 @@ class NativePytorchDataModule(torch.nn.Module):
         self.tile_size_y = tile_size_y
         self.tile_size_z = tile_size_z
         self.twoD = twoD
-        self.single_channel = single_channel
         self.return_label = return_label
         self.return_qdt = return_qdt
         self.batches_per_rank_epoch = batches_per_rank_epoch
@@ -354,7 +280,6 @@ class NativePytorchDataModule(torch.nn.Module):
             buffer_size = self.dict_buffer_sizes[k]
             variables = self.dict_in_variables[k]
             num_channels_used = self.num_channels_used[k]
-        single_channel = self.single_channel
         return_label = self.return_label
         if self.dataset == "imagenet":
             dict_data_train[k] = ProcessChannels(
@@ -385,7 +310,6 @@ class NativePytorchDataModule(torch.nn.Module):
                     buffer_size
                 ),
                 num_channels_used,
-                single_channel,
                 self.batch_size,
                 return_label,
                 self.adaptive_patching,
@@ -424,7 +348,6 @@ class NativePytorchDataModule(torch.nn.Module):
                     buffer_size
                 ),
                 num_channels_used,
-                single_channel,
                 self.batch_size,
                 return_label,
                 self.adaptive_patching,
@@ -523,6 +446,6 @@ class NativePytorchDataModule(torch.nn.Module):
             drop_last=True,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            collate_fn=lambda batch: collate_fn(batch, return_label=self.return_label, single_channel=self.single_channel, adaptive_patching = self.adaptive_patching, separate_channels=self.separate_channels, dataset=self.dataset, num_classes=self.num_classes, num_labels=num_labels, return_qdt=self.return_qdt, dict_key=k),
+            collate_fn=lambda batch: collate_fn(batch, return_label=self.return_label, adaptive_patching = self.adaptive_patching, separate_channels=self.separate_channels, dataset=self.dataset, num_classes=self.num_classes, num_labels=num_labels, return_qdt=self.return_qdt, dict_key=k),
         )
 

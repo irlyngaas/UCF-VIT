@@ -16,7 +16,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 
 from torch.nn import Sequential
-from UCF_VIT.fsdp.building_blocks import Block
+from UCF_VIT.model.building_blocks import Block
 from timm.layers import use_fused_attn
 
 def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, tensor_par_group):
@@ -57,7 +57,6 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
         drop_rate=conf["model"]["drop_rate"],
         twoD=conf["data"]["twoD"],
         default_vars=conf["data"]["default_vars"],
-        single_channel=False, #TODO: Take out single channel option altogether
         use_varemb=conf["model"]["use_channel_aggregation"], #TODO: Change use_varemb to use_channel_aggregation in arch.py
         adaptive_patching=conf["ap"]["do_ap"],
         fixed_length=conf["ap"]["fixed_length"],

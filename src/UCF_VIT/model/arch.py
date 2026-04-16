@@ -10,8 +10,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-#from UCF_VIT.simple.building_blocks import Block, PatchEmbed, Mlp, DropPath, AttentionPoolLatent, PatchDropout, \
-from .building_blocks import Block, PatchEmbed, Mlp, DropPath, AttentionPoolLatent, PatchDropout, \
+from UCF_VIT.model.building_blocks import Block, PatchEmbed, Mlp, DropPath, AttentionPoolLatent, PatchDropout, \
     trunc_normal_, resample_patch_embed, resample_abs_pos_embed, \
     get_act_layer, get_norm_layer, LayerType, \
     MyUnetBlock, EmbeddingDenseLayer, \
@@ -132,7 +131,6 @@ class VIT(nn.Module):
             adaptive_patching: Optional[bool] = False,
             fixed_length: Optional[int] = 4096,
             default_vars: List = None,
-            single_channel: bool = False,
             use_varemb: bool = False,
             tensor_par_size: int = 1,
             tensor_par_group: Optional[dist.ProcessGroup] = None,
@@ -166,7 +164,6 @@ class VIT(nn.Module):
             adaptive_patching: Whether to use adaptive patching
             fixed_length: Length for adaptive patches, only used if adative_patching=True
             default_vars: List of different potential modalities to be used as input.
-            single_channel: Variable for indicating that multiple modalities will be used, but the model will be fed with modalities separated into batches only containing a single modality
             use_varemb: Whether to use variable embedding tokens as an additional learnable parameter
         """
         super().__init__()
@@ -197,7 +194,6 @@ class VIT(nn.Module):
         self.adaptive_patching = adaptive_patching
         self.fixed_length = fixed_length
         self.default_vars = default_vars
-        self.single_channel = single_channel
         self.use_varemb = use_varemb
         self.aggregated_variables = 1 #Change this to an argument when adding different variable aggregation strategies
         self.class_token = class_token
@@ -305,14 +301,10 @@ class VIT(nn.Module):
 
         if self.use_varemb:
             self.var_embed, self.var_map = self.create_var_embedding(self.embed_dim)
-            if self.single_channel or len(self.default_vars) == 1:
-                self.var_query = None
-                self.var_agg = None
-            else:
-                self.var_query = nn.Parameter(torch.zeros(1, self.aggregated_variables, self.embed_dim), requires_grad=True)
-                #TODO: Different parameter for specifying num_heads in var_agg rather than encoder num_heads
-                #self.var_agg = nn.MultiheadAttention(self.embed_dim, self.num_heads, batch_first=True)
-                self.var_agg = VariableMapping_Attention(self.embed_dim, fused_attn=self.FusedAttn_option, num_heads=self.num_heads, qkv_bias=False, tensor_par_size = self.tensor_par_size, tensor_par_group = self.tensor_par_group)
+            self.var_query = nn.Parameter(torch.zeros(1, self.aggregated_variables, self.embed_dim), requires_grad=True)
+            #TODO: Different parameter for specifying num_heads in var_agg rather than encoder num_heads
+            #self.var_agg = nn.MultiheadAttention(self.embed_dim, self.num_heads, batch_first=True)
+            self.var_agg = VariableMapping_Attention(self.embed_dim, fused_attn=self.FusedAttn_option, num_heads=self.num_heads, qkv_bias=False, tensor_par_size = self.tensor_par_size, tensor_par_group = self.tensor_par_group)
 
         if self.use_adaptive_pos_emb:
             if self.twoD:
@@ -443,27 +435,15 @@ class VIT(nn.Module):
             var_ids = self.get_var_ids(variables, x.device)
             for i in range(len(var_ids)):
                 id = var_ids[i]
-                if self.single_channel:
-                    if self.adaptive_patching:
-                        x = self.token_embeds[id](torch.squeeze(x)) # B, L, D 
-                    else:
-                        x = self.token_embeds[id](x) # B, L, D 
-                    break #Should only be one channel
+                if self.adaptive_patching:
+                    embeds.append(self.token_embeds[id](torch.squeeze(x[:,i : i+1])))
                 else:
-                    if self.adaptive_patching:
-                        embeds.append(self.token_embeds[id](torch.squeeze(x[:,i : i+1])))
-                    else:
-                        embeds.append(self.token_embeds[id](x[:,i : i+1]))
+                    embeds.append(self.token_embeds[id](x[:,i : i+1]))
                     
             var_embed = self.get_var_emb(self.var_embed, variables) # 1, V, D
-            if not self.single_channel: #V > 1
-                x = torch.stack(embeds, dim=1)  # B, L, D -> B, V, L, D
-                x = x + var_embed.unsqueeze(2)  # 1, V, D -> 1, V, 1, D
-                x = self.aggregate_variables(x)  # B, V~ , L, D, where V~ is the aggregated variables
-            else: # V=1
-                #x -> B, L, D
-                var_embed = var_embed.unsqueeze(2) # 1, V=1, D -> 1, V=1, L=1, D
-                x = x + var_embed.squeeze(1)  # 1, V=1, L=1, D -> 1, L=1, D
+            x = torch.stack(embeds, dim=1)  # B, L, D -> B, V, L, D
+            x = x + var_embed.unsqueeze(2)  # 1, V, D -> 1, V, 1, D
+            x = self.aggregate_variables(x)  # B, V~ , L, D, where V~ is the aggregated variables
         else:
             if self.adaptive_patching and not self.sqrt_len_method:
                 x = rearrange(x, 'b c s p -> b s (p c)')
@@ -737,27 +717,15 @@ class MAE(VIT):
             var_ids = self.get_var_ids(variables, x.device)
             for i in range(len(var_ids)):
                 id = var_ids[i]
-                if self.single_channel:
-                    if self.adaptive_patching:
-                        x = self.token_embeds[id](torch.squeeze(x)) # B, L, D 
-                    else:
-                        x = self.token_embeds[id](x) # B, L, D 
-                    break #Should only be one channel
+                if self.adaptive_patching:
+                    embeds.append(self.token_embeds[id](torch.squeeze(x[:,i : i+1])))
                 else:
-                    if self.adaptive_patching:
-                        embeds.append(self.token_embeds[id](torch.squeeze(x[:,i : i+1])))
-                    else:
-                        embeds.append(self.token_embeds[id](x[:,i : i+1]))
+                    embeds.append(self.token_embeds[id](x[:,i : i+1]))
                     
             var_embed = self.get_var_emb(self.var_embed, variables) # 1, V, D
-            if not self.single_channel: #V > 1
-                x = torch.stack(embeds, dim=1)  # B, L, D -> B, V, L, D
-                x = x + var_embed.unsqueeze(2)  # 1, V, D -> 1, V, 1, D
-                x = self.aggregate_variables(x)  # B, V~ , L, D, where V~ is the aggregated variables
-            else: # V=1
-                #x -> B, L, D
-                var_embed = var_embed.unsqueeze(2) # 1, V=1, D -> 1, V=1, L=1, D
-                x = x + var_embed.squeeze(1)  # 1, V=1, L=1, D -> 1, L=1, D
+            x = torch.stack(embeds, dim=1)  # B, L, D -> B, V, L, D
+            x = x + var_embed.unsqueeze(2)  # 1, V, D -> 1, V, 1, D
+            x = self.aggregate_variables(x)  # B, V~ , L, D, where V~ is the aggregated variables
         else:
             if self.adaptive_patching:
                 x = rearrange(x, 'b c s p -> b s (p c)')
@@ -1069,27 +1037,15 @@ class UNETR(VIT):
             var_ids = self.get_var_ids(variables, x.device)
             for i in range(len(var_ids)):
                 id = var_ids[i]
-                if self.single_channel:
-                    if self.adaptive_patching:
-                        x = self.token_embeds[id](torch.squeeze(x)) # B, L, D 
-                    else:
-                        x = self.token_embeds[id](x) # B, L, D 
-                    break #Should only be one channel
+                if self.adaptive_patching:
+                    embeds.append(self.token_embeds[id](torch.squeeze(x[:,i : i+1])))
                 else:
-                    if self.adaptive_patching:
-                        embeds.append(self.token_embeds[id](torch.squeeze(x[:,i : i+1])))
-                    else:
-                        embeds.append(self.token_embeds[id](x[:,i : i+1]))
+                    embeds.append(self.token_embeds[id](x[:,i : i+1]))
                     
             var_embed = self.get_var_emb(self.var_embed, variables) # 1, V, D
-            if not self.single_channel: #V > 1
-                x = torch.stack(embeds, dim=1)  # B, L, D -> B, V, L, D
-                x = x + var_embed.unsqueeze(2)  # 1, V, D -> 1, V, 1, D
-                x = self.aggregate_variables(x)  # B, V~ , L, D, where V~ is the aggregated variables
-            else: # V=1
-                #x -> B, L, D
-                var_embed = var_embed.unsqueeze(2) # 1, V=1, D -> 1, V=1, L=1, D
-                x = x + var_embed.squeeze(1)  # 1, V=1, L=1, D -> 1, L=1, D
+            x = torch.stack(embeds, dim=1)  # B, L, D -> B, V, L, D
+            x = x + var_embed.unsqueeze(2)  # 1, V, D -> 1, V, 1, D
+            x = self.aggregate_variables(x)  # B, V~ , L, D, where V~ is the aggregated variables
         else:
             if self.adaptive_patching and not self.sqrt_len_method:
                 x = rearrange(x, 'b c s p -> b s (p c)')
@@ -1285,27 +1241,15 @@ class DiffusionVIT(VIT):
             var_ids = self.get_var_ids(variables, x.device)
             for i in range(len(var_ids)):
                 id = var_ids[i]
-                if self.single_channel:
-                    if self.adaptive_patching:
-                        x = self.token_embeds[id](torch.squeeze(x)) # B, L, D 
-                    else:
-                        x = self.token_embeds[id](x) # B, L, D 
-                    break #Should only be one channel
+                if self.adaptive_patching:
+                    embeds.append(self.token_embeds[id](torch.squeeze(x[:,i : i+1])))
                 else:
-                    if self.adaptive_patching:
-                        embeds.append(self.token_embeds[id](torch.squeeze(x[:,i : i+1])))
-                    else:
-                        embeds.append(self.token_embeds[id](x[:,i : i+1]))
+                    embeds.append(self.token_embeds[id](x[:,i : i+1]))
                     
             var_embed = self.get_var_emb(self.var_embed, variables) # 1, V, D
-            if not self.single_channel: #V > 1
-                x = torch.stack(embeds, dim=1)  # B, L, D -> B, V, L, D
-                x = x + var_embed.unsqueeze(2)  # 1, V, D -> 1, V, 1, D
-                x = self.aggregate_variables(x)  # B, V~ , L, D, where V~ is the aggregated variables
-            else: # V=1
-                #x -> B, L, D
-                var_embed = var_embed.unsqueeze(2) # 1, V=1, D -> 1, V=1, L=1, D
-                x = x + var_embed.squeeze(1)  # 1, V=1, L=1, D -> 1, L=1, D
+            x = torch.stack(embeds, dim=1)  # B, L, D -> B, V, L, D
+            x = x + var_embed.unsqueeze(2)  # 1, V, D -> 1, V, 1, D
+            x = self.aggregate_variables(x)  # B, V~ , L, D, where V~ is the aggregated variables
         else:
             if self.adaptive_patching:
                 x = rearrange(x, 'b c s p -> b s (p c)')

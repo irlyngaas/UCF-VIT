@@ -140,7 +140,6 @@ def main():
                 tile_size_y = conf["data"]["tile_size"][1],
                 tile_size_z = conf["data"]["tile_size"][2] if len(conf["data"]["tile_size"]) == 3 else None,
                 twoD = conf["data"]["twoD"],
-                single_channel = False, #TODO: Take out single_channel option altogether
                 return_label = conf["dataloader"]["return_label"],
                 dataset_group_list = dataset_group_list,
                 batches_per_rank_epoch = batches_per_rank_epoch,
