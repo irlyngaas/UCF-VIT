@@ -103,7 +103,7 @@ def main():
         batches_per_rank_epoch, dataset_group_list = calculate_load_balancing_on_the_fly(conf)
 
     #Set up communication groups based on the parallelism settings chosen
-    seq_par_group, ddp_group, tensor_par_group, data_seq_ort_group, fsdp_group, simple_ddp_group = init_par_groups(world_rank = world_rank, data_par_size = conf["parallelism"]["data_par_size"], tensor_par_size = conf["parallelism"]["tensor_par_size"], seq_par_size = 1, fsdp_size = conf["parallelism"]["fsdp_size"], simple_ddp_size = conf["parallelism"]["simple_ddp_size"]) #TODO: Take out seq_par_group and seq_par_size
+    ddp_group, tensor_par_group, data_seq_ort_group, fsdp_group, simple_ddp_group = init_par_groups(world_rank = world_rank, data_par_size = conf["parallelism"]["data_par_size"], tensor_par_size = conf["parallelism"]["tensor_par_size"], fsdp_size = conf["parallelism"]["fsdp_size"], simple_ddp_size = conf["parallelism"]["simple_ddp_size"])
 
 #2. Initialize model, optimizer, and scheduler
 ##############################################################################################################
