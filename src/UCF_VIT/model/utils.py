@@ -19,7 +19,7 @@ from torch.nn import Sequential
 from UCF_VIT.fsdp.building_blocks import Block
 from timm.layers import use_fused_attn
 
-def create_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, tensor_par_group):
+def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, tensor_par_group):
     world_rank = dist.get_rank()
 
     if conf["trainer"]["data_type"] == "bfloat16":
@@ -35,15 +35,15 @@ def create_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group,
             FusedAttn_option = FusedAttn.NONE
 
     if conf["model"]["type"] == "VIT":
-        from UCF_VIT.fsdp.arch import VIT as model_arch
+        from UCF_VIT.model.arch import VIT as model_arch
     elif conf["model"]["type"] == "SAP":
-        from UCF_VIT.fsdp.arch import SAP as model_arch
+        from UCF_VIT.model.arch import SAP as model_arch
     elif conf["model"]["type"] == "MAE":
-        from UCF_VIT.fsdp.arch import MAE as model_arch
+        from UCF_VIT.model.arch import MAE as model_arch
     elif conf["model"]["type"] == "UNETR":
-        from UCF_VIT.fsdp.arch import UNETR as model_arch
+        from UCF_VIT.model.arch import UNETR as model_arch
     elif conf["model"]["type"] == "DiffusionVIT":
-        from UCF_VIT.fsdp.arch import DiffusionVIT as model_arch
+        from UCF_VIT.model.arch import DiffusionVIT as model_arch
 
     model = model_arch(
         img_size=(conf["data"]["tile_size"][0],conf["data"]["tile_size"][1]) if conf["data"]["twoD"] else (conf["data"]["tile_size"][0],conf["data"]["tile_size"][1], conf["data"]["tile_size"][2]),
