@@ -109,8 +109,8 @@ def main():
 ##############################################################################################################
     model, epoch_start, loss_list = get_model(conf, pretrained_conf, device, local_rank, fsdp_group, simple_ddp_group, tensor_par_group)
 
-    optimizer = configure_optimizer(model,conf["optimizer"]["lr"],conf["optimizer"]["beta_1"],conf["optimizer"]["beta_2"],conf["optimizer"]["weight_decay"])
-    scheduler = configure_scheduler(optimizer,conf["scheduler"]["warmup_epochs"],conf["trainer"]["max_epochs"],conf["scheduler"]["warmup_start_lr"],conf["scheduler"]["eta_min"])
+    optimizer = configure_optimizer(model, conf["trainer"]["optimizer_type"], conf["optimizer"])
+    scheduler = configure_scheduler(optimizer, conf["trainer"]["scheduler_type"], conf["scheduler"])
 
     if conf["trainer"]["resume_from_checkpoint"]:
         optimizer, scheduler, epoch_start, loss_list = load_optimizer_scheduler_from_checkpoint(conf, optimizer, scheduler, device)

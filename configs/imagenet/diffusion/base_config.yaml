@@ -18,6 +18,7 @@ parallelism:
 
 # ---------------------------- OPTIMIZER -----------------------------------------
 optimizer:
+  type: "AdamW"
   lr: 0.0001
   beta_1: 0.9
   beta_2: 0.95
@@ -25,6 +26,7 @@ optimizer:
 
 # ---------------------------- SCHEDULER -----------------------------------------
 scheduler:
+  type: "linear-warmup-cosine-annealing"
   warmup_epochs: 4
   warmup_start_lr: 1e-8
   eta_min: 1e-8

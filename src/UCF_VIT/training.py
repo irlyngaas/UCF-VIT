@@ -22,7 +22,6 @@ def load_optimizer_scheduler_from_checkpoint(conf, optimizer, scheduler, data_se
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
-    #TODO: Load loss_list and epoch_start in create_model loading from checkpoint rather than here
     loss_list = checkpoint['loss_list']
     epoch_start = checkpoint['epoch'] + 1
 

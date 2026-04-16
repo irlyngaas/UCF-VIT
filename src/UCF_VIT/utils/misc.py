@@ -55,43 +55,28 @@ def unpatchify(patchified_pixel_values,data, patch_size, twoD):
         pixel_values = patchified_pixel_values.reshape(batch_size, num_channels, num_patches_x*patch_size, num_patches_y*patch_size, num_patches_z*patch_size)
     return pixel_values
 
-def configure_optimizer(model,lr,beta_1,beta_2,weight_decay):
-    decay = []
-    no_decay = []
-    for name, m in model.named_parameters():
-        if "var_embed" in name or "pos_embed" in name or "time_pos_embed" in name:
-            no_decay.append(m)
-        else:
-            decay.append(m)
-
-    optimizer = torch.optim.AdamW(
-        [
-        {
-            "params": decay,
-            "lr": lr,
-            "betas": (beta_1, beta_2),
-            "weight_decay": weight_decay,
-        },
-        {
-            "params": no_decay,
-            "lr": lr,
-            "betas": (beta_1, beta_2),
-            "weight_decay": 0,
-        },
-        ]
-    )
+def configure_optimizer(model, optimizer_type, optimizer_kwargs):
+    if optimizer_type.lower() == "sgd":
+        optimizer = torch.optim.SGD(model.parameters(), **optimizer_kwargs)
+    elif optimizer_type.lower() == "adam":
+        optimizer = torch.optim.Adam(model.parameters(), **optimizer_kwargs)
+    elif optimizer_type.lower() == "adamw":
+        optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
 
     return optimizer
 
-def configure_scheduler(optimizer,warmup_steps,max_steps,warmup_start_lr,eta_min):
-    
-    lr_scheduler = LinearWarmupCosineAnnealingLR(
-        optimizer,
-        warmup_steps,
-        max_steps,
-        warmup_start_lr,
-        eta_min,
-    )
+def configure_scheduler(optimizer, scheduler_type, scheduler_kwargs):
+
+    if scheduler_type == "constant":
+        lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, **scheduler_kwargs)
+    elif scheduler_type == "linear":
+        lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, **scheduler_kwargs)
+    elif scheduler_type == "exponential":
+        lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, **scheduler_kwargs)
+    elif scheduler_type == "linear-warmup-cosine-annealing":
+        lr_scheduler = LinearWarmupCosineAnnealingLR(optimizer, **scheduler_kwargs)
+    elif scheduler_type == "reduce-lr-on-plateau":
+        lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, **scheduler_kwargs)
 
     return lr_scheduler
 

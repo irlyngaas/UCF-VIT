@@ -191,6 +191,23 @@ def parse_config(args):
         save_frequency = 1
 
     resume_from_checkpoint = conf['trainer']['resume_from_checkpoint']
+
+    try:
+        optimizer_type = conf["optimizer"]["type"]
+        assert optimizer_type.lower() in ['sgd', 'adam', 'adamw'], "Optimizer type not supported. Choose optimizer type from the following choices: sgd, adam, adamw"
+    except KeyError:
+        if dist.get_rank() == 0:
+            print("Since no optimizer_type was given in the config file, defaulting to using SGD ")
+        optimizer_type = "sgd"
+
+    try:
+        scheduler_type = conf["scheduler"]["type"]
+        assert scheduler_type in ['constant', 'linear', 'exponential', 'linear-warmup-cosine-annealing', 'reduce-lr-on-plateau'], "Scheduler type not supported. Choose scheduler type from the following choices: constant, linear, exponential, linear-warmup-cosine-annealing, reduce-lr-on-plateau"
+    except KeyError:
+        if dist.get_rank() == 0:
+            print("Since no scheduler_type was given in the config file, defaulting to using linear")
+        scheduler_type = "linear"
+
     trainer_conf = {
         "max_epochs": conf['trainer']['max_epochs'],
         "data_type": conf['trainer']['data_type'],
@@ -200,6 +217,8 @@ def parse_config(args):
         "resume_from_checkpoint": resume_from_checkpoint,
         "use_pretrained_model": conf['trainer']['use_pretrained_model'] if not resume_from_checkpoint else False,
         "save_frequency": save_frequency,
+        "optimizer_type": optimizer_type,
+        "scheduler_type": scheduler_type,
     }
 
 
@@ -231,8 +250,7 @@ def parse_config(args):
     #TODO: Add checking on each argument, e.g. > 0
     optimizer_conf = {
         "lr": float(conf['optimizer']['lr']),
-        "beta_1": float(conf['optimizer']['beta_1']),
-        "beta_2": float(conf['optimizer']['beta_2']),
+        "betas": (float(conf['optimizer']['beta_1']), float(conf['optimizer']['beta_2'])),
         "weight_decay": float(conf['optimizer']['weight_decay']),
     }
 
@@ -242,6 +260,7 @@ def parse_config(args):
         "warmup_epochs": conf['scheduler']['warmup_epochs'],
         "warmup_start_lr": float(conf['scheduler']['warmup_start_lr']),
         "eta_min": float(conf['scheduler']['eta_min']),
+        "max_epochs": trainer_conf['max_epochs'],
     }
 
 # ---------------------------- GRAD SCALER ---------------------------------------
