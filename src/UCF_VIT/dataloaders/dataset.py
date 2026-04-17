@@ -118,13 +118,12 @@ class FileReader(IterableDataset):
                     ddp_rank = torch.distributed.get_rank(group=self.ddp_group)
 
             num_workers_per_ddp = worker_info.num_workers
-            assert num_workers_per_ddp == 1
             if self.multi_dataset_training:
                 group_list = list(map(lambda x: int(x), self.gx.split(":")))
                 group_id = np.where(np.cumsum(group_list) > ddp_rank)[0][0]
                 group_size = group_list[group_id]
                 group_rank = ddp_rank - ([0] + np.cumsum(group_list).tolist())[group_id]
-                num_shards = group_size
+                num_shards = group_size * num_workers_per_ddp
                 rank = group_rank
             else:
                 num_shards = num_workers_per_ddp * self.data_par_size
@@ -138,7 +137,6 @@ class FileReader(IterableDataset):
             iter_start = worker_id * per_worker
             iter_end = iter_start + per_worker
 
-        #print ("global rank %d: ddp rank %d, num_workers_per_ddp %d, worker_info_id %d, worker id %d, iter_start,iter_end = %d %d"%(torch.distributed.get_rank(), ddp_rank, num_workers_per_ddp, worker_info.id, worker_id, iter_start, iter_end), flush=True)
         for m in range(self.keys_to_add):
             start_it = iter_start + m*int(len(self.file_list)/self.keys_to_add)
             end_it = iter_end + m*int(len(self.file_list)/self.keys_to_add)

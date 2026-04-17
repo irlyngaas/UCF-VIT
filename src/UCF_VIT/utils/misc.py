@@ -223,8 +223,12 @@ def calculate_load_balancing_on_the_fly(conf, VERBOSE=False):
     use_all_data = conf['tiling']['use_all_data']
     patch_size =  conf['data']['patch_size']
     dataset = conf['data']['dataset']
-    data_par_size = conf['parallelism']['data_par_size']
-    num_total_ddp_ranks = data_par_size
+    num_total_ddp_ranks = conf['parallelism']['data_par_size']
+    num_workers = conf['dataloader']['num_workers']
+    #num_workers = 0, uses 1 worker. However, setting it to 0 means it uses the main process as the dataloader worker in the iterative dataloader.
+    #Need to set the local version of num_workers in this function to 1 in this case to calculate load balancing correctly
+    if num_workers == 0:
+        num_workers = 1
 
     if dataset == "imagenet":
         imagenet_resize = conf['dataset_options']['imagenet_resize']
@@ -236,7 +240,7 @@ def calculate_load_balancing_on_the_fly(conf, VERBOSE=False):
     if dataset != "imagenet":
         tile_size_z = int(tile_size[2])
 
-    dict_lister_trains = process_root_dirs(dataset, dict_root_dirs, data_par_size)
+    dict_lister_trains = process_root_dirs(dataset, dict_root_dirs, num_total_ddp_ranks)
 
     num_total_tiles = []
     num_total_images = []
@@ -431,27 +435,37 @@ def calculate_load_balancing_on_the_fly(conf, VERBOSE=False):
         assert ddp_rank_ratio[i] > 0, "All Datasets need at least one GPU. Add more GPUs to the training to resolve this issue, or consider removing datasets with small amounts of data"
 
     num_images_per_rank = []
+    num_images_per_rank_worker = []
+    actual_num_images_per_rank = []
     for i in range(len(num_total_tiles)):
         num_images_per_rank.append(int(math.floor(num_total_images[i] / float(ddp_rank_ratio[i]))))
-    #print("Num Images Per Rank", num_images_per_rank)
-    assert min(num_images_per_rank) >= 1.0, "Decrease number of GPUs, not all GPUs have their own image"
+        num_images_per_rank_worker.append(int(math.floor(num_images_per_rank[i] / float(num_workers))))
+        actual_num_images_per_rank.append(num_images_per_rank_worker[i]*num_workers)
+    if VERBOSE:
+        print("Num Images Per Rank", num_images_per_rank)
+        print("Num Images Per Worker", num_images_per_rank_worker)
+        print("Actual Num Images Per Rank", actual_num_images_per_rank)
+    assert min(num_images_per_rank) >= 1.0, "Decrease number of GPUs, not all GPUs have at least one image"
+    assert min(num_images_per_rank_worker) >= 1.0, "Decrease number of GPUs or num_workers, not all dataloader workers have at least one image"
 
     batches_per_rank = []
+    batches_per_worker = []
     tiles_per_rank = []
     for i in range(len(num_total_tiles)):
-        batches_per_rank.append(np.floor(num_images_per_rank[i])*tiles_per_image[i]/batch_size)
-        tiles_per_rank.append(np.floor(num_images_per_rank[i])*tiles_per_image[i])
+        batches_per_rank.append(np.floor(actual_num_images_per_rank[i])*tiles_per_image[i]/batch_size)
+        batches_per_worker.append(np.floor(num_images_per_rank_worker[i]*tiles_per_image[i]/batch_size))
+        tiles_per_rank.append(np.floor(actual_num_images_per_rank[i])*tiles_per_image[i])
     if VERBOSE:
         print("Tiles Per Rank", tiles_per_rank)
         print("USE BELOW IN CONFIG FILE")
         print("batches_per_rank_epoch: {")
     batches_per_rank_epoch = {}
     if dataset == "imagenet":
-        new_data = [("imagenet", int(min(batches_per_rank)))]
+        new_data = [("imagenet", int(min(batches_per_worker*num_workers)))]
         batches_per_rank_epoch.update(new_data)
     else:
         for i,k in enumerate(dict_lister_trains.keys()):
-            new_data = [(k, int(batches_per_rank[i]))]
+            new_data = [(k, int(batches_per_worker[i]*num_workers))]
             batches_per_rank_epoch.update(new_data)
 
     if VERBOSE:

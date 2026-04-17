@@ -174,10 +174,6 @@ class NativePytorchDataModule(torch.nn.Module):
         imagenet_resize: Optional[Dict] = None,
     ):
         super().__init__()
-        if num_workers > 1:
-            raise NotImplementedError(
-                "num_workers > 1 is not supported yet. Performance will likely degrage too with larger num_workers."
-            )
 
         assert len(dict_root_dirs) <= data_par_size, "the number of data parallel GPUs (data_par_size) needs to be at least equal to the number of datasets. Try to increase data_par_size"
 
