@@ -422,16 +422,14 @@ def parse_config(args):
     #num_channels required because we aren't requiring dict_in_variables to be specified
     #TODO: Put assert with sys.exit around num_channels since its required
     num_channels = conf['data']['num_channels']
-    if not use_channel_aggregation: 
-        for i,k in enumerate(num_channels):
-            if i == 0:
-                num_chan = num_channels[k]
-            else:
+    for i,k in enumerate(num_channels):
+        if i == 0:
+            num_chan = num_channels[k]
+        else:
+            if not use_channel_aggregation: 
                 assert num_chan == num_channels[k], "If not using channel aggregation, num_channels across different datasets must be the same"
     #in_chans is the num_channels to be used acrossed all datasets 
-        in_chans = num_chan
-    else:
-        in_chans = 1 
+    in_chans = num_chan
         
     #Create default dict_in_variables if it doesn't exist that assumes the channels are the same across different datasets
     try:
@@ -662,16 +660,14 @@ def parse_pretrained_config(args, conf):
         ##############################
         #num_channels required because we aren't requiring dict_in_variables to be specified
         num_channels = pretrained_conf['data']['num_channels']
-        if not use_channel_aggregation: 
-            for i,k in enumerate(num_channels):
-                if i == 0:
-                    num_chan = num_channels[k]
-                else:
+        for i,k in enumerate(num_channels):
+            if i == 0:
+                num_chan = num_channels[k]
+            else:
+                if not use_channel_aggregation: 
                     assert num_chan == num_channels[k], "If not using channel aggregation, num_channels across different datasets must be the same"
         #in_chans is the num_channels to be used acrossed all datasets 
-            in_chans = num_chan
-        else:
-            in_chans = 1 
+        in_chans = num_chan
 
         assert in_chans == conf['data']['in_chans'], "Number of input channels for the pre-trained model doesn't match the number of inputs for this model" 
 
