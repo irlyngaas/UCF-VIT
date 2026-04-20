@@ -201,11 +201,11 @@ def process_root_dirs(dataset, dict_root_dirs, data_par_size):
         dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in dict_root_dirs.items() }
     return dict_lister_trains
 
-def read_process_file(dataset, path, imagenet_resize):
+def read_process_file(dataset, path, resize):
     if dataset == "imagenet":
         data = Image.open(path).convert("RGB")
         data = np.array(data) 
-        data = cv.resize(data, dsize=[imagenet_resize["imagenet"][0],imagenet_resize["imagenet"][1]])
+        data = cv.resize(data, dsize=[resize["imagenet"][0],resize["imagenet"][1]])
     else:
         data = nib.load(path)
         data = np.array(data.dataobj).astype(np.float32)
@@ -231,9 +231,9 @@ def calculate_load_balancing_on_the_fly(conf, VERBOSE=False):
         num_workers = 1
 
     if dataset == "imagenet":
-        imagenet_resize = conf['dataset_options']['imagenet_resize']
+        resize = conf['dataset_options']['resize']
     else:
-        imagenet_resize = None
+        resize = None
 
     tile_size_x = int(tile_size[0])
     tile_size_y = int(tile_size[1])
@@ -258,7 +258,7 @@ def calculate_load_balancing_on_the_fly(conf, VERBOSE=False):
 
         #Assume all data has the same data size
         data_path = keys[0]
-        data = read_process_file(dataset, data_path, imagenet_resize)
+        data = read_process_file(dataset, data_path, resize)
 
         tile_overlap_size_x = int(tile_size_x*tile_overlap)
         tile_overlap_size_y = int(tile_size_y*tile_overlap)

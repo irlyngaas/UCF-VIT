@@ -150,7 +150,7 @@ def main():
                 separate_channels = conf["ap"]["separate_channels"],
                 data_par_size = conf["parallelism"]["data_par_size"],
                 dataset = conf["data"]["dataset"],
-                imagenet_resize = conf["dataset_options"]["imagenet_resize"],
+                resize = conf["dataset_options"]["resize"],
                 num_classes = conf["model"]["kwargs"]["num_classes"] if conf["model"]["type"] in ["UNETR", "SAP"] else None,
             ).to(device)
 

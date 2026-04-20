@@ -171,7 +171,7 @@ class NativePytorchDataModule(torch.nn.Module):
         return_qdt: Optional[bool] = False,
         ddp_group: Optional[dist.ProcessGroup] = None,
         num_classes: Optional[int] = None,
-        imagenet_resize: Optional[Dict] = None,
+        resize: Optional[Dict] = None,
     ):
         super().__init__()
 
@@ -215,7 +215,7 @@ class NativePytorchDataModule(torch.nn.Module):
                 assert num_classes != None, "If using segmentation with basic_ct need to pass the number of classes"
 
         if self.dataset == "imagenet":
-            self.imagenet_resize = imagenet_resize
+            self.resize = resize
 
         in_variables = {}
         for k, list_out in dict_in_variables.items():
@@ -269,7 +269,7 @@ class NativePytorchDataModule(torch.nn.Module):
             buffer_size = self.dict_buffer_sizes["imagenet"]
             variables = self.dict_in_variables["imagenet"]
             num_channels_used = self.num_channels_used["imagenet"]
-            imagenet_resize = self.imagenet_resize["imagenet"]
+            resize = self.resize["imagenet"]
         else:
             start_idx = self.dict_start_idx[k]
             end_idx = self.dict_end_idx[k]
@@ -292,7 +292,7 @@ class NativePytorchDataModule(torch.nn.Module):
                                 keys_to_add=keys_to_add,
                                 ddp_group=self.ddp_group,
                                 dataset=self.dataset,
-                                imagenet_resize=imagenet_resize,
+                                resize=resize,
                             ),
                         self.tile_size_x,
                         self.tile_size_y,

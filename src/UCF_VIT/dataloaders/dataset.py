@@ -27,7 +27,7 @@ class FileReader(IterableDataset):
         return_label: bool = False,
         keys_to_add: int = 1,
         dataset: str = "imagenet",
-        imagenet_resize: Optional[list] = [256,256],
+        resize: Optional[list] = [256,256],
     ) -> None:
         super().__init__()
         self.num_channels_available = len(variables)
@@ -46,13 +46,13 @@ class FileReader(IterableDataset):
 
         #Optional Inputs
         if self.dataset == "imagenet":
-            self.imagenet_resize = imagenet_resize
+            self.resize = resize
 
     def read_process_file(self, path):
         if self.dataset == "imagenet":
             data = Image.open(path).convert("RGB")
             data = np.array(data) 
-            data = cv.resize(data, dsize=[self.imagenet_resize[0],self.imagenet_resize[1]])
+            data = cv.resize(data, dsize=[self.resize[0],self.resize[1]])
             data = np.moveaxis(data,-1,0)
 
 

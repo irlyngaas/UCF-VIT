@@ -535,7 +535,7 @@ def parse_config(args, load_balance_offline=False):
 # ---------------------------- DATASET SPECIFIC OPTIONS --------------------------
     #TODO: Move this to its own function
     dataset_options_conf = {
-        "imagenet_resize": conf['dataset_options']['imagenet_resize'] if dataset == "imagenet" else None, 
+        "resize": conf['dataset_options']['resize'] if dataset == "imagenet" else None, 
     }
 
 
