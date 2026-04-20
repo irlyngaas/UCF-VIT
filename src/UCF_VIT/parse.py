@@ -326,8 +326,9 @@ def parse_config(args, load_balance_offline=False):
     try:
         loss_fn = conf["model"]["loss_fn"]
     except KeyError:
-        if dist.get_rank() == 0:
-            print("loss_fn is not set, by default this is set to the default loss for your model")
+        if not load_balance_offline:
+            if dist.get_rank() == 0:
+                print("loss_fn is not set, by default this is set to the default loss for your model")
         if model_type == "MAE":
             loss_fn = "MSE"
         else:
