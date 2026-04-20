@@ -22,7 +22,6 @@ class FileReader(IterableDataset):
         variables,
         gx,
         ddp_group,
-        multi_dataset_training=False,
         data_par_size: int = 1,
         twoD: bool = False,
         return_label: bool = False,
@@ -36,7 +35,6 @@ class FileReader(IterableDataset):
         end_idx = int(end_idx * len(file_list))
         file_list = file_list[start_idx:end_idx]
         self.file_list = file_list
-        self.multi_dataset_training = multi_dataset_training
         self.data_par_size = data_par_size
         self.twoD = twoD
         self.return_label = return_label
@@ -118,21 +116,15 @@ class FileReader(IterableDataset):
                     ddp_rank = torch.distributed.get_rank(group=self.ddp_group)
 
             num_workers_per_ddp = worker_info.num_workers
-            if self.multi_dataset_training:
-                group_list = list(map(lambda x: int(x), self.gx.split(":")))
-                group_id = np.where(np.cumsum(group_list) > ddp_rank)[0][0]
-                group_size = group_list[group_id]
-                group_rank = ddp_rank - ([0] + np.cumsum(group_list).tolist())[group_id]
-                num_shards = group_size * num_workers_per_ddp
-                rank = group_rank
-            else:
-                num_shards = num_workers_per_ddp * self.data_par_size
-                rank = ddp_rank
+            group_list = list(map(lambda x: int(x), self.gx.split(":")))
+            group_id = np.where(np.cumsum(group_list) > ddp_rank)[0][0]
+            group_size = group_list[group_id]
+            group_rank = ddp_rank - ([0] + np.cumsum(group_list).tolist())[group_id]
+            num_shards = group_size * num_workers_per_ddp
+            rank = group_rank
+
             per_worker = int(math.floor(len(self.file_list)/ float(self.keys_to_add) / float(num_shards)))
-            if per_worker == 0:
-                self.file_list = (self.file_list * math.ceil(num_shards/len(self.file_list)))[:num_shards]
-                per_worker = 1
-            assert per_worker > 0
+            assert per_worker > 0, "Each worker doesn't have at least one file, run utils/load_balance.py to diagnose the issue"
             worker_id = rank * num_workers_per_ddp + worker_info.id
             iter_start = worker_id * per_worker
             iter_end = iter_start + per_worker
