@@ -178,7 +178,7 @@ def get_kwargs(model_type, conf):
 
     return kwargs
 
-def parse_config(args):
+def parse_config(args, load_balance_offline=False):
 
     conf = yaml.load(open(args.config,'r'),Loader=yaml.FullLoader)
 
@@ -229,7 +229,8 @@ def parse_config(args):
     simple_ddp_size = conf['parallelism']['simple_ddp_size']
     data_par_size = fsdp_size * simple_ddp_size
     tensor_par_size = conf['parallelism']['tensor_par_size']
-    assert (data_par_size * tensor_par_size) == dist.get_world_size(), "DATA_PAR_SIZE * TENSOR_PAR_SIZE must equal world_size"
+    if not load_balance_offline:
+        assert (data_par_size * tensor_par_size) == dist.get_world_size(), "DATA_PAR_SIZE * TENSOR_PAR_SIZE must equal world_size"
 
 
     parallelism_conf = {
