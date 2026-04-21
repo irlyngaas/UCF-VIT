@@ -153,8 +153,6 @@ class TileDataIter(IterableDataset):
         self.return_label = return_label
         self.div = div
         self.start_overlap, self.end_overlap = calculate_tile_overlap(tile_overlap)
-        print ("start_overlap", self.start_overlap)
-        print ("end_overlap", self.end_overlap)
         self.tile_size_no_overlap = []
         for i in range(len(tile_size)):
             self.tile_size_no_overlap.append(self.tile_size[i] - (self.start_overlap[i] + self.end_overlap[i]))

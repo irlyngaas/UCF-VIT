@@ -411,19 +411,17 @@ def parse_config(args, load_balance_offline=False):
         else:
             assert len(tiling_conf["tile_overlap"]) == 3, "Tile overlap dimension doesn't match the dimensions of the data"
 
-    patch_size = conf['data']['patch_size']
 
     if twoD:
-        #tile_size = (int(img_size[0]/tiling_conf["div"]), int(img_size[1]/tiling_conf["div"]))
-        #tile_size = (img_size[0]//tiling_conf["div"]+tiling_conf["tile_overlap"][0], img_size[1]//tiling_conf["div"]+tiling_conf["tile_overlap"][1])
-        tile_size = (int(img_size[0]/tiling_conf["div"]+tiling_conf["tile_overlap"][0]), int(img_size[1]/tiling_conf["div"]+tiling_conf["tile_overlap"][1]))
+        tile_size = (img_size[0]//tiling_conf["div"]+tiling_conf["tile_overlap"][0], img_size[1]//tiling_conf["div"]+tiling_conf["tile_overlap"][1])
     else:
-        #tile_size = (int(img_size[0]/tiling_conf["div"]), int(img_size[1]/tiling_conf["div"]), int(img_size[2]/tiling_conf["div"]))
-        #tile_size = (img_size[0]//tiling_conf["div"]+tiling_conf["tile_overlap"][0], img_size[1]//tiling_conf["div"]+tiling_conf["tile_overlap"][1], img_size[2]//tiling_conf["div"]+tiling_conf["tile_overlap"][2])
-        tile_size = (int(img_size[0]/tiling_conf["div"]+tiling_conf["tile_overlap"][0]), int(img_size[1]/tiling_conf["div"]+tiling_conf["tile_overlap"][1]), int(img_size[2]/tiling_conf["div"]+tiling_conf["tile_overlap"][2]))
-    print("TILE_SIZE", tile_size)
+        tile_size = (img_size[0]//tiling_conf["div"]+tiling_conf["tile_overlap"][0], img_size[1]//tiling_conf["div"]+tiling_conf["tile_overlap"][1], img_size[2]//tiling_conf["div"]+tiling_conf["tile_overlap"][2])
 
+    if tiling_conf["do_tiling"]:
+        for i in range(len(tile_size)):
+            assert img_size[0] // tiling_conf["div"], "The image cannot be evenly divided into tiles. This assertion can be commented out and ignored if this was intended, however be aware not all of the image will be used in training"
         
+    patch_size = conf['data']['patch_size']
     #If doing standard patching, check if img_size/tile_size is divisible by patch_size
     if not ap_conf["do_ap"]:
         checkDims = 2 if twoD else 3
