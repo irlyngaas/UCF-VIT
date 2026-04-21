@@ -13,6 +13,8 @@ from .transform import Patchify, Patchify_3D
 from PIL import Image
 import cv2 as cv
 
+from UCF_VIT.utils.misc import calculate_tile_overlap
+
 class FileReader(IterableDataset):
     def __init__(
         self,
@@ -140,405 +142,128 @@ class FileReader(IterableDataset):
                     data = self.read_process_file(self.file_list[idx])
                     yield data, self.variables
 
-class ImageBlockDataIter_2D(IterableDataset):
+class TileDataIter(IterableDataset):
     def __init__(
-        self, dataset: FileReader, tile_size_x: int = 64, tile_size_y: int = 64, tile_size_z: int = None, return_label: bool = False, tile_overlap: float = 0.0, use_all_data: bool = False, classification: bool = False,
+        self, dataset: FileReader, tile_size: tuple[int, ...] = (64, 64), twoD: bool = True, return_label: bool = False, div: int = 1, tile_overlap: tuple[int,...] = (0,0), classification: bool = False,
     ) -> None:
         super().__init__()
         self.dataset = dataset
-        self.tile_size_x = tile_size_x
-        self.tile_size_y = tile_size_y
-        self.tile_size_z = tile_size_z
+        self.tile_size = tile_size
+        self.twoD = twoD
         self.return_label = return_label
-        self.tile_overlap = tile_overlap
-        self.use_all_data = use_all_data
+        self.div = div
+        self.start_overlap, self.end_overlap = calculate_tile_overlap(tile_overlap)
+        print ("start_overlap", self.start_overlap)
+        print ("end_overlap", self.end_overlap)
+        self.tile_size_no_overlap = []
+        for i in range(len(tile_size)):
+            self.tile_size_no_overlap.append(self.tile_size[i] - (self.start_overlap[i] + self.end_overlap[i]))
+
         self.classification = classification
 
+    def calculate_tile_bounds(
+        self, tile_idx, tile_size, overlap_start, overlap_end
+):
+        """Calculate boundaries for a single tile including overlap.
+        Args:
+            tile_idx: Index of current tile (0-based)
+            tile_size: Size of tile in the dimension
+            overlap_start: Overlap size at start of tile
+            overlap_end: Overlap size at end of tile
+        Returns:
+            tuple: (start, end) coordinates for this tile
+        """
+        if self.div == 1:
+            # No tiling: use full dimension
+            return 0, tile_size
+        # Base tile boundaries without overlap
+        start = tile_size * tile_idx
+        end = tile_size * (tile_idx + 1)
+
+        # Add overlap based on tile position
+        if tile_idx == 0:
+            # First tile: only overlap on right
+            end += overlap_start*2
+        elif tile_idx == self.div - 1:
+            # Last tile: only overlap on left
+            start -= overlap_end*2
+        else:
+            # Middle tiles: overlap on both sides
+            start -= overlap_start
+            end += overlap_end
+        return start, end
+
     def __iter__(self):
-        tile_overlap_size_x = int(self.tile_size_x*self.tile_overlap)
-        tile_overlap_size_y = int(self.tile_size_y*self.tile_overlap)
-        if tile_overlap_size_x == 0.0:
-            OTP2_x = 1
-            tile_overlap_size_x = 0
-        else:
-            OTP2_x = int(self.tile_size_x/tile_overlap_size_x)
-        if tile_overlap_size_y == 0.0:
-            OTP2_y = 1
-            tile_overlap_size_y = 0
-        else:
-            OTP2_y = int(self.tile_size_y/tile_overlap_size_y)
 
-        if self.return_label:
-            for (data,label,variables) in self.dataset:
-                #Total Tiles Evenly Spaced
-                TTE_x = data.shape[1]//self.tile_size_x
-                TTE_y = data.shape[2]//self.tile_size_y
-                num_blocks_x = (TTE_x-1)*OTP2_x + 1
-                num_blocks_y = (TTE_y-1)*OTP2_y + 1
-                if self.use_all_data:
-                    #Total Tiles
-                    TT_x = data.shape[1]/(self.tile_size_x)
-                    TT_y = data.shape[2]/(self.tile_size_y)
-                    # Number of leftover overlap patches for last tile
-                    LTOP_x = np.floor((TT_x-TTE_x)*OTP2_x)
-                    LTOP_y = np.floor((TT_y-TTE_y)*OTP2_y)
-                    if tile_overlap_size_x == 0:
-                        if data.shape[1] % self.tile_size_x != 0:
-                            LTOP_x += 1
-                    else: #>0
-                        if data.shape[1] % tile_overlap_size_x != 0:
-                            LTOP_x += 1
-                    if tile_overlap_size_y == 0:
-                        if data.shape[2] % self.tile_size_y != 0:
-                            LTOP_y += 1
-                    else: #>0
-                        if data.shape[2] % tile_overlap_size_y != 0:
-                            LTOP_y += 1
-                    num_blocks_x = int(num_blocks_x + LTOP_x)
-                    num_blocks_y = int(num_blocks_y + LTOP_y)
+        if len(self.tile_size) == 3: #Data is 3D 
+            if self.return_label:
+                for (data,label,variables) in self.dataset:
+                    if self.twoD: #Loop through slices of 3D data
+                        #The current implementation slices on the z dimension but, could do x or y as well
+                        #TODO: Add an option on which dimension to slice
+                        for z_idx in range(data.shape[2]):
+                            for x_idx in range(self.div):
+                                for y_idx in range(self.div):
+                                    start_x, end_x = self.calculate_tile_bounds(x_idx, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
+                                    start_y, end_y = self.calculate_tile_bounds(y_idx, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
+                                    if self.classification:
+                                        yield data[:, start_x:end_x, start_y:end_y, z_idx], label, variables
+                                    else:
+                                        yield data[:, start_x:end_x, start_y:end_y, z_idx], label[start_x:end_x, start_y:end_y, z_idx], variables
+                                    
+                    else: #Loop through full 3D
+                        for x_idx in range(self.div):
+                            for y_idx in range(self.div):
+                                for z_idx in range(self.div):
+                                    start_x, end_x = self.calculate_tile_bounds(x_idx, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
+                                    start_y, end_y = self.calculate_tile_bounds(y_idx, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
+                                    start_z, end_z = self.calculate_tile_bounds(z_idx, self.tile_size_no_overlap[2], self.start_overlap[2], self.end_overlap[2])
+                                    if self.classification:
+                                        yield data[:, start_x:end_x, start_y:end_y, start_z:end_z], label, variables
+                                    else:
+                                        yield data[:, start_x:end_x, start_y:end_y, start_z:end_z], label[start_x:end_x, start_y:end_y, start_z:end_z], variables
 
-                channels, datalen_x, datalen_y = data.shape
+            else:
+                for (data,variables) in self.dataset:
+                    if self.twoD: #Loop through slices of 3D data
+                        #The current implementation slices on the z dimension but, could do x or y as well
+                        #TODO: Add an option on which dimension to slice
+                        for z_idx in range(data.shape[2]):
+                            for x_idx in range(self.div):
+                                for y_idx in range(self.div):
+                                    start_x, end_x = self.calculate_tile_bounds(x_idx, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
+                                    start_y, end_y = self.calculate_tile_bounds(y_idx, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
+                                    yield data[:, start_x:end_x, start_y:end_y, z_idx], variables
 
-                x_step_size = self.tile_size_x-tile_overlap_size_x
-                y_step_size = self.tile_size_y-tile_overlap_size_y
-                for ii in range(num_blocks_x):
-                    for jj in range(num_blocks_y):
-                        if not self.use_all_data:
+                    else: #Loop through full 3D
+                        for x_idx in range(self.div):
+                            for y_idx in range(self.div):
+                                for z_idx in range(self.div):
+                                    start_x, end_x = self.calculate_tile_bounds(x_idx, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
+                                    start_y, end_y = self.calculate_tile_bounds(y_idx, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
+                                    start_z, end_z = self.calculate_tile_bounds(z_idx, self.tile_size_no_overlap[2], self.start_overlap[2], self.end_overlap[2])
+                                    yield data[:, start_x:end_x, start_y:end_y, start_z:end_z], variables
+
+        else: #Data is 2D 
+            if self.return_label:
+                for (data,label,variables) in self.dataset:
+                    for x_idx in range(self.div):
+                        for y_idx in range(self.div):
+                            start_x, end_x = self.calculate_tile_bounds(x_idx, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
+                            start_y, end_y = self.calculate_tile_bounds(y_idx, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
                             if self.classification:
-                                yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size], label, variables
+                                yield data[:, start_x:end_x, start_y:end_y], label, variables
                             else:
-                                yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size], variables
-                        else:
-                            if self.tile_size_x+ii*x_step_size > (datalen_x-1):
-                                if self.tile_size_y+jj*y_step_size > (datalen_y-1):
-                                    #xy
-                                    if self.classification:
-                                        yield data[:, datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y], label, variables
-                                    else:
-                                        yield data[:, datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y], label[datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y], variables
-                                else:
-                                #x
-                                    if self.classification:
-                                        yield data[:, datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size], label, variables
-                                    else:
-                                        yield data[:, datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size], label[datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size], variables
-                            elif self.tile_size_y+jj*y_step_size > (datalen_y-1):
-                            #y
-                                if self.classification:
-                                    yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y], label, variables
-                                else:
-                                    yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y], variables
-                            else:
-                                if self.classification:
-                                    yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size], label, variables
-                                else:
-                                    yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size], variables
+                                yield data[:, start_x:end_x, start_y:end_y], label[start_x:end_x, start_y:end_y], variables
 
-        else:
-            for (data,variables) in self.dataset:
-                #Total Tiles Evenly Spaced
-                TTE_x = data.shape[1]//self.tile_size_x
-                TTE_y = data.shape[2]//self.tile_size_y
-                num_blocks_x = (TTE_x-1)*OTP2_x + 1
-                num_blocks_y = (TTE_y-1)*OTP2_y + 1
-                if self.use_all_data:
-                    #Total Tiles
-                    TT_x = data.shape[1]/(self.tile_size_x)
-                    TT_y = data.shape[2]/(self.tile_size_y)
-                    # Number of leftover overlap patches for last tile
-                    LTOP_x = np.floor((TT_x-TTE_x)*OTP2_x)
-                    LTOP_y = np.floor((TT_y-TTE_y)*OTP2_y)
-                    if tile_overlap_size_x == 0:
-                        if data.shape[1] % self.tile_size_x != 0:
-                            LTOP_x += 1
-                    else: #>0
-                        if data.shape[1] % tile_overlap_size_x != 0:
-                            LTOP_x += 1
-                    if tile_overlap_size_y == 0:
-                        if data.shape[2] % self.tile_size_y != 0:
-                            LTOP_y += 1
-                    else: #>0
-                        if data.shape[2] % tile_overlap_size_y != 0:
-                            LTOP_y += 1
-                    num_blocks_x = int(num_blocks_x + LTOP_x)
-                    num_blocks_y = int(num_blocks_y + LTOP_y)
+            else:
+                for (data,variables) in self.dataset:
+                    for x_idx in range(self.div):
+                        for y_idx in range(self.div):
+                            start_x, end_x = self.calculate_tile_bounds(x_idx, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
+                            start_y, end_y = self.calculate_tile_bounds(y_idx, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
+                            yield data[:, start_x:end_x, start_y:end_y], variables
 
-                channels, datalen_x, datalen_y = data.shape
-
-                x_step_size = self.tile_size_x-tile_overlap_size_x
-                y_step_size = self.tile_size_y-tile_overlap_size_y
-                for ii in range(num_blocks_x):
-                    for jj in range(num_blocks_y):
-                        if not self.use_all_data:
-                            yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size], variables
-                        else:
-                            if self.tile_size_x+ii*x_step_size > (datalen_x-1):
-                                if self.tile_size_y+jj*y_step_size > (datalen_y-1):
-                                #xy
-                                    yield data[:, datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y], variables
-                                else:
-                                #x
-                                    yield data[:, datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size], variables
-                            elif self.tile_size_y+jj*y_step_size > (datalen_y-1):
-                                #y
-                                yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y], variables
-                            else:
-                                yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size], variables
-
-class ImageBlockDataIter_3D(IterableDataset):
-    def __init__(
-        self, dataset: FileReader, tile_size_x: int = 64, tile_size_y: int = 64, tile_size_z: int = 64, twoD: bool = True, return_label: bool = False, tile_overlap: float = 0.0, use_all_data: bool = False,
-    ) -> None:
-        super().__init__()
-        self.dataset = dataset
-        self.twoD = twoD
-        self.tile_size_x = tile_size_x
-        self.tile_size_y = tile_size_y
-        self.tile_size_z = tile_size_z
-        self.return_label = return_label
-        self.tile_overlap = tile_overlap
-        self.use_all_data = use_all_data
-
-    def __iter__(self):
-        tile_overlap_size_x = int(self.tile_size_x*self.tile_overlap)
-        tile_overlap_size_y = int(self.tile_size_y*self.tile_overlap)
-        tile_overlap_size_z = int(self.tile_size_z*self.tile_overlap)
-        if tile_overlap_size_x == 0.0:
-            OTP2_x = 1
-            tile_overlap_size_x = 0
-        else:
-            OTP2_x = int(self.tile_size_x/tile_overlap_size_x)
-        if tile_overlap_size_y == 0.0:
-            OTP2_y = 1
-            tile_overlap_size_y = 0
-        else:
-            OTP2_y = int(self.tile_size_y/tile_overlap_size_y)
-        if tile_overlap_size_z == 0.0:
-            OTP2_z = 1
-            tile_overlap_size_z = 0
-        else:
-            OTP2_z = int(self.tile_size_z/tile_overlap_size_z)
-
-        if self.return_label:
-            for (data,label,variables) in self.dataset:
-                #Total Tiles Evenly Spaced
-                TTE_x = data.shape[1]//self.tile_size_x
-                TTE_y = data.shape[2]//self.tile_size_y
-                num_blocks_x = (TTE_x-1)*OTP2_x + 1
-                num_blocks_y = (TTE_y-1)*OTP2_y + 1
-                if self.use_all_data:
-                    #Total Tiles
-                    TT_x = data.shape[1]/(self.tile_size_x)
-                    TT_y = data.shape[2]/(self.tile_size_y)
-                    # Number of leftover overlap patches for last tile
-                    LTOP_x = np.floor((TT_x-TTE_x)*OTP2_x)
-                    LTOP_y = np.floor((TT_y-TTE_y)*OTP2_y)
-                    if tile_overlap_size_x == 0:
-                        if data.shape[1] % self.tile_size_x != 0:
-                            LTOP_x += 1
-                    else: #>0
-                        if data.shape[1] % tile_overlap_size_x != 0:
-                            LTOP_x += 1
-                    if tile_overlap_size_y == 0:
-                        if data.shape[2] % self.tile_size_y != 0:
-                            LTOP_y += 1
-                    else: #>0
-                        if data.shape[2] % tile_overlap_size_y != 0:
-                            LTOP_y += 1
-                    num_blocks_x = int(num_blocks_x + LTOP_x)
-                    num_blocks_y = int(num_blocks_y + LTOP_y)
-
-                if self.twoD:
-                    if self.use_all_data:
-                        num_blocks_z = int(np.ceil(data.shape[3]/self.tile_size_z))
-                    else:
-                        num_blocks_z = data.shape[3]//self.tile_size_z
-                else:
-                    TTE_z = data.shape[3]//self.tile_size_z
-                    num_blocks_z = (TTE_z-1)*OTP2_z + 1
-                    if self.use_all_data:
-                        #Total Tiles
-                        TT_z = data.shape[3]/(self.tile_size_z)
-                        # Number of leftover overlap patches for last tile
-                        LTOP_z = np.floor((TT_z-TTE_z)*OTP2_z)
-                        if tile_overlap_size_z == 0:
-                            if data.shape[3] % self.tile_size_z != 0:
-                                LTOP_z += 1
-                        else: #>0
-                            if data.shape[3] % tile_overlap_size_z != 0:
-                                LTOP_z += 1
-                        num_blocks_z = int(num_blocks_z + LTOP_z)
-
-                channels, datalen_x, datalen_y, datalen_z = data.shape
-
-                x_step_size = self.tile_size_x-tile_overlap_size_x
-                y_step_size = self.tile_size_y-tile_overlap_size_y
-                if not self.twoD:
-                    z_step_size = self.tile_size_z-tile_overlap_size_z
-                for ii in range(num_blocks_x):
-                    for jj in range(num_blocks_y):
-                        for kk in range(num_blocks_z):
-                            if self.twoD:
-                                for kkk in range(self.tile_size_z):
-                                    if not self.use_all_data:
-                                        yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kkk+kk*self.tile_size_z], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kkk+kk*self.tile_size_z], variables
-                                    else:
-                                        if kkk+kk*self.tile_size_z > (datalen_z-1):
-                                            continue
-                                        elif self.tile_size_x+ii*x_step_size > (datalen_x-1):
-                                            if self.tile_size_y+jj*y_step_size > (datalen_y-1):
-                                            #xy
-                                                yield data[:, datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y, kkk+kk*self.tile_size_z], label[datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y, kkk+kk*self.tile_size_z], variables
-                                            else:
-                                            #x
-                                                yield data[:, datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size, kkk+kk*self.tile_size_z], label[datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size, kkk+kk*self.tile_size_z], variables
-                                        elif self.tile_size_y+jj*y_step_size > (datalen_y-1):
-                                        #y
-                                            yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y, kkk+kk*self.tile_size_z], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y, kkk+kk*self.tile_size_z], variables
-                                        else:
-                                            yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kkk+kk*self.tile_size_z], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kkk+kk*self.tile_size_z], variables
-
-                            else:
-                                if not self.use_all_data:
-                                    yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
-                                else:
-                                    if self.tile_size_x+ii*x_step_size > (datalen_x-1):
-                                        if self.tile_size_y+jj*y_step_size > (datalen_y-1):
-                                            if self.tile_size_z+kk*z_step_size > (datalen_z-1):
-                                            #xyz
-                                                yield data[:, datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y, datalen_z-self.tile_size_z:datalen_z], label[datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y, datalen_z-self.tile_size_z:datalen_z], variables
-                                            else:
-                                            #xy
-                                                yield data[:, datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y, kk*z_step_size:self.tile_size_z+kk*z_step_size], label[datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
-                                        elif self.tile_size_z+kk*z_step_size > (datalen_z-1):
-                                        #xz
-                                            yield data[:, datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size, datalen_z-self.tile_size_z:datalen_z], label[datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size, datalen_z-self.tile_size_z:datalen_z], variables
-                                        else:
-                                        #x
-                                            yield data[:, datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], label[datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
-                                    elif self.tile_size_y+jj*y_step_size > (datalen_y-1):
-                                        if self.tile_size_z+kk*z_step_size > (datalen_z-1):
-                                        #yz
-                                            yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y, datalen_z-self.tile_size_z:datalen_z], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y, datalen_z-self.tile_size_z:datalen_z], variables
-                                        else:
-                                        #y
-                                            yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y, kk*z_step_size:self.tile_size_z+kk*z_step_size], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
-                                    elif self.tile_size_z+kk*z_step_size > (datalen_z-1):
-                                    #z
-                                        yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, datalen_z-self.tile_size_z:datalen_z], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, datalen_z-self.tile_size_z:datalen_z], variables
-                                    else:
-                                        yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
-
-        else:
-            for (data,variables) in self.dataset:
-                #Total Tiles Evenly Spaced
-                TTE_x = data.shape[1]//self.tile_size_x
-                TTE_y = data.shape[2]//self.tile_size_y
-                num_blocks_x = (TTE_x-1)*OTP2_x + 1
-                num_blocks_y = (TTE_y-1)*OTP2_y + 1
-                if self.use_all_data:
-                    #Total Tiles
-                    TT_x = data.shape[1]/(self.tile_size_x)
-                    TT_y = data.shape[2]/(self.tile_size_y)
-                    # Number of leftover overlap patches for last tile
-                    LTOP_x = np.floor((TT_x-TTE_x)*OTP2_x)
-                    LTOP_y = np.floor((TT_y-TTE_y)*OTP2_y)
-                    if tile_overlap_size_x == 0:
-                        if data.shape[1] % self.tile_size_x != 0:
-                            LTOP_x += 1
-                    else: #>0
-                        if data.shape[1] % tile_overlap_size_x != 0:
-                            LTOP_x += 1
-                    if tile_overlap_size_y == 0:
-                        if data.shape[2] % self.tile_size_y != 0:
-                            LTOP_y += 1
-                    else: #>0
-                        if data.shape[2] % tile_overlap_size_y != 0:
-                            LTOP_y += 1
-                    num_blocks_x = int(num_blocks_x + LTOP_x)
-                    num_blocks_y = int(num_blocks_y + LTOP_y)
-
-                if self.twoD:
-                    if self.use_all_data:
-                        num_blocks_z = np.ceil(data.shape[3]/self.tile_size_z).astype(int)
-                    else:
-                        num_blocks_z = data.shape[3]//self.tile_size_z
-                else:
-                    TTE_z = data.shape[3]//self.tile_size_z
-                    num_blocks_z = (TTE_z-1)*OTP2_z + 1
-                    if self.use_all_data:
-                        #Total Tiles
-                        TT_z = data.shape[3]/(self.tile_size_z)
-                        # Number of leftover overlap patches for last tile
-                        LTOP_z = np.floor((TT_z-TTE_z)*OTP2_z)
-                        if tile_overlap_size_z == 0:
-                            if data.shape[3] % self.tile_size_z != 0:
-                                LTOP_z += 1
-                        else: #>0
-                            if data.shape[3] % tile_overlap_size_z != 0:
-                                LTOP_z += 1
-                        num_blocks_z = int(num_blocks_z + LTOP_z)
-
-                channels, datalen_x, datalen_y, datalen_z = data.shape
-
-                x_step_size = self.tile_size_x-tile_overlap_size_x
-                y_step_size = self.tile_size_y-tile_overlap_size_y
-                if not self.twoD:
-                    z_step_size = self.tile_size_z-tile_overlap_size_z
-                for ii in range(num_blocks_x):
-                    for jj in range(num_blocks_y):
-                        for kk in range(num_blocks_z):
-                            if self.twoD:
-                                for kkk in range(self.tile_size_z):
-                                    if not self.use_all_data:
-                                        yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kkk+kk*self.tile_size_z], variables
-                                    else:
-                                        if kkk+kk*self.tile_size_z > (datalen_z-1):
-                                            continue
-                                        elif self.tile_size_x+ii*x_step_size > (datalen_x-1):
-                                            if self.tile_size_y+jj*y_step_size > (datalen_y-1):
-                                            #xy
-                                                yield data[:, datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y, kkk+kk*self.tile_size_z], variables
-                                            else:
-                                            #x
-                                                yield data[:, datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size, kkk+kk*self.tile_size_z], variables
-                                        elif self.tile_size_y+jj*y_step_size > (datalen_y-1):
-                                        #y
-                                            yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y, kkk+kk*self.tile_size_z], variables
-                                        else:
-                                            yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kkk+kk*self.tile_size_z], variables
-
-                            else:
-                                if not self.use_all_data:
-                                    yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
-                                else:
-                                    if self.tile_size_x+ii*x_step_size > (datalen_x-1):
-                                        if self.tile_size_y+jj*y_step_size > (datalen_y-1):
-                                            if self.tile_size_z+kk*z_step_size > (datalen_z-1):
-                                            #xyz
-                                                yield data[:, datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y, datalen_z-self.tile_size_z:datalen_z], variables
-                                            else:
-                                            #xy
-                                                yield data[:, datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
-                                        elif self.tile_size_z+kk*z_step_size > (datalen_z-1):
-                                        #xz
-                                            yield data[:, datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size, datalen_z-self.tile_size_z:datalen_z], variables
-                                        else:
-                                        #x
-                                            yield data[:, datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
-                                    elif self.tile_size_y+jj*y_step_size > (datalen_y-1):
-                                        if self.tile_size_z+kk*z_step_size > (datalen_z-1):
-                                        #yz
-                                            yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y, datalen_z-self.tile_size_z:datalen_z], variables
-                                        else:
-                                        #y
-                                            yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
-                                    elif self.tile_size_z+kk*z_step_size > (datalen_z-1):
-                                    #z
-                                        yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, datalen_z-self.tile_size_z:datalen_z], variables
-                                    else:
-                                        yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
-            
 class ShuffleIterableDataset(IterableDataset):
     def __init__(self, dataset, buffer_size: int) -> None:
         super().__init__()

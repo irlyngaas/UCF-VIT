@@ -358,13 +358,12 @@ def parse_config(args, load_balance_offline=False):
         tiling_conf = {
             "do_tiling": do_tiling,
             "div": conf["tiling"]["div"] if do_tiling else 1,
-            "tile_overlap": conf["tiling"]["tile_overlap"] if do_tiling else 0.0,
-            "use_all_data": conf["tiling"]["use_all_data"] if do_tiling else False,
+            "tile_overlap": conf["tiling"]["tile_overlap"] if do_tiling else 0,
         }
     except KeyError:
         if dist.get_rank() == 0:
             print("Since no tiling_conf was given in the config file, this is defaulting to be ran without tiling")
-        tiling_conf = {"do_tiling": False, "div": 1, "tile_overlap": 0.0, "use_all_data": False}
+        tiling_conf = {"do_tiling": False, "div": 1, "tile_overlap": 0}
         
 # ---------------------------- AP ------------------------------------------------
     #TODO: Add checking on each argument, e.g. > 0
@@ -401,12 +400,28 @@ def parse_config(args, load_balance_offline=False):
     elif len(img_size) == 3:
         twoD = conf['data']['twoD']
 
+    if not isinstance(tiling_conf["tile_overlap"], tuple):
+        if twoD:
+            tiling_conf["tile_overlap"] = (tiling_conf["tile_overlap"], tiling_conf["tile_overlap"])
+        else:
+            tiling_conf["tile_overlap"] = (tiling_conf["tile_overlap"], tiling_conf["tile_overlap"], tiling_conf["tile_overlap"])
+    else:
+        if twoD:
+            assert len(tiling_conf["tile_overlap"]) == 2, "Tile overlap dimension doesn't match the dimensions of the data"
+        else:
+            assert len(tiling_conf["tile_overlap"]) == 3, "Tile overlap dimension doesn't match the dimensions of the data"
+
     patch_size = conf['data']['patch_size']
 
-    if len(img_size) == 2:
-        tile_size = (int(img_size[0]/tiling_conf["div"]), int(img_size[1]/tiling_conf["div"]))
+    if twoD:
+        #tile_size = (int(img_size[0]/tiling_conf["div"]), int(img_size[1]/tiling_conf["div"]))
+        #tile_size = (img_size[0]//tiling_conf["div"]+tiling_conf["tile_overlap"][0], img_size[1]//tiling_conf["div"]+tiling_conf["tile_overlap"][1])
+        tile_size = (int(img_size[0]/tiling_conf["div"]+tiling_conf["tile_overlap"][0]), int(img_size[1]/tiling_conf["div"]+tiling_conf["tile_overlap"][1]))
     else:
-        tile_size = (int(img_size[0]/tiling_conf["div"]), int(img_size[1]/tiling_conf["div"]), int(img_size[2]/tiling_conf["div"]))
+        #tile_size = (int(img_size[0]/tiling_conf["div"]), int(img_size[1]/tiling_conf["div"]), int(img_size[2]/tiling_conf["div"]))
+        #tile_size = (img_size[0]//tiling_conf["div"]+tiling_conf["tile_overlap"][0], img_size[1]//tiling_conf["div"]+tiling_conf["tile_overlap"][1], img_size[2]//tiling_conf["div"]+tiling_conf["tile_overlap"][2])
+        tile_size = (int(img_size[0]/tiling_conf["div"]+tiling_conf["tile_overlap"][0]), int(img_size[1]/tiling_conf["div"]+tiling_conf["tile_overlap"][1]), int(img_size[2]/tiling_conf["div"]+tiling_conf["tile_overlap"][2]))
+    print("TILE_SIZE", tile_size)
 
         
     #If doing standard patching, check if img_size/tile_size is divisible by patch_size
@@ -415,11 +430,6 @@ def parse_config(args, load_balance_offline=False):
         for i in range(checkDims):
             assert tile_size[i] % patch_size == 0, "img_size/tile_size not divisible by patch_size which is required when doing standard patching"
 
-    #Check if overlapping splits up image evenly
-    if tiling_conf["do_tiling"] and tiling_conf["tile_overlap"] > 0.0:
-        checkDims = 2 if twoD else 3
-        for i in range(checkDims):
-            assert tile_size[i] % int(tile_size[i]*tiling_conf["tile_overlap"]) == 0, "Tile overlap doesn't divide up tile evenly. This assert can be turned off . However, to use all of the data turn on the use_all_data flag"
 
     #num_channels required because we aren't requiring dict_in_variables to be specified
     #TODO: Put assert with sys.exit around num_channels since its required
@@ -485,6 +495,7 @@ def parse_config(args, load_balance_offline=False):
         
     data_conf = {    
         "dataset": dataset,
+        "img_size": img_size,
         "tile_size": tile_size,
         "patch_size": patch_size,
         "default_vars": default_vars,
@@ -618,8 +629,10 @@ def parse_pretrained_config(args, conf):
         pretrained_do_tiling = pretraind_conf["tiling"]["do_tiling"]
         if pretrained_do_tiling:
             pretrained_div = pretrained_conf["tiling"]["div"]
+            pretrained_tile_overlap = pretrained_conf["tiling"]["tile_overlap"]
         else:
             pretrained_div = 1
+            pretrained_tile_overlap = 0
 
 # ---------------------------- AP ------------------------------------------------
         pretrained_do_ap = pretrained_conf["ap"]["do_ap"]
@@ -639,10 +652,16 @@ def parse_pretrained_config(args, conf):
             twoD = pretrained_conf['data']['twoD'],
         assert twoD == conf["data"]["twoD"], "Pretrained model and this model do not have the same dimension data"
 
+        if not isinstance(pretrained_tile_overlap, tuple):
+            if twoD:
+                pretrained_tile_overlap = (pretrained_tile_overlap, pretrained_tile_overlap)
+            else:
+                pretrained_tile_overlap = (pretrained_tile_overlap, pretrained_tile_overlap, pretrained_tile_overlap)
+
         if twoD:
-            pretrained_tile_size = (pretrained_img_size[0]/pretrained_div, img_size[1]/pretrained_div)
+            pretrained_tile_size = (pretrained_img_size[0]//pretrained_div+pretrained_tile_overlap, pretrained_img_size[1]//pretrained_div+pretrained_tile_overlap)
         else:
-            pretrained_tile_size = (img_size[0]/pretrained_div, img_size[1]/pretrained_div, img_size[2]/pretrained_div)
+            pretrained_tile_size = (pretrained_img_size[0]//pretrained_div+pretraine_tile_overlap, pretrained_img_size[1]//pretrained_div+pretraine_tile_overlap, pretrained_img_size[2]//pretrained_div+pretraine_tile_overlap)
              
         for i in range(len(pretrained_tile_size)):
             assert pretrained_tile_size[i] == data_conf["tile_size"][i], "Image/Tile size does not match between pretrained model and this model"

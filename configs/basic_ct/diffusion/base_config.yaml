@@ -60,8 +60,7 @@ model:
 tiling:
   do_tiling: True
   div: 4
-  tile_overlap: 0.0
-  use_all_data: False
+  tile_overlap: 2
 
 # ---------------------------- AP ------------------------------------------------
 
@@ -76,7 +75,7 @@ data:
   dataset: "basic_ct"
   img_size: [256, 256, 256] #Can be 2D or 3D, on todo list create capability where this isn't required, but can be read determined base on the reading the raw data.
   twoD: False #If true when img_size is 3D, dataloader slices on the z dimension. If data is 2D, this variable will be ignored and default to True
-  patch_size: 4 #If non-adaptive patching this will change sequence length, if adaptive patching this will determine the common representation across all adaptive patches
+  patch_size: 6 #If non-adaptive patching this will change sequence length, if adaptive patching this will determine the common representation across all adaptive patches
   dict_root_dirs: {
     'ct1': '/lustre/orion/world-shared/nro108/anikat/dataset/Tr8_Training',
   }
@@ -102,5 +101,5 @@ dataloader:
     'ct1': 20,
   }
   batch_size: 2
-  num_workers: 0
+  num_workers: 1
   pin_memory: False

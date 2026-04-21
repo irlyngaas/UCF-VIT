@@ -86,7 +86,7 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
                 from UCF_VIT.fsdp.arch import DiffusionVIT as pretrained_model_arch
 
             pretrained_model = pretrained_model_arch(
-                img_size=conf["data"]["tile_size"],
+                img_size=(conf["data"]["tile_size"][0],conf["data"]["tile_size"][1]) if conf["data"]["twoD"] else (conf["data"]["tile_size"][0],conf["data"]["tile_size"][1], conf["data"]["tile_size"][2]),
                 patch_size=conf["data"]["patch_size"],
                 in_chans=conf["data"]["in_chans"],
                 embed_dim=conf["model"]["embed_dim"],

@@ -12,8 +12,7 @@ import torch.distributed as dist
 
 from .dataset import (
     FileReader,
-    ImageBlockDataIter_2D,
-    ImageBlockDataIter_3D,
+    TileDataIter,
     ShuffleIterableDataset,
     ProcessChannels,
 )
@@ -132,14 +131,12 @@ class NativePytorchDataModule(torch.nn.Module):
         num_workers (int, optional): Number of workers.
         pin_memory (bool, optional): Whether to pin memory.
         data_par_size (int, optional): the size of the data parallelism
-        tile_size_x (int, optional): the tile size in the x dimension
-        tile_size_y (int, optional): the tile size in the y dimension
-        tile_size_z (int, optional): the tile size in the z dimension
+        tile_size (tuple[int,...], optional): the tile size in each dimension
         twoD (bool, optional): Variable for indicating two or three dimensionsal input, if False, three dimensional input.
         return_label (bool, optional): Whether or not the dataloader returns segmentation labels 
         dataset_group_list (string, optional): How to split available GPUs amongst the available datasets, run "python utils/preprocess_load_balancing.py CONFIG_FILE NUM_GPUS" to obtain
-        tile_overlap (float, optional): Amount of tile overlapping to use, takes decimal values, multiples tile_size by tile_overlap to determine step size. Use 0.0 for no overlapping
-        use_all_data (bool, optional): Whether or not to use all data in dataloading. Including if tile size doesn't evenly split images. If tile size splits an image unevenly on last tile of a dimension go from last pixel backwards to get a full tile
+        div (int, optional): How many tiles to divide each image into
+        tile_overlap (tuple[int,...], optional): Amount of tile overlapping to use in each dimension. Use 0 in each dimension for no overlapping
     """
 
     def __init__(
@@ -154,14 +151,12 @@ class NativePytorchDataModule(torch.nn.Module):
         num_workers: int = 0,
         pin_memory: bool = False,
         patch_size: int = 16,
-        tile_size_x: int = 64,
-        tile_size_y: int = 64,
-        tile_size_z: int = None,
+        tile_size: tuple[int, ...] = (64, 64),
         twoD: bool = True,
         dataset_group_list: str = '',
         batches_per_rank_epoch: Dict = None,
-        tile_overlap: float = 0.0,
-        use_all_data: bool = False,
+        div: int = 1,
+        tile_overlap: tuple[int, ...] = (0, 0),
         adaptive_patching: bool = False,
         fixed_length: int = 4096,
         separate_channels: bool = False,
@@ -192,15 +187,13 @@ class NativePytorchDataModule(torch.nn.Module):
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.patch_size = patch_size
-        self.tile_size_x = tile_size_x
-        self.tile_size_y = tile_size_y
-        self.tile_size_z = tile_size_z
+        self.tile_size = tile_size
         self.twoD = twoD
         self.return_label = return_label
         self.return_qdt = return_qdt
         self.batches_per_rank_epoch = batches_per_rank_epoch
+        self.div = div
         self.tile_overlap = tile_overlap
-        self.use_all_data = use_all_data
         self.adaptive_patching = adaptive_patching
         self.fixed_length = fixed_length
         self.separate_channels = separate_channels
@@ -280,7 +273,7 @@ class NativePytorchDataModule(torch.nn.Module):
         if self.dataset == "imagenet":
             dict_data_train[k] = ProcessChannels(
                 ShuffleIterableDataset(
-                    ImageBlockDataIter_2D(
+                    TileDataIter(
                             FileReader(
                                 lister_train,
                                 gx = self.gx,
@@ -294,12 +287,11 @@ class NativePytorchDataModule(torch.nn.Module):
                                 dataset=self.dataset,
                                 resize=resize,
                             ),
-                        self.tile_size_x,
-                        self.tile_size_y,
-                        self.tile_size_z,
+                        self.tile_size,
+                        self.twoD,
                         return_label = return_label,
+                        div = self.div,
                         tile_overlap = self.tile_overlap,
-                        use_all_data = self.use_all_data,
                         classification = True,
                     ),
                     buffer_size
@@ -318,7 +310,7 @@ class NativePytorchDataModule(torch.nn.Module):
         else:
             dict_data_train[k] = ProcessChannels(
                 ShuffleIterableDataset(
-                    ImageBlockDataIter_3D(
+                    TileDataIter(
                             FileReader(
                                 lister_train,
                                 gx = self.gx,
@@ -331,13 +323,11 @@ class NativePytorchDataModule(torch.nn.Module):
                                 ddp_group = self.ddp_group,
                                 dataset=self.dataset
                             ),
-                        self.tile_size_x,
-                        self.tile_size_y,
-                        self.tile_size_z,
+                        self.tile_size,
                         self.twoD,
                         return_label = return_label,
+                        div = self.div,
                         tile_overlap = self.tile_overlap,
-                        use_all_data = self.use_all_data,
                     ),
                     buffer_size
                 ),

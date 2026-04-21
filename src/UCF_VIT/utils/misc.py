@@ -201,30 +201,21 @@ def process_root_dirs(dataset, dict_root_dirs, data_par_size):
         dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in dict_root_dirs.items() }
     return dict_lister_trains
 
-def read_process_file(dataset, path, resize):
-    if dataset == "imagenet":
-        data = Image.open(path).convert("RGB")
-        data = np.array(data) 
-        data = cv.resize(data, dsize=[resize["imagenet"][0],resize["imagenet"][1]])
-    else:
-        data = nib.load(path)
-        data = np.array(data.dataobj).astype(np.float32)
-    return data
-
 def calculate_load_balancing_on_the_fly(conf, VERBOSE=False):
 
     dict_root_dirs = conf['data']['dict_root_dirs']
     dict_start_idx = conf['dataloader']['dict_start_idx']
     dict_end_idx = conf['dataloader']['dict_end_idx']
+    img_size =  conf['data']['img_size']
     tile_size =  conf['data']['tile_size']
     twoD = conf['data']['twoD']
     batch_size = conf['dataloader']['batch_size']
-    tile_overlap = conf['tiling']['tile_overlap']
-    use_all_data = conf['tiling']['use_all_data']
+    div = conf['tiling']['div']
     patch_size =  conf['data']['patch_size']
     dataset = conf['data']['dataset']
     num_total_ddp_ranks = conf['parallelism']['data_par_size']
     num_workers = conf['dataloader']['num_workers']
+
     #num_workers = 0, uses 1 worker. However, setting it to 0 means it uses the main process as the dataloader worker in the iterative dataloader.
     #Need to set the local version of num_workers in this function to 1 in this case to calculate load balancing correctly
     if num_workers == 0:
@@ -234,11 +225,6 @@ def calculate_load_balancing_on_the_fly(conf, VERBOSE=False):
         resize = conf['dataset_options']['resize']
     else:
         resize = None
-
-    tile_size_x = int(tile_size[0])
-    tile_size_y = int(tile_size[1])
-    if dataset != "imagenet":
-        tile_size_z = int(tile_size[2])
 
     dict_lister_trains = process_root_dirs(dataset, dict_root_dirs, num_total_ddp_ranks)
 
@@ -256,106 +242,18 @@ def calculate_load_balancing_on_the_fly(conf, VERBOSE=False):
         keys = lister_train[start_idx:end_idx]
         num_total_images.append(len(keys))
 
-        #Assume all data has the same data size
-        data_path = keys[0]
-        data = read_process_file(dataset, data_path, resize)
+        if len(tile_size) == 3: #3D images
+            if twoD: #Slice on one of the dimensions
+                #The current implementation slices on the z dimension but, could do x or y as well
+                #TODO: Add an option on which dimension to slice
+                tiles_per_image.append(div*div*img_size[2])
 
-        tile_overlap_size_x = int(tile_size_x*tile_overlap)
-        tile_overlap_size_y = int(tile_size_y*tile_overlap)
-        
-        if tile_overlap == 0.0:
-            OTP2_x = 1
-            tile_overlap_size_x = tile_size_x
-        else:
-            OTP2_x = int(tile_size_x/tile_overlap_size_x)
-
-        if tile_overlap == 0.0:
-            OTP2_y = 1
-            tile_overlap_size_y = tile_size_y
-        else:
-            OTP2_y = int(tile_size_y/tile_overlap_size_y)
-            
-        #USE THIS IF RAW FILES ARE 2D
-        if dataset == "imagenet":
-            #Total Tiles Evenly Spaced
-            TTE_x = data.shape[0]//tile_size_x
-            TTE_y = data.shape[1]//tile_size_y
-            num_blocks_x = (TTE_x-1)*OTP2_x + 1
-            num_blocks_y = (TTE_y-1)*OTP2_y + 1
-            if use_all_data:
-                #Total Tiles
-                TT_x = data.shape[0]/(tile_size_x)
-                TT_y = data.shape[1]/(tile_size_y)
-                # Number of leftover overlap patches for last tile
-                LTOP_x = np.floor((TT_x-TTE_x)*OTP2_x)
-                LTOP_y = np.floor((TT_y-TTE_y)*OTP2_y)
-                if data.shape[0] % tile_overlap_size_x != 0:
-                    LTOP_x += 1
-                if data.shape[1] % tile_overlap_size_y != 0:
-                    LTOP_y += 1
-                num_blocks_x = int(num_blocks_x + LTOP_x)
-                num_blocks_y = int(num_blocks_y + LTOP_y)
-
-            if VERBOSE:
-                print("KEY", k, "DATA_SHAPE", data.shape,"NUM_BLOCKS:", num_blocks_x, num_blocks_y, flush=True)
-
-            tiles_per_image.append(num_blocks_x*num_blocks_y)
-        #USE THIS IF RAW FILES ARE 3D
-        else:
-            tile_overlap_size_z = int(tile_size_z*tile_overlap)
-            if tile_overlap == 0.0:
-                OTP2_z = 1
-                tile_overlap_size_z = tile_size_z
             else:
-                OTP2_z = int(tile_size_z/tile_overlap_size_z)
-            #Total Tiles Evenly Spaced
-            TTE_x = data.shape[0]//tile_size_x
-            TTE_y = data.shape[1]//tile_size_y
-            num_blocks_x = (TTE_x-1)*OTP2_x + 1
-            num_blocks_y = (TTE_y-1)*OTP2_y + 1
-            if use_all_data:
-                #Total Tiles
-                TT_x = data.shape[0]/(tile_size_x)
-                TT_y = data.shape[1]/(tile_size_y)
-                # Number of leftover overlap patches for last tile
-                LTOP_x = np.floor((TT_x-TTE_x)*OTP2_x)
-                LTOP_y = np.floor((TT_y-TTE_y)*OTP2_y)
-                if data.shape[0] % tile_overlap_size_x != 0:
-                    LTOP_x += 1
-                if data.shape[1] % tile_overlap_size_y != 0:
-                    LTOP_y += 1
-                num_blocks_x = int(num_blocks_x + LTOP_x)
-                num_blocks_y = int(num_blocks_y + LTOP_y)
+                tiles_per_image.append(div*div*div)
 
-            if twoD:
-                if use_all_data:
-                    num_blocks_z = data.shape[2]//tile_size_z
-                    leftover_z_tiles = data.shape[2] % tile_size_z
-                else:
-                    num_blocks_z = data.shape[2]//tile_size_z
-            else:
-                TTE_z = data.shape[2]//tile_size_z
-                num_blocks_z = (TTE_z-1)*OTP2_z + 1
-                if use_all_data:
-                    #Total Tiles Rounded Up
-                    TT_z = data.shape[2]/(tile_size_z)
-                    # Number of leftover overlap patches for last tile
-                    LTOP_z = np.floor((TT_z-TTE_z)*OTP2_z)
-                    if data.shape[2] % tile_overlap_size_z != 0:
-                        LTOP_z += 1
-                    num_blocks_z = int(num_blocks_z + LTOP_z)
+        else: #2D images
+            tiles_per_image.append(div*div)
 
-            if VERBOSE:
-                print("KEY", k, "DATA_SHAPE", data.shape,"NUM_BLOCKS:", num_blocks_x, num_blocks_y, num_blocks_z, flush=True)
-
-            if twoD:
-                if use_all_data:
-                    tiles_per_image.append(num_blocks_x*num_blocks_y*num_blocks_z*tile_size_z + num_blocks_x*num_blocks_y*leftover_z_tiles)
-                else:
-                    tiles_per_image.append(num_blocks_x*num_blocks_y*num_blocks_z*tile_size_z)
-            else:
-                tiles_per_image.append(num_blocks_x*num_blocks_y*num_blocks_z)
-            
         num_total_tiles.append(tiles_per_image[i] * num_total_images[i])
 
     if VERBOSE:
@@ -489,4 +387,18 @@ def is_power_of_two(n):
     return (n != 0) and (n & (n-1) == 0)
 
 
+def calculate_tile_overlap(overlap):
+    start_overlap = []
+    end_overlap = []
+    for i in range(len(overlap)):
+        if overlap[i] % 2 == 0:
+            # Even overlap: symmetric padding
+            start_overlap.append(overlap[i] // 2)
+            end_overlap.append(overlap[i] // 2)
+        else:
+            # Odd overlap: asymmetric padding
+            # Chose to pad one more to the end rather than the start. Could switch this order
+            start_overlap.append(overlap[i] // 2)
+            end_overlap.append(overlap[i] // 2 + 1)
 
+    return start_overlap, end_overlap
