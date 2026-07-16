@@ -18,6 +18,7 @@ class Rect:
     def contains(self, domain):
         patch = domain[self.y1:self.y2, self.x1:self.x2]
         return int(np.sum(patch)/255)
+        #return int(np.sum(patch))
     
     def get_area(self, img):
         return img[self.y1:self.y2, self.x1:self.x2, :]
@@ -121,7 +122,8 @@ class FixedQuadTree:
         while len(self.nodes)<self.fixed_length:
             bbox, value = max(self.nodes, key=lambda x:x[1])
             idx = self.nodes.index([bbox, value])
-            if bbox.get_size()[0] == 2:
+            #if bbox.get_size()[0] == 2:
+            if bbox.get_size()[0] == 4:
                 break
 
             x1,x2,y1,y2 = bbox.get_coord()

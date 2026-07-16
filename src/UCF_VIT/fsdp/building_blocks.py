@@ -29,7 +29,7 @@ from UCF_VIT.utils.dist_functions import F_AllReduce_B_Identity, F_Identity_B_Al
 from UCF_VIT.utils.fused_attn import FusedAttn
 
 import xformers
-from xformers.components.attention.core import scaled_dot_product_attention as xformers_sdpa
+#from xformers.components.attention.core import scaled_dot_product_attention as xformers_sdpa
 
 
 class PatchEmbed(nn.Module):

@@ -183,7 +183,7 @@ def main(device, local_rank):
         fixed_length = conf['model']['net']['init_args']['fixed_length']
         separate_channels = conf['model']['net']['init_args']['separate_channels']
         sqrt_len_method = True
-        use_qdt_pos = True
+        use_qdt_pos = False
 
         if not twoD:
             assert not separate_channels, "Adaptive Patching in 3D with multiple channels (non-separated) is not currently implemented"
@@ -191,6 +191,7 @@ def main(device, local_rank):
         fixed_length = None
         separate_channels = None
         sqrt_len_method = False
+        sqrt_len = None
         use_qdt_pos = False
 
     feature_size = conf['model']['net']['init_args']['feature_size']
@@ -281,11 +282,12 @@ def main(device, local_rank):
         assert x_p2, "tile_size_x must be a power of 2"
         y_p2 = is_power_of_two(tile_size_y)
         assert y_p2, "tile_size_y must be a power of 2"
-        if dataset != "imagenet":
+        if dataset != "imagenet" and not twoD:
             z_p2 = is_power_of_two(tile_size_z)
             assert z_p2, "tile_size_z must be a power of 2"
 
         if twoD:
+            sqrt_len=int(np.rint(math.pow(fixed_length,1/2)))
             assert fixed_length % 3 == 1 % 3, "Quadtree fixed length needs to be 3n+1, where n is some integer"
         else:
             sqrt_len=int(np.rint(math.pow(fixed_length,1/3)))
@@ -320,7 +322,7 @@ def main(device, local_rank):
     seq_par_group, ddp_group, tensor_par_group, data_seq_ort_group, fsdp_group, simple_ddp_group = init_par_groups(world_rank = world_rank, data_par_size = data_par_size, tensor_par_size = tensor_par_size, seq_par_size = seq_par_size, fsdp_size = fsdp_size, simple_ddp_size = simple_ddp_size)
 
     model = UNETR(
-        img_size=tile_size,
+        img_size=tile_size if not twoD else (tile_size[0],tile_size[1]),
         patch_size=patch_size,
         in_chans=max_channels,
         num_classes=num_classes,
@@ -667,22 +669,29 @@ def main(device, local_rank):
                 dist.broadcast(label, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
                 dist.broadcast_object_list(variables, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
             else: #Avoid unnecesary broadcasts if not using tensor parallelism
-                #data, label, variables, _ = next(it_loader)
-                data, seq, seq_size, seq_pos, label, seq_label, variables, _ = next(it_loader)
-                data = data.to(precision_dt)
-                data = data.to(device)
-                seq = seq.to(precision_dt)
-                seq = seq.to(device)
-                label = label.to(precision_dt)
-                label = label.to(device)
-                seq_size = torch.squeeze(seq_size)
-                seq_size = seq_size.to(torch.float32)
-                seq_size = seq_size.to(device)
-                seq_pos = torch.squeeze(seq_pos)
-                seq_pos = seq_pos.to(torch.float32)
-                seq_pos = seq_pos.to(device)
-                seq_size = seq_size.unsqueeze(-1)
-                seq_ps = torch.concat([seq_size, seq_pos],dim=-1)
+                if adaptive_patching:
+                    data, seq, seq_size, seq_pos, label, seq_label, variables, _ = next(it_loader)
+                    data = data.to(precision_dt)
+                    data = data.to(device)
+                    seq = seq.to(precision_dt)
+                    seq = seq.to(device)
+                    label = label.to(precision_dt)
+                    label = label.to(device)
+                    seq_size = torch.squeeze(seq_size)
+                    seq_size = seq_size.to(torch.float32)
+                    seq_size = seq_size.to(device)
+                    seq_pos = torch.squeeze(seq_pos)
+                    seq_pos = seq_pos.to(torch.float32)
+                    seq_pos = seq_pos.to(device)
+                    seq_size = seq_size.unsqueeze(-1)
+                    seq_ps = torch.concat([seq_size, seq_pos],dim=-1)
+                else:
+                    data, label, variables, _ = next(it_loader)
+                    data = data[:,:-1]
+                    data = data.to(precision_dt)
+                    data = data.to(device)
+                    label = label.to(precision_dt)
+                    label = label.to(device)
 
             if adaptive_patching:
                 loss, output = training_step_adaptive(data, seq, label, variables, model, patch_size, twoD, seq_ps, max_channels, sqrt_len)

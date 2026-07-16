@@ -7,7 +7,8 @@ from .quadtree import FixedQuadTree
 from .octree import FixedOctTree
 
 class Patchify(torch.nn.Module):
-    def __init__(self, sths=[0,1,3,5], fixed_length=196, cannys=[50, 100], patch_size=16, num_channels=3, dataset="imagenet", return_edges=False) -> None:
+    #def __init__(self, sths=[0,1,3,5], fixed_length=196, cannys=[50, 100], patch_size=16, num_channels=3, dataset="imagenet", return_edges=False) -> None:
+    def __init__(self, sths=[1,3,5], fixed_length=196, cannys=[50, 100], patch_size=16, num_channels=3, dataset="imagenet", return_edges=False) -> None:
         super().__init__()
         
         self.sths = sths
@@ -20,28 +21,36 @@ class Patchify(torch.nn.Module):
         
     def forward(self, img):  # we assume inputs are always structured like this
         # Do some transformations. Here, we're just passing though the input
+
+        edges = img[..., -1]    # edge data
+        img = img[..., :-1]    # actual data
+
+        edges = np.abs(edges)
+        threshold = np.percentile(edges, 0, axis=None)
+        edges = (edges > threshold).astype(int)
+        edges = edges*255
         
-        self.smooth_factor = random.choice(self.sths)
-        c = random.choice(self.cannys)
-        self.canny = [c, c+50]
-        # self.smooth_factor = 0
-        if self.smooth_factor ==0 :
-            if self.dataset == "imagenet":
-                edges = np.random.uniform(low=0,high=1,size=(img.shape[0],img.shape[1]))
-            else:
-                edges = np.random.uniform(low=np.min(img),high=np.max(img),size=(img.shape[0],img.shape[1]))
-        else:
-            if self.dataset == "imagenet":
-                grey_img = cv.GaussianBlur(img, (self.smooth_factor, self.smooth_factor), 0)
-                edges = cv.Canny(grey_img, self.canny[0], self.canny[1])
-            else:
-                #img = (img-img.min())/(img.max()-img.min())
-                print(img.min())
-                print(img.max())
-                grey_img = cv.GaussianBlur(img, (self.smooth_factor, self.smooth_factor), 0)
-                print(grey_img.min())
-                print(grey_img.max())
-                edges = cv.Canny((grey_img*255).astype(np.uint8), self.canny[0], self.canny[1])
+        #self.smooth_factor = random.choice(self.sths)
+        #c = random.choice(self.cannys)
+        #self.canny = [c, c+50]
+        ## self.smooth_factor = 0
+        #if self.smooth_factor ==0 :
+        #    if self.dataset == "imagenet":
+        #        edges = np.random.uniform(low=0,high=1,size=(img.shape[0],img.shape[1]))
+        #    else:
+        #        edges = np.random.uniform(low=np.min(img),high=np.max(img),size=(img.shape[0],img.shape[1]))
+        #else:
+        #    if self.dataset == "imagenet":
+        #        grey_img = cv.GaussianBlur(img, (self.smooth_factor, self.smooth_factor), 0)
+        #        edges = cv.Canny(grey_img, self.canny[0], self.canny[1])
+        #    else:
+        #        #img = (img-img.min())/(img.max()-img.min())
+        #        #print(img.min())
+        #        #print(img.max())
+        #        grey_img = cv.GaussianBlur(edges, (self.smooth_factor, self.smooth_factor), 0)
+        #        #print(grey_img.min())
+        #        #print(grey_img.max())
+        #        edges = cv.Canny((grey_img*255).astype(np.uint8), self.canny[0], self.canny[1])
 
         qdt = FixedQuadTree(domain=edges, fixed_length=self.fixed_length)
         seq_img, seq_size, seq_pos = qdt.serialize(img, size=(self.patch_size,self.patch_size,self.num_channels))

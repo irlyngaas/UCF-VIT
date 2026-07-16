@@ -956,11 +956,17 @@ class UNETR(VIT):
             self.out = UnetOutBlock(spatial_dims=spatial_dims, in_channels=self.feature_size, out_channels=self.num_classes)
 
             if self.feat_size[0]*16 != self.img_size[0]:
-                self.upsample = nn.Upsample(size=self.img_size,mode='trilinear',align_corners=True)
+                if self.twoD:
+                    self.upsample = nn.Upsample(size=self.img_size,mode='bilinear',align_corners=True)
+                else:
+                    self.upsample = nn.Upsample(size=self.img_size,mode='trilinear',align_corners=True)
 
         else: #Use Linear Decoder
             self.mlp_head = nn.Linear(self.embed_dim, self.num_classes) 
-            self.upsample = nn.Upsample(scale_factor=self.patch_size,mode='trilinear',align_corners=True)
+            if self.twoD:
+                self.upsample = nn.Upsample(scale_factor=self.patch_size,mode='bilinear',align_corners=True)
+            else:
+                self.upsample = nn.Upsample(scale_factor=self.patch_size,mode='trilinear',align_corners=True)
 
         self.init_weights('')
 
@@ -1008,9 +1014,9 @@ class UNETR(VIT):
             enc2 = self.encoder2(self.proj_feat(intermediates[int_len-3], self.embed_dim, self.feat_size))
             #print("ENC2 :", enc2.shape, flush=True)
             dec1 = self.decoder3(dec2, enc2)
+            #print("DEC1 :", dec1.shape, flush=True)
             if self.feat_size[0]*16 != self.img_size[0]:
                 dec1 = self.upsample(dec1)
-            #print("DEC1 :", dec1.shape, flush=True)
             #print("ENC1 :", enc1.shape, flush=True)
             out = self.decoder2(dec1, enc1)
             #print("OUT :", out.shape, flush=True)
