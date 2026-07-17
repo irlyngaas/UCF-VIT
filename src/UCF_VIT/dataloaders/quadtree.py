@@ -33,6 +33,7 @@ class Rect:
         # patch = np.expand_dims(patch, axis=-1)
         # import pdb
         # pdb.set_trace()
+        patch = np.expand_dims(patch, -1)
         mask[self.y1:self.y2, self.x1:self.x2, :] = patch
         return mask
     
@@ -211,8 +212,12 @@ class FixedQuadTree:
     def deserialize(self, seq, patch_size, channel):
 
         H,W = self.domain.shape
-        seq = np.reshape(seq, (self.fixed_length, patch_size, patch_size, channel))
-        seq = seq.astype(int)
+        #seq = np.reshape(seq, (self.fixed_length, patch_size, patch_size, channel))
+        #seq = seq.astype(int)
+        if channel == 1:
+            seq = np.expand_dims(seq, -1)
+        else:
+            seq = np.moveaxis(seq, 0, -1)
         mask = np.zeros(shape=(H, W, channel))
         print("demask:", mask.shape)
         

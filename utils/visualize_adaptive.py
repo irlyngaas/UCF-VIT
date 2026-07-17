@@ -15,6 +15,16 @@ import cv2 as cv
 
 from matplotlib import pyplot as plt
 import math
+from einops import rearrange
+
+def morton_decode(index, bits=4):
+    """Decode a z-order (Morton) index into (grid_x, grid_y)."""
+    x = 0
+    y = 0
+    for i in range(bits):
+        x |= ((index >> (2 * i)) & 1) << i
+        y |= ((index >> (2 * i + 1)) & 1) << i
+    return x, y
 
 def read_process_file(path, dataset, imagenet_resize, num_channels_available, nx, ny, nz, variables):
     if dataset == "imagenet":
@@ -124,6 +134,7 @@ def main():
     patch_size =  conf['model']['net']['init_args']['patch_size']
     fixed_length = conf['model']['net']['init_args']['fixed_length']
     if twoD:
+        sqrt_len=int(np.rint(math.pow(fixed_length,1/2)))
         assert fixed_length % 3 == 1 % 3, "Quadtree fixed length needs to be 3n+1, where n is some integer"
     else:
         sqrt_len=int(np.rint(math.pow(fixed_length,1/3)))
@@ -141,7 +152,9 @@ def main():
     np_image = get_data(data, dataset, twoD, tile_size_x, tile_size_y, tile_size_z, nx_skip[dict_key], ny_skip[dict_key], nz_skip[dict_key], chunk_size[dict_key])
     print(np_image.shape)
 
-    smooth_factor = [0,1,3,5,7]
+    #smooth_factor = [0,1,3,5,7]
+    #smooth_factor = [1,3,5,7]
+    smooth_factor = [3]
     canny1 = 50
     canny2 = 100
 
@@ -151,6 +164,8 @@ def main():
         patchify = Patchify_3D(sths=smooth_factor,cannys=[canny1,canny2],fixed_length=fixed_length, patch_size=patch_size, num_channels=len(variables[dict_key])-1, dataset=dataset, return_edges = True)
 
     seq_image, seq_size, seq_pos, qdt, edges = patchify(np.moveaxis(np_image,0,-1))
+    image = qdt.deserialize(seq_image, patch_size, len(variables[dict_key])-1)
+    image = np.moveaxis(image, -1, 0)
     print(seq_size)
     print("NNZ", np.count_nonzero(seq_size))
     print(seq_pos)
@@ -166,6 +181,39 @@ def main():
             ax.imshow(np_image[i])
             qdt.draw(ax=ax)
             plt.savefig(f'images/qdt_image_{variables[dict_key][i]}.png', bbox_inches='tight', dpi=200)
+
+        coords_np = seq_pos
+        x = coords_np[:, 0]
+        y = coords_np[:, 1]
+
+        plt.figure(figsize=(6, 6))
+        plt.plot(x, y, marker='o', linestyle='-', color='b')  # lines + points
+        plt.xlabel('X')
+        plt.ylabel('Y')
+        plt.title('Connected Points')
+        plt.savefig(f'images/seq_pos.png', bbox_inches='tight', dpi=200)
+        plt.clf()
+
+        plt.figure(figsize=(6, 6))
+        plt.imshow(image[0])
+        plt.title('Reconstructed 64x64 Image')
+        plt.savefig(f'images/deserialize.png', bbox_inches='tight', dpi=200)
+        plt.clf()
+
+        # Undo z-order into a proper 16x16 patch grid
+        seq_image = seq_image.reshape(len(variables[dict_key])-1,fixed_length, patch_size, patch_size)
+        grid = np.zeros((sqrt_len, sqrt_len, patch_size, patch_size), dtype=seq_image.dtype)
+        for z in range(fixed_length):
+            gx, gy = morton_decode(z, bits=patch_size)
+            grid[gy, gx] = np.flip(seq_image[0,z], axis=0)
+
+        image = rearrange(grid, 'gy gx py px -> (gy py) (gx px)')
+        image = np.flip(image, axis=0)
+        plt.figure(figsize=(6, 6))
+        plt.imshow(image)
+        plt.title('Reconstructed 64x64 Image')
+        plt.savefig(f'images/morton.png', bbox_inches='tight', dpi=200)
+
     else:
         z_slice = 32
         fig, ax = plt.subplots()

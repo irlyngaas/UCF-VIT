@@ -59,6 +59,8 @@ class Patchify(torch.nn.Module):
 
         #seq_img = np.reshape(seq_img, [self.patch_size*self.patch_size, -1, 3])
         if self.num_channels > 1:
+            #seq_img = np.reshape(seq_img, [self.num_channels, -1, self.patch_size*self.patch_size])
+            seq_img = np.moveaxis(seq_img, -1, 0)
             seq_img = np.reshape(seq_img, [self.num_channels, -1, self.patch_size*self.patch_size])
         else:
             seq_img = np.reshape(seq_img, [-1, self.patch_size*self.patch_size])
