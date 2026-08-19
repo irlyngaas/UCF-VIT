@@ -14,7 +14,19 @@ import math
 import torch.nn as nn
 
 class SinusoidalEmbeddings(nn.Module):
+    """Fixed sinusoidal timestep embeddings, e.g. for conditioning a diffusion model on `t`.
+
+    Precomputes a `(time_steps, embed_dim)` table of sine/cosine embeddings and looks
+    up rows by timestep index.
+    """
+
     def __init__(self, time_steps:int, embed_dim: int):
+        """Precomputes the sinusoidal embedding table.
+
+        Args:
+            time_steps: Number of distinct timesteps to precompute embeddings for.
+            embed_dim: Dimensionality of each embedding vector.
+        """
         super().__init__()
         position = torch.arange(time_steps).unsqueeze(1).float()
         div = torch.exp(torch.arange(0, embed_dim, 2).float() * -(math.log(10000.0) / embed_dim))
@@ -24,6 +36,15 @@ class SinusoidalEmbeddings(nn.Module):
         self.embeddings = embeddings
 
     def forward(self, x, t):
+        """Looks up the embedding for each timestep in `t`.
+
+        Args:
+            x: Reference tensor used only to determine the target device.
+            t: Tensor of timestep indices to look up.
+
+        Returns:
+            Tensor of embeddings for `t`, moved to `x`'s device.
+        """
         embeds = self.embeddings[t].to(x.device)
         return embeds
 
@@ -35,10 +56,20 @@ class SinusoidalEmbeddings(nn.Module):
 # MoCo v3: https://github.com/facebookresearch/moco-v3
 # --------------------------------------------------------
 def get_3d_sincos_pos_embed(embed_dim, grid_size_h, grid_size_w, grid_size_d, cls_token=False):
-    """
-    grid_size: int of the grid height and width
-    return:
-    pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
+    """Builds a fixed 3D sine-cosine positional embedding for a grid of patches.
+
+    Splits `embed_dim` evenly across the h/w/d axes and concatenates a 1D sine-cosine
+    embedding computed independently along each axis.
+
+    Args:
+        embed_dim: Total embedding dimension; must be divisible by 3.
+        grid_size_h: Number of grid positions along the height axis.
+        grid_size_w: Number of grid positions along the width axis.
+        grid_size_d: Number of grid positions along the depth axis.
+        cls_token: Unused; kept for interface compatibility with `get_2d_sincos_pos_embed`.
+
+    Returns:
+        Numpy array of shape [grid_size_h*grid_size_w*grid_size_d, embed_dim].
     """
     assert embed_dim % 3 == 0
     d_pos_embed = get_1d_sincos_pos_embed_from_grid(embed_dim // 3, np.arange(grid_size_d)) 
@@ -54,10 +85,17 @@ def get_3d_sincos_pos_embed(embed_dim, grid_size_h, grid_size_w, grid_size_d, cl
     return emb
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size_h, grid_size_w, cls_token=False):
-    """
-    grid_size: int of the grid height and width
-    return:
-    pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
+    """Builds a fixed 2D sine-cosine positional embedding for a grid of patches.
+
+    Args:
+        embed_dim: Total embedding dimension; must be divisible by 2.
+        grid_size_h: Number of grid positions along the height axis.
+        grid_size_w: Number of grid positions along the width axis.
+        cls_token: If True, prepend a zero embedding row for a class token.
+
+    Returns:
+        Numpy array of shape [grid_size_h*grid_size_w, embed_dim], or
+        [1+grid_size_h*grid_size_w, embed_dim] if `cls_token` is True.
     """
     grid_h = np.arange(grid_size_h, dtype=np.float32)
     grid_w = np.arange(grid_size_w, dtype=np.float32)
@@ -71,6 +109,17 @@ def get_2d_sincos_pos_embed(embed_dim, grid_size_h, grid_size_w, cls_token=False
     return pos_embed
 
 def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
+    """Builds a 2D sine-cosine embedding from explicit h/w grid coordinates.
+
+    Args:
+        embed_dim: Total embedding dimension; must be divisible by 2. Half is used
+            to encode the h coordinate and half the w coordinate.
+        grid: Array of shape [2, 1, H, W] with h coordinates in `grid[0]` and w
+            coordinates in `grid[1]`.
+
+    Returns:
+        Numpy array of shape [H*W, embed_dim].
+    """
     assert embed_dim % 2 == 0
 
     # use half of dimensions to encode grid_h
@@ -82,10 +131,15 @@ def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
 
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
-    """
-    embed_dim: output dimension for each position
-    pos: a list of positions to be encoded: size (M,)
-    out: (M, D)
+    """Builds a 1D sine-cosine embedding from a list of positions.
+
+    Args:
+        embed_dim: Output embedding dimension for each position; must be divisible
+            by 2.
+        pos: Array of positions to encode, shape (M,).
+
+    Returns:
+        Numpy array of shape (M, embed_dim).
     """
     assert embed_dim % 2 == 0
     omega = np.arange(embed_dim // 2, dtype=float)
@@ -108,6 +162,18 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 # DeiT: https://github.com/facebookresearch/deit
 # --------------------------------------------------------
 def interpolate_pos_embed(model, checkpoint_model, new_size=(64, 128)):
+    """Interpolates a checkpoint's 2D positional embedding to a new grid resolution.
+
+    Resizes the "net.pos_embed" entry of `checkpoint_model` (in place) via bicubic
+    interpolation, assuming a fixed 2:1 width:height aspect ratio for the original
+    grid, so it can be loaded into a model with a different input resolution.
+
+    Args:
+        model: Model providing `patch_size`, used to convert `new_size` from pixels
+            to grid units.
+        checkpoint_model: State dict loaded from a checkpoint; modified in place.
+        new_size: Target `(height, width)` in pixels for the new grid.
+    """
     if "net.pos_embed" in checkpoint_model:
         pos_embed_checkpoint = checkpoint_model["net.pos_embed"]
         embedding_size = pos_embed_checkpoint.shape[-1]
@@ -133,6 +199,13 @@ def interpolate_pos_embed(model, checkpoint_model, new_size=(64, 128)):
 
 
 def interpolate_channel_embed(checkpoint_model, new_len):
+    """Truncates a checkpoint's channel embedding table to a new number of channels.
+
+    Args:
+        checkpoint_model: State dict loaded from a checkpoint; modified in place.
+        new_len: Target number of channel embeddings. Only applied when it is less
+            than or equal to the checkpoint's current channel count.
+    """
     if "net.channel_embed" in checkpoint_model:
         channel_embed_checkpoint = checkpoint_model["net.channel_embed"]
         old_len = channel_embed_checkpoint.shape[1]

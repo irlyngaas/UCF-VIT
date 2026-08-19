@@ -25,6 +25,19 @@ from UCF_VIT.ddpm.ddpm import DDPM_Scheduler
 
 
 def init_dist(args):
+    """Determines this process's rank/device info and initializes the NCCL process group.
+
+    Supports two launch mechanisms: MPI (via mpi4py, deriving rank/world size from
+    `MPI.COMM_WORLD` and broadcasting the master address from rank 0) and Slurm
+    (via `SLURM_*` environment variables).
+
+    Args:
+        args: Parsed command-line arguments; must have a `launcher` attribute equal
+            to "mpi" or any other value (treated as Slurm).
+
+    Returns:
+        A tuple `(device, local_rank)`.
+    """
     if args.launcher == "mpi":
         from mpi4py import MPI
         import socket 
@@ -72,6 +85,14 @@ def init_dist(args):
 
 #def main(device, local_rank):
 def main():
+    """Parses CLI args and config, builds the model/optimizer/dataloader, and runs the full training loop.
+
+    Entry point for FSDP-based training: initializes distributed process groups
+    (data/tensor/FSDP parallel), builds the model via `get_model`, sets up the
+    optimizer/scheduler/grad scaler (restoring from a checkpoint if configured),
+    builds either the iterative or standard PyTorch dataloader, and then runs
+    `train_epoch` for each remaining epoch, resetting the dataloader between epochs.
+    """
 #1. Load arguments from config file and setup parallelization
 ##############################################################################################################
     parser = ArgumentParser(description="")

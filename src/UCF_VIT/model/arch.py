@@ -77,7 +77,16 @@ def feature_take_indices(
     return take_indices, max(take_indices)
 
 def init_weights_vit_timm(module: nn.Module, name: str = '') -> None:
-    """ ViT weight initialization, original timm impl (for reproducibility) """
+    """ViT weight initialization, original timm impl (for reproducibility).
+
+    Truncated-normal initializes `nn.Linear` weights (zeroing biases), or
+    delegates to a submodule's own `init_weights` method if it has one. Intended
+    to be applied recursively via `named_apply`/`module.apply`.
+
+    Args:
+        module: Submodule to initialize.
+        name: Fully-qualified name of `module` within the parent model; unused.
+    """
     if isinstance(module, nn.Linear):
         trunc_normal_(module.weight, std=.02)
         if module.bias is not None:
@@ -86,12 +95,31 @@ def init_weights_vit_timm(module: nn.Module, name: str = '') -> None:
         module.init_weights()
 
 def get_init_weights_vit(head_bias: float = 0.0) -> Callable:
+    """Returns the weight-initialization function to apply across a ViT model.
+
+    Args:
+        head_bias: Unused; kept for interface compatibility.
+
+    Returns:
+        `init_weights_vit_timm`.
+    """
     return init_weights_vit_timm
 
 def global_pool_nlc(
         x: torch.Tensor,
         num_prefix_tokens: int = 1,
 ):
+    """Pools a (Batch, N, Channel) sequence down to a single token per batch element.
+
+    Args:
+        x: Input sequence, shape (B, N, C).
+        num_prefix_tokens: Number of leading prefix tokens (e.g. class tokens). If
+            exactly 1, that single prefix token is returned; otherwise, all tokens
+            after the prefix tokens are returned (no pooling reduction is applied).
+
+    Returns:
+        `x[:, 0]` if `num_prefix_tokens == 1`, otherwise `x[:, num_prefix_tokens:]`.
+    """
     if num_prefix_tokens == 1:
         x = x[:, 0]  # class token
     else:
@@ -100,6 +128,16 @@ def global_pool_nlc(
     return x
 
 class VIT(nn.Module):
+    """Vision Transformer encoder (2D/3D), optionally with a classification head.
+
+    Supports standard convolutional patch embedding or pre-adaptively-patched
+    (quadtree/octree) input, per-variable/channel token embedding with attention-
+    based channel aggregation, tensor-parallel sharding of attention/MLP layers,
+    and either fixed sinusoidal or adaptive (position-dependent) positional
+    embeddings. Used both standalone (for classification) and as the encoder base
+    class for `SAP`, `MAE`, `UNETR`, and `DiffusionVIT`.
+    """
+
     def __init__(
             self,
             img_size: Union[int, Tuple[int, int], Tuple[int,int,int]] = 224,
@@ -138,33 +176,56 @@ class VIT(nn.Module):
             use_adaptive_pos_emb: bool = False,
             sqrt_len_method: bool = False,
     ) -> None:
-        """
+        """Builds the patch/token embedding, positional embedding, transformer blocks, and optional classification head.
+
         Args:
             img_size: Input image size.
             patch_size: Patch size.
             in_chans: Number of image input channels.
-            num_classes: Number of classes for classification head.
+            num_classes: Number of classes for classification head; if None, no
+                head is created (used when this class is a base for another head).
             embed_dim: Transformer embedding dimension.
             depth: Depth of transformer.
             num_heads: Number of attention heads.
             mlp_ratio: Ratio of mlp hidden dim to embedding dim.
             qkv_bias: Enable bias for qkv projections if True.
+            qk_norm: Whether to apply normalization to Q and K in attention.
             init_values: Layer-scale init values (layer-scale enabled if not None).
             class_token: Use class token.
+            pos_embed: Positional embedding type; `''`/`'none'` disables it,
+                `'learn'` creates a learned parameter (later re-initialized with a
+                fixed sin-cos embedding in `init_weights`).
             drop_rate: Head dropout rate.
             pos_drop_rate: Position embedding dropout rate.
+            patch_drop_rate: Patch dropout rate (fraction of patch tokens randomly
+                dropped); 0 disables patch dropout.
+            proj_drop_rate: Dropout rate applied after attention/MLP projections.
             attn_drop_rate: Attention dropout rate.
             drop_path_rate: Stochastic depth rate.
-            weight_init: Weight initialization scheme.
+            weight_init: Weight initialization scheme; `'skip'` to skip calling
+                `init_weights` at the end of construction (e.g. when a subclass
+                will call it itself after adding more layers).
             embed_layer: Patch embedding layer.
             norm_layer: Normalization layer.
             act_layer: MLP activation layer.
             block_fn: Transformer block layer.
+            mlp_layer: MLP layer used inside each transformer block.
             twoD: Variable for indicating two or three dimensionsal input, if False, three dimensional input.
             adaptive_patching: Whether to use adaptive patching
             fixed_length: Length for adaptive patches, only used if adative_patching=True
             default_vars: List of different potential modalities to be used as input.
             use_varemb: Whether to use variable embedding tokens as an additional learnable parameter
+            tensor_par_size: Number of tensor-parallel ranks to shard attention/MLP
+                layers across.
+            tensor_par_group: Process group for tensor-parallel communication.
+            FusedAttn_option: Which fused attention implementation the transformer
+                blocks should use.
+            use_adaptive_pos_emb: Whether to compute positional embeddings from
+                each patch's adaptive size/position rather than using a fixed
+                learned/sin-cos table.
+            sqrt_len_method: Whether the (adaptively-patched) input is arranged as
+                a dense square/cube grid, so a standard `embed_layer` can be used
+                instead of the flattened linear token embedding path.
         """
         super().__init__()
         assert pos_embed in ('', 'none', 'learn')
@@ -323,6 +384,16 @@ class VIT(nn.Module):
             self.init_weights('')
 
     def init_weights(self, mode: str = '') -> None:
+        """Initializes positional embeddings, cls token, patch embedding weights, and all submodules.
+
+        Overwrites the learned positional embedding with a fixed 2D/3D sin-cos
+        embedding (when not adaptively patched or when `sqrt_len_method` is set),
+        initializes the class token and variable embedding (if used), and applies
+        `init_weights_vit_timm` recursively to every submodule.
+
+        Args:
+            mode: Unused; kept for interface compatibility with subclass overrides.
+        """
         head_bias = 0.
         if not self.adaptive_patching or self.sqrt_len_method:
             if self.pos_embed is not None:
@@ -363,6 +434,19 @@ class VIT(nn.Module):
         named_apply(get_init_weights_vit(head_bias), self)
 
     def _pos_embed(self, x: torch.Tensor, seq_ps) -> torch.Tensor:
+        """Prepends the class token (if any) and adds positional embeddings to the patch sequence.
+
+        Args:
+            x: Patch token sequence, shape (B, N, embed_dim).
+            seq_ps: Per-patch size/position tensor used to compute adaptive
+                positional embeddings, when `self.use_adaptive_pos_emb` is True.
+
+        Returns:
+            Token sequence with class token prepended and positional embeddings
+            added, after position dropout. If `self.pos_embed` is None, `x` is
+            returned reshaped to (B, -1, embed_dim) with no positional embedding
+            added.
+        """
         if self.pos_embed is None:
             return x.view(x.shape[0], -1, x.shape[-1])
 
@@ -384,6 +468,16 @@ class VIT(nn.Module):
         return self.pos_drop(x)
 
     def create_var_embedding(self, dim):
+        """Creates a learned embedding parameter and name-to-index map for each variable in `self.default_vars`.
+
+        Args:
+            dim: Embedding dimension for each variable.
+
+        Returns:
+            A tuple `(var_embed, var_map)`: `var_embed` is a
+            `(1, len(default_vars), dim)` parameter, and `var_map` maps each
+            variable name to its row index in `var_embed`.
+        """
         var_map = {}
         idx = 0
         for var in self.default_vars:
@@ -395,16 +489,41 @@ class VIT(nn.Module):
 
     @lru_cache(maxsize=None)
     def get_var_ids(self, vars, device):
+        """Looks up the embedding row index for each variable name, cached per `(vars, device)`.
+
+        Args:
+            vars: Tuple of variable names to look up in `self.var_map`.
+            device: Device to place the resulting index tensor on.
+
+        Returns:
+            LongTensor of indices into `self.var_embed`, one per entry in `vars`.
+        """
         ids = np.array([self.var_map[var] for var in vars])
         return torch.from_numpy(ids).to(device)
 
     def get_var_emb(self, var_emb, vars):
+        """Selects the rows of `var_emb` corresponding to `vars`.
+
+        Args:
+            var_emb: Variable embedding table, shape (1, len(default_vars), D).
+            vars: Variable names to select embeddings for.
+
+        Returns:
+            Tensor of shape (1, len(vars), D).
+        """
         ids = self.get_var_ids(vars, var_emb.device)
         return var_emb[:, ids, :]
 
     def aggregate_variables(self, x: torch.Tensor):
-        """
-        x: B, V, L, D
+        """Cross-attends over the per-variable dimension to aggregate a variable number of input channels into a fixed set.
+
+        Args:
+            x: Per-variable token sequence, shape (B, V, L, D).
+
+        Returns:
+            Aggregated token sequence, shape (B, L, D) if
+            `self.aggregated_variables == 1`, otherwise (B, V~, L, D) where V~ is
+            `self.aggregated_variables`.
         """
         b, _, l, _ = x.shape
         x = torch.einsum("bvld->blvd", x)
@@ -428,6 +547,26 @@ class VIT(nn.Module):
         return x
 
     def forward_features(self, x: torch.Tensor, variables, seq_ps) -> torch.Tensor:
+        """Embeds patches/tokens, adds positional embeddings, and runs them through the transformer encoder.
+
+        When `self.use_varemb` is set, tokenizes each input channel separately,
+        adds its variable embedding, and aggregates channels via
+        `aggregate_variables` before the encoder. When `self.tensor_par_size > 1`,
+        broadcasts the embedded sequence to the rest of the tensor-parallel group
+        before the encoder blocks and re-broadcasts the encoder output afterward.
+
+        Args:
+            x: Input patch/pixel tensor (raw image or pre-tokenized adaptive-patch
+                sequence, depending on `self.adaptive_patching`).
+            variables: Variable/channel names corresponding to `x`'s channel
+                dimension, used to look up variable embeddings when
+                `self.use_varemb` is set.
+            seq_ps: Per-patch size/position tensor, used for adaptive positional
+                embeddings.
+
+        Returns:
+            Encoded token sequence, shape (B, N[+prefix], embed_dim).
+        """
         if self.use_varemb:
             embeds = []
             if isinstance(variables, list):
@@ -439,7 +578,7 @@ class VIT(nn.Module):
                     embeds.append(self.token_embeds[id](torch.squeeze(x[:,i : i+1])))
                 else:
                     embeds.append(self.token_embeds[id](x[:,i : i+1]))
-                    
+
             var_embed = self.get_var_emb(self.var_embed, variables) # 1, V, D
             x = torch.stack(embeds, dim=1)  # B, L, D -> B, V, L, D
             x = x + var_embed.unsqueeze(2)  # 1, V, D -> 1, V, 1, D
@@ -453,7 +592,7 @@ class VIT(nn.Module):
 
         x = self._pos_embed(x, seq_ps)
         x = self.patch_drop(x)
-        
+
         if self.tensor_par_size > 1:
             src_rank = dist.get_rank() - dist.get_rank(group=self.tensor_par_group)
             dist.broadcast(x, src_rank, group=self.tensor_par_group)
@@ -463,25 +602,69 @@ class VIT(nn.Module):
 
         if self.tensor_par_size > 1:
             x = F_Identity_B_Broadcast(x, src_rank, group=self.tensor_par_group)
-        
+
         return x
 
     def pool(self, x: torch.Tensor) -> torch.Tensor:
+        """Reduces the token sequence to a single per-sample representation.
+
+        Args:
+            x: Token sequence, shape (B, N[+prefix], C).
+
+        Returns:
+            Pooled tensor; see `global_pool_nlc`.
+        """
         x = global_pool_nlc(x, num_prefix_tokens=self.num_prefix_tokens)
         return x
 
     def forward_head(self, x: torch.Tensor) -> torch.Tensor:
+        """Pools the encoder output and applies the classification head.
+
+        Args:
+            x: Encoder output token sequence.
+
+        Returns:
+            Classification logits, shape (B, num_classes), or `x` pooled and
+            dropout-applied if `self.head` is `nn.Identity()`.
+        """
         x = self.pool(x)
         x = self.head_drop(x)
         return self.head(x)
 
     def forward(self, x: torch.Tensor, variables, seq_ps=None) -> torch.Tensor:
+        """Runs the full encoder + classification head forward pass.
+
+        Args:
+            x: Input patch/pixel tensor.
+            variables: Variable/channel names for `x`.
+            seq_ps: Per-patch size/position tensor for adaptive positional
+                embeddings.
+
+        Returns:
+            Classification logits, shape (B, num_classes).
+        """
         x = self.forward_features(x, variables, seq_ps)
         x = self.forward_head(x)
         return x
 
 class SAP(VIT):
+    """Segmentation-via-Adaptive-Patching model: a `VIT` encoder with a transposed-conv decoder head.
+
+    Reshapes the encoder's flat patch sequence back into a dense
+    `sqrt_len x sqrt_len[ x sqrt_len]` grid and upsamples it via a strided
+    transposed convolution ("neck") followed by a 1x1 conv classifier
+    ("mask_header") to produce a dense per-pixel segmentation mask.
+    """
+
     def __init__(self, *args, **kwargs):
+        """Builds the `VIT` encoder, then replaces its classification head with a segmentation decoder.
+
+        Args:
+            *args: Positional arguments forwarded to `VIT.__init__`.
+            **kwargs: Keyword arguments forwarded to `VIT.__init__`; must include
+                `sqrt_len`, the grid side length the flat adaptive-patch sequence
+                is reshaped to.
+        """
         self.sqrt_len = kwargs.pop('sqrt_len', '')
         super().__init__(*args, **kwargs)
         #Remove decoder from VIT
@@ -513,6 +696,15 @@ class SAP(VIT):
         self.init_weights('')
 
     def mask_head(self, x: torch.Tensor):
+        """Reshapes the flat patch sequence into a grid and decodes it into a dense segmentation mask.
+
+        Args:
+            x: Pooled encoder output, flat patch sequence of length
+                `sqrt_len**2` (2D) or `sqrt_len**3` (3D).
+
+        Returns:
+            Per-class segmentation logits, shape (B, num_classes, H, W[, D]).
+        """
         if self.twoD:
             x = rearrange(x, 'b (p1 p2) c -> b p1 p2 c', p1=self.sqrt_len, p2=self.sqrt_len)
             x = self.neck(x.permute(0,3,1,2))
@@ -524,12 +716,34 @@ class SAP(VIT):
         return x
 
     def forward_head(self, x: torch.Tensor) -> torch.Tensor:
+        """Pools the encoder output and decodes it into a segmentation mask.
+
+        Args:
+            x: Encoder output token sequence.
+
+        Returns:
+            Per-class segmentation logits, shape (B, num_classes, H, W[, D]).
+        """
         x = self.pool(x)
         return self.mask_head(x)
 
 class MAE(VIT):
 
     def __init__(self, *args, **kwargs):
+        """Builds the `VIT` encoder, then adds a masked-token decoder for reconstruction pretraining.
+
+        If `linear_decoder` is True, decodes directly with a single linear layer;
+        otherwise builds a separate (smaller) transformer decoder with its own
+        positional embedding and blocks.
+
+        Args:
+            *args: Positional arguments forwarded to `VIT.__init__`.
+            **kwargs: Keyword arguments forwarded to `VIT.__init__`; must include
+                `mask_ratio` (fraction of patches to mask), `linear_decoder`
+                (whether to use a single linear decoder), and, when
+                `linear_decoder` is False, `decoder_depth`, `decoder_embed_dim`,
+                `decoder_num_heads`, and `decoder_mlp_ratio`.
+        """
         self.mask_ratio = kwargs.pop('mask_ratio', '')
         self.linear_decoder = kwargs.pop('linear_decoder', '')
         self.decoder_depth = kwargs.pop('decoder_depth', '')
@@ -538,7 +752,7 @@ class MAE(VIT):
         self.decoder_mlp_ratio = kwargs.pop('decoder_mlp_ratio', '')
         super().__init__(*args, **kwargs)
         #Remove decoder from VIT
-        self.head = None 
+        self.head = None
 
         if self.linear_decoder:
             self.decoder_pred = nn.Linear(self.embed_dim, self.patch_dim)
@@ -594,6 +808,14 @@ class MAE(VIT):
         self.init_weights('')
 
     def init_weights(self, mode: str = '') -> None:
+        """Initializes encoder and decoder positional embeddings, cls token, patch embedding weights, and all submodules.
+
+        Like `VIT.init_weights`, but also initializes `self.decoder_pos_embed`
+        with a fixed sin-cos embedding when it exists.
+
+        Args:
+            mode: Unused; kept for interface compatibility.
+        """
         head_bias = 0.
         if not self.adaptive_patching:
             if self.pos_embed is not None:
@@ -635,7 +857,7 @@ class MAE(VIT):
 
         if self.cls_token is not None:
             nn.init.normal_(self.cls_token, std=1e-6)
-    
+
         if not self.adaptive_patching:
             if self.use_varemb:
                 for i in range(len(self.token_embeds)):
@@ -652,6 +874,25 @@ class MAE(VIT):
         named_apply(get_init_weights_vit(head_bias), self)
 
     def random_masking(self, sequence, noise=None):
+        """Randomly masks a fraction of patch tokens, keeping only `1 - mask_ratio` of them.
+
+        When tensor parallelism is enabled, the random noise used to determine the
+        mask is broadcast from rank 0 of the tensor-parallel group so every rank
+        masks the same positions.
+
+        Args:
+            sequence: Patch token sequence, shape (B, L, D) or, with channel
+                aggregation, (B, C, L, D).
+            noise: Optional precomputed noise tensor, shape (B, L), used to
+                determine the shuffle order; if None, random noise is generated.
+
+        Returns:
+            A tuple `(sequence_unmasked, mask, ids_restore)`: `sequence_unmasked`
+            is the kept (unmasked) subset of tokens, shape (B, len_keep, D); `mask`
+            is a (B, L) binary tensor (0 = kept, 1 = masked) in original token
+            order; `ids_restore` are the indices to unshuffle tokens back to
+            original order.
+        """
         if self.aggregated_variables > 1:
             batch_size, channels, seq_length, dim = sequence.shape
         else:
@@ -680,6 +921,24 @@ class MAE(VIT):
         return sequence_unmasked, mask, ids_restore
 
     def mask_head(self, x: torch.Tensor, ids_restore, seq_ps):
+        """Reinserts mask tokens and decodes the full patch sequence back into pixel-space predictions.
+
+        Refills the masked positions (dropped in `random_masking`) with a learned
+        mask token, restores original token order via `ids_restore`, then either
+        applies a single linear projection (`self.linear_decoder`) or runs a full
+        transformer decoder followed by the linear prediction head.
+
+        Args:
+            x: Encoded (unmasked-only) token sequence, shape (B, len_keep, D) (or
+                already `decoder_embed`-projected if `not self.linear_decoder`).
+            ids_restore: Indices to unshuffle tokens back to original order, as
+                returned by `random_masking`.
+            seq_ps: Per-patch size/position tensor, used for adaptive decoder
+                positional embeddings.
+
+        Returns:
+            Reconstructed per-patch pixel values, shape (B, L, patch_dim).
+        """
         if not self.linear_decoder:
             x = self.decoder_embed(x)
 
@@ -710,6 +969,23 @@ class MAE(VIT):
         return x
 
     def forward_features(self, x: torch.Tensor, variables, seq_ps) -> torch.Tensor:
+        """Embeds patches/tokens, adds positional embeddings, randomly masks, and runs the encoder.
+
+        Like `VIT.forward_features`, but applies `random_masking` after the
+        positional embedding so only the unmasked tokens are processed by the
+        encoder blocks.
+
+        Args:
+            x: Input patch/pixel tensor.
+            variables: Variable/channel names for `x`.
+            seq_ps: Per-patch size/position tensor for adaptive positional
+                embeddings.
+
+        Returns:
+            A tuple `(x, mask, ids_restore)`: `x` is the encoded unmasked token
+            sequence, `mask` the binary mask (0=kept, 1=masked) in original token
+            order, and `ids_restore` the indices to restore original token order.
+        """
         if self.use_varemb:
             embeds = []
             if isinstance(variables, list):
@@ -721,7 +997,7 @@ class MAE(VIT):
                     embeds.append(self.token_embeds[id](torch.squeeze(x[:,i : i+1])))
                 else:
                     embeds.append(self.token_embeds[id](x[:,i : i+1]))
-                    
+
             var_embed = self.get_var_emb(self.var_embed, variables) # 1, V, D
             x = torch.stack(embeds, dim=1)  # B, L, D -> B, V, L, D
             x = x + var_embed.unsqueeze(2)  # 1, V, D -> 1, V, 1, D
@@ -732,7 +1008,7 @@ class MAE(VIT):
                 x = self.token_embeds(x)
             else:
                 x = self.token_embeds(x)
-               
+
         x = self._pos_embed(x, seq_ps)
         x, mask, ids_restore = self.random_masking(x)
         x = self.patch_drop(x)
@@ -750,18 +1026,64 @@ class MAE(VIT):
         return x, mask, ids_restore
 
     def forward_head(self, x: torch.Tensor, ids_restore, seq_ps):
+        """Pools the encoder output and reconstructs the full (unmasked+masked) patch sequence.
+
+        Args:
+            x: Encoded unmasked token sequence.
+            ids_restore: Indices to restore original token order.
+            seq_ps: Per-patch size/position tensor for adaptive decoder positional
+                embeddings.
+
+        Returns:
+            Reconstructed per-patch pixel values, shape (B, L, patch_dim).
+        """
         x = self.pool(x)
         return self.mask_head(x, ids_restore, seq_ps)
 
 
     def forward(self, x: torch.Tensor, variables, seq_ps=None) -> torch.Tensor:
+        """Runs the full masked-autoencoding forward pass: mask, encode, decode/reconstruct.
+
+        Args:
+            x: Input patch/pixel tensor.
+            variables: Variable/channel names for `x`.
+            seq_ps: Per-patch size/position tensor for adaptive positional
+                embeddings.
+
+        Returns:
+            A tuple `(x, mask)`: `x` is the reconstructed per-patch pixel values
+            and `mask` is the binary mask (0=kept, 1=masked) in original token
+            order.
+        """
         x, mask, ids_restore = self.forward_features(x, variables, seq_ps)
         x = self.forward_head(x, ids_restore, seq_ps)
         return x, mask
 
 class UNETR(VIT):
+    """UNETR segmentation model: a `VIT` encoder with a convolutional U-Net-style decoder.
+
+    Reshapes intermediate encoder feature maps back into spatial grids and
+    progressively upsamples/decodes them (optionally with U-Net-style skip
+    connections from convolutional encoder stages, à la
+    "UNETR: Transformers for 3D Medical Image Segmentation") into a dense
+    per-pixel segmentation mask. Also supports a simpler linear-decoder mode that
+    skips the convolutional decoder entirely.
+    """
 
     def __init__(self, *args, **kwargs):
+        """Builds the `VIT` encoder, then adds the convolutional (or linear) segmentation decoder.
+
+        Args:
+            *args: Positional arguments forwarded to `VIT.__init__`.
+            **kwargs: Keyword arguments forwarded to `VIT.__init__`; must include
+                `linear_decoder` (whether to use a single linear decoder instead
+                of the convolutional U-Net decoder), `feature_size` (base channel
+                count for the convolutional decoder), `skip_connection` (whether
+                to add U-Net-style convolutional skip connections from
+                intermediate encoder features), and, when adaptive patching is
+                used, `sqrt_len` (the grid side length the flat adaptive-patch
+                sequence is reshaped to).
+        """
         self.linear_decoder = kwargs.pop('linear_decoder', '')
         self.feature_size = kwargs.pop('feature_size', '')
         self.skip_connection = kwargs.pop('skip_connection', '')
@@ -960,6 +1282,17 @@ class UNETR(VIT):
         self.init_weights('')
 
     def proj_feat(self, x, hidden_size, feat_size):
+        """Reshapes a flat patch-token sequence back into a spatial feature map.
+
+        Args:
+            x: Flat token sequence, shape (B, prod(feat_size), hidden_size).
+            hidden_size: Channel dimension of each token.
+            feat_size: Target spatial grid size, `(H, W)` for 2D or `(H, W, D)`
+                for 3D.
+
+        Returns:
+            Spatial feature map, shape (B, hidden_size, H, W[, D]).
+        """
         if self.twoD:
             x = x.view(x.size(0), feat_size[0], feat_size[1], hidden_size)
             x = x.permute(0,3,1,2)
@@ -969,6 +1302,27 @@ class UNETR(VIT):
         return x
 
     def unetr_head(self, x: torch.Tensor, intermediates, enc1):
+        """Decodes the encoder output (and intermediate features) into a segmentation mask.
+
+        With `self.linear_decoder`, applies a single linear layer and upsamples.
+        Without skip connections, runs the pooled encoder output through a stack
+        of upsampling decoder blocks. With skip connections, additionally fuses
+        each decoder stage with a convolutional encoder feature computed from the
+        corresponding `intermediates` entry (and the original-resolution `enc1`
+        feature at the final stage).
+
+        Args:
+            x: Pooled encoder output token sequence.
+            intermediates: List of intermediate encoder token sequences at the
+                configured `skip_indices`, as returned by `forward_intermediates`;
+                only used when `self.skip_connection` is True.
+            enc1: Original-resolution convolutional encoder feature (from
+                `self.encoder1`), used as the final skip connection; only used
+                when `self.skip_connection` is True.
+
+        Returns:
+            Per-class segmentation logits, shape (B, num_classes, H, W[, D]).
+        """
 
         if not self.skip_connection:
             if self.linear_decoder:
@@ -1014,17 +1368,28 @@ class UNETR(VIT):
             stop_early: bool = False,
             intermediates_only: bool = False,
     ) -> Union[List[torch.Tensor], Tuple[torch.Tensor, List[torch.Tensor]]]:
-        """ Forward features that returns intermediates.
+        """Forward features that returns intermediates.
+
+        Embeds patches/tokens and positional embeddings as in `forward_features`,
+        then runs the transformer blocks one at a time, collecting the output of
+        each block whose index is in `take_indices` (computed from `indices` via
+        `feature_take_indices`).
 
         Args:
             x: Input image tensor
+            variables: Variable/channel names for `x`.
+            seq_ps: Per-patch size/position tensor for adaptive positional
+                embeddings.
             indices: Take last n blocks if int, all if None, select matching indices if sequence
             return_prefix_tokens: Return both prefix and spatial intermediate tokens
             norm: Apply norm layer to all intermediates
             stop_early: Stop iterating over blocks when last desired intermediate hit
             intermediates_only: Only return intermediate features
         Returns:
-
+            If `intermediates_only` is True: just the list of intermediate
+            tensors (or `(spatial, prefix)` tuples if `return_prefix_tokens` is
+            True). Otherwise: a tuple `(x, intermediates)` where `x` is the final
+            normalized encoder output.
         """
         intermediates = []
         take_indices, max_index = feature_take_indices(len(self.blocks), indices)
@@ -1097,10 +1462,37 @@ class UNETR(VIT):
         return x, intermediates
 
     def forward_head(self, x: torch.Tensor, intermediates, enc1):
+        """Pools the encoder output and decodes it (and any intermediates) into a segmentation mask.
+
+        Args:
+            x: Encoder output token sequence.
+            intermediates: Intermediate encoder features for skip connections, or
+                None if `self.skip_connection` is False.
+            enc1: Original-resolution convolutional encoder feature for the final
+                skip connection, or None if `self.skip_connection` is False.
+
+        Returns:
+            Per-class segmentation logits, shape (B, num_classes, H, W[, D]).
+        """
         x = self.pool(x)
         return self.unetr_head(x, intermediates, enc1)
 
     def forward(self, x: torch.Tensor, variables, seq_ps=None, x_seq=None) -> torch.Tensor:
+        """Runs the full UNETR forward pass: convolutional stem (if skip connections), transformer encoder, decoder.
+
+        Args:
+            x: Original-resolution input tile, used for the convolutional
+                `encoder1` skip connection when `self.skip_connection` is True, and
+                as the transformer input directly when not adaptively patched.
+            variables: Variable/channel names for the transformer input.
+            seq_ps: Per-patch size/position tensor for adaptive positional
+                embeddings.
+            x_seq: Pre-tokenized adaptive-patch sequence, used as the transformer
+                input instead of `x` when `self.adaptive_patching` is True.
+
+        Returns:
+            Per-class segmentation logits, shape (B, num_classes, H, W[, D]).
+        """
         if self.adaptive_patching:
             if self.skip_connection:
                 enc1 = self.encoder1(x)
@@ -1124,8 +1516,26 @@ class UNETR(VIT):
         return x
 
 class DiffusionVIT(VIT):
+    """Diffusion denoising model: a `VIT` encoder conditioned on a diffusion timestep, with a reconstruction decoder.
+
+    Adds a sinusoidal timestep embedding (via `SinusoidalEmbeddings` +
+    `EmbeddingDenseLayer`) to the patch token sequence before the transformer
+    encoder, then decodes back to pixel-space per-patch predictions (the
+    predicted noise, in the standard DDPM formulation) via a linear or full
+    transformer decoder, mirroring `MAE`'s decoder but without masking.
+    """
 
     def __init__(self, *args, **kwargs):
+        """Builds the `VIT` encoder, then adds the timestep embedding and reconstruction decoder.
+
+        Args:
+            *args: Positional arguments forwarded to `VIT.__init__`.
+            **kwargs: Keyword arguments forwarded to `VIT.__init__`; must include
+                `linear_decoder` (whether to use a single linear decoder),
+                `time_steps` (number of diffusion timesteps to embed), and, when
+                `linear_decoder` is False, `decoder_depth`, `decoder_embed_dim`,
+                `decoder_num_heads`, and `decoder_mlp_ratio`.
+        """
         self.linear_decoder = kwargs.pop('linear_decoder', '')
         self.decoder_depth = kwargs.pop('decoder_depth', '')
         self.decoder_embed_dim = kwargs.pop('decoder_embed_dim', '')
@@ -1176,6 +1586,13 @@ class DiffusionVIT(VIT):
         self.init_weights('')
 
     def init_weights(self, mode: str = '') -> None:
+        """Initializes encoder and decoder positional embeddings, cls token, patch embedding weights, and all submodules.
+
+        Same as `MAE.init_weights`.
+
+        Args:
+            mode: Unused; kept for interface compatibility.
+        """
         head_bias = 0.
         if not self.adaptive_patching:
             if self.pos_embed is not None:
@@ -1217,7 +1634,7 @@ class DiffusionVIT(VIT):
 
         if self.cls_token is not None:
             nn.init.normal_(self.cls_token, std=1e-6)
-    
+
         if not self.adaptive_patching:
             if self.use_varemb:
                 for i in range(len(self.token_embeds)):
@@ -1234,6 +1651,20 @@ class DiffusionVIT(VIT):
         named_apply(get_init_weights_vit(head_bias), self)
 
     def forward_features(self, x: torch.Tensor, t, variables) -> torch.Tensor:
+        """Embeds patches/tokens, adds positional and timestep embeddings, and runs the transformer encoder.
+
+        Like `VIT.forward_features`, but additionally computes a sinusoidal
+        embedding of `t` and adds it (broadcast across the sequence dimension) to
+        the token sequence after the positional embedding.
+
+        Args:
+            x: Input patch/pixel tensor.
+            t: Diffusion timestep indices, one per batch element.
+            variables: Variable/channel names for `x`.
+
+        Returns:
+            Encoded token sequence, shape (B, N[+prefix], embed_dim).
+        """
         if self.use_varemb:
             embeds = []
             if isinstance(variables, list):
@@ -1276,6 +1707,15 @@ class DiffusionVIT(VIT):
         return x
 
     def forward_head(self, x: torch.Tensor):
+        """Pools the encoder output and decodes it into a per-patch pixel-space prediction.
+
+        Args:
+            x: Encoder output token sequence.
+
+        Returns:
+            Predicted per-patch pixel values (e.g. predicted noise), shape (B, L,
+            patch_dim).
+        """
         x = self.pool(x)
         if not self.linear_decoder:
             if self.tensor_par_size > 1:
@@ -1293,6 +1733,17 @@ class DiffusionVIT(VIT):
         return self.decoder_pred(x)
 
     def forward(self, x: torch.Tensor, t, variables) -> torch.Tensor:
+        """Runs the full timestep-conditioned forward pass: encode then decode.
+
+        Args:
+            x: Noised input patch/pixel tensor.
+            t: Diffusion timestep indices, one per batch element.
+            variables: Variable/channel names for `x`.
+
+        Returns:
+            Predicted per-patch pixel values (e.g. predicted noise), shape (B, L,
+            patch_dim).
+        """
         t = t.to('cpu')
         x = self.forward_features(x, t, variables)
         x = self.forward_head(x)

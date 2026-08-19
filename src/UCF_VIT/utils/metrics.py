@@ -9,6 +9,18 @@ import torchvision
 import torch.nn.functional as torchF
         
 def masked_mse(pred, y, mask):
+    """Computes the mean squared error over only the masked (e.g. patch-level) positions.
+
+    Args:
+        pred: Predicted values.
+        y: Target values, same shape as `pred`.
+        mask: Mask indicating which positions along the batch/sequence dimension to
+            include in the loss (1 = include, 0 = exclude); broadcastable against the
+            per-position mean of `(pred - y) ** 2`.
+
+    Returns:
+        Scalar tensor with the mean squared error averaged over the masked positions.
+    """
 
     loss = (pred - y) ** 2
     loss = loss.mean(dim=-1)
@@ -17,6 +29,30 @@ def masked_mse(pred, y, mask):
     return loss
 
 def adaptive_patching_mse(output, y, size, pos, patch_size, twoD):
+    """Computes MSE loss between adaptively-sized predicted patches and the target image.
+
+    Each predicted patch is resized (bicubic) from `patch_size` back up to its
+    original adaptive-patch size, then compared against the corresponding region of
+    the target image `y` located via `pos`/`size`. Patches with size 0 (unused/padded
+    patches) are skipped, and the final loss is averaged over the number of patches
+    actually compared.
+
+    Args:
+        output: Predicted patch values, shape (Batch, Channel, Seq_Length,
+            Patch_Size*Patch_Size) or (Batch, Channel, Seq_Length,
+            Patch_Size*Patch_Size*Patch_Size) for 3D.
+        y: Target image, shape (Batch, Channel, H, W) for 2D or (Batch, Channel, H,
+            W, D) for 3D.
+        size: Side length of each adaptive patch, shape (Batch, Channel, Seq_Length, 1).
+        pos: Center coordinates of each adaptive patch, shape (Batch, Channel,
+            Seq_Length, (x_center, y_center)) or with a z_center added for 3D.
+        patch_size: Fixed spatial size that predicted patches are stored at before
+            being resized to their adaptive size.
+        twoD: Whether the data is 2D (True) or 3D (False).
+
+    Returns:
+        Scalar tensor with the MSE loss averaged over all non-empty patches.
+    """
     #output (Batch, Channel, Seq_Length, Patch_Size*Patch_Size)
     #data (Batch, Channel, Tile_Size_x, Tile_Size_y)
     #size (Batch, Channel, Seq_Length, 1)
@@ -93,13 +129,42 @@ def adaptive_patching_mse(output, y, size, pos, patch_size, twoD):
     return loss
 
 class DiceBLoss(nn.Module):
+    """Combined Dice loss and binary cross-entropy loss for segmentation.
+
+    Computes a weighted sum of binary cross-entropy and soft Dice loss, both
+    excluding the first (background) class channel.
+    """
+
     def __init__(self, weight=0.5, num_class=2, size_average=True):
+        """Initializes the loss weighting between BCE and Dice loss.
+
+        Args:
+            weight: Weight given to the BCE term; the Dice term is weighted by
+                `1 - weight`.
+            num_class: Number of segmentation classes. Unused directly but stored
+                for reference.
+            size_average: Unused; kept for interface compatibility.
+        """
         super(DiceBLoss, self).__init__()
         self.weight = weight
         self.num_class = num_class
 
     def forward(self, inputs, targets, smooth=1, act=True):
-    
+        """Computes the combined Dice + BCE loss.
+
+        Args:
+            inputs: Predicted logits (or probabilities if `act=False`), shape
+                (Batch, Class, ...).
+            targets: Ground-truth one-hot/probability targets, same shape as
+                `inputs`.
+            smooth: Smoothing constant added to numerator/denominator of the Dice
+                coefficient to avoid division by zero.
+            act: If True, apply a sigmoid activation to `inputs` before computing
+                the loss.
+
+        Returns:
+            Scalar tensor with `weight * BCE + (1 - weight) * dice_loss`.
+        """
         #comment out if your model contains a sigmoid or equivalent activation layer
         if act:
             inputs = torchF.sigmoid(inputs)    

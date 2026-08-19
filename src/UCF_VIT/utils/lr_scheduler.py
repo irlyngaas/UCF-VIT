@@ -40,7 +40,12 @@ class LinearWarmupCosineAnnealingLR(_LRScheduler):
         super().__init__(optimizer, last_epoch)
 
     def get_lr(self) -> List[float]:
-        """Compute learning rate using chainable form of the scheduler."""
+        """Compute learning rate using chainable form of the scheduler.
+
+        Returns:
+            List of learning rates, one per optimizer parameter group, for the
+            current `self.last_epoch`.
+        """
         if not self._get_lr_called_within_step:
             warnings.warn(
                 "To get the last learning rate computed by the scheduler, " "please use `get_last_lr()`.",
@@ -77,7 +82,12 @@ class LinearWarmupCosineAnnealingLR(_LRScheduler):
         ]
 
     def _get_closed_form_lr(self) -> List[float]:
-        """Called when epoch is passed as a param to the `step` function of the scheduler."""
+        """Called when epoch is passed as a param to the `step` function of the scheduler.
+
+        Returns:
+            List of learning rates, one per base learning rate in `self.base_lrs`,
+            computed directly from `self.last_epoch` (closed-form, non-chainable).
+        """
         if self.last_epoch < self.warmup_epochs:
             return [
                 self.warmup_start_lr

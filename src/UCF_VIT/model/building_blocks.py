@@ -33,7 +33,10 @@ from xformers.components.attention.core import scaled_dot_product_attention as x
 
 
 class PatchEmbed(nn.Module):
-    """ 2D/3D Image to Patch Embedding
+    """2D/3D Image to Patch Embedding.
+
+    Projects non-overlapping image/volume patches to embedding vectors via a
+    strided convolution, then flattens the spatial dimensions into a sequence.
     """
 
     def __init__(
@@ -47,6 +50,22 @@ class PatchEmbed(nn.Module):
             bias: bool = True,
             sqrt_len_method: bool = False,
     ):
+        """Initializes the patch projection convolution and derived grid dimensions.
+
+        Args:
+            img_size: Input image/volume size (scalar, applied to every spatial
+                dimension); None to skip computing `grid_size`/`num_patches`.
+            patch_size: Patch size (scalar, applied to every spatial dimension).
+            in_chans: Number of input channels.
+            embed_dim: Output embedding dimension.
+            twoD: Whether input is 2D (`Conv2d`) or 3D (`Conv3d`).
+            norm_layer: Optional normalization layer constructor applied to the
+                output embeddings.
+            bias: Whether the projection convolution has a bias term.
+            sqrt_len_method: If True, skip the input-size assertion in `forward`
+                (used when the sequence length is derived differently, e.g. via
+                adaptive patching's square/cube-root grid).
+        """
         super().__init__()
         self.twoD = twoD
         self.sqrt_len_method = sqrt_len_method
@@ -66,6 +85,15 @@ class PatchEmbed(nn.Module):
         self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
 
     def _init_img_size(self, img_size: Union[int, Tuple[int, int], Tuple[int, int, int]]):
+        """Computes the patch grid size and total patch count for a given image size.
+
+        Args:
+            img_size: Input image/volume size; None to skip computation.
+
+        Returns:
+            A tuple `(img_size, grid_size, num_patches)`, or `(None, None, None)`
+            if `img_size` is None.
+        """
         assert self.patch_size
         if img_size is None:
             return None, None, None
@@ -81,6 +109,14 @@ class PatchEmbed(nn.Module):
         return img_size, grid_size, num_patches
 
     def forward(self, x):
+        """Projects `x` into patch embeddings and flattens spatial dims into a sequence.
+
+        Args:
+            x: Input tensor, shape (B, C, H, W) for 2D or (B, C, H, W, D) for 3D.
+
+        Returns:
+            Tensor of patch embeddings, shape (B, num_patches, embed_dim).
+        """
         if self.twoD:
             B, C, H, W = x.shape
         else:
@@ -97,7 +133,11 @@ class PatchEmbed(nn.Module):
         return x
 
 class Mlp(nn.Module):
-    """ MLP as used in Vision Transformer, MLP-Mixer and related networks
+    """MLP as used in Vision Transformer, MLP-Mixer and related networks.
+
+    A two-layer feedforward block (`fc1 -> act -> drop -> norm -> fc2 -> drop`),
+    with the hidden layer optionally tensor-parallel sharded across
+    `tensor_par_group`.
     """
     def __init__(
             self,
@@ -112,6 +152,24 @@ class Mlp(nn.Module):
             tensor_par_size: int = 1,
             tensor_par_group: Optional[dist.ProcessGroup] = None,
     ):
+        """Initializes the MLP's linear/conv layers, activation, dropout, and norm.
+
+        Args:
+            in_features: Input feature dimension.
+            hidden_features: Hidden layer dimension; defaults to `in_features`.
+            out_features: Output feature dimension; defaults to `in_features`.
+            act_layer: Activation layer constructor.
+            norm_layer: Optional normalization layer constructor applied between
+                the two linear layers.
+            bias: Whether each linear layer has a bias term (a 2-tuple applies
+                separately to `fc1`/`fc2`).
+            drop: Dropout probability (a 2-tuple applies separately after `fc1`
+                and `fc2`).
+            use_conv: If True, use 1x1 `Conv2d` layers instead of `Linear`.
+            tensor_par_size: Number of tensor-parallel ranks the hidden dimension
+                is sharded across.
+            tensor_par_group: Process group for tensor-parallel communication.
+        """
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
@@ -129,6 +187,14 @@ class Mlp(nn.Module):
         self.drop2 = nn.Dropout(drop_probs[1])
 
     def forward(self, x):
+        """Runs the two-layer MLP, all-reducing gradients across the tensor-parallel group if sharded.
+
+        Args:
+            x: Input tensor, shape (..., in_features).
+
+        Returns:
+            Output tensor, shape (..., out_features).
+        """
         if self.tensor_par_size > 1:
             x = F_Identity_B_AllReduce(x, group=self.tensor_par_group)
 
@@ -145,6 +211,15 @@ class Mlp(nn.Module):
         return x
 
 class Attention(nn.Module):
+    """Multi-head self-attention, with optional fused-attention kernels and tensor parallelism.
+
+    Projects `x` to query/key/value, runs scaled dot-product attention (via
+    xformers flash/CK kernels, PyTorch's fused SDPA, or a plain implementation
+    depending on `fused_attn`), and projects back to `dim`. When
+    `tensor_par_size > 1`, the head dimension is sharded across
+    `tensor_par_group` and gradients/activations are synchronized accordingly.
+    """
+
     def __init__(
             self,
             dim: int,
@@ -158,6 +233,21 @@ class Attention(nn.Module):
             tensor_par_size: int = 1,
             tensor_par_group: Optional[dist.ProcessGroup] = None,
     ) -> None:
+        """Initializes the QKV projection, optional Q/K norm, and output projection.
+
+        Args:
+            dim: Total embedding dimension; must be divisible by `num_heads`.
+            fused_attn: Which fused attention implementation to use.
+            num_heads: Number of attention heads.
+            qkv_bias: Whether the QKV projection has a bias term.
+            qk_norm: Whether to apply `norm_layer` to Q and K before attention.
+            attn_drop: Attention dropout probability.
+            proj_drop: Output projection dropout probability.
+            norm_layer: Normalization layer constructor used for `qk_norm`.
+            tensor_par_size: Number of tensor-parallel ranks the head dimension is
+                sharded across.
+            tensor_par_group: Process group for tensor-parallel communication.
+        """
         super().__init__()
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
         self.num_heads = num_heads
@@ -175,6 +265,14 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Runs multi-head self-attention on `x`.
+
+        Args:
+            x: Input tensor, shape (B, N, C).
+
+        Returns:
+            Output tensor, shape (B, N, C).
+        """
         B, N, C = x.shape
 
         if self.tensor_par_size > 1:
@@ -220,6 +318,12 @@ class Attention(nn.Module):
         return x
 
 class Block(nn.Module):
+    """Standard pre-norm transformer encoder block: self-attention + MLP, each with residual connections.
+
+    Applies `x = x + drop_path(layerscale(attn(norm1(x))))` followed by
+    `x = x + drop_path(layerscale(mlp(norm2(x))))`.
+    """
+
     def __init__(
             self,
             dim: int,
@@ -238,6 +342,28 @@ class Block(nn.Module):
             tensor_par_size: int = 1,
             tensor_par_group: Optional[dist.ProcessGroup] = None,
     ) -> None:
+        """Initializes the block's attention, MLP, normalization, layer-scale, and drop-path sublayers.
+
+        Args:
+            dim: Embedding dimension.
+            num_heads: Number of attention heads.
+            fused_attn: Which fused attention implementation `Attention` should use.
+            mlp_ratio: Ratio of MLP hidden dimension to `dim`.
+            qkv_bias: Whether the attention QKV projection has a bias term.
+            qk_norm: Whether to normalize Q/K in attention.
+            proj_drop: Dropout probability for the attention output projection and
+                MLP.
+            attn_drop: Attention dropout probability.
+            init_values: Layer-scale initial value; if None, layer scale is
+                disabled (identity).
+            drop_path: Stochastic depth drop probability.
+            act_layer: MLP activation layer constructor.
+            norm_layer: Normalization layer constructor for `norm1`/`norm2`.
+            mlp_layer: MLP layer constructor.
+            tensor_par_size: Number of tensor-parallel ranks to shard attention/MLP
+                across.
+            tensor_par_group: Process group for tensor-parallel communication.
+        """
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = Attention(
@@ -268,6 +394,14 @@ class Block(nn.Module):
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Runs the attention and MLP sublayers with residual connections.
+
+        Args:
+            x: Input tensor, shape (B, N, dim).
+
+        Returns:
+            Output tensor, shape (B, N, dim).
+        """
         x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
         x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
         return x
@@ -313,15 +447,33 @@ class MyUnetBlock(nn.Module):
         )
 
     def forward(self, inp):
+        """Upsamples `inp` via the transposed convolution.
+
+        Args:
+            inp: Input feature map.
+
+        Returns:
+            Upsampled feature map with `out_channels` channels (matching the
+            channel count expected for a UNETR skip connection).
+        """
         # number of channels for skip should equals to out_channels
         out = self.transp_conv(inp)
         return out
 
 class EmbeddingDenseLayer(nn.Module):
-    def __init__(self, 
-            c_in: int, 
+    """Two-layer dense projection with ReLU and dropout, used to project embeddings (e.g. variable embeddings)."""
+
+    def __init__(self,
+            c_in: int,
             c_out: int,
             dropout_prob: float):
+        """Initializes the two linear layers, ReLU, and dropout.
+
+        Args:
+            c_in: Input feature dimension.
+            c_out: Output (and hidden) feature dimension.
+            dropout_prob: Dropout probability applied after the ReLU.
+        """
         super().__init__()
         self.linear1 = nn.Linear(c_in,c_out)
         self.linear2 = nn.Linear(c_out,c_out)
@@ -330,9 +482,24 @@ class EmbeddingDenseLayer(nn.Module):
 
     #input here is gonna be just [B,C]
     def forward(self, x):
+        """Runs `linear1 -> relu -> dropout -> linear2`.
+
+        Args:
+            x: Input tensor, shape (B, c_in).
+
+        Returns:
+            Output tensor, shape (B, c_out).
+        """
         return(self.linear2(self.dropout(self.relu(self.linear1(x)))))
 
 class VariableMapping_Attention(nn.Module):
+    """Cross-attention that aggregates a variable number of input-channel tokens into a fixed set of query tokens.
+
+    Used for channel aggregation: a learned/fixed `var_query` attends over the
+    per-variable input tokens `x`, producing one output token per aggregated
+    variable regardless of how many input channels were present.
+    """
+
     def __init__(
             self,
             dim: int,
@@ -346,6 +513,21 @@ class VariableMapping_Attention(nn.Module):
             tensor_par_size: int = 1,
             tensor_par_group = None,
     ) -> None:
+        """Initializes the query/key-value projections and output projection.
+
+        Args:
+            dim: Embedding dimension; must be divisible by `num_heads`.
+            fused_attn: Which fused attention implementation to use.
+            num_heads: Number of attention heads.
+            qkv_bias: Whether the Q and KV projections have a bias term.
+            qk_norm: Whether to apply `norm_layer` to Q and K before attention.
+            attn_drop: Attention dropout probability.
+            proj_drop: Output projection dropout probability.
+            norm_layer: Normalization layer constructor used for `qk_norm`.
+            tensor_par_size: Number of tensor-parallel ranks the head dimension is
+                sharded across.
+            tensor_par_group: Process group for tensor-parallel communication.
+        """
         super().__init__()
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
         self.num_heads = num_heads
@@ -366,6 +548,15 @@ class VariableMapping_Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, var_query: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """Cross-attends `var_query` over `x`'s per-variable tokens.
+
+        Args:
+            var_query: Query tokens, one per aggregated variable, shape (B, N_a, C).
+            x: Input tokens, one per input channel/variable, shape (B, N_i, C).
+
+        Returns:
+            Output tensor, shape (B, N_a, C).
+        """
 
         if self.tensor_par_size >1:
 

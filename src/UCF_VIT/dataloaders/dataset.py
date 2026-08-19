@@ -16,6 +16,14 @@ import cv2 as cv
 from UCF_VIT.utils.misc import calculate_tile_overlap
 
 class FileReader(IterableDataset):
+    """Iterable dataset that reads and preprocesses raw data files, sharded across DDP ranks and dataloader workers.
+
+    Slices `file_list` to the `[start_idx, end_idx)` fraction requested, then in
+    `__iter__` further splits the remaining files across the data-parallel group
+    (identified via `gx`) and dataloader workers so each worker yields a disjoint
+    shard.
+    """
+
     def __init__(
         self,
         file_list,
@@ -31,6 +39,28 @@ class FileReader(IterableDataset):
         dataset: str = "imagenet",
         resize: Optional[list] = [256,256],
     ) -> None:
+        """Initializes the reader over the `[start_idx, end_idx)` fraction of `file_list`.
+
+        Args:
+            file_list: Full list of file paths for this dataset.
+            start_idx: Fraction (0.0-1.0) of `file_list` to start reading from.
+            end_idx: Fraction (0.0-1.0) of `file_list` to stop reading at.
+            variables: Variable/channel labels to attach to each yielded sample.
+            gx: Colon-separated string of data-parallel GPU counts per dataset,
+                used in `__iter__` to determine this rank's shard.
+            ddp_group: Process group used to determine this rank's position within
+                `gx`.
+            data_par_size: Total number of data-parallel ranks; overridden to 1 if
+                `torch.distributed` is not initialized.
+            twoD: Whether the data is 2D or 3D; stored but not directly used here.
+            return_label: Whether to read and yield a label alongside the data.
+            keys_to_add: Number of times to repeat iteration over the (sharded)
+                file list per epoch, used to balance dataset sizes.
+            dataset: Dataset name, e.g. "imagenet" or "basic_ct"; determines how
+                files are read in `read_process_file`.
+            resize: `[height, width]` to resize images to; only used for
+                `dataset == "imagenet"`.
+        """
         super().__init__()
         self.num_channels_available = len(variables)
         start_idx = int(start_idx * len(file_list))
@@ -51,6 +81,20 @@ class FileReader(IterableDataset):
             self.resize = resize
 
     def read_process_file(self, path):
+        """Reads and preprocesses a single data file according to `self.dataset`.
+
+        For "imagenet", loads and resizes an RGB image and, if `return_label`,
+        derives the class label from the parent directory name. For "basic_ct",
+        loads a NIfTI volume, min-max normalizes it, and if `return_label`, loads
+        the corresponding label volume from the sibling "labelsTr" directory.
+
+        Args:
+            path: Path to the file to read.
+
+        Returns:
+            `data` (channel-first array), or `(data, label)` if `self.return_label`
+            is True.
+        """
         if self.dataset == "imagenet":
             data = Image.open(path).convert("RGB")
             data = np.array(data) 
@@ -97,6 +141,18 @@ class FileReader(IterableDataset):
                     return data
 
     def __iter__(self):
+        """Yields preprocessed samples for this worker's shard of `self.file_list`.
+
+        Determines this dataloader worker's contiguous shard of `self.file_list`
+        based on the data-parallel rank (via `gx`/`ddp_group`) and the worker's
+        index among `torch.utils.data.get_worker_info()`, then repeats iteration
+        over that shard `self.keys_to_add` times, calling `read_process_file` on
+        each file.
+
+        Yields:
+            `(data, label, self.variables)` if `self.return_label` is True,
+            otherwise `(data, self.variables)`.
+        """
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is None:
             assert torch.distributed.is_initialized()
@@ -143,9 +199,35 @@ class FileReader(IterableDataset):
                     yield data, self.variables
 
 class TileDataIter(IterableDataset):
+    """Iterable dataset that splits each sample from an upstream dataset into overlapping tiles.
+
+    Wraps a `FileReader` (or similarly-shaped iterable) and, for each yielded
+    sample, iterates over a `div x div[ x div]` grid of tiles (optionally slicing
+    3D volumes into 2D slices first), yielding one tile at a time.
+    """
+
     def __init__(
         self, dataset: FileReader, tile_size: tuple[int, ...] = (64, 64), twoD: bool = True, return_label: bool = False, div: int = 1, tile_overlap: tuple[int,...] = (0,0), classification: bool = False,
     ) -> None:
+        """Initializes the tiling parameters.
+
+        Args:
+            dataset: Upstream iterable dataset yielding `(data, [label,] variables)`.
+            tile_size: Target tile size (including overlap), one entry per spatial
+                dimension.
+            twoD: If the upstream data is 3D, whether to slice it into 2D tiles
+                along the z-axis (True) or tile it fully in 3D (False). Also
+                controls how many spatial dims `tile_size` has.
+            return_label: Whether upstream samples include a label to also tile
+                (for segmentation) or pass through unchanged (for classification).
+            div: Number of tiles to divide each spatial dimension into.
+            tile_overlap: Total overlap amount per dimension between adjacent
+                tiles, used to compute `start_overlap`/`end_overlap` via
+                `calculate_tile_overlap`.
+            classification: If True, labels are per-sample (not tiled) and passed
+                through unchanged for every tile; if False, labels are tiled the
+                same way as the data (segmentation).
+        """
         super().__init__()
         self.dataset = dataset
         self.tile_size = tile_size
@@ -192,8 +274,20 @@ class TileDataIter(IterableDataset):
         return start, end
 
     def __iter__(self):
+        """Yields one tile at a time from every sample produced by `self.dataset`.
 
-        if len(self.tile_size) == 3: #Data is 3D 
+        For 3D data with `self.twoD=True`, first iterates over z-slices and then
+        the 2D tile grid within each slice; for 3D data with `self.twoD=False`,
+        iterates over the full 3D tile grid; for 2D data, iterates over the 2D tile
+        grid directly.
+
+        Yields:
+            `(tile, label, variables)` if `self.return_label` is True (with `label`
+            tiled too unless `self.classification` is True), otherwise `(tile,
+            variables)`.
+        """
+
+        if len(self.tile_size) == 3: #Data is 3D
             if self.return_label:
                 for (data,label,variables) in self.dataset:
                     if self.twoD: #Loop through slices of 3D data
@@ -263,13 +357,31 @@ class TileDataIter(IterableDataset):
                             yield data[:, start_x:end_x, start_y:end_y], variables
 
 class ShuffleIterableDataset(IterableDataset):
+    """Iterable dataset that approximately shuffles an upstream iterable using a fixed-size reservoir buffer."""
+
     def __init__(self, dataset, buffer_size: int) -> None:
+        """Initializes the shuffle buffer over an upstream dataset.
+
+        Args:
+            dataset: Upstream iterable dataset to shuffle.
+            buffer_size: Size of the reservoir buffer; must be greater than 0.
+                Larger values give better shuffling at the cost of memory.
+        """
         super().__init__()
         assert buffer_size > 0
         self.dataset = dataset
         self.buffer_size = buffer_size
 
     def __iter__(self):
+        """Yields samples from `self.dataset` in reservoir-shuffled order.
+
+        Fills a buffer of `self.buffer_size` samples, then for each new sample
+        swaps it with a random buffer slot and yields the evicted sample; once the
+        upstream dataset is exhausted, shuffles and drains the remaining buffer.
+
+        Yields:
+            Samples from `self.dataset`, in shuffled order.
+        """
         buf = []
 
         for x in self.dataset:
@@ -284,7 +396,37 @@ class ShuffleIterableDataset(IterableDataset):
             yield buf.pop()
 
 class ProcessChannels(IterableDataset):
+    """Iterable dataset that batches samples from an upstream dataset and optionally adaptively patchifies them.
+
+    Buffers `batch_size` upstream samples (tiles/images and, if present, labels)
+    before draining them one at a time, applying `Patchify`/`Patchify_3D` per sample
+    when `adaptive_patching` is enabled (including patchifying segmentation labels
+    with the same quadtree/octree used for the image).
+    """
+
     def __init__(self, dataset, num_channels: int, batch_size: int, return_label: bool, adaptive_patching: bool, separate_channels: bool, patch_size: int, fixed_length: int, twoD: bool, _dataset: str, return_qdt: bool) -> None:
+        """Initializes the batching buffer and, if needed, the adaptive-patching transform.
+
+        Args:
+            dataset: Upstream iterable dataset yielding `(data, [label,]
+                variables)`.
+            num_channels: Number of channels in each sample, used to configure the
+                adaptive-patching transform.
+            batch_size: Number of upstream samples to buffer before yielding.
+            return_label: Whether upstream samples include a label.
+            adaptive_patching: Whether to adaptively patchify each sample (and its
+                label, for segmentation datasets) via a quadtree/octree.
+            separate_channels: Whether adaptive patching is done independently per
+                channel (True, using a `num_channels=1` patcher applied per
+                channel) or jointly across all channels (False).
+            patch_size: Leaf patch size used by the adaptive-patching transform.
+            fixed_length: Fixed output sequence length for adaptive patching.
+            twoD: Whether samples are 2D (`Patchify`) or 3D (`Patchify_3D`).
+            _dataset: Dataset name, e.g. "imagenet" or "basic_ct"; determines label
+                handling and the patchifier's edge-detection behavior.
+            return_qdt: Whether to also yield the quadtree/octree object(s) used
+                for each sample.
+        """
         super().__init__()
         self.dataset = dataset
         self.num_channels = num_channels
@@ -309,6 +451,14 @@ class ProcessChannels(IterableDataset):
                     self.patchify = Patchify_3D(fixed_length=fixed_length, patch_size=patch_size, num_channels=num_channels, dataset=self._dataset)
 
     def __iter__(self):
+        """Buffers `self.batch_size` upstream samples, then yields them one by one, patchified if configured.
+
+        Yields:
+            A tuple whose composition depends on `self.adaptive_patching`,
+            `self.return_label`, `self._dataset`, and `self.return_qdt`; broadly:
+            `(image, [seq_image, seq_size, seq_pos,] [label, [seq_label,]]
+            variables, [qdt])`.
+        """
         yield_x_list = []
         yield_var_list = []
         if self.return_label:

@@ -7,6 +7,20 @@ import torch
 from UCF_VIT.dataloaders.transform import Patchify, Patchify_3D
 
 def CatsDogsCollate(batch, adaptive_patching, return_label):
+    """Collate function for `CatsDogsDataset`, stacking per-sample numpy arrays into batched tensors.
+
+    Args:
+        batch: List of samples as returned by `CatsDogsDataset.__getitem__`.
+        adaptive_patching: Whether each sample includes adaptive-patching sequence
+            data (patch sequence, size, and position) in addition to the raw image.
+        return_label: Whether to include the label in the returned tuple.
+
+    Returns:
+        A tuple of batched tensors/values. With `adaptive_patching=True`:
+        `(inp, seq, size, pos, [label,] variables, dict_key)`. Otherwise:
+        `(inp, [label,] variables, dict_key)`. The label is included only when
+        `return_label` is True.
+    """
     if adaptive_patching:
         inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
         seq = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
@@ -31,7 +45,29 @@ def CatsDogsCollate(batch, adaptive_patching, return_label):
 
 
 class CatsDogsDataset(Dataset):
+    """Torch `Dataset` for the Kaggle cats-vs-dogs image classification dataset.
+
+    Loads and resizes each image to `tile_size`, derives a binary label from the
+    filename, and optionally adaptively patchifies the image.
+    """
+
     def __init__(self, file_list, variables, tile_size, twoD = True, adaptive_patching = False, fixed_length=196, patch_size=16, num_channels=3, dataset="catsdogs"):
+        """Initializes the dataset over a list of image file paths.
+
+        Args:
+            file_list: List of image file paths, each named like ".../cat.123.jpg"
+                or ".../dog.123.jpg".
+            variables: Variable/channel labels to attach to each returned sample.
+            tile_size: `(width, height)` to resize each image to.
+            twoD: Whether to use the 2D (`Patchify`) or 3D (`Patchify_3D`) adaptive
+                patcher when `adaptive_patching` is True.
+            adaptive_patching: Whether to also compute an adaptive-patching sequence
+                for each image.
+            fixed_length: Fixed output sequence length for adaptive patching.
+            patch_size: Patch size used by the adaptive patcher.
+            num_channels: Number of image channels.
+            dataset: Dataset name to attach to each returned sample.
+        """
         self.file_list = file_list
         self.variables = variables
         self.tile_size = tile_size
@@ -49,10 +85,26 @@ class CatsDogsDataset(Dataset):
                 self.patchify = Patchify_3D(fixed_length=fixed_length, patch_size=patch_size, num_channels=num_channels, dataset=self.dataset)
 
     def __len__(self):
+        """Returns the number of images in the dataset.
+
+        Returns:
+            Number of files in `self.file_list`.
+        """
         self.filelength = len(self.file_list)
         return self.filelength
 
     def __getitem__(self, idx):
+        """Loads, resizes, and labels the image at `idx`, optionally adaptively patchifying it.
+
+        Args:
+            idx: Index into `self.file_list`.
+
+        Returns:
+            If `self.adaptive_patching` is True: `(image, seq_img, seq_size, seq_pos,
+            label, self.variables, self.dataset)`. Otherwise: `(image, label,
+            self.variables, self.dataset)`. `image` is a channel-first numpy array
+            and `label` is 1 for "dog" and 0 for "cat".
+        """
         img_path = self.file_list[idx]
         img = Image.open(img_path)
         img = np.array(img)

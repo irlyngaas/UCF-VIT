@@ -4,7 +4,19 @@ import cv2 as cv
 from scipy.interpolate import RegularGridInterpolator
 
 class Cube:
+    """An axis-aligned cubic (or cuboid) region of a 3D volume, used as an octree node."""
+
     def __init__(self, x1, x2, y1, y2, z1, z2) -> None:
+        """Initializes the cube's bounding coordinates.
+
+        Args:
+            x1: Lower bound along the x axis.
+            x2: Upper bound along the x axis; must be >= `x1`.
+            y1: Lower bound along the y axis.
+            y2: Upper bound along the y axis; must be >= `y1`.
+            z1: Lower bound along the z axis.
+            z2: Upper bound along the z axis; must be >= `z1`.
+        """
         # *q
         # p*
         self.x1 = x1
@@ -19,13 +31,44 @@ class Cube:
         assert z1<=z2, 'z1 > z2, wrong coordinate.'
     
     def contains(self, domain, norm_factor):
+        """Computes a normalized edge-density score for this cube's region of `domain`.
+
+        Args:
+            domain: 3D edge-intensity volume, shape (Z, Y, X).
+            norm_factor: Divisor used to normalize the summed edge intensity.
+
+        Returns:
+            Integer edge-density score for this cube's region.
+        """
         patch = domain[self.z1:self.z2, self.y1:self.y2, self.x1:self.x2]
         return int(np.sum(patch)/norm_factor)
-        
+
     def get_area(self, img):
+        """Extracts this cube's region from a 4D (Z, Y, X, Channel) image volume.
+
+        Args:
+            img: Image volume, shape (Z, Y, X, Channel).
+
+        Returns:
+            The sub-volume within this cube's bounds.
+        """
         return img[self.z1:self.z2, self.y1:self.y2, self.x1:self.x2, :]
 
     def set_area(self, mask, patch, num_channels):
+        """Resizes `patch` to this cube's size and writes it into `mask` at this cube's location.
+
+        Uses multilinear (`RegularGridInterpolator`) interpolation to resize the
+        cubic `patch` from its native size to this cube's actual size before
+        writing it in place.
+
+        Args:
+            mask: Output volume to write into, in place, shape (Z, Y, X, Channel).
+            patch: Cubic patch to resize and place, shape (h1, h1, h1, num_channels).
+            num_channels: Number of channels in `patch`.
+
+        Returns:
+            `mask`, with this cube's region overwritten by the resized `patch`.
+        """
         # import pdb
         # pdb.set_trace()
         patch_size = self.get_size()
@@ -54,22 +97,59 @@ class Cube:
         return mask
 
     def get_coord(self):
+        """Returns this cube's bounding coordinates.
+
+        Returns:
+            Tuple `(x1, x2, y1, y2, z1, z2)`.
+        """
         return self.x1,self.x2,self.y1,self.y2,self.z1,self.z2
 
     def get_size(self):
+        """Returns this cube's side lengths.
+
+        Returns:
+            Tuple `(x2-x1, y2-y1, z2-z1)`.
+        """
         return self.x2-self.x1, self.y2-self.y1, self.z2-self.z1
-    
+
     def get_center(self):
+        """Returns this cube's center coordinates.
+
+        Returns:
+            Tuple `(x_center, y_center, z_center)`.
+        """
         return (self.x2+self.x1)/2, (self.y2+self.y1)/2, (self.z2+self.z1)/2
 
 class FixedOctTree:
+    """An octree over a 3D edge-intensity volume with a fixed number of leaf nodes.
+
+    Recursively subdivides the volume with `Cube`s, always splitting the node with
+    the highest edge-density score into 8 octants, until exactly `fixed_length`
+    nodes exist (or a node can no longer be halved). This concentrates small
+    (high-resolution) patches around edges and leaves large patches over flat
+    regions.
+    """
+
     def __init__(self, domain, fixed_length=128, norm_factor=255) -> None:
+        """Builds the octree over `domain`.
+
+        Args:
+            domain: 3D edge-intensity volume, shape (Z, Y, X), to subdivide.
+            fixed_length: Target number of leaf nodes to subdivide into.
+            norm_factor: Divisor used to normalize each node's edge-density score.
+        """
         self.domain = domain
         self.fixed_length = fixed_length
         self.norm_factor = norm_factor
         self._build_tree()
 
     def _build_tree(self):
+        """Iteratively splits the highest edge-density node into 8 octants until `fixed_length` nodes exist.
+
+        Populates `self.nodes` as a list of `[Cube, edge_density_score]` pairs.
+        Stops early if the highest-scoring node's side length has shrunk to 2 (it
+        can't be evenly halved further).
+        """
         #channel, height, width, depth = self.domain.shape
         h, w, d = self.domain.shape
         assert h>0 and w >0 and d>0, "Wrong img size."
@@ -102,6 +182,22 @@ class FixedOctTree:
             self.nodes = self.nodes[:idx] + [[n1,v1], [n2,v2], [n3,v3], [n4,v4],[n5,v5], [n6,v6], [n7,v7], [n8,v8]] +  self.nodes[idx+1:]
 
     def serialize(self, img, size=(8,8,8,1)):
+        """Extracts and resizes each leaf node's patch from `img` into a fixed-length sequence.
+
+        Each node's variable-sized cubic region is extracted from `img` and
+        resized (multilinear interpolation) to `size`. Pads with zero patches if
+        the tree has fewer than `fixed_length` nodes.
+
+        Args:
+            img: Image volume to extract patches from, shape (Z, Y, X, Channel).
+            size: Target `(h, w, d, channel)` size for every patch.
+
+        Returns:
+            A tuple `(seq_patch, seq_size, seq_pos)`: `seq_patch` is a list of
+            `fixed_length` resized patches, `seq_size` a list of each node's
+            original side length (0 for padding), and `seq_pos` a list of each
+            node's center coordinates (`(-1, -1, -1)` for padding).
+        """
         seq_patch = []
         seq_size = []
         seq_pos = []
@@ -150,6 +246,18 @@ class FixedOctTree:
         return seq_patch, seq_size, seq_pos
 
     def serialize_labels(self, img, size=(8,8,8,1)):
+        """Like `serialize`, but resizes each patch with nearest-neighbor interpolation.
+
+        Intended for label/segmentation-mask volumes, where nearest-neighbor
+        resizing avoids introducing invalid interpolated class values.
+
+        Args:
+            img: Label volume to extract patches from, shape (Z, Y, X, Channel).
+            size: Target `(h, w, d, channel)` size for every patch.
+
+        Returns:
+            A tuple `(seq_patch, seq_size, seq_pos)`, as in `serialize`.
+        """
         seq_patch = []
         seq_size = []
         seq_pos = []
@@ -199,6 +307,22 @@ class FixedOctTree:
         return seq_patch, seq_size, seq_pos
 
     def deserialize(self, seq, patch_size, channel):
+        """Reassembles a flat sequence of predicted patches back into a full-size volume.
+
+        Inverse of `serialize`: reshapes `seq` into per-node patches and writes each
+        one into its node's location via `Cube.set_area` (which resizes it back up
+        to the node's actual size).
+
+        Args:
+            seq: Flat array of predicted patch values, reshaped to (fixed_length,
+                patch_size, patch_size, patch_size, channel).
+            patch_size: Side length each patch is stored at.
+            channel: Number of channels.
+
+        Returns:
+            Reconstructed volume, shape matching `self.domain` with `channel`
+            channels appended.
+        """
 
         H,W,D = self.domain.shape
         seq = np.reshape(seq, (self.fixed_length, patch_size, patch_size, patch_size, channel))

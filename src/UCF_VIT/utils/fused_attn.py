@@ -1,15 +1,15 @@
 from enum import Enum
-"""
-This module defines the `FusedAttn` enumeration
-Classes:
-    FusedAttn (Enum): An enumeration representing the modes of fused attention.
-        - CK: Represents the "CK" mode using ROCm Composable Kernels.
-        - DEFAULT: Represents the "DEFAULT" mode using PyTorch/Triton.
-        - NONE: Represents no fused attention.
-
-"""
 
 class FusedAttn(Enum):
+    """Enumeration of the fused attention implementations that can be selected for a model.
+
+    Attributes:
+        FLASH: Use flash attention (e.g. via xformers/PyTorch SDPA).
+        CK: Use ROCm Composable Kernels fused attention, for AMD GPUs.
+        DEFAULT: Use PyTorch/Triton's built-in fused attention.
+        NONE: Do not use a fused attention implementation; fall back to a basic
+            Python implementation.
+    """
     FLASH = "FLASH"
     CK = "CK"
     DEFAULT = "DEFAULT"

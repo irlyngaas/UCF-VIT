@@ -18,6 +18,21 @@ from matplotlib import pyplot as plt
 import math
 
 def read_process_file(path, dataset, num_channels_available, variables, imagenet_resize=None):
+    """Reads and preprocesses a single image/volume file for visualization.
+
+    Args:
+        path: Path to the file to read.
+        dataset: Dataset type, "imagenet" or "basic_ct".
+        num_channels_available: Number of channels available; if 1 for "basic_ct",
+            a channel dimension is added.
+        variables: Unused for "imagenet"; kept for interface symmetry.
+        imagenet_resize: `[height, width]` to resize to; only used for
+            `dataset == "imagenet"`.
+
+    Returns:
+        Channel-first data array, or None if `dataset` is neither "imagenet" nor
+        "basic_ct".
+    """
     if dataset == "imagenet":
         data = Image.open(path).convert("RGB")
         data = np.array(data) 
@@ -38,6 +53,22 @@ def read_process_file(path, dataset, num_channels_available, variables, imagenet
             return data
 
 def get_data(data, dataset, twoD, tile_size_x, tile_size_y, tile_size_z):
+    """Extracts the first tile (and, for 2D, the first z-slice) from a loaded volume/image.
+
+    Args:
+        data: Data array as returned by `read_process_file`.
+        dataset: Dataset type, "basic_ct" or "imagenet".
+        twoD: For "basic_ct", whether to extract a single 2D z-slice tile (True) or
+            a 3D tile (False).
+        tile_size_x: Tile size along the x dimension.
+        tile_size_y: Tile size along the y dimension.
+        tile_size_z: Tile size along the z dimension (3D tiling) or slice stride
+            (2D slicing).
+
+    Returns:
+        For "basic_ct", the first tile (or slice) of `data`. For "imagenet", `data`
+        unchanged.
+    """
     if dataset == "basic_ct":
         kk = 0 #which tile in z dim
         jj = 0 #which tile in y dim
@@ -56,6 +87,13 @@ def get_data(data, dataset, twoD, tile_size_x, tile_size_y, tile_size_z):
 
 
 def main():
+    """Visualizes adaptive quadtree/octree patchification of a single image or volume.
+
+    Reads the config path, image/volume path, and dataset key from `sys.argv[1:4]`,
+    loads and tiles one sample, adaptively patchifies it (with edge maps returned),
+    and saves the detected edges and per-channel quadtree/octree overlay images
+    under an "images" directory.
+    """
     config_path = sys.argv[1]
     img_path = sys.argv[2]
     dict_key = sys.argv[3]

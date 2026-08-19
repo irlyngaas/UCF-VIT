@@ -18,6 +18,39 @@ from .dataset import (
 )
 
 def collate_fn(batch, return_label, adaptive_patching, separate_channels, dataset, num_classes, num_labels, return_qdt, dict_key):
+    """Collate function for `NativePytorchDataModule`'s iterative dataloaders.
+
+    Stacks per-sample numpy arrays into batched tensors, handling several
+    combinations of adaptive patching, labeling, and dataset type (e.g. one-hot
+    encoding segmentation masks for "basic_ct", stacking per-channel label lists for
+    other segmentation datasets).
+
+    Args:
+        batch: List of samples as yielded by the underlying `ProcessChannels`
+            iterable dataset.
+        return_label: Whether samples include a label and whether it should be
+            included in the returned tuple.
+        adaptive_patching: Whether samples include adaptive-patching sequence data
+            (patch sequence, size, and position) in addition to the raw tile.
+        separate_channels: Whether adaptive patching was done per channel
+            (True) or jointly across channels (False); affects how `size`/`pos`
+            are stacked.
+        dataset: Dataset name, e.g. "imagenet" or "basic_ct"; determines label/
+            seq_label handling.
+        num_classes: Number of segmentation classes, used to one-hot encode masks
+            for "basic_ct".
+        num_labels: Number of per-channel label tensors to stack for non-"basic_ct"
+            segmentation datasets.
+        return_qdt: Whether to also collect and return the list of quadtree/octree
+            objects for each sample.
+        dict_key: Dataset key to attach to the batch, returned as the final tuple
+            element.
+
+    Returns:
+        A tuple of batched tensors/values whose exact composition depends on
+        `adaptive_patching`, `return_label`, `dataset`, and `return_qdt`; always ends
+        with `dict_key`.
+    """
     if adaptive_patching:
         if return_label:
             inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
@@ -168,6 +201,13 @@ class NativePytorchDataModule(torch.nn.Module):
         num_classes: Optional[int] = None,
         resize: Optional[Dict] = None,
     ):
+        """Initializes the data module and builds the per-dataset file listings.
+
+        See the class docstring for a description of each argument. Splits
+        data-parallel ranks across datasets according to `dataset_group_list` (or
+        evenly if not given) and calls `process_root_dirs` to list each dataset's
+        files.
+        """
         super().__init__()
 
         assert len(dict_root_dirs) <= data_par_size, "the number of data parallel GPUs (data_par_size) needs to be at least equal to the number of datasets. Try to increase data_par_size"
@@ -225,6 +265,16 @@ class NativePytorchDataModule(torch.nn.Module):
         self.dict_data_train: Optional[Dict] = None
 
     def process_root_dirs(self):
+        """Builds per-data-parallel-group lists of image file paths for `self.dataset`.
+
+        For "imagenet", groups classes under each root directory into
+        `self.data_par_size` (or fewer) buckets of combined class image lists. For
+        other datasets, lists all files under each root directory's "imagesTr"
+        subfolder, one entry per key in `self.dict_root_dirs`.
+
+        Returns:
+            Dict mapping a group/dataset key to a list of file paths.
+        """
         if self.dataset == "imagenet":
             dict_lister_trains = {}
             for k, root_dir in self.dict_root_dirs.items():
@@ -256,6 +306,21 @@ class NativePytorchDataModule(torch.nn.Module):
         return dict_lister_trains
 
     def set_iterative_dataloader(self, dict_data_train, k, lister_train, keys_to_add):
+        """Builds the iterable dataset pipeline (file read -> tile -> shuffle -> channel processing) for one dataset key.
+
+        Args:
+            dict_data_train: Dict of dataset-key -> iterable dataset to update in
+                place with the new pipeline for `k`.
+            k: Dataset key to build the pipeline for.
+            lister_train: List of file paths for this dataset key (already
+                shuffled/replicated by the caller as needed).
+            keys_to_add: Number of times `lister_train` was replicated to balance
+                dataset sizes; passed through to `FileReader` as `keys_to_add`.
+
+        Returns:
+            `dict_data_train`, with `dict_data_train[k]` set to the new
+            `ProcessChannels`-wrapped iterable dataset.
+        """
         if self.dataset == "imagenet":
             start_idx = self.dict_start_idx["imagenet"]
             end_idx = self.dict_end_idx["imagenet"]
@@ -346,6 +411,14 @@ class NativePytorchDataModule(torch.nn.Module):
         
 
     def setup(self):
+        """Builds the iterable training datasets for every dataset key, if not already built.
+
+        Computes `self.max_balance`, the largest `batches_per_rank_epoch` across
+        datasets, then replicates each dataset's file listing enough times
+        (`keys_to_add`) so that dataloading can continue reusing files until the
+        largest dataset is exhausted, and builds each dataset's pipeline via
+        `set_iterative_dataloader`. No-op if `self.dict_data_train` is already set.
+        """
         # load datasets only if they're not loaded already
         if not self.dict_data_train:
 
@@ -380,6 +453,12 @@ class NativePytorchDataModule(torch.nn.Module):
             self.dict_data_train = dict_data_train
 
     def reset(self):
+        """Rebuilds each dataset's iterable pipeline with a freshly shuffled file order.
+
+        Called between epochs to randomize file order and reintroduce data that may
+        have been missed in prior epochs (files get dropped when a dataset's file
+        count isn't evenly divisible by the number of GPUs splitting it up).
+        """
         #Reset data file list to randomize order of files. Needed in order to introduce data that was potentially missed in prior epochs. Some data files are missed when the number of files for each dataset is not divisible by the number of GPUs that's splitting up those files
         dict_data_train = {}
         for i, k in enumerate(self.dict_lister_trains.keys()):
@@ -401,6 +480,19 @@ class NativePytorchDataModule(torch.nn.Module):
         self.dict_data_train = dict_data_train
 
     def train_dataloader(self):
+        """Builds the `DataLoader` for the dataset assigned to this rank's data-parallel group.
+
+        Requires `torch.distributed` to be initialized. Determines which dataset
+        this rank belongs to from `self.gx` (the colon-separated GPU-per-dataset
+        split) and this rank's position within `self.ddp_group`, then wraps that
+        dataset's iterable pipeline in a `DataLoader` using `collate_fn`.
+
+        Returns:
+            A `torch.utils.data.DataLoader` over this rank's assigned dataset.
+
+        Raises:
+            NotImplementedError: If `torch.distributed` is not initialized.
+        """
         if not torch.distributed.is_initialized():
             raise NotImplementedError("Only support distributed training")
             

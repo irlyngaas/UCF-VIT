@@ -13,6 +13,22 @@ from monai.data import decollate_batch
 from UCF_VIT.utils.metrics import DiceBLoss
 
 def load_optimizer_scheduler_from_checkpoint(conf, optimizer, scheduler, data_seq_ort_group, device):
+    """Restores optimizer and scheduler state, loss history, and epoch from a checkpoint.
+
+    Args:
+        conf: Parsed training configuration dict (as returned by `parse_config`).
+        optimizer: Optimizer instance to load state into, in place.
+        scheduler: LR scheduler instance to load state into, in place.
+        data_seq_ort_group: Process group used to locate this rank's corresponding
+            checkpoint file (the checkpoint from the equivalent tensor-parallel rank
+            within this rank's data-parallel replica).
+        device: Unused device argument; loading is done onto CPU regardless.
+
+    Returns:
+        A tuple `(optimizer, scheduler, loss_list, epoch_start)` where `loss_list`
+        is the loss history restored from the checkpoint and `epoch_start` is the
+        epoch to resume training from (one past the checkpointed epoch).
+    """
     src_rank = dist.get_rank() - conf["parallelism"]["tensor_par_size"] * dist.get_rank(group=data_seq_ort_group)
 
     map_location = 'cpu' #TODO: Choose cpu or cuda+str
@@ -29,6 +45,21 @@ def load_optimizer_scheduler_from_checkpoint(conf, optimizer, scheduler, data_se
     return optimizer, scheduler, loss_list, epoch_start
 
 def train_step(conf, batch, model):
+    """Runs a single forward pass and loss computation for one training batch.
+
+    Dispatches to architecture-specific forward/loss logic based on
+    `conf["model"]["type"]` (VIT classification cross-entropy, SAP/UNETR
+    segmentation Dice(+CE) loss, MAE/DiffusionVIT reconstruction MSE loss).
+
+    Args:
+        conf: Parsed training configuration dict (as returned by `parse_config`).
+        batch: Dict of batch tensors as returned by `process_batch`.
+        model: Model to run the forward pass on.
+
+    Returns:
+        For "VIT" and "UNETR": a tuple `(loss, output)`. For "SAP", "MAE", and
+        "DiffusionVIT": just `loss`.
+    """
 
     if conf["model"]["type"] == "VIT":
         output = model.forward(batch["data"], batch["variables"], batch["seq_ps"])
@@ -105,6 +136,20 @@ def train_step(conf, batch, model):
         return loss
 
 def get_batch(conf, it_loader):
+    """Pulls the next batch from a dataloader iterator and packages it into a dict.
+
+    The exact tuple unpacked from `it_loader` depends on `conf["model"]["type"]` and
+    whether adaptive patching is enabled.
+
+    Args:
+        conf: Parsed training configuration dict (as returned by `parse_config`).
+        it_loader: Iterator over the training dataloader.
+
+    Returns:
+        Dict with keys "data", "variables", "dict_key", "seq", "seq_size",
+        "seq_pos", "label", and "seq_label"; entries not applicable to the current
+        model type/adaptive-patching setting are set to None.
+    """
     if conf["model"]["type"] == "VIT":
         if conf["ap"]["do_ap"]:
             data, seq, seq_size, seq_pos, label, variables, dict_key = next(it_loader)
@@ -135,6 +180,31 @@ def get_batch(conf, it_loader):
            }
 
 def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_scheduler):
+    """Fetches a training batch and distributes it across a tensor-parallel group.
+
+    When tensor parallelism is enabled (`tensor_par_size > 1`), only rank 0 of each
+    tensor-parallel group reads from `train_dataloader`; the batch's tensors,
+    variable list, and dataset key are then broadcast to the rest of the group
+    (other ranks pre-allocate correctly-shaped placeholder tensors to broadcast
+    into). For "DiffusionVIT", also samples a random timestep `t` and noise `e` per
+    batch and forms the noised input. Also reshapes adaptive-patching `seq_size`/
+    `seq_pos` into the combined `seq_ps` tensor used for adaptive position
+    embeddings.
+
+    Args:
+        conf: Parsed training configuration dict (as returned by `parse_config`).
+        train_dataloader: Training dataloader to read the next batch from (read only
+            by rank 0 of `tensor_par_group`).
+        device: Device to move batch tensors to.
+        tensor_par_group: Process group for tensor-parallel broadcast of the batch.
+        ddpm_scheduler: `DDPM_Scheduler` used to look up alpha values for noising the
+            input, when `conf["model"]["type"] == "DiffusionVIT"`.
+
+    Returns:
+        Dict with keys "data", "variables", "dict_key", "seq", "seq_ps", "label",
+        "seq_label", "t", and "e"; entries not applicable to the current model
+        type/adaptive-patching setting are set to None.
+    """
     tensor_par_size = conf["parallelism"]["tensor_par_size"]
 
     if conf["trainer"]["data_type"] == "float32":
@@ -368,6 +438,21 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
       
 
 def save_checkpoint(conf, model, optimizer, scheduler, epoch, loss_list):
+    """Saves model/optimizer/scheduler state and loss history to a per-rank checkpoint file.
+
+    Only ranks below `conf["parallelism"]["tensor_par_size"]` (i.e. rank 0 of each
+    tensor-parallel group) write a checkpoint file. All ranks synchronize on a
+    barrier afterward.
+
+    Args:
+        conf: Parsed training configuration dict (as returned by `parse_config`).
+        model: Model whose state dict is saved.
+        optimizer: Optimizer whose state dict is saved.
+        scheduler: LR scheduler whose state dict is saved.
+        epoch: Current epoch number, saved alongside the state and used in the
+            checkpoint filename.
+        loss_list: Accumulated loss history to save.
+    """
     model_states = model.state_dict()
     optimizer_states = optimizer.state_dict()
     scheduler_states = scheduler.state_dict()
@@ -387,6 +472,30 @@ def save_checkpoint(conf, model, optimizer, scheduler, epoch, loss_list):
     #del scheduler_states
 
 def train_epoch(conf, model, train_dataloader, epoch, iterations_per_epoch, optimizer, scheduler, grad_scaler, min_scale, loss_list, device, tensor_par_group, ddpm_scheduler):
+    """Runs one full training epoch: batch loop, backward pass, optimizer/scheduler step, checkpointing.
+
+    For each of `iterations_per_epoch` iterations, fetches and processes a batch,
+    runs the forward pass and loss, computes accuracy/Dice metric where applicable,
+    backpropagates (optionally through a gradient scaler), and steps the optimizer.
+    After the loop, steps the scheduler, appends the epoch loss to `loss_list`, and
+    saves a checkpoint if `epoch` falls on the configured save frequency.
+
+    Args:
+        conf: Parsed training configuration dict (as returned by `parse_config`).
+        model: Model being trained.
+        train_dataloader: Training dataloader.
+        epoch: Current epoch number.
+        iterations_per_epoch: Number of batches to process this epoch.
+        optimizer: Optimizer to step.
+        scheduler: LR scheduler to step once per epoch.
+        grad_scaler: Gradient scaler used when `conf["grad_scaler"]["use_grad_scaler"]`
+            is True.
+        min_scale: Minimum allowed grad scaler scale, enforced after each update.
+        loss_list: Loss history list; the epoch's total loss is appended in place.
+        device: Device to run the epoch's loss/accuracy accumulators on.
+        tensor_par_group: Process group for tensor-parallel batch distribution.
+        ddpm_scheduler: `DDPM_Scheduler` used when training a "DiffusionVIT" model.
+    """
 
     epoch_loss = torch.tensor(0.0 , dtype=torch.float32, device=device)
     epoch_accuracy = torch.tensor(0.0 , dtype=torch.float32, device=device)

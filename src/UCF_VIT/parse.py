@@ -7,6 +7,22 @@ import torch.distributed as dist
 from UCF_VIT.utils.misc import is_power_of_two
 
 def get_kwargs(model_type, conf):
+    """Build the architecture-specific keyword arguments for a given model type.
+
+    Reads the model-type-specific settings out of the parsed config dict (e.g.
+    `num_classes` for VIT, `mask_ratio`/decoder settings for MAE, `feature_size` for
+    UNETR, `num_time_steps`/decoder settings for DiffusionVIT), applying defaults and
+    exiting with an error message when a required setting is missing.
+
+    Args:
+        model_type: Model architecture type. One of "VIT", "SAP", "MAE", "UNETR",
+            "DiffusionVIT".
+        conf: Raw config dict loaded from the training YAML file.
+
+    Returns:
+        A dict of keyword arguments to be passed to the model architecture's
+        constructor (via `**kwargs`), specific to `model_type`.
+    """
     kwargs = {}
     #TODO: Add checking on each argument, e.g. > 0
     if model_type == "VIT":
@@ -179,6 +195,26 @@ def get_kwargs(model_type, conf):
     return kwargs
 
 def parse_config(args, load_balance_offline=False):
+    """Load and validate a training configuration YAML file into a structured dict.
+
+    Reads the YAML file at `args.config`, applies defaults for optional settings,
+    validates required settings and cross-field consistency (e.g. parallelism sizes
+    against world size, tile size divisibility by patch size, adaptive-patching
+    fixed-length constraints), and exits with an error message via `sys.exit` when a
+    required setting is missing or invalid.
+
+    Args:
+        args: Parsed command-line arguments; must have a `config` attribute giving
+            the path to the training config YAML file.
+        load_balance_offline: If True, skip checks that require a live distributed
+            process group (e.g. matching parallelism sizes to `dist.get_world_size()`),
+            for use when computing load balancing outside of a training run.
+
+    Returns:
+        A dict with keys "trainer", "parallelism", "optimizer", "scheduler",
+        "grad_scaler", "model", "tiling", "ap", "data", "dataloader", and
+        "dataset_options", each holding the validated configuration for that section.
+    """
 
     conf = yaml.load(open(args.config,'r'),Loader=yaml.FullLoader)
 
@@ -563,7 +599,25 @@ def parse_config(args, load_balance_offline=False):
     } 
 
 def parse_pretrained_config(args, conf):
+    """Load and validate the configuration of a pretrained model to fine-tune from.
 
+    If `conf` indicates a pretrained model should be used (and training is not
+    resuming from a checkpoint), loads the pretrained model's own config YAML file
+    (`args.pretrained_config`) and checks that its architecture and data settings
+    (embed_dim, depth, num_heads, mlp_ratio, tensor_par_size, image dimensionality,
+    tile size, patch size, channel aggregation, input channels/variables) are
+    compatible with the model described by `conf`.
+
+    Args:
+        args: Parsed command-line arguments; must have a `pretrained_config`
+            attribute giving the path to the pretrained model's config YAML file.
+        conf: Validated training configuration dict for the model to be trained, as
+            returned by `parse_config`.
+
+    Returns:
+        A dict with keys "model_type", "default_vars", and "kwargs" describing the
+        pretrained model, or an empty dict if no pretrained model is being used.
+    """
 
     resume_from_checkpoint = conf['trainer']['resume_from_checkpoint']
 

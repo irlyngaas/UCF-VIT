@@ -12,6 +12,18 @@ import torchdata.datapipes as dp
 from UCF_VIT.utils.lr_scheduler import LinearWarmupCosineAnnealingLR
 
 def patchify( data, patch_size, twoD):
+    """Splits a batch of images into a sequence of flattened, non-overlapping patches.
+
+    Args:
+        data: Input tensor, shape (Batch, Channel, X, Y) for 2D or (Batch, Channel,
+            X, Y, Z) for 3D.
+        patch_size: Side length of each square/cube patch.
+        twoD: Whether `data` is 2D (True) or 3D (False).
+
+    Returns:
+        Tensor of shape (Batch, num_patches, patch_size**2 * Channel) for 2D, or
+        (Batch, num_patches, patch_size**3 * Channel) for 3D.
+    """
     batch_size = data.shape[0]
     num_channels = data.shape[1]
     dim_x = data.shape[2]
@@ -33,6 +45,23 @@ def patchify( data, patch_size, twoD):
     return patchified_pixel_values
 
 def unpatchify(patchified_pixel_values,data, patch_size, twoD):
+    """Reassembles a sequence of flattened patches back into a batch of images.
+
+    Inverse of `patchify`.
+
+    Args:
+        patchified_pixel_values: Patch sequence tensor, shape (Batch, num_patches,
+            patch_size**2 * Channel) for 2D, or (Batch, num_patches, patch_size**3 *
+            Channel) for 3D.
+        data: Reference tensor whose shape gives the target channel count and
+            original spatial dimensions, e.g. (Batch, Channel, X, Y[, Z]).
+        patch_size: Side length of each square/cube patch.
+        twoD: Whether the data is 2D (True) or 3D (False).
+
+    Returns:
+        Reconstructed image tensor, shape (Batch, Channel, X, Y) for 2D or (Batch,
+        Channel, X, Y, Z) for 3D.
+    """
     if twoD:
         original_x, original_y = data.shape[2], data.shape[3]
     else:
@@ -56,6 +85,18 @@ def unpatchify(patchified_pixel_values,data, patch_size, twoD):
     return pixel_values
 
 def configure_optimizer(model, optimizer_type, optimizer_kwargs):
+    """Builds a PyTorch optimizer for a model's parameters.
+
+    Args:
+        model: Model whose `.parameters()` will be optimized.
+        optimizer_type: Optimizer type, case-insensitive; one of "sgd", "adam",
+            "adamw".
+        optimizer_kwargs: Keyword arguments passed through to the optimizer
+            constructor (e.g. `lr`, `betas`, `weight_decay`).
+
+    Returns:
+        The instantiated `torch.optim.Optimizer`.
+    """
     if optimizer_type.lower() == "sgd":
         optimizer = torch.optim.SGD(model.parameters(), **optimizer_kwargs)
     elif optimizer_type.lower() == "adam":
@@ -66,6 +107,18 @@ def configure_optimizer(model, optimizer_type, optimizer_kwargs):
     return optimizer
 
 def configure_scheduler(optimizer, scheduler_type, scheduler_kwargs):
+    """Builds a learning rate scheduler for an optimizer.
+
+    Args:
+        optimizer: Optimizer to schedule.
+        scheduler_type: One of "constant", "linear", "exponential",
+            "linear-warmup-cosine-annealing", "reduce-lr-on-plateau".
+        scheduler_kwargs: Keyword arguments passed through to the scheduler
+            constructor.
+
+    Returns:
+        The instantiated learning rate scheduler.
+    """
 
     if scheduler_type == "constant":
         lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, **scheduler_kwargs)
@@ -81,6 +134,18 @@ def configure_scheduler(optimizer, scheduler_type, scheduler_kwargs):
     return lr_scheduler
 
 def interpolate_pos_embed_adaptive(model, checkpoint_model, new_size=127):
+    """Interpolates adaptive-patching positional embeddings from a checkpoint to a new length.
+
+    Resizes the "pos_embed" and, if present, "decoder_pos_embed" entries of
+    `checkpoint_model` (in place) via 1D linear interpolation along the sequence
+    dimension, so they can be loaded into a model whose sequence length differs from
+    the checkpoint's.
+
+    Args:
+        model: Unused; kept for interface compatibility with `interpolate_pos_embed`.
+        checkpoint_model: State dict loaded from a checkpoint; modified in place.
+        new_size: Target sequence length for the interpolated embeddings.
+    """
     if "pos_embed" in checkpoint_model:
         pos_embed_checkpoint = checkpoint_model["pos_embed"]
         embedding_size = pos_embed_checkpoint.shape[-1]
@@ -112,6 +177,29 @@ def interpolate_pos_embed_adaptive(model, checkpoint_model, new_size=127):
             del new_pos_tokens
 
 def init_par_groups(world_rank, data_par_size, tensor_par_size, fsdp_size, simple_ddp_size):
+    """Creates the distributed process groups used for hybrid tensor/data/FSDP parallelism.
+
+    Partitions the world of ranks (assumed laid out as tensor-parallel-size-major, i.e.
+    consecutive ranks belong to the same tensor-parallel group) into tensor-parallel
+    groups, FSDP shard groups, simple-DDP replica groups, a combined DDP group per
+    tensor-parallel index, and an orthogonal "data_seq" group that collects one rank
+    per tensor-parallel group across the data-parallel dimension.
+
+    Args:
+        world_rank: Global rank of the current process.
+        data_par_size: Number of data-parallel replicas (`fsdp_size * simple_ddp_size`).
+        tensor_par_size: Number of ranks participating in tensor parallelism.
+        fsdp_size: Number of ranks over which parameters are FSDP-sharded within a
+            replica.
+        simple_ddp_size: Number of FSDP shard groups that are DDP-synchronized with
+            each other.
+
+    Returns:
+        A tuple `(ddp_group, tensor_par_group, data_seq_ort_group, fsdp_group,
+        simple_ddp_group)` of `torch.distributed.ProcessGroup` objects (or None where
+        the current rank does not belong to a given group), each containing only the
+        groups that `world_rank` is a member of.
+    """
 
     tensor_par_group = None
 
@@ -171,6 +259,22 @@ def init_par_groups(world_rank, data_par_size, tensor_par_size, fsdp_size, simpl
     return ddp_group, tensor_par_group, data_seq_ort_group, fsdp_group, simple_ddp_group
 
 def process_root_dirs(dataset, dict_root_dirs, data_par_size):
+    """Builds per-data-parallel-group lists of image file paths for a dataset.
+
+    For "imagenet", groups classes under each root directory into `data_par_size`
+    (or fewer) buckets of combined class image lists. For other datasets, lists all
+    files under each root directory's "imagesTr" subfolder, one entry per key in
+    `dict_root_dirs`.
+
+    Args:
+        dataset: Dataset name, e.g. "imagenet" or another supported dataset key.
+        dict_root_dirs: Dict mapping a dataset key to its root directory path.
+        data_par_size: Number of data-parallel groups to split the imagenet classes
+            across; unused for non-imagenet datasets.
+
+    Returns:
+        Dict mapping a group/dataset key to a list of file paths.
+    """
     if dataset == "imagenet":
         dict_lister_trains = {}
         for k, root_dir in dict_root_dirs.items():
@@ -202,6 +306,24 @@ def process_root_dirs(dataset, dict_root_dirs, data_par_size):
     return dict_lister_trains
 
 def calculate_load_balancing_on_the_fly(conf, VERBOSE=False):
+    """Computes how many DDP ranks and batches-per-epoch each dataset should get.
+
+    Given the relative size (in tiles) of each dataset, allocates data-parallel ranks
+    proportionally (rounding to whole ranks while ensuring every dataset gets at
+    least one rank and the total matches `data_par_size`), then computes how many
+    images/batches per epoch each rank and each dataloader worker should process.
+
+    Args:
+        conf: Parsed training configuration dict (as returned by `parse_config`).
+        VERBOSE: If True, print intermediate values useful for filling in the
+            `batches_per_rank_epoch` and `dataset_group_list` config entries.
+
+    Returns:
+        A tuple `(batches_per_rank_epoch, grouplist_str)` where `batches_per_rank_epoch`
+        is a dict mapping each dataset key to the number of batches per rank per
+        epoch, and `grouplist_str` is a colon-separated string of the number of DDP
+        ranks assigned to each dataset, in the same order as `dict_root_dirs`.
+    """
 
     dict_root_dirs = conf['data']['dict_root_dirs']
     dict_start_idx = conf['dataloader']['dict_start_idx']
@@ -384,10 +506,31 @@ def calculate_load_balancing_on_the_fly(conf, VERBOSE=False):
     return batches_per_rank_epoch, grouplist_str
 
 def is_power_of_two(n):
+    """Checks whether an integer is a power of two.
+
+    Args:
+        n: Integer to check.
+
+    Returns:
+        True if `n` is a nonzero power of two, False otherwise.
+    """
     return (n != 0) and (n & (n-1) == 0)
 
 
 def calculate_tile_overlap(overlap):
+    """Splits a total per-dimension overlap into start/end padding amounts.
+
+    Even overlap is split symmetrically; odd overlap pads one extra unit onto the
+    end rather than the start.
+
+    Args:
+        overlap: Sequence of total overlap amounts, one per spatial dimension.
+
+    Returns:
+        A tuple `(start_overlap, end_overlap)` of lists, each the same length as
+        `overlap`, giving the overlap to apply at the start and end of each
+        dimension respectively.
+    """
     start_overlap = []
     end_overlap = []
     for i in range(len(overlap)):

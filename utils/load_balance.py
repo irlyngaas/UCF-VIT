@@ -7,6 +7,12 @@ from UCF_VIT.parse import parse_config
 
 
 def main():
+    """Compute and print the offline load-balancing assignment for a training run.
+
+    Parses a config YAML file given as a command-line argument, then computes how
+    dataset batches should be distributed across ranks/epochs so that each rank
+    processes a balanced amount of data, printing the details as it goes.
+    """
     parser = ArgumentParser(description="")
     parser.add_argument("config", type=str, help="Path to configuration YAML file")
     args = parser.parse_args()

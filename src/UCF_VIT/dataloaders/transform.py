@@ -7,9 +7,31 @@ from .quadtree import FixedQuadTree
 from .octree import FixedOctTree
 
 class Patchify(torch.nn.Module):
+    """Adaptive (quadtree-based) patchification transform for 2D images.
+
+    Detects edges with a randomly smoothed Canny filter, builds a `FixedQuadTree`
+    over the edge map, and serializes the image into a fixed-length sequence of
+    variable-sized patches concentrated around detected edges.
+    """
+
     def __init__(self, sths=[0,1,3,5], fixed_length=196, cannys=[50, 100], patch_size=16, num_channels=3, dataset="imagenet", return_edges=False) -> None:
+        """Initializes the randomization ranges and patch parameters for the transform.
+
+        Args:
+            sths: Candidate Gaussian smoothing kernel sizes to randomly choose from
+                before edge detection (0 = no smoothing, use uniform random noise as
+                the edge map instead).
+            fixed_length: Fixed number of patches the image is serialized into.
+            cannys: `[low, high)` range of Canny lower thresholds to randomly choose
+                from; the corresponding upper threshold is `low + 50`.
+            patch_size: Side length of the (square) leaf patches.
+            num_channels: Number of image channels.
+            dataset: Dataset name; controls how edges are computed/normalized
+                ("imagenet"/"catsdogs" vs. other datasets).
+            return_edges: If True, also return the computed edge map from `forward`.
+        """
         super().__init__()
-        
+
         self.sths = sths
         self.fixed_length = fixed_length
         self.cannys = [x for x in range(cannys[0], cannys[1], 1)]
@@ -19,8 +41,20 @@ class Patchify(torch.nn.Module):
         self.return_edges = return_edges
         
     def forward(self, img):  # we assume inputs are always structured like this
+        """Computes an edge map for `img` and adaptively patchifies it via a quadtree.
+
+        Args:
+            img: Input 2D image array, shape (H, W[, C]).
+
+        Returns:
+            If `self.return_edges` is False: `(seq_img, seq_size, seq_pos, qdt)`.
+            If True: `(seq_img, seq_size, seq_pos, qdt, edges)`. `seq_img` is the
+            flattened patch sequence, `seq_size` the per-patch side length,
+            `seq_pos` the per-patch center position, `qdt` the `FixedQuadTree`
+            instance, and `edges` the computed edge map.
+        """
         # Do some transformations. Here, we're just passing though the input
-        
+
         self.smooth_factor = random.choice(self.sths)
         c = random.choice(self.cannys)
         self.canny = [c, c+50]
@@ -54,10 +88,32 @@ class Patchify(torch.nn.Module):
             return seq_img, seq_size, seq_pos, qdt
 
 class Patchify_3D(torch.nn.Module):
+    """Adaptive (octree-based) patchification transform for 3D volumes.
+
+    Detects edges per-slice with a Gaussian-smoothed Sobel/Canny pipeline, combines
+    them into a 3D binary edge volume, builds a `FixedOctTree` over it, and
+    serializes the volume into a fixed-length sequence of variable-sized patches
+    concentrated around detected edges.
+    """
+
     #TODO: Pass dtype for preferred return dtype
     def __init__(self, sths=[0,1,3,5], fixed_length=196, cannys=[50, 100], patch_size=16, num_channels=3, dataset="basic_ct", return_edges=False) -> None:
+        """Initializes the randomization ranges and patch parameters for the transform.
+
+        Args:
+            sths: Candidate Gaussian smoothing sigmas to randomly choose from before
+                edge detection.
+            fixed_length: Fixed number of patches the volume is serialized into.
+            cannys: `[low, high)` range of Canny lower thresholds to randomly choose
+                from; the corresponding upper threshold is `low + 50`.
+            patch_size: Side length of the (cubic) leaf patches.
+            num_channels: Number of volume channels.
+            dataset: Dataset name; kept for interface compatibility with `Patchify`.
+            return_edges: If True, also return the computed edge volume from
+                `forward`.
+        """
         super().__init__()
-        
+
         self.sths = sths
         self.fixed_length = fixed_length
         self.cannys = [x for x in range(cannys[0], cannys[1], 1)]
@@ -67,6 +123,18 @@ class Patchify_3D(torch.nn.Module):
         self.return_edges = return_edges
 
     def forward(self, img):  # we assume inputs are always structured like this
+        """Computes a 3D edge volume for `img` and adaptively patchifies it via an octree.
+
+        Args:
+            img: Input 3D volume array, shape (D, H, W, C).
+
+        Returns:
+            If `self.return_edges` is False: `(seq_img, seq_size, seq_pos,
+            octtree)`. If True: `(seq_img, seq_size, seq_pos, octtree, edges)`.
+            `seq_img` is the flattened patch sequence, `seq_size` the per-patch side
+            length, `seq_pos` the per-patch center position, `octtree` the
+            `FixedOctTree` instance, and `edges` the computed edge volume.
+        """
         self.smooth_factor = random.choice(self.sths)
         c = random.choice(self.cannys)
         self.canny = [c, c+50]
