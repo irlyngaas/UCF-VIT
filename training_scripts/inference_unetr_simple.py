@@ -30,7 +30,27 @@ from UCF_VIT.utils.fused_attn import FusedAttn
 import einops
 from matplotlib import pyplot as plt
 
-def test_step_adaptive(data, variables, net: UNETR, patch_size, twoD, seq_ps, in_chans, sqrt_len):
+def test_step_adaptive(data, seq, label, variables, net: UNETR, patch_size, twoD, seq_ps, in_chans, sqrt_len):
+    """Runs a UNETR forward pass for an adaptively-patched inference sample.
+
+    Args:
+        data: Full-resolution input tile.
+        seq: Flattened adaptive-patch sequence to reshape into a dense grid before
+            the forward pass.
+        label: Unused.
+        variables: Variable/channel labels for `data`.
+        net: UNETR model to run inference with.
+        patch_size: Patch size used by the adaptive patcher.
+        twoD: Whether the data is 2D (True) or 3D (False).
+        seq_ps: Combined patch size/position tensor used for adaptive position
+            embeddings.
+        in_chans: Unused.
+        sqrt_len: Grid side length (square/cube root of the fixed adaptive-patch
+            sequence length).
+
+    Returns:
+        Model output logits.
+    """
     if twoD:
         seq = einops.rearrange(seq, 'b c (s1 s2) (ps1 ps2)-> b c (s1 ps1) (s2 ps2)', s1=sqrt_len, s2=sqrt_len, ps1=patch_size, ps2=patch_size)
     else:
@@ -40,12 +60,34 @@ def test_step_adaptive(data, variables, net: UNETR, patch_size, twoD, seq_ps, in
     return output
 
 def test_step(data, label, variables, net: UNETR):
+    """Runs a UNETR forward pass for a standard-patched (non-adaptive) inference sample.
+
+    Args:
+        data: Input tile.
+        label: Unused.
+        variables: Variable/channel labels for `data`.
+        net: UNETR model to run inference with.
+
+    Returns:
+        Model output logits.
+    """
 
     output = net.forward(data, variables)
 
     return output
 
 def main(device, local_rank):
+    """Loads a UNETR model, optionally initializes it from a pretrained MAE encoder or checkpoint, and runs one batch of inference.
+
+    Reads the config path from `sys.argv[1]`, builds the model and dataloader,
+    runs a single inference batch (adaptive or standard patching depending on the
+    config), computes the Dice metric, and saves prediction/label visualizations to
+    an "images" directory (rank 0 only).
+
+    Args:
+        device: Device to run the model and data on.
+        local_rank: Local rank of this process, used for DDP device placement.
+    """
 #1. Load arguments from config file and setup parallelization
 ##############################################################################################################
 
