@@ -20,6 +20,33 @@ from UCF_VIT.model.building_blocks import Block
 from timm.layers import use_fused_attn
 
 def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, tensor_par_group):
+    """Build the model architecture, load its initial weights, and wrap it with FSDP.
+
+    Instantiates the model type given in `conf`, initializes its weights either from
+    scratch, from a pretrained checkpoint, or by resuming from an existing checkpoint,
+    then wraps the model in FSDP with the sharding strategy implied by the configured
+    parallelism sizes and applies activation checkpointing to each transformer block.
+
+    Args:
+        conf: Parsed training configuration dict (as returned by `parse_config`).
+        p_conf: Parsed pretrained-model configuration dict (as returned by
+            `parse_pretrained_config`), used only when `conf["trainer"]["use_pretrained_model"]`
+            is True.
+        device: Device to move the model to.
+        local_rank: Local rank of this process, used as the FSDP `device_id`.
+        fsdp_group: Process group over which parameters are fully/hybrid sharded.
+        simple_ddp_group: Process group over which sharded replicas are data-parallel
+            synchronized.
+        tensor_par_group: Process group used for tensor-parallel weight synchronization.
+
+    Returns:
+        A tuple `(model, epoch_start, loss_list)` where `model` is the FSDP-wrapped
+        model, `epoch_start` is the starting epoch (0 when training from scratch or
+        from a pretrained model, or one past the checkpointed epoch when resuming),
+        and `loss_list` is the loss history accumulated so far (empty when training
+        from scratch or from a pretrained model, or restored from the checkpoint
+        when resuming). Identical on every rank.
+    """
     world_rank = dist.get_rank()
 
     if conf["trainer"]["data_type"] == "bfloat16":
@@ -170,11 +197,25 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
 
                 checkpoint = torch.load(conf["trainer"]["checkpoint_path"]+"/"+conf["trainer"]["checkpoint_filename"]+"_rank_"+str(world_rank)+".ckpt",map_location=map_location)
                 model.load_state_dict(checkpoint['model_state_dict'])
+                loss_list = checkpoint['loss_list']
+                epoch_start = checkpoint['epoch'] + 1
                 del checkpoint
 
             else:
                 print("resume from checkpoint was set to True. But the checkpoint path does not exist.",flush=True)
                 sys.exit("checkpoint path does not exist")
+
+        #Only ranks below tensor_par_size actually read a checkpoint file above; broadcast
+        #the resumed epoch_start/loss_list from rank 0 so every rank starts the training
+        #loop at the same epoch (required for collective ops to stay in sync) instead of
+        #silently restarting other ranks' progress at epoch 0.
+        epoch_start_tensor = torch.tensor(epoch_start if world_rank < conf["parallelism"]["tensor_par_size"] else 0)
+        dist.broadcast(epoch_start_tensor, src=0)
+        epoch_start = epoch_start_tensor.item()
+
+        loss_list_holder = [loss_list] if world_rank < conf["parallelism"]["tensor_par_size"] else [None]
+        dist.broadcast_object_list(loss_list_holder, src=0)
+        loss_list = loss_list_holder[0]
 
     dist.barrier()
     
