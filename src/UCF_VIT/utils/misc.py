@@ -384,9 +384,9 @@ def calculate_load_balancing_on_the_fly(conf, VERBOSE=False):
         print("Total Tiles per Dataset", num_total_tiles)
         print("Total Tiles", sum(num_total_tiles))
         if twoD:
-            print("Total Tokens", sum(num_total_tiles)*(tile_size_x/patch_size)*(tile_size_y/patch_size))
+            print("Total Tokens", sum(num_total_tiles)*(tile_size[0]/patch_size)*(tile_size[1]/patch_size))
         else:
-            print("Total Tokens", sum(num_total_tiles)*(tile_size_x/patch_size)*(tile_size_y/patch_size)*(tile_size_z/patch_size))
+            print("Total Tokens", sum(num_total_tiles)*(tile_size[0]/patch_size)*(tile_size[1]/patch_size)*(tile_size[2]/patch_size))
         
     total_tiles_all_data = sum(num_total_tiles)
         
