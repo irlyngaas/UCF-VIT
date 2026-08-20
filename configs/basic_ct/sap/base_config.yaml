@@ -55,14 +55,14 @@ model:
 tiling:
   do_tiling: True
   div: 4
-  tile_overlap: 0.0
+  tile_overlap: 0
   use_all_data: False
 
 # ---------------------------- AP ------------------------------------------------
 
 ap:
   do_ap: True
-  fixed_length: 512
+  fixed_length: 196
   separate_channels: False
   use_adaptive_pos_emb: True
   

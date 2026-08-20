@@ -61,7 +61,7 @@ model:
 tiling:
   do_tiling: False
   div: 1
-  tile_overlap: 0.0
+  tile_overlap: 0
   use_all_data: False
 
 # ---------------------------- AP ------------------------------------------------
@@ -111,6 +111,6 @@ dataloader:
 # ---------------------------- DATASET SPECIFIC OPTIONS -------------------------------------------
 dataset_options:
 
-  imagenet_resize: {
+  resize: {
       'imagenet': [256,256],
     }

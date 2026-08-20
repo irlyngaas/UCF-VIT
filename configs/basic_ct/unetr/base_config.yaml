@@ -58,7 +58,7 @@ model:
 tiling:
   do_tiling: True
   div: 4
-  tile_overlap: 0.0
+  tile_overlap: 0
   use_all_data: False
 
 # ---------------------------- AP ------------------------------------------------
