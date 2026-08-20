@@ -157,19 +157,42 @@ class NativePytorchDataModule(torch.nn.Module):
         dict_root_dirs (Dict): Dictionary of root directories for each source.
         dict_start_idx (Dict): Dictionary of start indices ratio (between 0.0 and 1.0) for each source.
         dict_end_idx (Dict): Dictionary of end indices ratio (between 0.0 and 1.0) for each source.
+        dict_buffer_sizes (Dict): Dictionary of shuffle-buffer sizes for each source, used by
+            `ShuffleIterableDataset`.
         dict_in_variables (Dict): Dictionary of input modality variables for each source
-        dict_buffer_sizes (Dict): Dictionary of buffer sizes for each source.
         num_channels_used (Dict): Dictionary of number of channels used from each source.
         batch_size (int, optional): Batch size.
         num_workers (int, optional): Number of workers.
         pin_memory (bool, optional): Whether to pin memory.
-        data_par_size (int, optional): the size of the data parallelism
+        patch_size (int, optional): Patch size used by the adaptive-patching transform
+            (`Patchify`/`Patchify_3D`), when `adaptive_patching` is True.
         tile_size (tuple[int,...], optional): the tile size in each dimension
         twoD (bool, optional): Variable for indicating two or three dimensionsal input, if False, three dimensional input.
-        return_label (bool, optional): Whether or not the dataloader returns segmentation labels 
         dataset_group_list (string, optional): How to split available GPUs amongst the available datasets, run "python utils/preprocess_load_balancing.py CONFIG_FILE NUM_GPUS" to obtain
+        batches_per_rank_epoch (Dict, optional): Dict mapping each dataset key to the number of
+            batches per rank per epoch (as returned by `calculate_load_balancing_on_the_fly`),
+            used in `setup`/`reset` to determine how many times each dataset's file listing
+            needs to be replicated to balance dataset sizes.
         div (int, optional): How many tiles to divide each image into
         tile_overlap (tuple[int,...], optional): Amount of tile overlapping to use in each dimension. Use 0 in each dimension for no overlapping
+        adaptive_patching (bool, optional): Whether to adaptively patchify each sample via a
+            quadtree/octree instead of returning fixed-size tiles.
+        fixed_length (int, optional): Fixed output sequence length for adaptive patching, when
+            `adaptive_patching` is True.
+        separate_channels (bool, optional): Whether adaptive patching is done independently per
+            channel (True) or jointly across all channels (False).
+        data_par_size (int, optional): the size of the data parallelism
+        dataset (str, optional): Dataset name, e.g. "imagenet" or "basic_ct"; determines how
+            files are listed and how samples are processed/collated.
+        return_label (bool, optional): Whether or not the dataloader returns segmentation labels
+        return_qdt (bool, optional): Whether to also yield the quadtree/octree object(s) used for
+            each adaptively-patched sample.
+        ddp_group (ProcessGroup, optional): Process group used to determine this rank's assigned
+            dataset in `train_dataloader`; defaults to the default world group if None.
+        num_classes (int, optional): Number of segmentation classes; required when `dataset` is
+            "basic_ct" and `return_label` is True, to one-hot encode masks in `collate_fn`.
+        resize (Dict, optional): Dict mapping "imagenet" to the `[height, width]` size to resize
+            images to; only used when `dataset` is "imagenet".
     """
 
     def __init__(

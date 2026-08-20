@@ -98,7 +98,8 @@ def main():
     img_path = sys.argv[2]
     dict_key = sys.argv[3]
 
-    conf = yaml.load(open(config_path,'r'),Loader=yaml.FullLoader)
+    with open(config_path,'r') as f:
+        conf = yaml.load(f,Loader=yaml.FullLoader)
 
     dataset = conf['data']['dataset']
 

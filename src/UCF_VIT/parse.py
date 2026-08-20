@@ -216,7 +216,8 @@ def parse_config(args, load_balance_offline=False):
         "dataset_options", each holding the validated configuration for that section.
     """
 
-    conf = yaml.load(open(args.config,'r'),Loader=yaml.FullLoader)
+    with open(args.config,'r') as f:
+        conf = yaml.load(f,Loader=yaml.FullLoader)
 
 # ---------------------------- TRAINER -------------------------------------------
     try:
@@ -644,7 +645,8 @@ def parse_pretrained_config(args, conf):
             sys.exit("pretrained_checkpoint_filename needs to be set in the trainer section")
 
         if args.pretrained_config != "":
-            pretrained_conf = yaml.load(open(args.pretrained_config,'r'),Loader=yaml.FullLoader)
+            with open(args.pretrained_config,'r') as f:
+                pretrained_conf = yaml.load(f,Loader=yaml.FullLoader)
         
 # ---------------------------- MODEL ---------------------------------------------
 
