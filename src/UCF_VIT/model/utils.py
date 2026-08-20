@@ -208,12 +208,12 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
         #the resumed epoch_start/loss_list from rank 0 so every rank starts the training
         #loop at the same epoch (required for collective ops to stay in sync) instead of
         #silently restarting other ranks' progress at epoch 0.
-        epoch_start_tensor = torch.tensor(epoch_start if world_rank < conf["parallelism"]["tensor_par_size"] else 0)
+        epoch_start_tensor = torch.tensor(epoch_start if world_rank < conf["parallelism"]["tensor_par_size"] else 0, device=device)
         dist.broadcast(epoch_start_tensor, src=0)
         epoch_start = epoch_start_tensor.item()
 
         loss_list_holder = [loss_list] if world_rank < conf["parallelism"]["tensor_par_size"] else [None]
-        dist.broadcast_object_list(loss_list_holder, src=0)
+        dist.broadcast_object_list(loss_list_holder, src=0, device=device)
         loss_list = loss_list_holder[0]
 
     dist.barrier()
