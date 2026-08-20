@@ -102,15 +102,15 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
                 print("Train starting from pretrained model.",flush=True)
 
             if p_conf["model_type"] == "VIT":
-                from UCF_VIT.fsdp.arch import VIT as pretrained_model_arch
+                from UCF_VIT.model.arch import VIT as pretrained_model_arch
             elif p_conf["model_type"] == "SAP":
-                from UCF_VIT.fsdp.arch import SAP as pretrained_model_arch
+                from UCF_VIT.model.arch import SAP as pretrained_model_arch
             elif p_conf["model_type"] == "MAE":
-                from UCF_VIT.fsdp.arch import MAE as pretrained_model_arch
+                from UCF_VIT.model.arch import MAE as pretrained_model_arch
             elif p_conf["model_type"] == "UNETR":
-                from UCF_VIT.fsdp.arch import UNETR as pretrained_model_arch
+                from UCF_VIT.model.arch import UNETR as pretrained_model_arch
             elif p_conf["model_type"] == "DiffusionVIT":
-                from UCF_VIT.fsdp.arch import DiffusionVIT as pretrained_model_arch
+                from UCF_VIT.model.arch import DiffusionVIT as pretrained_model_arch
 
             pretrained_model = pretrained_model_arch(
                 img_size=(conf["data"]["tile_size"][0],conf["data"]["tile_size"][1]) if conf["data"]["twoD"] else (conf["data"]["tile_size"][0],conf["data"]["tile_size"][1], conf["data"]["tile_size"][2]),
@@ -124,7 +124,6 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
                 drop_rate=conf["model"]["drop_rate"],
                 twoD=conf["data"]["twoD"],
                 default_vars=p_conf["default_vars"],
-                single_channel=False, #TODO: Take out single channel option altogether
                 use_varemb=conf["model"]["use_channel_aggregation"], #TODO: Change use_varemb to use_channel_aggregation in arch.py
                 adaptive_patching=conf["ap"]["do_ap"],
                 fixed_length=conf["ap"]["fixed_length"],
