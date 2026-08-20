@@ -14,20 +14,28 @@ run -- each one a fully separate multi-process job step, with no nesting.
 For each config under configs/**/base_config.yaml, this script:
   1. Writes a single smoke-test config to a job-scoped scratch dir: same data
      paths, tiling, and adaptive-patching settings as the real config (so the
-     real data pipeline runs unmodified), but a tiny model (embed_dim=32,
+     real data pipeline runs unmodified), but a tiny model (embed_dim=24,
      num_heads=2, depth=4 -- not 1, since UNETR's skip-connection indexing
      does depth // 4 and degenerates to duplicate indices below that),
      max_epochs=1, save_frequency=1, resume_from_checkpoint=False, a scratch
-     checkpoint_path, and -- for configs using the iterative dataloader
-     (dataloader.type == "iterative_dataloader", e.g. basic_ct/imagenet, but
-     not catsdogs, which globs every file directly with no trimming knob) --
-     narrowed dict_start_idx/dict_end_idx so only a small, fixed number of
-     real files get read regardless of how large the real dataset actually
-     is. This is computed dynamically (see compute_narrow_dict_idx) by
-     calling the same UCF_VIT.utils.misc.process_root_dirs the real pipeline
-     uses to get actual file counts, rather than guessing a fixed fraction
-     that could round to 0 files for a modest dataset or barely help for a
-     huge one like full ImageNet.
+     checkpoint_path, and one of two real-data-narrowing mechanisms so only a
+     small, fixed number of real files get read regardless of how large the
+     real dataset actually is:
+       - For configs using the iterative dataloader (dataloader.type ==
+         "iterative_dataloader", e.g. basic_ct/imagenet): narrowed
+         dict_start_idx/dict_end_idx, computed dynamically (see
+         compute_narrow_dict_idx) by calling the same
+         UCF_VIT.utils.misc.process_root_dirs the real pipeline uses to get
+         actual file counts, rather than guessing a fixed fraction that
+         could round to 0 files for a modest dataset or barely help for a
+         huge one like full ImageNet.
+       - For configs using the plain dataloader (dataloader.type ==
+         "dataloader", e.g. catsdogs): train.py globs every real file
+         directly with no config-level trimming knob at all, so instead (see
+         create_narrow_catsdogs_dir) this globs the real directory itself,
+         then points dict_root_dirs at a scratch directory of *symlinks* to
+         a subset of the real files -- same "real data, just less of it"
+         principle, since there's no index-based slicing to hook into here.
   2. Runs it via `srun -n <ntasks> python training_scripts/train.py <config>`
      and checks it exits 0 and actually wrote a rank-0 checkpoint file.
   3. Edits that *same* config file in place -- resume_from_checkpoint=True,
@@ -173,26 +181,91 @@ def compute_narrow_dict_idx(conf, min_files):
     return {k: frac_for(len(v)) for k, v in dict_lister_trains.items()}
 
 
+def create_narrow_catsdogs_dir(conf, scratch_dir, min_files):
+    """Narrows a "dataloader"-type config's real data by symlinking a subset of real files.
+
+    Only meaningful for conf["dataloader"]["type"] == "dataloader" (e.g.
+    catsdogs). train.py's handling of this type globs every *.jpg file
+    directly from dict_root_dirs with no config-level trimming knob at all
+    (unlike the iterative dataloader's dict_start_idx/dict_end_idx), so this
+    globs the real directory itself (mirroring train.py's own
+    `glob.glob(os.path.join(dict_root_dirs[dkey], '*.jpg'))`, and takes the
+    same first dict_root_dirs key train.py's "dataloader_type == 'dataloader'"
+    branch does), then creates a scratch directory of symlinks to a subset of
+    the real files -- same "real data, just less of it" principle as
+    compute_narrow_dict_idx.
+
+    The subset size is max(min_files, batch_size * data_par_size), not just
+    min_files: train.py wraps this dataset in a DataLoader with
+    drop_last=True, so after DistributedSampler splits files across
+    data_par_size ranks, each rank needs at least batch_size files or its
+    entire (undersized) batch gets silently dropped -- giving an empty
+    dataloader (0 iterations/epoch) rather than an error, which would make
+    the smoke test report PASS despite zero actual training happening.
+
+    Args:
+        conf: A parsed (real, un-tinied) config dict. Needs
+            conf["data"]["dict_root_dirs"]/["dataset"],
+            conf["dataloader"]["batch_size"], and
+            conf["parallelism"]["fsdp_size"]/["simple_ddp_size"].
+        scratch_dir: Job-scoped scratch directory to create the symlink
+            subdirectory under.
+        min_files: Target (minimum) number of real files to symlink.
+
+    Returns:
+        A tuple (dkey, narrowed_dir): dkey is the dict_root_dirs key train.py
+        actually uses for this dataloader type, and narrowed_dir is the
+        scratch directory of symlinks to point dict_root_dirs[dkey] at
+        instead of the real directory.
+
+    Raises:
+        NoRealDataFoundError: If the real directory has zero *.jpg files.
+    """
+    dkey_train = list(conf["data"]["dict_root_dirs"])[0]
+    real_dir = conf["data"]["dict_root_dirs"][dkey_train]
+    real_files = sorted(glob.glob(os.path.join(real_dir, "*.jpg")))
+
+    if not real_files:
+        raise NoRealDataFoundError(
+            f"No *.jpg files found for dataset={conf['data']['dataset']!r}, key {dkey_train!r} "
+            f"under dict_root_dirs={{{dkey_train!r}: {real_dir!r}}}"
+        )
+
+    data_par_size = conf["parallelism"]["fsdp_size"] * conf["parallelism"]["simple_ddp_size"]
+    needed = conf["dataloader"]["batch_size"] * data_par_size
+    count = min(len(real_files), max(min_files, needed))
+
+    narrowed_dir = os.path.join(scratch_dir, "narrowed_data")
+    os.makedirs(narrowed_dir, exist_ok=True)
+    for f in real_files[:count]:
+        os.symlink(f, os.path.join(narrowed_dir, os.path.basename(f)))
+
+    return dkey_train, narrowed_dir
+
+
 def make_smoke_config(base_config_path, scratch_dir, min_files=DEFAULT_MIN_FILES):
     """Loads a real config and writes a tiny/fast, freshly-training smoke-test variant.
 
     Only overrides model size, epoch count, checkpoint location,
-    resume_from_checkpoint, and (see compute_narrow_dict_idx)
-    dict_start_idx/dict_end_idx. Everything else -- data paths, tiling,
-    adaptive patching, batch size, load-balancing settings -- is left exactly
-    as in the real config.
+    resume_from_checkpoint, and (see compute_narrow_dict_idx /
+    create_narrow_catsdogs_dir) the real-data-narrowing fields appropriate to
+    this config's dataloader type. Everything else -- data paths (beyond
+    narrowing), tiling, adaptive patching, batch size, load-balancing
+    settings -- is left exactly as in the real config.
 
     Args:
         base_config_path: Path to the real config YAML to base this on.
-        scratch_dir: Job-scoped scratch directory to write the checkpoint and
-            this generated config file into.
-        min_files: Passed through to compute_narrow_dict_idx.
+        scratch_dir: Job-scoped scratch directory to write the checkpoint,
+            any narrowed-data symlinks, and this generated config file into.
+        min_files: Passed through to compute_narrow_dict_idx /
+            create_narrow_catsdogs_dir.
 
     Returns:
         Path to the written smoke-test config file.
 
     Raises:
-        NoRealDataFoundError: See compute_narrow_dict_idx.
+        NoRealDataFoundError: See compute_narrow_dict_idx /
+            create_narrow_catsdogs_dir.
     """
     with open(base_config_path) as f:
         conf = yaml.load(f, Loader=yaml.FullLoader)
@@ -204,12 +277,16 @@ def make_smoke_config(base_config_path, scratch_dir, min_files=DEFAULT_MIN_FILES
     conf["trainer"]["max_epochs"] = 1
     conf["trainer"]["resume_from_checkpoint"] = False
 
-    narrow_end_idx = compute_narrow_dict_idx(conf, min_files)
-    if narrow_end_idx is not None:
+    os.makedirs(scratch_dir, exist_ok=True)
+
+    if conf["dataloader"]["type"] == "iterative_dataloader":
+        narrow_end_idx = compute_narrow_dict_idx(conf, min_files)
         conf["dataloader"]["dict_start_idx"] = {k: 0.0 for k in narrow_end_idx}
         conf["dataloader"]["dict_end_idx"] = narrow_end_idx
+    elif conf["dataloader"]["type"] == "dataloader":
+        dkey, narrowed_dir = create_narrow_catsdogs_dir(conf, scratch_dir, min_files)
+        conf["data"]["dict_root_dirs"][dkey] = narrowed_dir
 
-    os.makedirs(scratch_dir, exist_ok=True)
     out_path = os.path.join(scratch_dir, "smoke.yaml")
     with open(out_path, "w") as f:
         yaml.dump(conf, f)

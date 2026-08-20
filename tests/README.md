@@ -160,29 +160,43 @@ For each of the 10 shipped configs, in order:
 
 1. Writes a smoke-test config to `/tmp/$SLURM_JOB_ID/checkpoint_smoke_test/<config>/smoke.yaml`:
    real data paths, tiling, and adaptive-patching settings, unmodified; only
-   the model is shrunk (`embed_dim=32, num_heads=2, depth=4`),
-   `max_epochs=1`, `resume_from_checkpoint=False`, `checkpoint_path` pointed
-   at that scratch directory, and — for configs using the iterative
-   dataloader (`basic_ct`/`imagenet`, not `catsdogs`, which globs every file
-   directly with no trimming knob) — `dict_start_idx`/`dict_end_idx`
-   narrowed so only ~64 real files get read per dataset key, regardless of
-   how large the real dataset actually is. This is computed dynamically
-   (`compute_narrow_dict_idx`) by calling the same
-   `UCF_VIT.utils.misc.process_root_dirs` the real pipeline uses to get
-   actual file counts on Frontier's filesystem, rather than guessing a fixed
-   fraction that could round to 0 files for a modest dataset or barely help
-   for one as huge as full ImageNet. `--min-files` overrides the target
-   (default 64 — comfortably above `data_par_size` and every shipped
-   config's `batch_size`, so at least one real batch per rank should still
-   be possible; if a real run shows too few/many files, adjust this rather
-   than the fraction directly). If `process_root_dirs` finds **zero** real
-   files for a dataset key — almost always a stale/wrong `dict_root_dirs`
-   path in the config, not a code bug — this step raises
-   `NoRealDataFoundError` with the offending key and path, and that config is
-   marked `FAIL (no real data found)` **without ever launching `srun`**,
-   rather than burning ~20s of GPU allocation on a run that's guaranteed to
-   crash confusingly deep inside `calculate_load_balancing_on_the_fly` with
-   a bare `ZeroDivisionError`.
+   the model is shrunk (`embed_dim=24, num_heads=2, depth=4` — `embed_dim`
+   must be divisible by `LCM(4, 6)=12` for the 2D/3D sincos position
+   embeddings and by `num_heads`), `max_epochs=1`,
+   `resume_from_checkpoint=False`, `checkpoint_path` pointed at that scratch
+   directory, and one of two real-data-narrowing mechanisms depending on
+   `dataloader.type`, so only a small, fixed number of real files get read
+   regardless of how large the real dataset actually is:
+   - For the iterative dataloader (`basic_ct`/`imagenet`):
+     `dict_start_idx`/`dict_end_idx` narrowed so only ~64 real files get read
+     per dataset key. This is computed dynamically
+     (`compute_narrow_dict_idx`) by calling the same
+     `UCF_VIT.utils.misc.process_root_dirs` the real pipeline uses to get
+     actual file counts on Frontier's filesystem, rather than guessing a
+     fixed fraction that could round to 0 files for a modest dataset or
+     barely help for one as huge as full ImageNet.
+   - For the plain dataloader (`catsdogs`), which globs every real file
+     directly in `train.py` with no config-level trimming knob at all:
+     `create_narrow_catsdogs_dir` globs the real directory itself the same
+     way `train.py` does, then points `dict_root_dirs` at a scratch
+     directory of *symlinks* to a subset of the real files — `max(min_files,
+     batch_size * data_par_size)` of them, not just `min_files`, since
+     `train.py` wraps this dataset in a `DataLoader` with `drop_last=True`:
+     with too few files, `DistributedSampler` would give some rank an
+     undersized batch that gets silently dropped entirely, yielding 0
+     iterations/epoch (and a false `PASS`) instead of an error.
+
+   `--min-files` overrides the target for both mechanisms (default 64 —
+   comfortably above `data_par_size` and every shipped config's
+   `batch_size`, so at least one real batch per rank should still be
+   possible; if a real run shows too few/many files, adjust this rather than
+   editing either mechanism directly). If no real files are found at all —
+   almost always a stale/wrong `dict_root_dirs` path in the config, not a
+   code bug — this step raises `NoRealDataFoundError` with the offending key
+   and path, and that config is marked `FAIL (no real data found)` **without
+   ever launching `srun`**, rather than burning GPU allocation on a run
+   that's guaranteed to crash confusingly deep inside
+   `calculate_load_balancing_on_the_fly` with a bare `ZeroDivisionError`.
 2. Runs it, and checks it exits 0 and actually wrote a rank-0 checkpoint.
 3. Edits that *same* config file in place — `resume_from_checkpoint=True`,
    `checkpoint_filename="epoch_0"` (the file the fresh run actually
