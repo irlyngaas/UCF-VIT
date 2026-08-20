@@ -265,6 +265,17 @@ real `parse_config` call end to end against those fixtures.
    150s rather than an actual hang. Not yet root-caused; try a longer
    `--timeout` (e.g. via `run_training_smoke_single.sh`, which defaults to
    300s) next.
+4. With one `dict_root_dirs` path fixed, `basic_ct-unetr` (a 3D config —
+   `twoD: False`) got past data loading and failed inside `get_model` with
+   `assert embed_dim % 3 == 0` in `get_3d_sincos_pos_embed` — a bug in
+   `TINY_MODEL_OVERRIDES` itself, not the library: `embed_dim=32` isn't
+   divisible by 3. Tracing the exact assert chain: `get_2d_sincos_pos_embed`
+   needs `embed_dim % 4 == 0` (halves it, then the halved value must itself
+   be even) and `get_3d_sincos_pos_embed` needs `embed_dim % 6 == 0` (same
+   halving, split three ways) — since the override applies to both 2D and 3D
+   configs uniformly, fixed to `embed_dim=24` (divisible by `LCM(4,6)=12`,
+   and by `num_heads=2`). Verified against the real `pos_embed.py` functions
+   locally before pushing back.
 
 That fixture testing also surfaced (but didn't need fixing to proceed) a
 narrower, real edge case in `process_root_dirs`: when an `imagenet`-format

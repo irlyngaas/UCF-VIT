@@ -69,7 +69,12 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 from UCF_VIT.utils.misc import process_root_dirs  # noqa: E402 (needs REPO_ROOT/src on sys.path first)
 
 TINY_MODEL_OVERRIDES = {
-    "embed_dim": 32,
+    # embed_dim must be divisible by 12: get_2d_sincos_pos_embed needs
+    # embed_dim % 4 == 0 (it halves embed_dim, then get_1d_sincos_pos_embed_
+    # from_grid needs that half to itself be even) and get_3d_sincos_pos_embed
+    # needs embed_dim % 6 == 0 (same halving logic, split three ways instead
+    # of two) -- LCM(4, 6) = 12. Also needs to be divisible by num_heads.
+    "embed_dim": 24,
     "num_heads": 2,
     "depth": 4,
 }
