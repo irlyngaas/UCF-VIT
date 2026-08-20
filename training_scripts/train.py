@@ -134,7 +134,7 @@ def main():
     scheduler = configure_scheduler(optimizer, conf["trainer"]["scheduler_type"], conf["scheduler"])
 
     if conf["trainer"]["resume_from_checkpoint"]:
-        optimizer, scheduler, epoch_start, loss_list = load_optimizer_scheduler_from_checkpoint(conf, optimizer, scheduler, device)
+        optimizer, scheduler, loss_list, epoch_start = load_optimizer_scheduler_from_checkpoint(conf, optimizer, scheduler, data_seq_ort_group, device)
 
     if conf["grad_scaler"]["use_grad_scaler"]:
         grad_scaler = ShardedGradScaler(init_scale=conf["grad_scaler"]["init_scale"], growth_interval=conf["grad_scaler"]["growth_interval"])
