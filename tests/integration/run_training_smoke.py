@@ -92,6 +92,18 @@ def config_slug(config_path):
     return os.path.dirname(rel).replace(os.sep, "-")
 
 
+class NoRealDataFoundError(Exception):
+    """Raised when process_root_dirs finds zero real files for a dataset key.
+
+    Almost always means dict_root_dirs points at a stale/wrong/empty path in
+    the config -- not a bug in this driver or in UCF_VIT. Raised early
+    (before ever launching srun) specifically so callers can fail fast with
+    a clear message instead of burning GPU allocation time on a training run
+    that's guaranteed to crash confusingly deep inside
+    calculate_load_balancing_on_the_fly with a ZeroDivisionError.
+    """
+
+
 def compute_narrow_dict_idx(conf, min_files):
     """Computes tight dict_start_idx/dict_end_idx overrides from real file counts.
 
@@ -122,6 +134,11 @@ def compute_narrow_dict_idx(conf, min_files):
         A dict {key: fraction in (0, 1]} to use as both dict_end_idx and (with
         every value replaced by 0.0) dict_start_idx, or None if this config
         doesn't use the iterative dataloader.
+
+    Raises:
+        NoRealDataFoundError: If process_root_dirs finds zero real files for
+            any dataset key (or none at all) -- almost always a stale/wrong
+            dict_root_dirs path in the config, not a code bug.
     """
     if conf["dataloader"]["type"] != "iterative_dataloader":
         return None
@@ -131,6 +148,15 @@ def compute_narrow_dict_idx(conf, min_files):
     data_par_size = conf["parallelism"]["fsdp_size"] * conf["parallelism"]["simple_ddp_size"]
 
     dict_lister_trains = process_root_dirs(dataset, dict_root_dirs, data_par_size)
+
+    empty_keys = [k for k, v in dict_lister_trains.items() if len(v) == 0]
+    if not dict_lister_trains or empty_keys:
+        bad_keys = empty_keys or list(dict_root_dirs.keys())
+        paths = {k: dict_root_dirs.get(k, "<no matching dict_root_dirs entry>") for k in bad_keys}
+        raise NoRealDataFoundError(
+            f"No real files found for dataset={dataset!r}, key(s) {bad_keys} "
+            f"under dict_root_dirs={paths}"
+        )
 
     def frac_for(count):
         return min(1.0, min_files / count) if count > 0 else 1.0
@@ -159,6 +185,9 @@ def make_smoke_config(base_config_path, scratch_dir, min_files=DEFAULT_MIN_FILES
 
     Returns:
         Path to the written smoke-test config file.
+
+    Raises:
+        NoRealDataFoundError: See compute_narrow_dict_idx.
     """
     with open(base_config_path) as f:
         conf = yaml.load(f, Loader=yaml.FullLoader)
@@ -252,7 +281,24 @@ def main():
         scratch_dir = os.path.join(scratch_root, slug)
         print(f"\n{'='*80}\n{slug} ({config_path})\n{'='*80}", flush=True)
 
-        smoke_config = make_smoke_config(config_path, scratch_dir, min_files=args.min_files)
+        try:
+            smoke_config = make_smoke_config(config_path, scratch_dir, min_files=args.min_files)
+        except NoRealDataFoundError as e:
+            # Fail fast, before ever spending GPU allocation time on a run
+            # that's guaranteed to crash confusingly deep inside
+            # calculate_load_balancing_on_the_fly with a ZeroDivisionError.
+            fresh_status = "FAIL (no real data found)"
+            fresh_elapsed = 0.0
+            print(f"[{slug}] {e}", flush=True)
+            print(f"[{slug}] fresh run: {fresh_status} (srun never launched)", flush=True)
+            results.append({
+                "slug": slug, "config": config_path,
+                "fresh_status": fresh_status, "fresh_elapsed": fresh_elapsed,
+                "resume_status": "SKIPPED (fresh run didn't produce a checkpoint)", "resume_elapsed": None,
+            })
+            shutil.rmtree(scratch_dir, ignore_errors=True)
+            continue
+
         print(f"[{slug}] fresh run: srun -n {args.ntasks} python train.py {smoke_config}", flush=True)
         t0 = time.time()
         fresh = run_training(smoke_config, args.ntasks, args.timeout)

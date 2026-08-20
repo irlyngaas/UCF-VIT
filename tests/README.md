@@ -175,7 +175,14 @@ For each of the 10 shipped configs, in order:
    (default 64 — comfortably above `data_par_size` and every shipped
    config's `batch_size`, so at least one real batch per rank should still
    be possible; if a real run shows too few/many files, adjust this rather
-   than the fraction directly).
+   than the fraction directly). If `process_root_dirs` finds **zero** real
+   files for a dataset key — almost always a stale/wrong `dict_root_dirs`
+   path in the config, not a code bug — this step raises
+   `NoRealDataFoundError` with the offending key and path, and that config is
+   marked `FAIL (no real data found)` **without ever launching `srun`**,
+   rather than burning ~20s of GPU allocation on a run that's guaranteed to
+   crash confusingly deep inside `calculate_load_balancing_on_the_fly` with
+   a bare `ZeroDivisionError`.
 2. Runs it, and checks it exits 0 and actually wrote a rank-0 checkpoint.
 3. Edits that *same* config file in place — `resume_from_checkpoint=True`,
    `checkpoint_filename="epoch_0"` (the file the fresh run actually
@@ -190,12 +197,24 @@ For each of the 10 shipped configs, in order:
 
 Prints a per-config, per-stage PASS/FAIL/TIMEOUT table at the end and exits
 nonzero if anything failed. Defaults: 8 `srun` tasks and a 150s timeout per
-run; both are CLI flags (`--ntasks`, `--timeout`) if a config needs more (or
-you want to fail faster). You can also run it directly against one config
-instead of all 10:
+run; both are CLI flags (`--ntasks`, `--timeout`, and `--min-files` — see
+above) if a config needs more (or you want to fail faster). You can also run
+it directly against one config instead of all 10:
 
 ```bash
 python tests/integration/run_training_smoke.py configs/basic_ct/unetr/base_config.yaml
+```
+
+For iterating on a single failing config without paying for (or waiting on)
+the other 9 every time, `run_training_smoke_single.sh` wraps this in its own
+sbatch script — shorter time limit, and a more generous default per-run
+timeout (300s) since there's only one run to budget for:
+
+```bash
+cd launch/tests
+sbatch run_training_smoke_single.sh ../../configs/basic_ct/unetr/base_config.yaml
+# extra flags pass straight through to run_training_smoke.py:
+sbatch run_training_smoke_single.sh ../../configs/basic_ct/unetr/base_config.yaml --timeout 600 --min-files 128
 ```
 
 **Writing this surfaced a real, serious bug before it ever touched
@@ -214,13 +233,38 @@ left in that code for the multi-rank case); verified locally against real
 `parse_config` calls with both a complete and a partially-missing checkpoint
 set, for `tensor_par_size` of 1 and 2.
 
-Not yet run against real Frontier data — this needs a real allocation and
-your actual data paths to validate, unlike Tiers 1-2. `compute_narrow_dict_idx`
-itself was verified against fabricated local directory structures mimicking
-both the `basic_ct` (`imagesTr/`) and `imagenet` (class-subdirectory)
-layouts, in both the "fewer real files than `--min-files`" (kept as-is) and
-"more" (correctly trimmed) cases, plus a real `parse_config` call end to end
-against those fixtures.
+`compute_narrow_dict_idx` was verified against fabricated local directory
+structures mimicking both the `basic_ct` (`imagesTr/`) and `imagenet`
+(class-subdirectory) layouts, in both the "fewer real files than
+`--min-files`" (kept as-is) and "more" (correctly trimmed) cases, plus a
+real `parse_config` call end to end against those fixtures.
+
+**First two real runs on Frontier:**
+
+1. The `UCF_VIT` package resolved to a stale, unrelated checkout
+   (`.../DUMMY_DATASET/src/UCF_VIT/...`) instead of this one, even though
+   `training_scripts/train.py` itself was read from the right place —
+   `PYTHONPATH=$PWD:$PYTHONPATH` (copied from every other `launch/*/*.sh`
+   script) only helps if `$PWD` happens to contain `UCF_VIT`, which it
+   doesn't from `launch/tests/`; the actual import was resolving via a
+   separately-installed editable package. Not a bug in this repo's code —
+   fixed by correcting the environment directly. Worth checking whether the
+   *other* `launch/*/*.sh` scripts have silently had the same issue.
+2. With that fixed, all 7 `basic_ct`/`imagenet` configs still failed, but for
+   an unrelated reason confirmed by direct filesystem inspection: their
+   `dict_root_dirs` paths are themselves stale (only `catsdogs`'s data path
+   is currently valid). This is what motivated the `NoRealDataFoundError`
+   fail-fast check described above — it turns a ~20s confusing
+   `ZeroDivisionError` deep in a training subprocess into an immediate,
+   clear "no real files found at `<path>`" before `srun` is even invoked.
+3. All 3 `catsdogs` configs (the only ones with currently-valid data) hit
+   the 150s per-run timeout rather than failing outright — `catsdogs` uses
+   `dataloader.type: "dataloader"`, which globs every real file directly in
+   `train.py` with no `dict_start_idx`/`dict_end_idx` trimming mechanism
+   available, so this is plausibly just real data loading taking longer than
+   150s rather than an actual hang. Not yet root-caused; try a longer
+   `--timeout` (e.g. via `run_training_smoke_single.sh`, which defaults to
+   300s) next.
 
 That fixture testing also surfaced (but didn't need fixing to proceed) a
 narrower, real edge case in `process_root_dirs`: when an `imagenet`-format
