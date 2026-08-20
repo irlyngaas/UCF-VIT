@@ -3,7 +3,7 @@
 This project uses [pytest](https://docs.pytest.org/). Tests live under `tests/`,
 mirroring the layout of `src/UCF_VIT/`.
 
-## Two tiers
+## Three tiers
 
 - **Tier 1** (`tests/*.py`, `tests/dataloaders/`, `tests/utils/`): fast,
   single-process tests that don't need a GPU or a SLURM allocation. Runs
@@ -14,6 +14,13 @@ mirroring the layout of `src/UCF_VIT/`.
   see "Running the distributed (Tier 2) tests" below. These are meaningless
   as a single local process, so `tests/distributed/conftest.py` skips the
   whole directory (with a clear reason) if not actually launched under `srun`.
+- **Tier 3** (`tests/integration/`): a real (tiny, tiny-model) training run
+  against your actual data on Frontier, through the real
+  `training_scripts/train.py` entry point, including a checkpoint
+  save-then-resume cycle. Launched via
+  `sbatch launch/tests/run_training_smoke.sh` — see "Running the training
+  smoke test (Tier 3)" below. Not pytest-based, and not a single local
+  process either — see that section for why.
 
 ## Setup
 
@@ -80,10 +87,9 @@ allocation. You don't need to do anything to use it — it's automatic.
   `monai`, and `xformers` — the last is GPU/build-toolchain-sensitive, so
   forward-pass tests for these are better verified directly in the
   `forge-vit` env on Frontier than guessed at in a generic dev environment).
-- `get_model`'s FSDP wrap/checkpoint-resume path, and `training.py`'s
-  `process_batch` tensor-parallel broadcasts. Both need a live distributed
-  setup like Tier 2's, but weren't added in this first pass — a reasonable
-  next step once `tests/distributed/`'s current tests are confirmed working.
+- `training.py`'s `process_batch` tensor-parallel broadcasts specifically
+  (as opposed to the rest of a training run, which Tier 3 now covers
+  end-to-end) — would need its own live distributed setup like Tier 2's.
 - `UCF_VIT.parse` itself only has indirect coverage today, through
   `test_config_validation.py` running real shipped configs end to end
   (rather than unit tests of individual branches) — this is what caught the
@@ -123,12 +129,107 @@ rank's own `SLURM_PROCID`. Both existing test files follow this pattern
 (see the module docstrings); breaking it will hang or crash the job, not just
 fail a test.
 
-I wasn't able to execute these against a live multi-GPU job myself (no
-Frontier access in this environment) — they're written from a careful,
-by-hand trace of `init_par_groups`'/`dist_functions.py`'s exact source, but
-the first real run on Frontier is the actual verification. If something
-fails, `test_smoke.py`'s result tells you whether to look at the environment
-or at the specific collective's logic.
+Verified with a real 1-node/8-GPU run on Frontier (job 5314922): all 14
+tests passed on all 8 ranks. (An earlier run, job 5314802, caught a real bug
+first — `tests/conftest.py`'s autouse fixture was also firing for
+`tests/distributed/` since it's a parent directory, racing this directory's
+own multi-process init and making every test error out at setup with
+"trying to initialize the default process group twice!"; fixed in
+`tests/conftest.py`, see its docstring.) If something fails after a future
+change, `test_smoke.py`'s result tells you whether to look at the
+environment or at the specific collective's logic.
+
+## Running the training smoke test (Tier 3)
+
+```bash
+cd launch/tests
+sbatch run_training_smoke.sh
+```
+
+Unlike Tier 2, this does **not** run under a top-level `srun` — `sbatch`
+launches `tests/integration/run_training_smoke.py` as a single plain
+process, and that script spawns its own `srun -n 8 python
+training_scripts/train.py <config>` subprocess per training run. Nesting a
+real training launch inside a pytest process already running under its own
+`srun` (the way Tier 2 works) would hit the same "process group already
+initialized twice" class of bug fixed for Tier 2 — running the driver as an
+unwrapped single process and letting *it* own each `srun` call sidesteps
+that entirely. Output lands in `training-smoke-<jobid>.out`.
+
+For each of the 10 shipped configs, in order:
+
+1. Writes a smoke-test config to `/tmp/$SLURM_JOB_ID/checkpoint_smoke_test/<config>/smoke.yaml`:
+   real data paths, tiling, and adaptive-patching settings, unmodified; only
+   the model is shrunk (`embed_dim=32, num_heads=2, depth=4`),
+   `max_epochs=1`, `resume_from_checkpoint=False`, `checkpoint_path` pointed
+   at that scratch directory, and — for configs using the iterative
+   dataloader (`basic_ct`/`imagenet`, not `catsdogs`, which globs every file
+   directly with no trimming knob) — `dict_start_idx`/`dict_end_idx`
+   narrowed so only ~64 real files get read per dataset key, regardless of
+   how large the real dataset actually is. This is computed dynamically
+   (`compute_narrow_dict_idx`) by calling the same
+   `UCF_VIT.utils.misc.process_root_dirs` the real pipeline uses to get
+   actual file counts on Frontier's filesystem, rather than guessing a fixed
+   fraction that could round to 0 files for a modest dataset or barely help
+   for one as huge as full ImageNet. `--min-files` overrides the target
+   (default 64 — comfortably above `data_par_size` and every shipped
+   config's `batch_size`, so at least one real batch per rank should still
+   be possible; if a real run shows too few/many files, adjust this rather
+   than the fraction directly).
+2. Runs it, and checks it exits 0 and actually wrote a rank-0 checkpoint.
+3. Edits that *same* config file in place — `resume_from_checkpoint=True`,
+   `checkpoint_filename="epoch_0"` (the file the fresh run actually
+   produced), `max_epochs=2` — the way a real user resumes: flipping fields
+   in their one config, not maintaining a separate "resume" file.
+4. Runs it again and checks it exits 0 — this is the first real exercise of
+   `get_model`'s and `load_optimizer_scheduler_from_checkpoint`'s actual
+   resume path against a real checkpoint (Tier 2 only covers the
+   process-group primitives underneath it).
+5. Sets `resume_from_checkpoint` back to `False` in the file, then deletes
+   the whole scratch directory for that config.
+
+Prints a per-config, per-stage PASS/FAIL/TIMEOUT table at the end and exits
+nonzero if anything failed. Defaults: 8 `srun` tasks and a 150s timeout per
+run; both are CLI flags (`--ntasks`, `--timeout`) if a config needs more (or
+you want to fail faster). You can also run it directly against one config
+instead of all 10:
+
+```bash
+python tests/integration/run_training_smoke.py configs/basic_ct/unetr/base_config.yaml
+```
+
+**Writing this surfaced a real, serious bug before it ever touched
+Frontier**: `parse_config`'s pre-flight checkpoint-existence check (used
+whenever `resume_from_checkpoint: True`) looked for a bare
+`<checkpoint_path>/<checkpoint_filename>` file — but `save_checkpoint`
+always writes `<checkpoint_path>/epoch_<N>_rank_<R>.ckpt`, and the code that
+actually loads a checkpoint looks for
+`<checkpoint_path>/<checkpoint_filename>_rank_<N>.ckpt`. The pre-check's
+filename never matched anything that gets created, so it would
+`sys.exit("Checkpoint file does not exist")` on *every* resume attempt, for
+any config, checkpoint present or not — `resume_from_checkpoint` could never
+have worked in production before this. Fixed in `parse.py` to check every
+tensor-parallel rank's actual checkpoint file (fully resolving a `#TODO`
+left in that code for the multi-rank case); verified locally against real
+`parse_config` calls with both a complete and a partially-missing checkpoint
+set, for `tensor_par_size` of 1 and 2.
+
+Not yet run against real Frontier data — this needs a real allocation and
+your actual data paths to validate, unlike Tiers 1-2. `compute_narrow_dict_idx`
+itself was verified against fabricated local directory structures mimicking
+both the `basic_ct` (`imagesTr/`) and `imagenet` (class-subdirectory)
+layouts, in both the "fewer real files than `--min-files`" (kept as-is) and
+"more" (correctly trimmed) cases, plus a real `parse_config` call end to end
+against those fixtures.
+
+That fixture testing also surfaced (but didn't need fixing to proceed) a
+narrower, real edge case in `process_root_dirs`: when an `imagenet`-format
+dataset has `<= data_par_size` classes, `classes_to_combine` is only assigned
+inside an `if len(classes) > data_par_size:` block, so it's referenced
+unassigned (`UnboundLocalError`) right after. Real ImageNet-1k (1000 classes)
+is far above any realistic `data_par_size`, so this shouldn't affect the
+configs actually shipped here — flagging it in case a future config points
+at a small custom classification dataset in `imagenet` format.
 
 ## Validating a config file by hand
 
