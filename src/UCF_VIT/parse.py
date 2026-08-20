@@ -649,28 +649,28 @@ def parse_pretrained_config(args, conf):
 # ---------------------------- MODEL ---------------------------------------------
 
         #Get and check model arguments
-        embed_dim=pretrained_conf["model"]["embed_dim"],
+        embed_dim=pretrained_conf["model"]["embed_dim"]
         assert embed_dim == conf["model"]["embed_dim"], "Pretrained embed_dim does not match model to be trained"
 
-        depth=pretrained_conf["model"]["depth"],
+        depth=pretrained_conf["model"]["depth"]
         assert depth == conf["model"]["depth"], "Pretrained depth does not match model to be trained"
 
-        num_heads=pretrained_conf["model"]["num_heads"],
+        num_heads=pretrained_conf["model"]["num_heads"]
         assert num_heads == conf["model"]["num_heads"], "Pretrained num_heads does not match model to be trained"
 
-        mlp_ratio=pretrained_conf["model"]["mlp_ratio"],
+        mlp_ratio=pretrained_conf["model"]["mlp_ratio"]
         assert mlp_ratio == conf["model"]["mlp_ratio"], "Pretrained num_heads does not match model to be trained"
 
         #TODO: Checking for drop_path_rate and drop_rate needed?
-        drop_path_rate=pretrained_conf["model"]["drop_path"],
-        drop_rate=pretrained_conf["model"]["drop_rate"],
+        drop_path_rate=pretrained_conf["model"]["drop_path"]
+        drop_rate=pretrained_conf["model"]["drop_rate"]
 
         tensor_par_size = pretrained_conf["parallelism"]["tensor_par_size"]
         assert tensor_par_size == conf["parallelism"]["tensor_par_size"], "Tensor_par_size of the pre-trained model needs to match the tensor_par_size of the model to be trained"
 
         #TODO: If tensor_parallel check if all checkpoint files exist
         #Check if all checkpoint file exists, for given parallelism setup
-        checkpointExists = os.path.isfile(os.path.join(pretrained_conf["checkpoint_path"],conf["trainer"]["pretrained_checkpoint_filename"])), 
+        checkpointExists = os.path.isfile(os.path.join(pretrained_conf["trainer"]["checkpoint_path"],conf["trainer"]["pretrained_checkpoint_filename"]))
         if not checkpointExists:
             sys.exit("Checkpoint file does not exist")
 
@@ -678,7 +678,7 @@ def parse_pretrained_config(args, conf):
         kwargs = get_kwargs(model_type, conf)
 
 # ---------------------------- TILING ------------------------------------------
-        pretrained_do_tiling = pretraind_conf["tiling"]["do_tiling"]
+        pretrained_do_tiling = pretrained_conf["tiling"]["do_tiling"]
         if pretrained_do_tiling:
             pretrained_div = pretrained_conf["tiling"]["div"]
             pretrained_tile_overlap = pretrained_conf["tiling"]["tile_overlap"]
@@ -689,19 +689,19 @@ def parse_pretrained_config(args, conf):
 # ---------------------------- AP ------------------------------------------------
         pretrained_do_ap = pretrained_conf["ap"]["do_ap"]
         if pretrained_do_ap:
-            assert ap_conf["do_ap"], "If pretrained model was trained with adaptive patching, the downstream model needs to use adaptive patching"
+            assert conf["ap"]["do_ap"], "If pretrained model was trained with adaptive patching, the downstream model needs to use adaptive patching"
         else:
-            assert not ap_conf["do_ap"], "If pretrained model was trained with standard patching, this model needs to use standard patching"
+            assert not conf["ap"]["do_ap"], "If pretrained model was trained with standard patching, this model needs to use standard patching"
         ###fixed_length=conf["ap"]["fixed_length"],
         ###use_adaptive_pos_emb=conf["ap"]["use_adaptive_pos_emb"],
 
 # ---------------------------- DATA ----------------------------------------------
         #Get and check data arguments
-        pretrained_img_size = pretrained_conf["data"]["img_size"],
+        pretrained_img_size = pretrained_conf["data"]["img_size"]
         if len(pretrained_img_size) == 2:
             twoD = True
         elif len(pretrained_img_size) == 3:
-            twoD = pretrained_conf['data']['twoD'],
+            twoD = pretrained_conf['data']['twoD']
         assert twoD == conf["data"]["twoD"], "Pretrained model and this model do not have the same dimension data"
 
         if not isinstance(pretrained_tile_overlap, tuple):
@@ -711,18 +711,18 @@ def parse_pretrained_config(args, conf):
                 pretrained_tile_overlap = (pretrained_tile_overlap, pretrained_tile_overlap, pretrained_tile_overlap)
 
         if twoD:
-            pretrained_tile_size = (pretrained_img_size[0]//pretrained_div+pretrained_tile_overlap, pretrained_img_size[1]//pretrained_div+pretrained_tile_overlap)
+            pretrained_tile_size = (pretrained_img_size[0]//pretrained_div+pretrained_tile_overlap[0], pretrained_img_size[1]//pretrained_div+pretrained_tile_overlap[1])
         else:
-            pretrained_tile_size = (pretrained_img_size[0]//pretrained_div+pretraine_tile_overlap, pretrained_img_size[1]//pretrained_div+pretraine_tile_overlap, pretrained_img_size[2]//pretrained_div+pretraine_tile_overlap)
-             
+            pretrained_tile_size = (pretrained_img_size[0]//pretrained_div+pretrained_tile_overlap[0], pretrained_img_size[1]//pretrained_div+pretrained_tile_overlap[1], pretrained_img_size[2]//pretrained_div+pretrained_tile_overlap[2])
+
         for i in range(len(pretrained_tile_size)):
-            assert pretrained_tile_size[i] == data_conf["tile_size"][i], "Image/Tile size does not match between pretrained model and this model"
-        
-        pretrained_patch_size=pretrained_conf["data"]["patch_size"],
-        assert pretrained_patch_size == data_conf["patch_size"], "Patch size does not match between pretrained model and this model"
+            assert pretrained_tile_size[i] == conf["data"]["tile_size"][i], "Image/Tile size does not match between pretrained model and this model"
+
+        pretrained_patch_size=pretrained_conf["data"]["patch_size"]
+        assert pretrained_patch_size == conf["data"]["patch_size"], "Patch size does not match between pretrained model and this model"
 
         try:
-            use_channel_aggregation = pretrained_conf['model']['use_channel_aggregation'],
+            use_channel_aggregation = pretrained_conf['model']['use_channel_aggregation']
         except KeyError:
             if dist.get_rank() == 0:
                 print("use_channel_aggregation is not set, by default this is set to False")
@@ -746,8 +746,8 @@ def parse_pretrained_config(args, conf):
 
         #Create default dict_in_variables if it doesn't exist that assumes the channels are the same across different datasets
         try:
-            dict_in_variables = pretrained_conf['data']['dict_in_variables'],
-            #Check if number of variables is valid 
+            dict_in_variables = pretrained_conf['data']['dict_in_variables']
+            #Check if number of variables is valid
             for i,k in enumerate(pretrained_conf['data']['dict_in_variables']):
                 assert len(pretrained_conf['data']['dict_in_variables'][k]) == num_channels[k], "dict_in_variables must have the same amount as the num_channels"
         except KeyError:
