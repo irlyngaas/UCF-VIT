@@ -5,14 +5,15 @@ mirroring the layout of `src/UCF_VIT/`.
 
 ## Two tiers
 
-- **Tier 1 (this directory)**: fast, single-process tests that don't need a
-  GPU or a SLURM allocation. Runs anywhere in a couple of seconds.
-- **Tier 2 (not yet added)**: multi-process/multi-GPU tests for the code that
-  genuinely needs a live `torch.distributed` process group (`init_par_groups`,
-  `dist_functions.py`'s custom collectives, `get_model`'s FSDP wrap and
-  checkpoint-resume path, `process_batch`'s tensor-parallel broadcasts). These
-  will be launched via a dedicated `sbatch` script on Frontier, modeled on the
-  existing scripts in `launch/`, once added.
+- **Tier 1** (`tests/*.py`, `tests/dataloaders/`, `tests/utils/`): fast,
+  single-process tests that don't need a GPU or a SLURM allocation. Runs
+  anywhere in a couple of seconds.
+- **Tier 2** (`tests/distributed/`): multi-process/multi-GPU tests for the
+  code that genuinely needs a live `torch.distributed` process group.
+  Launched via `sbatch launch/tests/run_distributed_tests.sh` on Frontier —
+  see "Running the distributed (Tier 2) tests" below. These are meaningless
+  as a single local process, so `tests/distributed/conftest.py` skips the
+  whole directory (with a clear reason) if not actually launched under `srun`.
 
 ## Setup
 
@@ -79,13 +80,55 @@ allocation. You don't need to do anything to use it — it's automatic.
   `monai`, and `xformers` — the last is GPU/build-toolchain-sensitive, so
   forward-pass tests for these are better verified directly in the
   `forge-vit` env on Frontier than guessed at in a generic dev environment).
-- `UCF_VIT.utils.dist_functions`, `init_par_groups`, `get_model`,
-  `training.py` — need a real (or multi-process-simulated) distributed
-  setup; this is what Tier 2 is for.
+- `get_model`'s FSDP wrap/checkpoint-resume path, and `training.py`'s
+  `process_batch` tensor-parallel broadcasts. Both need a live distributed
+  setup like Tier 2's, but weren't added in this first pass — a reasonable
+  next step once `tests/distributed/`'s current tests are confirmed working.
 - `UCF_VIT.parse` itself only has indirect coverage today, through
   `test_config_validation.py` running real shipped configs end to end
   (rather than unit tests of individual branches) — this is what caught the
   config vs. parser mismatches below.
+
+## Running the distributed (Tier 2) tests
+
+```bash
+cd launch/tests
+sbatch run_distributed_tests.sh
+```
+
+This requests 1 node / 8 GPUs (matching every other script in `launch/`) and
+runs `srun -n 8 python -m pytest ../../tests/distributed/ -v` — each of the 8
+tasks is an independent pytest process, one per rank, all running the same
+test files. `tests/distributed/conftest.py` initializes an NCCL process group
+per-process from `SLURM_PROCID`/`SLURM_NTASKS`/`SLURM_LOCALID` (the same env
+vars `training_scripts/train.py`'s `init_dist` uses), so no `torchrun` wrapper
+is needed. Output lands in `pytest-distributed-<jobid>.out` in that directory.
+
+**Covered today:**
+
+| File | Covers |
+| --- | --- |
+| `tests/distributed/test_smoke.py` | Basic connectivity: rank/world_size sanity, a plain `all_reduce`. Check this first if anything else fails — it isolates launch/environment problems from actual `UCF_VIT` bugs. |
+| `tests/distributed/test_init_par_groups.py` | `init_par_groups`'s process-group membership (world size and this rank's local rank within each of the 5 returned groups), across several `tensor_par_size`/`fsdp_size`/`simple_ddp_size` splits of the job's actual world size. |
+| `tests/distributed/test_dist_functions.py` | Forward (and, for `all_reduce`/`broadcast`, backward) correctness of the collective autograd ops most exercised by tensor parallelism: `all_reduce`, `broadcast`, `all_gather`, `gather`, `F_Identity_B_AllReduce`, `F_AllReduce_B_Identity`. |
+
+**Important constraint if you add more tests here**: `init_par_groups` and the
+`dist_functions.py` ops all make *collective* calls (`dist.new_group`,
+`dist.broadcast`, etc.), which every process in the job must call in the same
+order. Since each rank runs its own independent pytest process (there's no
+cross-process pytest coordination here), any test skip/parametrize decision
+must depend only on values that are identical across ranks and available
+before any process has connected — i.e. `SLURM_NTASKS`/world size, never this
+rank's own `SLURM_PROCID`. Both existing test files follow this pattern
+(see the module docstrings); breaking it will hang or crash the job, not just
+fail a test.
+
+I wasn't able to execute these against a live multi-GPU job myself (no
+Frontier access in this environment) — they're written from a careful,
+by-hand trace of `init_par_groups`'/`dist_functions.py`'s exact source, but
+the first real run on Frontier is the actual verification. If something
+fails, `test_smoke.py`'s result tells you whether to look at the environment
+or at the specific collective's logic.
 
 ## Validating a config file by hand
 
