@@ -448,6 +448,9 @@ def parse_config(args, load_balance_offline=False):
         else:
             assert len(tiling_conf["tile_overlap"]) == 3, "Tile overlap dimension doesn't match the dimensions of the data"
 
+    #Require overlap values to be ints (not e.g. a YAML float like 0.0), since a
+    #float would otherwise silently turn tile_size into floats downstream
+    assert all(isinstance(v, int) for v in tiling_conf["tile_overlap"]), "tiling.tile_overlap must be an int (or tuple of ints) in the config, not a float"
 
     if twoD:
         tile_size = (img_size[0]//tiling_conf["div"]+tiling_conf["tile_overlap"][0], img_size[1]//tiling_conf["div"]+tiling_conf["tile_overlap"][1])
@@ -711,6 +714,10 @@ def parse_pretrained_config(args, conf):
                 pretrained_tile_overlap = (pretrained_tile_overlap, pretrained_tile_overlap)
             else:
                 pretrained_tile_overlap = (pretrained_tile_overlap, pretrained_tile_overlap, pretrained_tile_overlap)
+
+        #Require overlap values to be ints (not e.g. a YAML float like 0.0), since a
+        #float would otherwise silently turn pretrained_tile_size into floats downstream
+        assert all(isinstance(v, int) for v in pretrained_tile_overlap), "tiling.tile_overlap must be an int (or tuple of ints) in the pretrained model's config, not a float"
 
         if twoD:
             pretrained_tile_size = (pretrained_img_size[0]//pretrained_div+pretrained_tile_overlap[0], pretrained_img_size[1]//pretrained_div+pretrained_tile_overlap[1])
