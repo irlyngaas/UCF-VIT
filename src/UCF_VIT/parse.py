@@ -220,7 +220,7 @@ def parse_config(args, load_balance_offline=False):
 
 # ---------------------------- TRAINER -------------------------------------------
     try:
-        save_frequency = conf['trainer']['save_frequency'],
+        save_frequency = conf['trainer']['save_frequency']
     except KeyError:
         if dist.get_rank() == 0:
             print("Since no save_frequency was given in the config file, defaulting to saving every epoch")
