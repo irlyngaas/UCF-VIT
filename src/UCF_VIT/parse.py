@@ -277,12 +277,15 @@ def parse_config(args, load_balance_offline=False):
         "tensor_par_size": tensor_par_size,
     }
 
-    #TODO: If tensor_parallel check if all checkpoint files exist
-    #Check if all checkpoint file exists, for given parallelism setup
+    #Check that every tensor-parallel rank's checkpoint file exists, matching the
+    #"<checkpoint_filename>_rank_<N>.ckpt" naming save_checkpoint (training.py)
+    #actually writes and get_model (model/utils.py) actually reads -- not a bare
+    #"<checkpoint_filename>" file, which is never created.
     if resume_from_checkpoint:
-        checkpointExists = os.path.isfile(os.path.join(trainer_conf["checkpoint_path"],trainer_conf["checkpoint_filename"])) 
-        if not checkpointExists:
-            sys.exit("Checkpoint file does not exist")
+        for rank in range(tensor_par_size):
+            checkpoint_file = trainer_conf["checkpoint_path"]+"/"+trainer_conf["checkpoint_filename"]+"_rank_"+str(rank)+".ckpt"
+            if not os.path.isfile(checkpoint_file):
+                sys.exit(f"Checkpoint file does not exist: {checkpoint_file}")
 
 # ---------------------------- OPTIMIZER -----------------------------------------
     #TODO: Add checking on each argument, e.g. > 0
