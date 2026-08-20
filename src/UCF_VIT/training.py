@@ -539,7 +539,7 @@ def train_epoch(conf, model, train_dataloader, epoch, iterations_per_epoch, opti
             grad_scaler.step(optimizer)
             grad_scaler.update()
             if grad_scaler._scale < min_scale:
-                grad_scaler._scale = torch.tensor(min_scale).to(scaler._scale)
+                grad_scaler._scale = torch.tensor(min_scale).to(grad_scaler._scale)
         else:
             loss.backward()
             optimizer.step()
