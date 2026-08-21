@@ -231,6 +231,7 @@ is needed. Output lands in `pytest-distributed-<jobid>.out` in that directory.
 | `tests/distributed/test_dist_functions.py` | Forward (and, for `all_reduce`/`broadcast`, backward) correctness of the collective autograd ops most exercised by tensor parallelism: `all_reduce`, `broadcast`, `all_gather`, `gather`, `F_Identity_B_AllReduce`, `F_AllReduce_B_Identity`. |
 | `tests/distributed/test_dataloader_real_data.py` | `FileReader`'s DDP-rank sharding and `ShuffleIterableDataset`'s no-loss/no-duplication guarantee, against real `basic_ct` and `imagenet` file lists on Frontier and `torch.distributed.get_rank()` for real (not simulated) across all `world_size` ranks, across `num_workers` (0/1/4) and `buffer_size` (1/20/100) — the real-scale counterpart to `tests/dataloaders/test_dataset.py`'s simulated-rank coverage of the same `num_workers=0` fix. File I/O itself is stubbed out (`FileReader.read_process_file` monkeypatched to a no-op) so this stays fast and focused on correctness, not decode speed. |
 | `tests/distributed/test_catsdogs_real_data.py` | The real production `DistributedSampler` + `DataLoader` + `CatsDogsDataset`/`CatsDogsCollate` wiring, against real CatsDogs JPEGs and real ranks — disjoint/complete file sharding across `num_workers` (0/1/4), and `adaptive_patching=True` against real photo content (not synthetic random-noise JPEGs, unlike `tests/datasets/test_catsdogs.py`), which actually exercises Canny edge detection on real image structure. Unlike the row above, file I/O is *not* stubbed — `CatsDogsDataset.__getitem__` has no meaningful decode-free path. |
+| `tests/distributed/test_dataloader_real_pipeline.py` | The full real pipeline — decode, tile, (for `basic_ct`) adaptive patch, collate — for `basic_ct`/`unetr` and `imagenet`/`classification`, built via the exact same `parse_config` + `calculate_load_balancing_on_the_fly` + `NativePytorchDataModule` construction `train.py` itself uses. No stubbing anywhere; checks the actual decoded/collated batch (shapes, finite values, normalized ranges, valid label ranges, one-hot `seq_label` correctness for `basic_ct`'s real segmentation masks) rather than just sharding math. |
 
 **Important constraint if you add more tests here**: `init_par_groups` and the
 `dist_functions.py` ops all make *collective* calls (`dist.new_group`,
@@ -307,6 +308,50 @@ files is fast enough not to need it.
 Both files verified with a real 1-node/8-GPU run on Frontier (job 5321217):
 all 36 tests passed on all 8 ranks (the original 14 plus these two files'
 18 + 4 new parametrized cases) in 28s.
+
+`test_dataloader_real_pipeline.py` (added later, not yet run on Frontier)
+closes what was, as of this session, the biggest remaining gap in
+dataloader test coverage: every other real-data test above deliberately
+stubs out file I/O to stay fast and focus on sharding correctness, so
+nothing previously decoded a real file and checked what came out the other
+end of `TileDataIter`/`ProcessChannels`/`collate_fn`. This file does exactly
+that, with no stubbing, for `basic_ct/unetr` (real NIfTI decode, full 3D
+tiling, adaptive patching, and real segmentation labels — the other gap
+flagged this session, since `test_dataloader_real_data.py` only ever globs
+`imagesTr`, never `labelsTr`) and `imagenet/classification` (real JPEG
+decode + resize, real classification labels). Rather than hand-assembling
+`FileReader`/`TileDataIter`/`ProcessChannels`/`collate_fn` a third time, it
+builds the data module via the exact same `parse_config` +
+`calculate_load_balancing_on_the_fly` + `NativePytorchDataModule`
+construction `train.py` itself makes for `dataloader.type ==
+"iterative_dataloader"` — skipping only the model/optimizer/training-loop
+parts it has no need for — and reuses Tier 3's `compute_narrow_dict_idx` for
+data narrowing rather than a third reimplementation of that either. Both
+configs' real `parallelism` settings (`data_par_size=8`, `tensor_par_size=1`)
+already exactly match this file's real 8-rank launch, so unlike Tier 3's
+smoke test, no parallelism overrides are needed.
+
+`compute_narrow_dict_idx`'s `min_files` means something different for the
+two datasets, which the test accounts for with separate constants: for
+`basic_ct` (one `dict_root_dirs` key) it's a total file count that
+`FileReader`'s own sharding then divides across ranks, and tiling
+multiplies each real file into `div**3` samples (64, for `unetr`'s real
+`div=4`), so even 1 file/rank is comfortably enough. For `imagenet`,
+`process_root_dirs` already buckets real files one bucket per rank *before*
+`min_files` narrows within each bucket, and classification has no tiling
+multiplication (`div=1`) — so `min_files` there must directly cover
+`batch_size * NUM_BATCHES_TO_CHECK` real images per rank (`IMAGENET_MIN_FILES
+= 100`, comfortably above `32 * 2 = 64`), not just per dataset. Getting this
+wrong (an earlier draft shared one `min_files` value across both) doesn't
+error loudly — it just silently returns fewer batches than expected, caught
+here by asserting the exact batch count pulled.
+
+Verified locally against fabricated NIfTI/JPEG files structured to match
+the real directories (single-process, `parallelism` scaled to
+`world_size=1` so `parse_config`'s real-world-size assertion holds without
+needing 8 real ranks) before ever touching real Frontier data — both
+configs' full chain (decode through collate) produces correctly-shaped,
+finite, correctly-ranged batches.
 
 ## Running the training smoke test (Tier 3)
 
