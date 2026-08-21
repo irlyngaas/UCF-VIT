@@ -559,7 +559,7 @@ structures mimicking both the `basic_ct` (`imagesTr/`) and `imagenet`
 `--min-files`" (kept as-is) and "more" (correctly trimmed) cases, plus a
 real `parse_config` call end to end against those fixtures.
 
-**First two real runs on Frontier:**
+**Real runs on Frontier so far:**
 
 1. The `UCF_VIT` package resolved to a stale, unrelated checkout
    (`.../DUMMY_DATASET/src/UCF_VIT/...`) instead of this one, even though
@@ -596,15 +596,301 @@ real `parse_config` call end to end against those fixtures.
    configs uniformly, fixed to `embed_dim=24` (divisible by `LCM(4,6)=12`,
    and by `num_heads=2`). Verified against the real `pos_embed.py` functions
    locally before pushing back.
+5. With that fixed, `basic_ct-unetr`'s **fresh run passed end to end for the
+   first time** — real data loading, model construction, training, and
+   checkpoint save all completed (227s) — but its resume run failed
+   immediately with `RuntimeError: No backend type associated with device
+   type cpu` inside `get_model`'s checkpoint-resume rank-sync broadcast
+   (added earlier this session): `torch.tensor(epoch_start, ...)` created a
+   CPU tensor by default, but `dist.broadcast` on an NCCL process group
+   needs a GPU tensor. Fixed by passing `device=device` (already used
+   elsewhere in `get_model` for the same purpose) to that call, and
+   proactively to the following `dist.broadcast_object_list` call too, since
+   it would have hit the identical failure right after — PyTorch added a
+   `device` parameter to that function specifically for this NCCL
+   requirement.
+6. With both fixed, **`basic_ct-unetr` passed fully — fresh and resume —
+   against real data**, the first shipped config to do so end to end. The
+   first genuine, from-scratch validation of this session's `get_model`
+   checkpoint-resume consistency fix, the `parse_config` checkpoint-existence
+   fix, and everything else these logs surfaced along the way.
+7. Root-caused the `catsdogs` timeout from item 3: `dataloader.type:
+   "dataloader"` has no index-based trimming knob, so with no narrowing at
+   all, every real file in `dict_root_dirs` gets globbed and decoded each
+   epoch — for a real `catsdogs` directory of any real size, comfortably
+   over 150s (or 300s). Fixed by adding `create_narrow_catsdogs_dir` (see
+   above): globs the real directory the same way `train.py` does, then
+   symlinks a `max(min_files, batch_size * data_par_size)`-sized subset into
+   a scratch directory and points `dict_root_dirs` at that instead.
+   **Verified: `catsdogs-classification` now passes against real data** with
+   this fix in place.
+8. A full `run_training_smoke.sh` run (job 5317650) against real data: all 3
+   `catsdogs` and all 3 `imagenet` configs **passed fully, fresh and
+   resume** — 6 of 10 shipped configs now fully verified end to end.
+   `basic_ct-unetr` and `basic_ct-diffusion` both hit `run_training_smoke.sh`'s
+   then-default 150s timeout — not a regression: `basic_ct-unetr`'s fresh run
+   had already measured 227s in item 6, comfortably over 150s but under
+   `run_training_smoke_single.sh`'s separate 300s default, so the two
+   scripts' timeouts had silently drifted apart. Fixed by making 300s the one
+   shared default both scripts use (see "Running the training smoke test"
+   above) — `run_training_smoke_single.sh` no longer hardcodes its own
+   `--timeout`.
 
-That fixture testing also surfaced (but didn't need fixing to proceed) a
-narrower, real edge case in `process_root_dirs`: when an `imagenet`-format
-dataset has `<= data_par_size` classes, `classes_to_combine` is only assigned
-inside an `if len(classes) > data_par_size:` block, so it's referenced
-unassigned (`UnboundLocalError`) right after. Real ImageNet-1k (1000 classes)
-is far above any realistic `data_par_size`, so this shouldn't affect the
-configs actually shipped here — flagging it in case a future config points
-at a small custom classification dataset in `imagenet` format.
+   `basic_ct-mae` and `basic_ct-sap` both failed for real, and for the same
+   root cause: `UCF_VIT.parse.parse_config` computes `data.tile_size` as a
+   plain 2-tuple `(x, y)` whenever `twoD` is `True` — which conflates two
+   different situations that both set `twoD=True`: genuinely 2D data
+   (`imagenet`/`catsdogs`, where `img_size` itself has 2 entries and a
+   2-tuple `tile_size` is correct) and 3D data being *sliced* into 2D
+   z-planes (`basic_ct` with `data.twoD: True`, where `img_size` has 3
+   entries but `tile_size` collapsed to 2D anyway). `TileDataIter.__iter__`
+   uses `len(self.tile_size) == 3` to decide whether the *raw* incoming data
+   is 3D; with a collapsed 2-tuple, `basic_ct-mae`/`basic_ct-sap` silently
+   took the plain-2D tiling branch, which only slices the x/y axes and
+   leaves the entire untouched z-axis (256) tacked onto every tile —
+   producing a 5D batch (`(32, 1, 64, 64, 256)`) by the time it reached
+   `PatchEmbed` (`ValueError: too many values to unpack (expected 4)` for
+   `basic_ct-mae`) or the quadtree serializer (`...expected 3` for
+   `basic_ct-sap`). `basic_ct-unetr` (`twoD: False`, full 3D tiling) never
+   exercised this branch, and `imagenet`/`catsdogs` never exercised it
+   incorrectly (their `img_size` genuinely is 2D), which is why this went
+   undetected until the first real run of a `twoD: True` `basic_ct` config.
+   Fixed in three places:
+   - `parse.py`: `tile_size` is now a 3-tuple whenever `img_size` is 3D,
+     regardless of `twoD` — for `twoD: True` the z entry is the raw,
+     undivided depth (`img_size[2]`, not tiled — z-planes are walked one
+     index at a time, not chunked), restoring `len(tile_size) == 3` as an
+     accurate "raw data is 3D" signal.
+   - `TileDataIter.__init__`: `tile_size_no_overlap` now loops over
+     `len(tile_overlap)` instead of `len(tile_size)`, since `tile_size` can
+     now have an extra z entry with no corresponding overlap value (would
+     otherwise `IndexError`).
+   - `TileDataIter.__iter__`: its z-slice loop bound was `data.shape[2]`,
+     which is actually the *y*-axis size for channel-first `(C, X, Y, Z)`
+     data, not z — silently harmless only because `basic_ct`'s volumes are
+     cubic (256×256×256). Changed to `self.tile_size[2]` (the now-correct z
+     size threaded through from `parse.py`), which is right regardless of
+     whether the volume is cubic.
+   Verified locally: a synthetic `(1, 256, 256, 256)` sample through the
+   fixed `TileDataIter` now yields exactly `(1, 64, 64)` tiles (was `(1, 64,
+   64, 256)`), and `parse_config` against the real `basic_ct-mae`/
+   `basic_ct-sap`/`basic_ct-unetr` configs now reports `tile_size` of
+   `(64, 64, 256)`, `(64, 64, 256)`, and `(64, 64, 64)` respectively. Not yet
+   verified against a real Frontier run — and since `basic_ct-mae`/
+   `basic_ct-sap` will now actually iterate instead of crashing in ~30-45s,
+   watch for a *new* timeout: each real volume yields `div² × 256` z-sliced
+   tiles (4096 for `div=4`) versus `basic_ct-unetr`'s `div³` full-3D tiles
+   (64), so an epoch over even a handful of real files could turn out to
+   need much more than 300s.
+9. Confirmed: a rerun had **7 of 10 configs pass** (all 3 `catsdogs`, all 3
+   `imagenet`, and now `basic_ct-unetr` too), leaving `basic_ct-diffusion`,
+   `basic_ct-mae`, and `basic_ct-sap` timing out — as predicted in item 8 for
+   `mae`/`sap`. Root-caused with real numbers this time: `Tr8_Training` has
+   852 real file pairs (not ~8 as its name suggests), so the shared
+   `min_files=64` default narrows to ~64 files total, ~8/rank across
+   `simple_ddp_size=8`. For `mae`/`sap` (`twoD: True`, `tiling.div: 4`),
+   each of those real files yields `div² × 256 = 4096` z-sliced tiles (not
+   `div³ = 64` the way `basic_ct-unetr`'s `twoD: False` does), so 8
+   files/rank is ~32768 tiles/rank/epoch. `basic_ct-diffusion` is
+   `twoD: False` with the same tile-count formula, `batch_size`, and
+   `fixed_length` as `basic_ct-unetr` (whose own fresh run measured 227s,
+   only ~73s under the then-300s default) — no tile-count explanation, so
+   plausibly just real Frontier I/O/scheduling variance pushing it over that
+   thin margin.
+
+   Added `PER_CONFIG_OVERRIDES` in `run_training_smoke.py` — a slug-keyed
+   dict of `min_files`/`timeout` overrides applied under the shared
+   `--min-files`/`--timeout` CLI defaults but under an explicit CLI flag
+   (which always wins over both): `basic_ct-mae`: `min_files=16` (~2
+   files/rank — chosen with margin above the `simple_ddp_size=8` floor,
+   against `int()` truncation in `FileReader`'s start/end-idx narrowing,
+   rather than cutting to the bare 1-file/rank minimum), bringing it to
+   ~256 iterations/epoch, close to `basic_ct-unetr`'s own real iteration
+   count. `basic_ct-sap`: same `min_files=16`, but its `batch_size=2` (vs
+   `mae`'s 32) means that's still ~4096 iterations/epoch — `min_files` is
+   already near its practical floor (can't drop below ~8 total without
+   going under 1 file/rank and hitting `FileReader`'s own `per_worker > 0`
+   assertion), so `sap` additionally gets `timeout=1800` as the real lever;
+   if that's still not enough, the next lever would be lowering `tiling.div`
+   for the smoke test specifically (fewer spatial tiles per z-slice), not
+   `min_files`. `basic_ct-diffusion`: `timeout=900`, no `min_files` change
+   (no tile-count case for it). Bumped both launch scripts' sbatch time
+   limits for the new worst-case totals
+   (`run_training_smoke.sh`: 90min → 2h; `run_training_smoke_single.sh`:
+   20min → 75min, since `sap` alone could now need up to 30min for a single
+   run). Not yet verified against a real Frontier run — the `min_files=16`
+   estimates in particular are rough (based on iteration-count reasoning,
+   not a measured per-iteration cost), so treat these as a first attempt to
+   tune from, not a guaranteed fix.
+
+10. Rather than keep tuning `PER_CONFIG_OVERRIDES` around `basic_ct-mae`'s
+    persistent timeout, reconfigured all 4 `basic_ct` configs
+    (`unetr`/`mae`/`sap`/`diffusion`) to share one baseline: `ap.do_ap`,
+    `tiling.do_tiling`, and `data.twoD` all `False` (removing the
+    `twoD: True` + `do_tiling: True` z-slice/tile explosion that motivated
+    the overrides in the first place -- each real volume now yields exactly
+    one sample), `tiling.div`/`tiling.tile_overlap` set to `1`/`0`
+    (cosmetic -- `parse.py` already force-overrides these whenever
+    `do_tiling: False`), `data.patch_size: 32` (512 tokens/sample, the same
+    order of magnitude as `imagenet`/`catsdogs`'s 256-token baseline), and
+    `dataloader.batch_size`/`num_workers`/`dict_buffer_sizes.ct1` unified to
+    `32`/`1`/`100`, matching `imagenet`/`catsdogs`. One exception, found by
+    running `tests/test_config_validation.py` against the edited configs:
+    `parse.py` (`get_kwargs`) hard-asserts `SAP` requires `do_ap: True` --
+    architectural, not a cost tradeoff -- so `basic_ct-sap` keeps
+    `do_ap: True` with `fixed_length: 512` (needed a value satisfying both
+    "cube root is a whole number" and "`fixed_length % 7 == 1`" now that
+    `twoD: False` routes it through the octree check instead of the quadtree
+    one its old `twoD: True` + `fixed_length: 196` combination satisfied).
+    Confirmed all 10 shipped configs still parse (`pytest
+    tests/test_config_validation.py -v`) and manually verified `tile_size`/
+    `twoD`/`patch_size`/`do_ap`/`fixed_length` come out as intended for all
+    4 edited configs. Updated
+    `tests/distributed/test_dataloader_real_pipeline.py`'s
+    `test_real_pipeline_basic_ct_unetr` for the new non-adaptive 4-tuple
+    batch shape (`inp, label, variables, dict_key`, mirroring
+    `test_real_pipeline_imagenet_classification`) -- including that
+    non-adaptive `basic_ct` labels come straight from `FileReader` as
+    `int64`, not the `uint8` the adaptive-patching branch explicitly casts
+    to, a real dtype difference between the two code paths this test now
+    asserts on. `BASIC_CT_MIN_FILES` in both that file and
+    `tests/dataloaders/test_dataset_speed_real_data.py` raised from 16 to
+    `batch_size(32) * N * data_par_size(8)` (512 and 1024 respectively) --
+    with tiling/z-slicing no longer multiplying each file into many
+    samples, `min_files` must now directly cover a full batch per rank, the
+    same reasoning `catsdogs` already used. Removed `PER_CONFIG_OVERRIDES`
+    from `run_training_smoke.py` entirely (all 4 `basic_ct` configs now
+    share the same defaults as everything else) and raised
+    `DEFAULT_MIN_FILES` from 64 to 256 for the same batch-coverage reason.
+    Confirmed real basic_ct file count is comfortably in the hundreds+
+    (consistent with `Tr8_Training`'s known 852 real file pairs from item 9
+    above), so `batch_size: 32` is achievable. Full local `pytest -q` (Tier
+    1) passes (113 passed, 36 skipped -- the real-data tests needing
+    Frontier mounts). **Not yet verified against a real Frontier run** --
+    next step is rerunning `run_training_smoke.sh` (Tier 3) and
+    `run_distributed_tests.sh` (Tier 2, for the updated real-pipeline test)
+    to confirm all 10 configs now pass with the simplified defaults, and to
+    get a real "real runs on Frontier" measurement to replace item 9's
+    now-obsolete tile-count-based numbers.
+11. Real run (job 5322693) against item 10's baseline: **`basic_ct-diffusion`
+    passed fully, fresh and resume** (177s/102s) -- confirming the
+    tiling/`twoD` fix actually resolves the timeout it was meant to.
+    `basic_ct-mae`, `basic_ct-sap`, and `basic_ct-unetr` all failed, each for
+    a different, genuine reason -- not the same root cause repeating:
+    - `basic_ct-mae`: `AssertionError: embed_dim % 3 == 0` in
+      `get_3d_sincos_pos_embed`, called from `MAE.init_weights` for the
+      *decoder* pos embed. `decoder_embed_dim: 512` was never touched by
+      this session's baseline changes (it's a per-model decoder setting, not
+      an "advanced feature"), but flipping `mae`'s `twoD` to `False` routed
+      it through the 3D sincos path (`embed_dim % 3 == 0`) instead of the 2D
+      one (`% 4 == 0`) it satisfied before -- 512 divides by 4 but not by 3.
+      Fixed: `decoder_embed_dim: 480` (divisible by both 3 and
+      `decoder_num_heads=16`).
+    - `basic_ct-sap`: `torch.OutOfMemoryError: HIP out of memory. Tried to
+      allocate 512.00 GiB` inside `SAP.mask_head`'s `neck` -- a single
+      `nn.ConvTranspose3d(embed_dim, 256, kernel_size=patch_size,
+      stride=patch_size)` (`arch.py:685-693`). Its memory scales as
+      `patch_size**3`; the requested 512 GiB is *exactly*
+      `(32/4)**3 = 512` times whatever `patch_size=4` needed -- unambiguous
+      confirmation of the cubic relationship. Unlike `do_ap`, this isn't a
+      config-parsing assertion, so nothing caught it before a real GPU run.
+      Fixed: reverted `sap`'s `patch_size` to its original `4` (an
+      architecture-driven exception, documented alongside its `do_ap: True`
+      exception) -- confirmed via `training.py`'s loss computation
+      (`einops.rearrange` using `conf["data"]["patch_size"]` dynamically for
+      both the model output and the reshaped `seq_label`) that this doesn't
+      introduce a shape mismatch: output and label resolution are always
+      `sqrt_len * patch_size` by construction, self-consistent for any
+      `patch_size` value, not tied to the literal `tile_size`.
+    - `basic_ct-unetr`: `torch.OutOfMemoryError: HIP out of memory. Tried to
+      allocate 40.00 GiB` inside MONAI's `dynunet_block.py`, not
+      `PatchEmbed` -- `UNETR.encoder1` (`arch.py:1135-1143`) is a plain
+      `Conv3d` that runs directly on the **full 256^3-resolution raw
+      volume**, with `feature_size=16` output channels, entirely
+      independent of `patch_size`/`embed_dim`. At `batch_size=32` that one
+      activation alone is `32 * 16 * 256**3 * 4 bytes` ~= 34 GB, comfortably
+      explaining the OOM on a 64 GB GPU. This is a structural property of
+      full-resolution conv segmentation decoders, not something the
+      tiny-model smoke-test override (`embed_dim`/`depth`/`num_heads`) could
+      mask, since none of those touch `feature_size` or `batch_size`.
+      Fixed: `unetr`'s `batch_size` reverted to `4` (another
+      architecture-driven exception; `patch_size` stays `32` since the OOM
+      was batch_size-driven, not patch_size-driven). `BASIC_CT_MIN_FILES` in
+      `test_dataloader_real_pipeline.py`/`test_dataset_speed_real_data.py`
+      (which target `basic_ct/unetr`'s config) lowered from the
+      `batch_size=32` formula to `batch_size=4` accordingly.
+
+    So `basic_ct` now has three documented, architecture-driven exceptions
+    on top of the unified baseline: `sap` (`do_ap: True`, `patch_size: 4`)
+    and `unetr` (`batch_size: 4`) -- not a regression back to
+    `PER_CONFIG_OVERRIDES`-style tuning (those were workarounds for a single
+    shared root cause; these are three separate, real architectural
+    constraints specific to each model's decoder). Full local `pytest -q`
+    passes (113 passed, 36 skipped) and all 10 configs still parse with
+    these changes. **Not yet verified against a real Frontier run** -- next
+    step is rerunning `run_training_smoke.sh` again to confirm all three
+    fixes actually work (the `sap`/`unetr` memory numbers in particular are
+    reasoned from the failure messages, not yet measured after the fix).
+12. Reran after item 11's fixes: `basic_ct-mae`'s and `basic_ct-sap`'s
+    failures are gone, but `basic_ct-unetr` now **times out** instead of
+    OOMing (log not saved, but reported directly). Root cause: `min_files`
+    (the target real-file count `make_smoke_config` narrows to) was a flat
+    `DEFAULT_MIN_FILES=256` shared by every config, sized for the shared
+    `batch_size=32` most configs use (256 = 32 * data_par_size(8), ~1
+    batch/rank). `basic_ct-unetr`'s `batch_size=4` exception (item 11) meant
+    the same 256 real files worked out to 32 files/rank / 4 = 8
+    batches/rank/epoch instead of 1 -- 8x the iterations through UNETR's
+    inherently expensive full-resolution conv decoder (`encoder1` runs a
+    plain `Conv3d` on the raw 256^3 volume regardless of `patch_size`/
+    `embed_dim`, so every iteration is costly no matter what else changed).
+    This was flagged as a risk when `batch_size:4` was applied ("generous
+    ... but that's harmless" -- true for correctness, false for wall-clock
+    time). Fixed structurally rather than with another single-config
+    override: `make_smoke_config` now caps whatever `min_files` it's given
+    down to *that config's own* `batch_size * data_par_size`, so every
+    config gets ~1 batch/rank regardless of its `batch_size` -- automatically
+    right-sizing itself for any future batch_size exception too, not just
+    `unetr`'s current one. Doesn't change behavior for any config that
+    already had `batch_size=32` (256 already equalled that cap). Full local
+    `pytest -q` still passes (113 passed, 36 skipped). **Not yet verified
+    against a real Frontier run.**
+13. Reran after item 12's fix (job 5322916): **all 10 shipped configs now
+    pass Tier 3 fully, fresh and resume** --
+    `basic_ct-{diffusion,mae,sap,unetr}` (145s/94s, 81s/68s, 212s/173s,
+    220s/43s), all 3 `imagenet` configs, and all 3 `catsdogs` configs. This
+    closes out the config-baseline reconfiguration effort: the original
+    `basic_ct-mae` timeout that started it is gone (structural fix, not a
+    tuned-around workaround), and the three follow-on issues it
+    surfaced -- `mae`'s decoder pos-embed divisibility, `sap`'s
+    patch_size-cubed decoder memory, `unetr`'s batch_size-linear decoder
+    memory and its knock-on min_files/iteration-count timeout -- are all
+    fixed and verified for real. `basic_ct` now ships with three documented,
+    architecture-driven exceptions to the shared baseline (`sap`:
+    `do_ap: True` + `patch_size: 4`; `unetr`: `batch_size: 4`); everything
+    else (tensor parallelism, tiling, `twoD`, `num_workers`,
+    `dict_buffer_sizes`) is uniform across all 4 `basic_ct` configs, matching
+    `imagenet`/`catsdogs`. Next: rerun `run_distributed_tests.sh` (Tier 2) to
+    confirm `test_dataloader_real_pipeline.py`'s updated
+    `test_real_pipeline_basic_ct_unetr` (non-adaptive 4-tuple batch shape)
+    passes for real too.
+
+That fixture testing also surfaced a narrower, real edge case in
+`process_root_dirs`: when an `imagenet`-format dataset has `<= data_par_size`
+classes, `classes_to_combine` was only assigned inside an `if len(classes) >
+data_par_size:` block, so it was referenced unassigned (`UnboundLocalError`)
+right after. Real ImageNet-1k (1000 classes) is far above any realistic
+`data_par_size`, so this never affected the configs actually shipped here —
+now fixed anyway (`classes_to_combine = 1` in that case, giving one bucket
+per class — `len(classes)` buckets rather than `data_par_size`, matching the
+function's own "`data_par_size` (or fewer) buckets" docstring), with new
+`tests/utils/test_misc.py` coverage for `process_root_dirs`'s bucketing
+generally: the evenly- and non-evenly-divisible `> data_par_size` cases
+(including documenting, not fixing, the pre-existing "leftover classes past
+`data_par_size * classes_to_combine` are silently dropped" behavior — flagged
+by its own `# TODO: Add shuffling for data_par_size if it doesn't divide
+1000 equally` comment), the `<= data_par_size` regression case parametrized
+across several class counts, bucket-content correctness (not just counts),
+and the non-`imagenet` (`basic_ct`-style) branch.
 
 ## Validating a config file by hand
 
