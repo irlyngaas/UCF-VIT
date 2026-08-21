@@ -83,7 +83,7 @@ NUM_BATCHES_TO_PULL = 4
 # process_root_dirs already buckets real files one bucket per rank before
 # min_files narrows *within* each bucket, so imagenet's min_files only needs
 # to cover batch_size * NUM_BATCHES_TO_PULL per rank, not per dataset.
-BASIC_CT_MIN_FILES = 32 * NUM_BATCHES_TO_PULL * 8
+BASIC_CT_MIN_FILES = 4 * NUM_BATCHES_TO_PULL * 8  # basic_ct/unetr's real batch_size=4 (UNETR's own decoder-memory exception -- see its config comment)
 IMAGENET_MIN_FILES = 32 * NUM_BATCHES_TO_PULL + 32  # >= 32 (real batch_size) * NUM_BATCHES_TO_PULL, with margin
 CATSDOGS_MIN_FILES = 32 * NUM_BATCHES_TO_PULL * 8
 

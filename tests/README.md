@@ -507,11 +507,17 @@ Prints a per-config, per-stage PASS/FAIL/TIMEOUT table at the end and exits
 nonzero if anything failed. Defaults: 8 `srun` tasks and a 300s timeout per
 run; both are CLI flags (`--ntasks`, `--timeout`, and `--min-files` — see
 above) if a config needs more (or you want to fail faster). All 10 shipped
-configs now share the same data-pipeline baseline (tensor parallelism,
-adaptive patching, tiling, and — for `basic_ct` — `twoD` all off by default,
-`SAP` excepted since it architecturally requires adaptive patching), so no
-config currently needs a different `--min-files`/`--timeout` than the shared
-default. You can also run it directly against one config instead of all 10:
+configs share the same data-pipeline baseline (tensor parallelism, adaptive
+patching, tiling, and — for `basic_ct` — `twoD` all off by default), with
+three documented, architecture-driven exceptions for `basic_ct`: `sap` keeps
+`ap.do_ap: True` (`parse.py` hard-requires it for `SAP`) and `patch_size: 4`
+(its decoder is a single `ConvTranspose3d(kernel=stride=patch_size)`, whose
+memory scales as `patch_size**3`); `unetr` keeps `batch_size: 4` (its
+skip-connection decoder runs a plain `Conv3d` on the full-resolution volume
+regardless of `patch_size`/`embed_dim`, so memory scales with `batch_size`
+directly). No config currently needs a different `--min-files`/`--timeout`
+CLI value than the shared default. You can also run it directly against one
+config instead of all 10:
 
 ```bash
 python tests/integration/run_training_smoke.py configs/basic_ct/unetr/base_config.yaml

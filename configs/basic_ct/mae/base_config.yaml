@@ -52,7 +52,7 @@ model:
   loss_fn: "MSE"
   mask_ratio: 0.75
   linear_decoder: False
-  decoder_embed_dim: 512
+  decoder_embed_dim: 480 # must be divisible by 3 (get_3d_sincos_pos_embed, twoD:False) and by decoder_num_heads; 512 no longer satisfies the former
   decoder_depth: 8
   decoder_num_heads: 16
   decoder_mlp_ratio: 4

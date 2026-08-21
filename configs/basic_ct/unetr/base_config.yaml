@@ -99,6 +99,6 @@ dataloader:
   dict_buffer_sizes: {
     'ct1': 100,
   }
-  batch_size: 32
+  batch_size: 4 # UNETR exception: its skip-connection decoder (encoder1) runs a plain Conv3d directly on the full 256^3-resolution volume regardless of patch_size/embed_dim -- batch_size:32 OOM'd (~34GB for that one activation alone)
   num_workers: 1
   pin_memory: False

@@ -94,7 +94,7 @@ NUM_BATCHES_TO_CHECK = 2
 # *within* each bucket, and there's no tiling multiplication (div=1 for
 # classification) -- so min_files here must directly cover
 # batch_size * NUM_BATCHES_TO_CHECK samples per rank, not just per dataset.
-BASIC_CT_MIN_FILES = 32 * NUM_BATCHES_TO_CHECK * 8  # data_par_size=8 for basic_ct/unetr's real config
+BASIC_CT_MIN_FILES = 4 * NUM_BATCHES_TO_CHECK * 8  # basic_ct/unetr's real batch_size=4 (UNETR's own decoder-memory exception -- see its config comment), data_par_size=8
 IMAGENET_MIN_FILES = 100  # >= 32 (real batch_size) * 2 (NUM_BATCHES_TO_CHECK), with margin
 
 # create_narrow_catsdogs_dir's min_files is a floor under max(min_files,
