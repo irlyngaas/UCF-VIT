@@ -180,6 +180,19 @@ numbers:
 pytest -m dataloader_speed -s
 ```
 
+Runs anywhere (no GPU/SLURM needed) — that's just the local invocation. To
+run it on a real Frontier compute node instead of a login node (mainly so
+the `num_workers` cases have real, uncontended cores behind them):
+
+```bash
+cd launch/tests
+sbatch run_dataloader_speed.sh
+```
+
+A single plain process (no `srun`, unlike `run_distributed_tests.sh`) — the
+tests themselves are CPU-only and don't touch `torch.distributed` or the
+GPUs. Output lands in `pytest-dataloader-speed-<jobid>.out`.
+
 ## What isn't covered yet
 
 - `UCF_VIT.model.arch` / `UCF_VIT.model.building_blocks` (needs `timm`,
