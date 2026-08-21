@@ -87,19 +87,19 @@ TINY_MODEL_OVERRIDES = {
     "depth": 4,
 }
 
-# Default target number of real files to keep per dataset key (or, for
-# imagenet, per data-parallel bucket) after narrowing dict_start_idx/
-# dict_end_idx -- see compute_narrow_dict_idx. 8 of the 10 shipped configs
-# share batch_size=32 (basic_ct-unetr is the exception at batch_size=4, its
-# own decoder-memory constraint -- see its config comment); basic_ct's
-# baseline config (do_tiling=False, twoD=False, do_ap=False -- do_ap=True
-# only for the sap exception, which doesn't affect sample count) no longer
-# multiplies each real file into many tiles/z-slices, so min_files must
-# directly cover a full batch per rank: batch_size(32) * a typical
+# Default (ceiling) target number of real files to keep per dataset key (or,
+# for imagenet, per data-parallel bucket) after narrowing dict_start_idx/
+# dict_end_idx -- see compute_narrow_dict_idx. Sized for the shared
+# batch_size=32 most configs use: batch_size(32) * a typical
 # data_par_size(8) = 256, comfortably under Tr8_Training's real 852 file
-# pairs. Generous for basic_ct-unetr specifically (only needs 4*8=32), but
-# that's harmless -- narrowing less tightly than strictly necessary, not an
-# error.
+# pairs -- basic_ct's baseline config (do_tiling=False, twoD=False,
+# do_ap=False -- do_ap=True only for the sap exception, which doesn't affect
+# sample count) no longer multiplies each real file into many tiles/
+# z-slices, so min_files must directly cover a full batch per rank.
+# make_smoke_config further caps this down to each *individual* config's own
+# batch_size * data_par_size, so a smaller-batch_size exception (currently
+# basic_ct-unetr, batch_size=4) doesn't end up running many more
+# batches/epoch than it needs -- see the comment there.
 DEFAULT_MIN_FILES = 256
 
 # Default per-run timeout in seconds. Previously 300s left basic_ct-unetr's
@@ -296,6 +296,19 @@ def make_smoke_config(base_config_path, scratch_dir, min_files=DEFAULT_MIN_FILES
     """
     with open(base_config_path) as f:
         conf = yaml.load(f, Loader=yaml.FullLoader)
+
+    # DEFAULT_MIN_FILES (or an explicit --min-files) is a ceiling, not a
+    # target: it's sized for the shared batch_size=32 most configs use, but
+    # basic_ct-unetr's batch_size=4 exception (see its config comment) means
+    # 256 real files there works out to 8 batches/rank/epoch instead of 1 --
+    # plenty of real data for correctness, but the extra iterations through
+    # UNETR's inherently expensive full-resolution conv decoder cost real
+    # wall-clock time and were timing out the smoke test. Capping min_files
+    # to this config's own batch_size * data_par_size keeps every config to
+    # ~1 batch/rank regardless of how small its batch_size is, without
+    # needing a per-config override.
+    data_par_size = conf["parallelism"]["fsdp_size"] * conf["parallelism"]["simple_ddp_size"]
+    min_files = min(min_files, conf["dataloader"]["batch_size"] * data_par_size)
 
     conf["model"].update(TINY_MODEL_OVERRIDES)
 
