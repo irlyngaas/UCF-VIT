@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:8
 #SBATCH --ntasks-per-node=8
 #SBATCH --cpus-per-task=7
-#SBATCH -t 00:05:00
+#SBATCH -t 00:10:00
 #SBATCH -p batch
 #SBATCH -o pytest-distributed-%j.out
 #SBATCH -e pytest-distributed-%j.out

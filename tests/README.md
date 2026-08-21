@@ -200,6 +200,7 @@ is needed. Output lands in `pytest-distributed-<jobid>.out` in that directory.
 | `tests/distributed/test_smoke.py` | Basic connectivity: rank/world_size sanity, a plain `all_reduce`. Check this first if anything else fails — it isolates launch/environment problems from actual `UCF_VIT` bugs. |
 | `tests/distributed/test_init_par_groups.py` | `init_par_groups`'s process-group membership (world size and this rank's local rank within each of the 5 returned groups), across several `tensor_par_size`/`fsdp_size`/`simple_ddp_size` splits of the job's actual world size. |
 | `tests/distributed/test_dist_functions.py` | Forward (and, for `all_reduce`/`broadcast`, backward) correctness of the collective autograd ops most exercised by tensor parallelism: `all_reduce`, `broadcast`, `all_gather`, `gather`, `F_Identity_B_AllReduce`, `F_AllReduce_B_Identity`. |
+| `tests/distributed/test_dataloader_real_data.py` | `FileReader`'s DDP-rank sharding and `ShuffleIterableDataset`'s no-loss/no-duplication guarantee, against real `basic_ct` and `imagenet` file lists on Frontier and `torch.distributed.get_rank()` for real (not simulated) across all `world_size` ranks, across `num_workers` (0/1/4) and `buffer_size` (1/20/100) — the real-scale counterpart to `tests/dataloaders/test_dataset.py`'s simulated-rank coverage of the same `num_workers=0` fix. File I/O itself is stubbed out (`FileReader.read_process_file` monkeypatched to a no-op) so this stays fast and focused on correctness, not decode speed. |
 
 **Important constraint if you add more tests here**: `init_par_groups` and the
 `dist_functions.py` ops all make *collective* calls (`dist.new_group`,
@@ -221,6 +222,35 @@ own multi-process init and making every test error out at setup with
 `tests/conftest.py`, see its docstring.) If something fails after a future
 change, `test_smoke.py`'s result tells you whether to look at the
 environment or at the specific collective's logic.
+
+`test_dataloader_real_data.py` (added later, alongside the `FileReader`
+`num_workers=0` DDP-sharding fix) hasn't been run on Frontier yet — not yet
+included in that 14-test count above, and it bumps the sbatch time limit to
+10 minutes (from 5) since it's now 2 datasets x 3 `num_workers` x 3
+`buffer_size` = 18 parametrized cases. It covers both `basic_ct` (where the
+`num_workers=0` fix specifically mattered — `basic_ct/sap` and
+`basic_ct/unetr` both ship with `num_workers: 0`) and `imagenet` (a
+meaningfully different code path in `process_root_dirs`, per-class bucketing
+rather than a flat file listing, though every shipped `imagenet` config uses
+`num_workers: 1` so wasn't actually broken); `imagenet`'s real directory can
+be on the order of a million files, so its file list here is deliberately
+narrowed to the first few real class subdirectories (`IMAGENET_MAX_CLASSES`
+in the test file) — same "real data, just less of it" principle as Tier 3's
+`create_narrow_catsdogs_dir`. `num_workers > 0` combines a real DDP rank
+with a *simulated* per-worker split (monkeypatched
+`torch.utils.data.get_worker_info`, same technique as Tier 1), rather than
+spawning real DataLoader multiprocessing workers — real ranks are what Tier
+1 could only simulate and is the part that was actually broken; real
+multiprocess workers under an already-NCCL-initialized process add real
+complexity (CUDA-after-fork concerns) without testing anything Tier 1 didn't
+already cover for the per-worker-split math itself. Each combination also
+round-trips this rank's real shard through `ShuffleIterableDataset` at the
+given `buffer_size` and checks the result is set-identical to the
+unshuffled shard (no loss/duplication), reusing Tier 1's synthetic-data
+invariant against real files instead. If a given `(num_workers,
+buffer_size)` combination needs more real files than are actually available
+(e.g. `basic_ct`'s `Tr8_Training` is a small, ~8-volume demo dataset), that
+combination is skipped rather than failed — see the test's docstring.
 
 ## Running the training smoke test (Tier 3)
 
