@@ -869,10 +869,14 @@ real `parse_config` call end to end against those fixtures.
     `do_ap: True` + `patch_size: 4`; `unetr`: `batch_size: 4`); everything
     else (tensor parallelism, tiling, `twoD`, `num_workers`,
     `dict_buffer_sizes`) is uniform across all 4 `basic_ct` configs, matching
-    `imagenet`/`catsdogs`. Next: rerun `run_distributed_tests.sh` (Tier 2) to
-    confirm `test_dataloader_real_pipeline.py`'s updated
-    `test_real_pipeline_basic_ct_unetr` (non-adaptive 4-tuple batch shape)
-    passes for real too.
+    `imagenet`/`catsdogs`.
+14. Tier 2 rerun (job 5323450) confirms the rest: **all 39 tests pass on all
+    8 ranks** (74.72s), including `test_real_pipeline_basic_ct_unetr` against
+    its updated non-adaptive 4-tuple batch shape. No failures anywhere in the
+    log. This closes out the config-baseline reconfiguration effort
+    end to end -- both Tier 3 (all 10 configs, item 13) and Tier 2 (all 39
+    tests, real data, real 8-rank launch) are green against the new
+    `basic_ct` baseline.
 
 That fixture testing also surfaced a narrower, real edge case in
 `process_root_dirs`: when an `imagenet`-format dataset has `<= data_par_size`
