@@ -68,11 +68,46 @@ pytest tests/test_config_validation.py -v
 | --- | --- |
 | `tests/dataloaders/test_quadtree.py` | `Rect` geometry, `FixedQuadTree` subdivision, node-value/encode-decode |
 | `tests/dataloaders/test_octree.py` | `Cube` geometry, `FixedOctTree` subdivision |
+| `tests/dataloaders/test_dataset.py` | `TileDataIter` (2D, 3D-full, and 3D-twoD-sliced tiling, with/without labels, overlap), `ShuffleIterableDataset` (no data loss/duplication across buffer sizes), `ProcessChannels` (batching, adaptive-patching wiring), `FileReader` (DDP-rank + dataloader-worker sharding disjointness/coverage up to `num_workers=7`, `keys_to_add` replication) |
 | `tests/utils/test_misc.py` | `is_power_of_two`, `calculate_tile_overlap`, `patchify`/`unpatchify` roundtrips |
 | `tests/utils/test_pos_embed.py` | 1D/2D/3D sin-cos position embeddings, `SinusoidalEmbeddings` |
 | `tests/utils/test_lr_scheduler.py` | `LinearWarmupCosineAnnealingLR` warmup/annealing shape |
 | `tests/utils/test_metrics.py` | `masked_mse`, `DiceBLoss` |
 | `tests/test_config_validation.py` | Every YAML under `configs/` actually parses via `parse_config` |
+
+`tests/dataloaders/test_dataset.py`'s `TileDataIter` coverage is deliberately
+thorough: that class is where a real, live bug was found and fixed this
+session (a 3D `basic_ct` volume being twoD-sliced into 2D z-planes was
+silently treated as genuinely-2D data, leaving the whole z-axis attached to
+every tile and producing a 5D batch several layers downstream — see "Real
+runs on Frontier so far" below). The `twoD=True`/`twoD=False` 3D tests there
+are regression tests for exactly that bug.
+
+Writing `test_filereader_*` also surfaced and fixed a second real bug (not
+found via a real run, so not in the Frontier findings log below), more
+serious than it first looked: `FileReader.__iter__`'s `num_workers=0`
+branch (`torch.utils.data.get_worker_info()` returns `None` whenever
+`num_workers=0`) never applied DDP-rank sharding at all — it unconditionally
+set `iter_start=0, iter_end=len(file_list)`, so *every* DDP rank read the
+*entire* file list instead of its own shard. This was live today, not a
+landmine: `basic_ct/sap` and `basic_ct/unetr` both ship with
+`num_workers: 0` and `simple_ddp_size: 8`. A related symptom of the same
+broken branch: combined with `keys_to_add > 1` (dataset-balancing
+replication across multiple, differently-sized `dict_root_dirs` keys), it
+would walk past the end of `file_list` and raise `IndexError` — that part
+alone doesn't hit any shipped config today (every shipped `basic_ct` config
+has exactly one key), but the missing DDP-rank sharding did. Fixed by
+routing `num_workers=0` through the same DDP-rank/`gx`-based sharding math
+as `num_workers >= 1`, instead of duplicating (and getting wrong) a separate
+code path for it. `test_filereader_num_workers_zero_shards_by_ddp_rank` and
+`test_filereader_shards_combine_ddp_rank_and_dataloader_workers` (the
+latter parametrized up to `num_workers=7`, matching real Frontier node
+core counts) are the regression tests.
+
+`tests/dataloaders/test_dataset_speed.py` has informational-only throughput
+measurements (buffer_size, num_workers) for the same pipeline — no
+pass/fail threshold, and not run by default; see "Running the dataloader
+speed tests" below.
 
 `tests/conftest.py` provides a session-wide, autouse fixture that initializes
 a single-process (`world_size=1`, `gloo` backend) `torch.distributed` group.
@@ -80,6 +115,20 @@ This exists because several functions (notably `parse_config`) call
 `dist.get_rank()`/`dist.get_world_size()` even outside of a real multi-process
 launch; the fixture lets those calls succeed locally without any SLURM
 allocation. You don't need to do anything to use it — it's automatic.
+
+## Running the dataloader speed tests
+
+`tests/dataloaders/test_dataset_speed.py` measures throughput of
+`ShuffleIterableDataset` across `buffer_size` values and of a `DataLoader`
+wrapping a synthetic (artificially delayed) source across `num_workers`
+values. These are excluded from the default `pytest` run (see `addopts` in
+`pyproject.toml`) since they take longer and, being timing measurements,
+aren't meaningfully pass/fail — run them explicitly and read the printed
+numbers:
+
+```bash
+pytest -m dataloader_speed -s
+```
 
 ## What isn't covered yet
 

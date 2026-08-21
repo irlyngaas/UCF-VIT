@@ -40,4 +40,8 @@ test = ["pytest>=7.0"]
 minversion = "7.0"
 testpaths = ["tests"]
 pythonpath = ["src", "utils"]
+markers = [
+    "dataloader_speed: informational dataloader throughput measurements (buffer_size/num_workers) -- not run by default, no pass/fail threshold; run explicitly with `pytest -m dataloader_speed`",
+]
+addopts = "-m 'not dataloader_speed'"
 

@@ -155,37 +155,40 @@ class FileReader(IterableDataset):
         """
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is None:
+            # No DataLoader multiprocessing workers (num_workers=0) -- stand
+            # in with a single worker per DDP rank so this still shards by
+            # DDP rank via gx/ddp_group below. Previously this branch skipped
+            # that sharding entirely (iter_start=0, iter_end=len(file_list)),
+            # so every DDP rank silently read the *entire* file_list with
+            # num_workers=0 instead of its own shard.
             assert torch.distributed.is_initialized()
             class dummy:
                 num_workers = 1
                 id = 0
             worker_info = dummy()
-            iter_start = 0
-            iter_end = len(self.file_list)
 
+        if not torch.distributed.is_initialized():
+            ddp_rank = 0
+            self.data_par_size = 1
         else:
-            if not torch.distributed.is_initialized():
-                ddp_rank = 0
-                self.data_par_size = 1
+            if self.ddp_group == None:
+                ddp_rank = torch.distributed.get_rank()
             else:
-                if self.ddp_group == None:
-                    ddp_rank = torch.distributed.get_rank()
-                else:
-                    ddp_rank = torch.distributed.get_rank(group=self.ddp_group)
+                ddp_rank = torch.distributed.get_rank(group=self.ddp_group)
 
-            num_workers_per_ddp = worker_info.num_workers
-            group_list = list(map(lambda x: int(x), self.gx.split(":")))
-            group_id = np.where(np.cumsum(group_list) > ddp_rank)[0][0]
-            group_size = group_list[group_id]
-            group_rank = ddp_rank - ([0] + np.cumsum(group_list).tolist())[group_id]
-            num_shards = group_size * num_workers_per_ddp
-            rank = group_rank
+        num_workers_per_ddp = worker_info.num_workers
+        group_list = list(map(lambda x: int(x), self.gx.split(":")))
+        group_id = np.where(np.cumsum(group_list) > ddp_rank)[0][0]
+        group_size = group_list[group_id]
+        group_rank = ddp_rank - ([0] + np.cumsum(group_list).tolist())[group_id]
+        num_shards = group_size * num_workers_per_ddp
+        rank = group_rank
 
-            per_worker = int(math.floor(len(self.file_list)/ float(self.keys_to_add) / float(num_shards)))
-            assert per_worker > 0, "Each worker doesn't have at least one file, run utils/load_balance.py to diagnose the issue"
-            worker_id = rank * num_workers_per_ddp + worker_info.id
-            iter_start = worker_id * per_worker
-            iter_end = iter_start + per_worker
+        per_worker = int(math.floor(len(self.file_list)/ float(self.keys_to_add) / float(num_shards)))
+        assert per_worker > 0, "Each worker doesn't have at least one file, run utils/load_balance.py to diagnose the issue"
+        worker_id = rank * num_workers_per_ddp + worker_info.id
+        iter_start = worker_id * per_worker
+        iter_end = iter_start + per_worker
 
         for m in range(self.keys_to_add):
             start_it = iter_start + m*int(len(self.file_list)/self.keys_to_add)
