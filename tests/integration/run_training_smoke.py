@@ -203,7 +203,18 @@ def compute_narrow_dict_idx(conf, min_files):
     dict_root_dirs = conf["data"]["dict_root_dirs"]
     data_par_size = conf["parallelism"]["fsdp_size"] * conf["parallelism"]["simple_ddp_size"]
 
-    dict_lister_trains = process_root_dirs(dataset, dict_root_dirs, data_par_size)
+    try:
+        dict_lister_trains = process_root_dirs(dataset, dict_root_dirs, data_par_size)
+    except FileNotFoundError as e:
+        # process_root_dirs' imagenet branch does a bare os.listdir(root_dir);
+        # a root_dir that doesn't exist at all (as opposed to existing but
+        # empty, the case already handled below) raises FileNotFoundError
+        # directly rather than returning an empty listing -- normalize both
+        # into the same NoRealDataFoundError so callers get one consistent,
+        # always-gracefully-skippable failure mode.
+        raise NoRealDataFoundError(
+            f"No real files found for dataset={dataset!r} under dict_root_dirs={dict_root_dirs}: {e}"
+        ) from e
 
     empty_keys = [k for k, v in dict_lister_trains.items() if len(v) == 0]
     if not dict_lister_trains or empty_keys:

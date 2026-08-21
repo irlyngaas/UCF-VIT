@@ -76,6 +76,7 @@ pytest tests/test_config_validation.py -v
 | `tests/utils/test_lr_scheduler.py` | `LinearWarmupCosineAnnealingLR` warmup/annealing shape |
 | `tests/utils/test_metrics.py` | `masked_mse`, `DiceBLoss` |
 | `tests/test_config_validation.py` | Every YAML under `configs/` actually parses via `parse_config` |
+| `tests/integration/test_run_training_smoke_helpers.py` | `run_training_smoke.py`'s `compute_narrow_dict_idx` (real-data-found narrowing, empty-but-existing-dir and nonexistent-dir both raising `NoRealDataFoundError`, no-op for non-`iterative_dataloader` configs) |
 
 `tests/dataloaders/test_dataset.py`'s `TileDataIter` coverage is deliberately
 thorough: that class is where a real, live bug was found and fixed this
@@ -192,6 +193,45 @@ sbatch run_dataloader_speed.sh
 A single plain process (no `srun`, unlike `run_distributed_tests.sh`) — the
 tests themselves are CPU-only and don't touch `torch.distributed` or the
 GPUs. Output lands in `pytest-dataloader-speed-<jobid>.out`.
+
+`tests/dataloaders/test_dataset_speed_real_data.py` replaces
+`test_dataset_speed.py`'s made-up `time.sleep()` delay with genuine
+NIfTI/JPEG decode, for `basic_ct/unetr`, `imagenet/classification`, and
+`catsdogs/classification` — the same real construction
+`tests/distributed/test_dataloader_real_pipeline.py` uses
+(`parse_config`/`calculate_load_balancing_on_the_fly`/
+`NativePytorchDataModule` for the first two; `CatsDogsDataset` +
+`DistributedSampler` + `DataLoader` for `catsdogs`), just single-process —
+`parse_config(..., load_balance_offline=True)` skips the
+`data_par_size * tensor_par_size == world_size` assertion the real shipped
+configs (`data_par_size=8`) would otherwise fail under a lone process, and
+`calculate_load_balancing_on_the_fly`/`NativePytorchDataModule` both derive
+sharding from the config's stated `data_par_size` rather than the real
+world size regardless, so this process still ends up decoding a real,
+correctly-sharded ~1/8th slice — genuine work, not a full-scale
+measurement. Sweeps `num_workers` up to 7 (matching real Frontier node core
+counts) for all three; needs real Frontier data to mean anything, so (like
+`tests/distributed/`'s real-data files) it skips gracefully rather than
+failing when the real paths aren't reachable — `run_dataloader_speed.sh`
+above is what actually runs it against real data. See the module docstring
+for a caveat on `num_workers > 0`: worker-subprocess startup cost is
+included in the timed region, so it can dominate the measurement at small
+batch counts, especially at higher worker
+counts.
+
+Writing this surfaced a real gap in `compute_narrow_dict_idx` (shared with
+`test_dataloader_real_pipeline.py` and Tier 3's smoke test): it already
+handled a `dict_root_dirs` path that exists but is empty (raising
+`NoRealDataFoundError`, caught and skipped), but a path that doesn't exist
+*at all* let a raw `FileNotFoundError` (from `process_root_dirs`'
+`os.listdir`/`FileLister` calls) propagate uncaught instead — this only
+surfaced now because this file is the first real-data test that isn't
+gated behind a real SLURM launch (`test_dataloader_real_pipeline.py` lives
+in `tests/distributed/`, so it's skipped entirely before ever reaching this
+code path when run without `srun`). Fixed by normalizing both cases to the
+same `NoRealDataFoundError`; `tests/integration/test_run_training_smoke_
+helpers.py` (new — `run_training_smoke.py`'s narrowing helpers had no unit
+tests of their own before this) is the regression test.
 
 ## What isn't covered yet
 

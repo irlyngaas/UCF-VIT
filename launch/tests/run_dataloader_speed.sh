@@ -33,8 +33,8 @@ mkdir -p $MIOPEN_USER_DB_PATH
 
 export PYTHONPATH=$PWD:$PYTHONPATH
 
-# tests/dataloaders/test_dataset_speed.py is CPU-only (no GPU/torch.distributed
-# needed) and just a single plain process -- no srun here, unlike
+# tests/dataloaders/*speed*.py are CPU-only (no GPU/torch.distributed needed)
+# and just a single plain process -- no srun here, unlike
 # run_distributed_tests.sh. Requesting a full node (matching every other
 # launch/*/*.sh script) mainly so num_workers up to 7 has real cores behind
 # it, not login-node contention with everyone else's shell sessions; the
@@ -45,4 +45,11 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 # informational timing measurements with no pass/fail threshold, not
 # correctness tests. -s shows the printed timing output (pytest captures
 # stdout by default otherwise).
-time python -m pytest -m dataloader_speed -s ../../tests/dataloaders/test_dataset_speed.py -v
+#
+# Points at the whole tests/dataloaders/ directory (marker-filtered, so only
+# dataloader_speed-marked tests actually run) rather than a single file, so
+# both test_dataset_speed.py (synthetic delay) and
+# test_dataset_speed_real_data.py (real NIfTI/JPEG decode -- needs real
+# Frontier data, which is why this has to run here and not just anywhere)
+# run together; any future speed-test file gets picked up the same way.
+time python -m pytest -m dataloader_speed -s ../../tests/dataloaders/ -v
