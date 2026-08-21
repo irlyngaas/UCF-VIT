@@ -94,6 +94,49 @@ TINY_MODEL_OVERRIDES = {
 # configs), so at least one real batch per rank should still be possible.
 DEFAULT_MIN_FILES = 64
 
+# Default per-run timeout in seconds -- basic_ct-unetr's fresh run alone
+# measured 227s against real data.
+DEFAULT_TIMEOUT = 300
+
+# Per-config overrides of --min-files/--timeout, keyed by config_slug(). Only
+# needed for configs where the shared defaults above don't fit -- see each
+# entry's comment for why.
+#
+# basic_ct/mae and basic_ct/sap both have twoD: True and tiling.div: 4: for
+# 3D data sliced into 2D z-planes, TileDataIter yields div*div*Z tiles per
+# real file (Z = the full, un-narrowed depth -- 256 here), not div**3 the
+# way basic_ct/unetr's twoD: False does -- 4096 tiles/file vs 64. With
+# Tr8_Training's real 852 file pairs, the shared min_files=64 default
+# narrows to ~64 files total (~8/rank across simple_ddp_size=8), i.e.
+# ~32768 tiles/rank/epoch for these two configs -- comfortably explains the
+# timeout. min_files=16 (~2 files/rank -- deliberately kept above the
+# data_par_size=8 floor with some margin against int() truncation in
+# FileReader's start_idx/end_idx narrowing, rather than cutting all the way
+# to the 1-file/rank minimum) cuts that by ~4x.
+#
+# That's enough for basic_ct/mae (batch_size=32, so ~2 files/rank is only
+# ~256 iterations/epoch -- close to basic_ct/unetr's own real 227s fresh
+# run). It is NOT enough on its own for basic_ct/sap: batch_size=2 means the
+# same ~2 files/rank is still ~4096 iterations/epoch, ~16x unetr's -- and
+# min_files can't be lowered further without dropping below 1 file/rank and
+# hitting FileReader's own `per_worker > 0` assertion. So sap also gets a
+# much larger timeout; if that's still not enough, the next lever would be
+# lowering tiling.div for the smoke test specifically (fewer spatial tiles
+# per z-slice), not min_files.
+#
+# basic_ct/diffusion has twoD: False (same div**3 = 64 tiles/file as
+# basic_ct/unetr, and identical batch_size=2/fixed_length=512), so its
+# timeout isn't explained by tile-count math the way mae/sap's is -- given
+# unetr's own real 227s fresh run left only ~73s of margin under the
+# previous 300s default, this is plausibly just a slower run (real
+# Frontier I/O/scheduling variance) landing over that margin, so it gets
+# a larger timeout and no min_files change.
+PER_CONFIG_OVERRIDES = {
+    "basic_ct-mae": {"min_files": 16},
+    "basic_ct-sap": {"min_files": 16, "timeout": 1800},
+    "basic_ct-diffusion": {"timeout": 900},
+}
+
 
 def discover_configs():
     return sorted(glob.glob(os.path.join(REPO_ROOT, "configs", "**", "base_config.yaml"), recursive=True))
@@ -349,8 +392,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("configs", nargs="*", help="Specific config file(s) to test; default is every configs/**/base_config.yaml")
     parser.add_argument("--ntasks", type=int, default=8, help="Number of srun tasks per training run (default 8, matching launch/*/*.sh)")
-    parser.add_argument("--timeout", type=int, default=300, help="Per-run timeout in seconds (default 300 -- basic_ct-unetr's fresh run alone measured 227s against real data)")
-    parser.add_argument("--min-files", type=int, default=DEFAULT_MIN_FILES, help=f"Target real files to keep per dataset key after narrowing dict_start_idx/dict_end_idx (default {DEFAULT_MIN_FILES})")
+    parser.add_argument("--timeout", type=int, default=None, help=f"Per-run timeout in seconds (default {DEFAULT_TIMEOUT}, unless overridden per-config -- see PER_CONFIG_OVERRIDES. An explicit --timeout always wins over both.)")
+    parser.add_argument("--min-files", type=int, default=None, help=f"Target real files to keep per dataset key after narrowing dict_start_idx/dict_end_idx (default {DEFAULT_MIN_FILES}, unless overridden per-config -- see PER_CONFIG_OVERRIDES. An explicit --min-files always wins over both.)")
     args = parser.parse_args()
 
     config_paths = args.configs if args.configs else discover_configs()
@@ -363,8 +406,16 @@ def main():
         scratch_dir = os.path.join(scratch_root, slug)
         print(f"\n{'='*80}\n{slug} ({config_path})\n{'='*80}", flush=True)
 
+        # Precedence: an explicit --min-files/--timeout always wins; failing
+        # that, PER_CONFIG_OVERRIDES; failing that, the plain default.
+        overrides = PER_CONFIG_OVERRIDES.get(slug, {})
+        min_files = args.min_files if args.min_files is not None else overrides.get("min_files", DEFAULT_MIN_FILES)
+        timeout = args.timeout if args.timeout is not None else overrides.get("timeout", DEFAULT_TIMEOUT)
+        if overrides and args.min_files is None and args.timeout is None:
+            print(f"[{slug}] using overrides: {overrides}", flush=True)
+
         try:
-            smoke_config = make_smoke_config(config_path, scratch_dir, min_files=args.min_files)
+            smoke_config = make_smoke_config(config_path, scratch_dir, min_files=min_files)
         except NoRealDataFoundError as e:
             # Fail fast, before ever spending GPU allocation time on a run
             # that's guaranteed to crash confusingly deep inside
@@ -383,7 +434,7 @@ def main():
 
         print(f"[{slug}] fresh run: srun -n {args.ntasks} python train.py {smoke_config}", flush=True)
         t0 = time.time()
-        fresh = run_training(smoke_config, args.ntasks, args.timeout)
+        fresh = run_training(smoke_config, args.ntasks, timeout)
         fresh_elapsed = time.time() - t0
 
         fresh_status = "TIMEOUT" if fresh["returncode"] is None else ("PASS" if fresh["returncode"] == 0 else "FAIL")
@@ -400,7 +451,7 @@ def main():
             set_resume(smoke_config, resume=True)
             print(f"[{slug}] resume run: srun -n {args.ntasks} python train.py {smoke_config}", flush=True)
             t0 = time.time()
-            resume = run_training(smoke_config, args.ntasks, args.timeout)
+            resume = run_training(smoke_config, args.ntasks, timeout)
             resume_elapsed = time.time() - t0
 
             resume_status = "TIMEOUT" if resume["returncode"] is None else ("PASS" if resume["returncode"] == 0 else "FAIL")

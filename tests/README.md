@@ -365,7 +365,12 @@ Prints a per-config, per-stage PASS/FAIL/TIMEOUT table at the end and exits
 nonzero if anything failed. Defaults: 8 `srun` tasks and a 300s timeout per
 run (basic_ct-unetr's fresh run alone measured 227s against real data); both
 are CLI flags (`--ntasks`, `--timeout`, and `--min-files` — see above) if a
-config needs more (or you want to fail faster). You can also run it directly
+config needs more (or you want to fail faster). A few configs need more than
+the shared defaults and get a `PER_CONFIG_OVERRIDES` entry in
+`run_training_smoke.py` instead of a CLI flag (currently
+`basic_ct-mae`/`sap`/`diffusion` — see "Real runs on Frontier so far"
+below); an explicit `--timeout`/`--min-files` always wins over both the
+shared default and any per-config override. You can also run it directly
 against one config instead of all 10:
 
 ```bash

@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:8
 #SBATCH --ntasks-per-node=8
 #SBATCH --cpus-per-task=7
-#SBATCH -t 00:20:00
+#SBATCH -t 01:15:00
 #SBATCH -p batch
 #SBATCH -o training-smoke-single-%j.out
 #SBATCH -e training-smoke-single-%j.out
@@ -39,9 +39,12 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 # (or waiting on) the other 9 every time. Also NOT run under a top-level
 # srun -- see tests/integration/run_training_smoke.py's module docstring.
 #
-# Doesn't pass --timeout itself, so it shares run_training_smoke.py's default
-# (currently 300s) with run_training_smoke.sh -- pass --timeout explicitly
-# below to override it for just this run.
+# Doesn't pass --timeout/--min-files itself, so it shares run_training_smoke.py's
+# defaults (currently 300s / 64 files) with run_training_smoke.sh, including
+# its PER_CONFIG_OVERRIDES for configs that need more of one or the other
+# (currently basic_ct-mae/sap/diffusion) -- pass --timeout/--min-files
+# explicitly below to override either for just this run, which always wins
+# over both the shared default and PER_CONFIG_OVERRIDES.
 #
 # Usage:
 #   cd launch/tests
