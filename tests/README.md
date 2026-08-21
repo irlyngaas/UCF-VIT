@@ -217,6 +217,7 @@ is needed. Output lands in `pytest-distributed-<jobid>.out` in that directory.
 | `tests/distributed/test_init_par_groups.py` | `init_par_groups`'s process-group membership (world size and this rank's local rank within each of the 5 returned groups), across several `tensor_par_size`/`fsdp_size`/`simple_ddp_size` splits of the job's actual world size. |
 | `tests/distributed/test_dist_functions.py` | Forward (and, for `all_reduce`/`broadcast`, backward) correctness of the collective autograd ops most exercised by tensor parallelism: `all_reduce`, `broadcast`, `all_gather`, `gather`, `F_Identity_B_AllReduce`, `F_AllReduce_B_Identity`. |
 | `tests/distributed/test_dataloader_real_data.py` | `FileReader`'s DDP-rank sharding and `ShuffleIterableDataset`'s no-loss/no-duplication guarantee, against real `basic_ct` and `imagenet` file lists on Frontier and `torch.distributed.get_rank()` for real (not simulated) across all `world_size` ranks, across `num_workers` (0/1/4) and `buffer_size` (1/20/100) — the real-scale counterpart to `tests/dataloaders/test_dataset.py`'s simulated-rank coverage of the same `num_workers=0` fix. File I/O itself is stubbed out (`FileReader.read_process_file` monkeypatched to a no-op) so this stays fast and focused on correctness, not decode speed. |
+| `tests/distributed/test_catsdogs_real_data.py` | The real production `DistributedSampler` + `DataLoader` + `CatsDogsDataset`/`CatsDogsCollate` wiring, against real CatsDogs JPEGs and real ranks — disjoint/complete file sharding across `num_workers` (0/1/4), and `adaptive_patching=True` against real photo content (not synthetic random-noise JPEGs, unlike `tests/datasets/test_catsdogs.py`), which actually exercises Canny edge detection on real image structure. Unlike the row above, file I/O is *not* stubbed — `CatsDogsDataset.__getitem__` has no meaningful decode-free path. |
 
 **Important constraint if you add more tests here**: `init_par_groups` and the
 `dist_functions.py` ops all make *collective* calls (`dist.new_group`,
@@ -267,6 +268,28 @@ invariant against real files instead. If a given `(num_workers,
 buffer_size)` combination needs more real files than are actually available
 (e.g. `basic_ct`'s `Tr8_Training` is a small, ~8-volume demo dataset), that
 combination is skipped rather than failed — see the test's docstring.
+
+`test_catsdogs_real_data.py` (added later, also not yet run on Frontier) is
+a different kind of check: `catsdogs` is the only shipped dataset using
+`dataloader.type: "dataloader"`, sharded by PyTorch's own
+`DistributedSampler` rather than any UCF_VIT-custom logic like
+`FileReader`'s — so there's no known bug to regression-test the way there
+was for `test_dataloader_real_data.py`. Its value is confirming the real
+production wiring (`train.py`'s exact
+`DistributedSampler(..., num_replicas=data_par_size, rank=world_rank)` +
+`DataLoader(..., num_workers=...)` + `CatsDogsCollate` construction) works
+end to end against real files, real ranks, and — for `adaptive_patching`
+specifically — real photo content, since Canny edge detection on an actual
+photo exercises real image structure that
+`tests/datasets/test_catsdogs.py`'s synthetic random-noise JPEGs can't.
+Narrows the real `CatsDogs` directory to an exact multiple of `world_size`
+real files (`FILES_PER_RANK * world_size`) so `DistributedSampler`'s default
+`drop_last=False` padding (which repeats samples to round up to a multiple
+of `num_replicas`) never kicks in, keeping the disjointness check
+unambiguous. File reads are *not* stubbed here, unlike
+`test_dataloader_real_data.py` — `CatsDogsDataset.__getitem__` has no
+meaningful decode-free path, and real decode against a handful of narrowed
+files is fast enough not to need it.
 
 ## Running the training smoke test (Tier 3)
 
