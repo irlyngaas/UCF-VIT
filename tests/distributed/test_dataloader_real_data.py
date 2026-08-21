@@ -19,8 +19,10 @@ works at the scale/environment it's meant for. Parametrized across
 num_workers (0, 1, 4 -- num_workers > 0 combines a real DDP rank with a
 *simulated* per-worker split, monkeypatched the same way Tier 1 does, rather
 than spawning real DataLoader multiprocessing workers under an
-already-NCCL-initialized process) and buffer_size (1, 20, 100 -- 20 and 100
-are basic_ct/unetr's and imagenet/classification's real shipped values).
+already-NCCL-initialized process) and buffer_size (1, 20, 100 -- 100 is both
+basic_ct/unetr's and imagenet/classification's real shipped
+dict_buffer_sizes value; 20 and 1 are extra coverage, not tied to a shipped
+config).
 
 File *reading* itself is stubbed out (FileReader.read_process_file
 monkeypatched to return the path unchanged) so this stays fast and focused

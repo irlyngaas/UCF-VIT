@@ -92,9 +92,12 @@ serious than it first looked: `FileReader.__iter__`'s `num_workers=0`
 branch (`torch.utils.data.get_worker_info()` returns `None` whenever
 `num_workers=0`) never applied DDP-rank sharding at all — it unconditionally
 set `iter_start=0, iter_end=len(file_list)`, so *every* DDP rank read the
-*entire* file list instead of its own shard. This was live today, not a
-landmine: `basic_ct/sap` and `basic_ct/unetr` both ship with
-`num_workers: 0` and `simple_ddp_size: 8`. A related symptom of the same
+*entire* file list instead of its own shard. This was live at the time,
+against `basic_ct/sap` and `basic_ct/unetr`'s then-shipped `num_workers: 0`
++ `simple_ddp_size: 8` (both now ship `num_workers: 1` as part of this
+session's config-baseline reconfiguration, but the bug and its regression
+test stand regardless of what any shipped config currently uses). A related
+symptom of the same
 broken branch: combined with `keys_to_add > 1` (dataset-balancing
 replication across multiple, differently-sized `dict_root_dirs` keys), it
 would walk past the end of `file_list` and raise `IndexError` — that part
@@ -315,8 +318,9 @@ environment or at the specific collective's logic.
 `num_workers=0` DDP-sharding fix) bumps the sbatch time limit to 10 minutes
 (from 5) since it's 2 datasets x 3 `num_workers` x 3 `buffer_size` = 18
 parametrized cases. It covers both `basic_ct` (where the `num_workers=0` fix
-specifically mattered — `basic_ct/sap` and `basic_ct/unetr` both ship with
-`num_workers: 0`) and `imagenet` (a meaningfully different code path in
+specifically mattered — `basic_ct/sap` and `basic_ct/unetr` shipped with
+`num_workers: 0` at the time; both now ship `num_workers: 1` as part of this
+session's config-baseline reconfiguration) and `imagenet` (a meaningfully different code path in
 `process_root_dirs`, per-class bucketing rather than a flat file listing,
 though every shipped `imagenet` config uses `num_workers: 1` so wasn't
 actually broken); `imagenet`'s real directory can be on the order of a
@@ -372,10 +376,11 @@ dataloader test coverage: every other real-data test above deliberately
 stubs out file I/O to stay fast and focus on sharding correctness, so
 nothing previously decoded a real file and checked what came out the other
 end of `TileDataIter`/`ProcessChannels`/`collate_fn`. This file does exactly
-that, with no stubbing, for `basic_ct/unetr` (real NIfTI decode, full 3D
-tiling, adaptive patching, and real segmentation labels — the other gap
-flagged this session, since `test_dataloader_real_data.py` only ever globs
-`imagesTr`, never `labelsTr`), `imagenet/classification` (real JPEG decode +
+that, with no stubbing, for `basic_ct/unetr` (real NIfTI decode, the
+baseline config -- no tiling/adaptive patching -- and real segmentation
+labels -- the other gap flagged this session, since
+`test_dataloader_real_data.py` only ever globs `imagesTr`, never
+`labelsTr`), `imagenet/classification` (real JPEG decode +
 resize, real classification labels), and `catsdogs/classification` (also
 real JPEG decode + resize + classification labels, but a completely
 different production code path — `dataloader.type: "dataloader"`, not
@@ -404,14 +409,16 @@ docstring) — a wrong argument there surfaces here as a real crash.
 `compute_narrow_dict_idx`'s `min_files` means something different across the
 `iterative_dataloader` datasets, which the test accounts for with separate
 constants: for `basic_ct` (one `dict_root_dirs` key) it's a total file count
-that `FileReader`'s own sharding then divides across ranks, and tiling
-multiplies each real file into `div**3` samples (64, for `unetr`'s real
-`div=4`), so even 1 file/rank is comfortably enough. For `imagenet`,
-`process_root_dirs` already buckets real files one bucket per rank *before*
-`min_files` narrows within each bucket, and classification has no tiling
-multiplication (`div=1`) — so `min_files` there must directly cover
-`batch_size * NUM_BATCHES_TO_CHECK` real images per rank (`IMAGENET_MIN_FILES
-= 100`, comfortably above `32 * 2 = 64`), not just per dataset. `catsdogs`'s
+that `FileReader`'s own sharding then divides across ranks; with the
+baseline config's `do_tiling=False`/`twoD=False`, each real file is exactly
+one sample (no tiling/z-slice multiplication), so `min_files` must directly
+cover `batch_size * NUM_BATCHES_TO_CHECK * data_par_size` real files total
+(`BASIC_CT_MIN_FILES = 512`), the same reasoning as `catsdogs` below. For
+`imagenet`, `process_root_dirs` already buckets real files one bucket per
+rank *before* `min_files` narrows within each bucket — so `min_files` there
+must directly cover `batch_size * NUM_BATCHES_TO_CHECK` real images per rank
+(`IMAGENET_MIN_FILES = 100`, comfortably above `32 * 2 = 64`), not just per
+dataset. `catsdogs`'s
 `create_narrow_catsdogs_dir` has its own, different floor
 (`max(min_files, batch_size * data_par_size)`), so `CATSDOGS_MIN_FILES` is
 set explicitly to `batch_size * NUM_BATCHES_TO_CHECK * data_par_size` rather
@@ -473,11 +480,11 @@ For each of the 10 shipped configs, in order:
      undersized batch that gets silently dropped entirely, yielding 0
      iterations/epoch (and a false `PASS`) instead of an error.
 
-   `--min-files` overrides the target for both mechanisms (default 64 —
-   comfortably above `data_par_size` and every shipped config's
-   `batch_size`, so at least one real batch per rank should still be
-   possible; if a real run shows too few/many files, adjust this rather than
-   editing either mechanism directly). If no real files are found at all —
+   `--min-files` overrides the target for both mechanisms (default 256 —
+   comfortably above `data_par_size` (8) and every shipped config's now
+   shared `batch_size` (32), so at least one real batch per rank should
+   still be possible; if a real run shows too few/many files, adjust this
+   rather than editing either mechanism directly). If no real files are found at all —
    almost always a stale/wrong `dict_root_dirs` path in the config, not a
    code bug — this step raises `NoRealDataFoundError` with the offending key
    and path, and that config is marked `FAIL (no real data found)` **without
@@ -498,15 +505,13 @@ For each of the 10 shipped configs, in order:
 
 Prints a per-config, per-stage PASS/FAIL/TIMEOUT table at the end and exits
 nonzero if anything failed. Defaults: 8 `srun` tasks and a 300s timeout per
-run (basic_ct-unetr's fresh run alone measured 227s against real data); both
-are CLI flags (`--ntasks`, `--timeout`, and `--min-files` — see above) if a
-config needs more (or you want to fail faster). A few configs need more than
-the shared defaults and get a `PER_CONFIG_OVERRIDES` entry in
-`run_training_smoke.py` instead of a CLI flag (currently
-`basic_ct-mae`/`sap`/`diffusion` — see "Real runs on Frontier so far"
-below); an explicit `--timeout`/`--min-files` always wins over both the
-shared default and any per-config override. You can also run it directly
-against one config instead of all 10:
+run; both are CLI flags (`--ntasks`, `--timeout`, and `--min-files` — see
+above) if a config needs more (or you want to fail faster). All 10 shipped
+configs now share the same data-pipeline baseline (tensor parallelism,
+adaptive patching, tiling, and — for `basic_ct` — `twoD` all off by default,
+`SAP` excepted since it architecturally requires adaptive patching), so no
+config currently needs a different `--min-files`/`--timeout` than the shared
+default. You can also run it directly against one config instead of all 10:
 
 ```bash
 python tests/integration/run_training_smoke.py configs/basic_ct/unetr/base_config.yaml

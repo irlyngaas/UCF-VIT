@@ -15,12 +15,11 @@ stubbed out, but nothing previously decoded a real file and checked the
 resulting batch.
 
 Three configs, chosen to cover meaningfully different branches:
-  - basic_ct/unetr: adaptive_patching=True, twoD=False (full 3D tiling, no
-    z-slice explosion -- see tests/README.md's "Real runs on Frontier so
-    far" for why twoD=True configs need much smaller min_files), and real
-    segmentation labels (the other real gap flagged this session --
-    test_dataloader_real_data.py only ever globs imagesTr, never touches
-    labelsTr).
+  - basic_ct/unetr: the baseline config (adaptive_patching=False,
+    do_tiling=False, twoD=False -- one real volume = one sample, no
+    z-slice/tile multiplication), and real segmentation labels (the other
+    real gap flagged this session -- test_dataloader_real_data.py only ever
+    globs imagesTr, never touches labelsTr).
   - imagenet/classification: adaptive_patching=False, real classification
     labels, real JPEG decode + resize.
   - catsdogs/classification: the "dataloader" type -- a completely different
@@ -85,16 +84,17 @@ NUM_BATCHES_TO_CHECK = 2
 
 # compute_narrow_dict_idx's min_files means different things for the two
 # datasets: for basic_ct (a single dict_root_dirs key), it's a total file
-# count that FileReader's own DDP-rank sharding then divides across ranks,
-# and tiling multiplies each real file into div**3 = 64 samples (unetr's
-# real div=4) -- so even 1 file/rank is comfortably enough for
-# NUM_BATCHES_TO_CHECK batches at batch_size=2. For imagenet,
-# process_root_dirs already buckets real files one bucket per rank before
-# min_files narrows *within* each bucket, and there's no tiling
-# multiplication (div=1 for classification) -- so min_files here must
-# directly cover batch_size * NUM_BATCHES_TO_CHECK samples per rank, not
-# just per dataset.
-BASIC_CT_MIN_FILES = 16
+# count that FileReader's own DDP-rank sharding then divides across ranks.
+# basic_ct's baseline config now has do_tiling=False/twoD=False/do_ap=False,
+# so (unlike before this file's basic_ct config was baseline-ified) each real
+# file is exactly one sample, no tiling/z-slice multiplication -- min_files
+# must directly cover batch_size * NUM_BATCHES_TO_CHECK * data_par_size real
+# files, same as imagenet/catsdogs below. For imagenet, process_root_dirs
+# already buckets real files one bucket per rank before min_files narrows
+# *within* each bucket, and there's no tiling multiplication (div=1 for
+# classification) -- so min_files here must directly cover
+# batch_size * NUM_BATCHES_TO_CHECK samples per rank, not just per dataset.
+BASIC_CT_MIN_FILES = 32 * NUM_BATCHES_TO_CHECK * 8  # data_par_size=8 for basic_ct/unetr's real config
 IMAGENET_MIN_FILES = 100  # >= 32 (real batch_size) * 2 (NUM_BATCHES_TO_CHECK), with margin
 
 # create_narrow_catsdogs_dir's min_files is a floor under max(min_files,
@@ -206,9 +206,10 @@ def _assert_finite(name, tensor):
 
 
 def test_real_pipeline_basic_ct_unetr(dist_info):
-    """Real basic_ct: NIfTI decode, full 3D tiling, adaptive patching, and
-    (the other real-data gap this closes) real segmentation labels -- one
-    of the two never previously exercised by any test with real content.
+    """Real basic_ct: NIfTI decode, no tiling/adaptive patching (baseline
+    config), and real segmentation labels -- one of the two never previously
+    exercised by any test with real content (test_dataloader_real_data.py
+    only ever globs imagesTr, never touches labelsTr).
     """
     config_path = _narrowed_config_path(BASIC_CT_CONFIG, BASIC_CT_MIN_FILES, f"basic_ct-{dist_info['world_rank']}")
     conf, data_module = _build_data_module(config_path)
@@ -217,32 +218,25 @@ def test_real_pipeline_basic_ct_unetr(dist_info):
     batch_size = conf["dataloader"]["batch_size"]
     num_channels = conf["data"]["num_channels"]["ct1"]
     tile_size = conf["data"]["tile_size"]
-    fixed_length = conf["ap"]["fixed_length"]
-    patch_size = conf["data"]["patch_size"]
     num_classes = conf["model"]["kwargs"]["num_classes"]
 
     batches = list(itertools.islice(loader, NUM_BATCHES_TO_CHECK))
     assert len(batches) == NUM_BATCHES_TO_CHECK
 
-    for inp, seq, size, pos, label, seq_label, variables, dict_key in batches:
+    for inp, label, variables, dict_key in batches:
         assert inp.shape == (batch_size, num_channels, *tile_size)
-        assert seq.shape == (batch_size, 1, fixed_length, patch_size ** 3)
-        assert size.shape == (batch_size, 1, fixed_length)
-        assert pos.shape == (batch_size, 1, fixed_length, 3)
         assert label.shape == (batch_size, 1, *tile_size)
-        assert seq_label.shape == (batch_size, num_classes, patch_size ** 3, fixed_length)
 
         _assert_finite("inp", inp)
         # basic_ct's FileReader min-max-normalizes each volume to [0, 1]
         assert inp.min() >= 0.0 and inp.max() <= 1.0
 
-        assert label.dtype == torch.uint8
+        # non-adaptive-patching basic_ct labels come straight from
+        # FileReader (np.array(label.dataobj).astype(np.int64)), not the
+        # np.uint8 cast the adaptive-patching branch applies -- unlike inp,
+        # label's dtype genuinely differs between the two code paths.
+        assert label.dtype == torch.int64
         assert label.min() >= 0 and label.max() < num_classes  # real labels, shifted to [0, num_classes)
-
-        # seq_label is one-hot over the class axis (dim=1)
-        torch.testing.assert_close(
-            seq_label.sum(dim=1), torch.ones(batch_size, patch_size ** 3, fixed_length, dtype=seq_label.dtype)
-        )
 
         assert dict_key == "ct1"
         assert variables == conf["data"]["dict_in_variables"]["ct1"]

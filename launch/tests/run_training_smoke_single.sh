@@ -40,11 +40,9 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 # srun -- see tests/integration/run_training_smoke.py's module docstring.
 #
 # Doesn't pass --timeout/--min-files itself, so it shares run_training_smoke.py's
-# defaults (currently 300s / 64 files) with run_training_smoke.sh, including
-# its PER_CONFIG_OVERRIDES for configs that need more of one or the other
-# (currently basic_ct-mae/sap/diffusion) -- pass --timeout/--min-files
-# explicitly below to override either for just this run, which always wins
-# over both the shared default and PER_CONFIG_OVERRIDES.
+# defaults (currently 300s / 256 files) with run_training_smoke.sh -- pass
+# --timeout/--min-files explicitly below to override either for just this
+# run.
 #
 # Usage:
 #   cd launch/tests

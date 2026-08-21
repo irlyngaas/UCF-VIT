@@ -76,12 +76,14 @@ NUM_WORKERS_VALUES = [0, 1, 4, 7]
 NUM_BATCHES_TO_PULL = 4
 
 # Same min_files reasoning as tests/distributed/test_dataloader_real_pipeline.py:
-# basic_ct's tiling multiplies each real file into div**3 = 64 samples
-# (unetr's real div=4), so a small file count comfortably covers
-# NUM_BATCHES_TO_PULL; imagenet/catsdogs have no such multiplier, so their
-# min_files must directly cover batch_size * NUM_BATCHES_TO_PULL real
-# images per rank.
-BASIC_CT_MIN_FILES = 16
+# basic_ct's baseline config now has do_tiling=False/twoD=False/do_ap=False,
+# so each real file is exactly one sample, no tiling/z-slice multiplication
+# -- min_files is a *total* count that the config's declared data_par_size=8
+# then divides (same as catsdogs below), unlike imagenet where
+# process_root_dirs already buckets real files one bucket per rank before
+# min_files narrows *within* each bucket, so imagenet's min_files only needs
+# to cover batch_size * NUM_BATCHES_TO_PULL per rank, not per dataset.
+BASIC_CT_MIN_FILES = 32 * NUM_BATCHES_TO_PULL * 8
 IMAGENET_MIN_FILES = 32 * NUM_BATCHES_TO_PULL + 32  # >= 32 (real batch_size) * NUM_BATCHES_TO_PULL, with margin
 CATSDOGS_MIN_FILES = 32 * NUM_BATCHES_TO_PULL * 8
 
@@ -218,7 +220,7 @@ def _report(dataset_label, num_workers, elapsed, num_batches, batch_size, extra=
 
 @pytest.mark.parametrize("num_workers", NUM_WORKERS_VALUES)
 def test_real_decode_throughput_basic_ct_unetr(num_workers):
-    """Real NIfTI decode + full 3D tiling + adaptive patching."""
+    """Real NIfTI decode, no tiling/adaptive patching (baseline config)."""
     config_path = _narrowed_config_path(BASIC_CT_CONFIG, BASIC_CT_MIN_FILES, num_workers, f"basic_ct-{num_workers}")
     conf, data_module = _build_data_module(config_path)
     loader = data_module.train_dataloader()

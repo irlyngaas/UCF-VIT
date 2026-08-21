@@ -423,8 +423,10 @@ def test_filereader_num_workers_zero_shards_by_ddp_rank(monkeypatch):
     (torch.utils.data.get_worker_info() is None) branch used to skip
     DDP-rank sharding entirely -- iter_start=0, iter_end=len(file_list)
     unconditionally -- so *every* DDP rank read the whole file_list instead
-    of its own shard. This is live today, not just a landmine: basic_ct/sap
-    and basic_ct/unetr both ship with num_workers: 0 and simple_ddp_size: 8.
+    of its own shard. Any shipped config with num_workers: 0 and
+    simple_ddp_size > 1 would hit this live, not just as a landmine -- kept
+    as a permanent regression test even though no shipped config currently
+    uses num_workers: 0.
     """
     monkeypatch.setattr(FileReader, "read_process_file", lambda self, path: path)
     monkeypatch.setattr("torch.utils.data.get_worker_info", lambda: None)
