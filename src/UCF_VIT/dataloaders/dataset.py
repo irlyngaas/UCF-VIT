@@ -236,7 +236,12 @@ class TileDataIter(IterableDataset):
         self.div = div
         self.start_overlap, self.end_overlap = calculate_tile_overlap(tile_overlap)
         self.tile_size_no_overlap = []
-        for i in range(len(tile_size)):
+        # Only the dims with an overlap value (x, y) are ever div'd into
+        # tiles -- `tile_size` can have an extra untiled z entry (3D data
+        # sliced into 2D z-planes; see parse.py's tile_size computation), so
+        # this must iterate over tile_overlap's length, not tile_size's, or
+        # it would index past the end of start_overlap/end_overlap.
+        for i in range(len(tile_overlap)):
             self.tile_size_no_overlap.append(self.tile_size[i] - (self.start_overlap[i] + self.end_overlap[i]))
 
         self.classification = classification
@@ -293,7 +298,11 @@ class TileDataIter(IterableDataset):
                     if self.twoD: #Loop through slices of 3D data
                         #The current implementation slices on the z dimension but, could do x or y as well
                         #TODO: Add an option on which dimension to slice
-                        for z_idx in range(data.shape[2]):
+                        # self.tile_size[2] is the raw (untiled) z-axis size -- was
+                        # data.shape[2], which is actually the y-axis size, not z
+                        # (data is channel-first (C, X, Y, Z)); only happened to be
+                        # harmless for basic_ct's cubic 256x256x256 volumes.
+                        for z_idx in range(self.tile_size[2]):
                             for x_idx in range(self.div):
                                 for y_idx in range(self.div):
                                     start_x, end_x = self.calculate_tile_bounds(x_idx, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
@@ -320,7 +329,11 @@ class TileDataIter(IterableDataset):
                     if self.twoD: #Loop through slices of 3D data
                         #The current implementation slices on the z dimension but, could do x or y as well
                         #TODO: Add an option on which dimension to slice
-                        for z_idx in range(data.shape[2]):
+                        # self.tile_size[2] is the raw (untiled) z-axis size -- was
+                        # data.shape[2], which is actually the y-axis size, not z
+                        # (data is channel-first (C, X, Y, Z)); only happened to be
+                        # harmless for basic_ct's cubic 256x256x256 volumes.
+                        for z_idx in range(self.tile_size[2]):
                             for x_idx in range(self.div):
                                 for y_idx in range(self.div):
                                     start_x, end_x = self.calculate_tile_bounds(x_idx, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])

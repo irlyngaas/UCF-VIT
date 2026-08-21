@@ -39,10 +39,14 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 # (or waiting on) the other 9 every time. Also NOT run under a top-level
 # srun -- see tests/integration/run_training_smoke.py's module docstring.
 #
+# Doesn't pass --timeout itself, so it shares run_training_smoke.py's default
+# (currently 300s) with run_training_smoke.sh -- pass --timeout explicitly
+# below to override it for just this run.
+#
 # Usage:
 #   cd launch/tests
 #   sbatch run_training_smoke_single.sh ../../configs/basic_ct/unetr/base_config.yaml
-#   sbatch run_training_smoke_single.sh ../../configs/basic_ct/unetr/base_config.yaml --timeout 300 --min-files 128
+#   sbatch run_training_smoke_single.sh ../../configs/basic_ct/unetr/base_config.yaml --timeout 600 --min-files 128
 
 if [ -z "$1" ]; then
     echo "Usage: sbatch run_training_smoke_single.sh <path/to/base_config.yaml> [extra run_training_smoke.py args...]"
@@ -52,4 +56,4 @@ fi
 CONFIG=$1
 shift
 
-time python ../../tests/integration/run_training_smoke.py "$CONFIG" --timeout 300 "$@"
+time python ../../tests/integration/run_training_smoke.py "$CONFIG" "$@"

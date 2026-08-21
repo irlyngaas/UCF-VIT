@@ -455,8 +455,21 @@ def parse_config(args, load_balance_offline=False):
     #float would otherwise silently turn tile_size into floats downstream
     assert all(isinstance(v, int) for v in tiling_conf["tile_overlap"]), "tiling.tile_overlap must be an int (or tuple of ints) in the config, not a float"
 
-    if twoD:
+    if len(img_size) == 2:
+        # Genuinely 2D data (imagenet/catsdogs): a 2-tuple tile_size is both
+        # correct and, via TileDataIter's `len(self.tile_size) == 3` check,
+        # the signal that tells it there's no z-axis to slice at all.
         tile_size = (img_size[0]//tiling_conf["div"]+tiling_conf["tile_overlap"][0], img_size[1]//tiling_conf["div"]+tiling_conf["tile_overlap"][1])
+    elif twoD:
+        # 3D data (basic_ct) sliced into 2D z-planes: tile_size must still be
+        # a 3-tuple -- collapsing it to 2D here (as if it were genuinely 2D
+        # data) previously made TileDataIter's `len(self.tile_size) == 3`
+        # dispatch take the wrong branch, silently keeping the full,
+        # untouched z-axis on every tile and producing a 5D batch by the
+        # time it reached PatchEmbed. The z entry itself isn't tiled (every
+        # z-index is walked one at a time in TileDataIter's twoD branch), so
+        # it's the raw, undivided depth.
+        tile_size = (img_size[0]//tiling_conf["div"]+tiling_conf["tile_overlap"][0], img_size[1]//tiling_conf["div"]+tiling_conf["tile_overlap"][1], img_size[2])
     else:
         tile_size = (img_size[0]//tiling_conf["div"]+tiling_conf["tile_overlap"][0], img_size[1]//tiling_conf["div"]+tiling_conf["tile_overlap"][1], img_size[2]//tiling_conf["div"]+tiling_conf["tile_overlap"][2])
 

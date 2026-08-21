@@ -349,7 +349,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("configs", nargs="*", help="Specific config file(s) to test; default is every configs/**/base_config.yaml")
     parser.add_argument("--ntasks", type=int, default=8, help="Number of srun tasks per training run (default 8, matching launch/*/*.sh)")
-    parser.add_argument("--timeout", type=int, default=150, help="Per-run timeout in seconds (default 150)")
+    parser.add_argument("--timeout", type=int, default=300, help="Per-run timeout in seconds (default 300 -- basic_ct-unetr's fresh run alone measured 227s against real data)")
     parser.add_argument("--min-files", type=int, default=DEFAULT_MIN_FILES, help=f"Target real files to keep per dataset key after narrowing dict_start_idx/dict_end_idx (default {DEFAULT_MIN_FILES})")
     args = parser.parse_args()
 

@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:8
 #SBATCH --ntasks-per-node=8
 #SBATCH --cpus-per-task=7
-#SBATCH -t 01:00:00
+#SBATCH -t 01:30:00
 #SBATCH -p batch
 #SBATCH -o training-smoke-%j.out
 #SBATCH -e training-smoke-%j.out

@@ -210,10 +210,11 @@ For each of the 10 shipped configs, in order:
    the whole scratch directory for that config.
 
 Prints a per-config, per-stage PASS/FAIL/TIMEOUT table at the end and exits
-nonzero if anything failed. Defaults: 8 `srun` tasks and a 150s timeout per
-run; both are CLI flags (`--ntasks`, `--timeout`, and `--min-files` — see
-above) if a config needs more (or you want to fail faster). You can also run
-it directly against one config instead of all 10:
+nonzero if anything failed. Defaults: 8 `srun` tasks and a 300s timeout per
+run (basic_ct-unetr's fresh run alone measured 227s against real data); both
+are CLI flags (`--ntasks`, `--timeout`, and `--min-files` — see above) if a
+config needs more (or you want to fail faster). You can also run it directly
+against one config instead of all 10:
 
 ```bash
 python tests/integration/run_training_smoke.py configs/basic_ct/unetr/base_config.yaml
@@ -221,8 +222,10 @@ python tests/integration/run_training_smoke.py configs/basic_ct/unetr/base_confi
 
 For iterating on a single failing config without paying for (or waiting on)
 the other 9 every time, `run_training_smoke_single.sh` wraps this in its own
-sbatch script — shorter time limit, and a more generous default per-run
-timeout (300s) since there's only one run to budget for:
+sbatch script with a shorter time limit. It shares the same 300s default
+per-run timeout as `run_training_smoke.sh` (it doesn't pass `--timeout`
+itself), so the two scripts can't drift out of sync — pass `--timeout`
+explicitly to override it for just one run:
 
 ```bash
 cd launch/tests
