@@ -579,7 +579,7 @@ class ProcessChannels(IterableDataset):
                                 seq_pos_list = []
                                 qdt_list = []
                                 for j in range(self.num_channels):
-                                    seq_image, seq_size, seq_pos, _ = self.patchify(np.expand_dims(np_image[j],axis=-1))
+                                    seq_image, seq_size, seq_pos, qdt = self.patchify(np.expand_dims(np_image[j],axis=-1))
                                     seq_image_list.append(seq_image)
                                     seq_size_list.append(seq_size)
                                     seq_pos_list.append(seq_pos)
@@ -590,7 +590,7 @@ class ProcessChannels(IterableDataset):
                                 qdt = qdt_list
 
                             else:
-                                seq_image, seq_size, seq_pos, _ = self.patchify(np.moveaxis(np_image,0,-1))
+                                seq_image, seq_size, seq_pos, qdt = self.patchify(np.moveaxis(np_image,0,-1))
                             if self._dataset == "imagenet":
                                 if self.return_qdt:
                                     yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_var_list.pop(), qdt
@@ -598,7 +598,7 @@ class ProcessChannels(IterableDataset):
                                     yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_var_list.pop()
                             else:
                                 if self.return_qdt:
-                                    yield np_image, seq_image, seq_size, seq_pos, yield_var_list.pop(), qdt 
+                                    yield np_image, seq_image, seq_size, seq_pos, yield_var_list.pop(), qdt
                                 else:
                                     yield np_image, seq_image, seq_size, seq_pos, yield_var_list.pop()
                         else:

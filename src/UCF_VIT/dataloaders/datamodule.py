@@ -55,9 +55,12 @@ def collate_fn(batch, return_label, adaptive_patching, separate_channels, datase
         if return_label:
             inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
 
-            #TODO: Generalize this 
+            #TODO: Generalize this
             if dataset == "basic_ct":
-                seq = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
+                if separate_channels:
+                    seq = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
+                else:
+                    seq = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
             else:
                 seq = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
 
@@ -114,7 +117,14 @@ def collate_fn(batch, return_label, adaptive_patching, separate_channels, datase
                     return (inp, seq, size, pos, label, seq_label, variables, dict_key)
         else:
             inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
-            seq = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
+            #TODO: Generalize this
+            if dataset == "basic_ct":
+                if separate_channels:
+                    seq = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
+                else:
+                    seq = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
+            else:
+                seq = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
             #TODO: Finish and Test separate_channels implementation
             if separate_channels:
                 size = torch.stack([torch.from_numpy(batch[i][2]) for i in range(len(batch))])

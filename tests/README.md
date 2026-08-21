@@ -68,7 +68,8 @@ pytest tests/test_config_validation.py -v
 | --- | --- |
 | `tests/dataloaders/test_quadtree.py` | `Rect` geometry, `FixedQuadTree` subdivision, node-value/encode-decode |
 | `tests/dataloaders/test_octree.py` | `Cube` geometry, `FixedOctTree` subdivision |
-| `tests/dataloaders/test_dataset.py` | `TileDataIter` (2D, 3D-full, and 3D-twoD-sliced tiling, with/without labels, overlap), `ShuffleIterableDataset` (no data loss/duplication across buffer sizes), `ProcessChannels` (batching, adaptive-patching wiring), `FileReader` (DDP-rank + dataloader-worker sharding disjointness/coverage up to `num_workers=7`, `keys_to_add` replication) |
+| `tests/dataloaders/test_dataset.py` | `TileDataIter` (2D, 3D-full, and 3D-twoD-sliced tiling, with/without labels, overlap), `ShuffleIterableDataset` (no data loss/duplication across buffer sizes), `ProcessChannels` (batching, adaptive-patching wiring, `separate_channels`), `FileReader` (DDP-rank + dataloader-worker sharding disjointness/coverage up to `num_workers=7`, `keys_to_add` replication) |
+| `tests/dataloaders/test_datamodule.py` | `collate_fn` across `adaptive_patching`/`return_label`/`separate_channels`/`return_qdt`/dataset-type combinations, built from real `ProcessChannels` output rather than hand-fabricated tuples |
 | `tests/utils/test_misc.py` | `is_power_of_two`, `calculate_tile_overlap`, `patchify`/`unpatchify` roundtrips |
 | `tests/utils/test_pos_embed.py` | 1D/2D/3D sin-cos position embeddings, `SinusoidalEmbeddings` |
 | `tests/utils/test_lr_scheduler.py` | `LinearWarmupCosineAnnealingLR` warmup/annealing shape |
@@ -103,6 +104,39 @@ code path for it. `test_filereader_num_workers_zero_shards_by_ddp_rank` and
 `test_filereader_shards_combine_ddp_rank_and_dataloader_workers` (the
 latter parametrized up to `num_workers=7`, matching real Frontier node
 core counts) are the regression tests.
+
+`tests/dataloaders/test_datamodule.py`'s `collate_fn` tests surfaced and
+fixed four more real bugs, all in the `return_label=False` +
+`adaptive_patching=True` corner, which had drifted out of sync with its
+(correct) `return_label=True` sibling — exactly the territory the code's own
+`# TODO: Finish and Test separate_channels implementation` comments flagged
+as unfinished:
+1. `ProcessChannels.__iter__` raised `UnboundLocalError` for
+   `separate_channels=True`: the per-channel patchify loop discarded the
+   quadtree object into `_` instead of `qdt`, then referenced the
+   never-assigned `qdt` name a few lines later.
+2. The same discard-into-`_` mistake in the `separate_channels=False`
+   sibling, but only triggered by `return_qdt=True` — unreachable in
+   production today (`return_qdt` defaults to `False`, nothing sets it
+   `True`).
+3. `collate_fn`'s `seq` computation for `dataset="basic_ct"` +
+   `separate_channels=True` produced a wrong, spurious extra dimension — the
+   `return_label=True` branch applied an `expand_dims` meant only for
+   `separate_channels=False`, without checking `separate_channels` first
+   (unlike `size`/`pos` right below it, which already did).
+4. `collate_fn`'s `return_label=False` branch never added the channel
+   dimension `basic_ct`'s (typically single-channel, un-separated) `seq`
+   needs at all, producing a 3D tensor where the model's
+   `rearrange(x, 'b c s p -> b s (p c)')` needs 4D.
+
+None of these are hit by any shipped config today — all four need either
+`separate_channels: True` (every shipped config uses `False`), `return_qdt:
+True` (nothing sets it), or a `basic_ct` MAE/DiffusionVIT config with
+`do_ap: True` (both ship with `do_ap: False`) — but all four are real, and
+all four are fixed. See `tests/dataloaders/test_datamodule.py`'s module
+docstring for the full detail on each, and
+`test_dataset.py::test_processchannels_separate_channels_does_not_crash` for
+the `ProcessChannels`-level regression test on #1.
 
 `tests/dataloaders/test_dataset_speed.py` has informational-only throughput
 measurements (buffer_size, num_workers) for the same pipeline — no
