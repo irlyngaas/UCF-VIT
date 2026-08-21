@@ -78,7 +78,7 @@ data:
   twoD: True #If true when img_size is 3D, dataloader slices on the z dimension. If data is 2D, this variable will be ignored and default to True
   patch_size: 16 #If non-adaptive patching this will change sequence length, if adaptive patching this will determine the common representation across all adaptive patches
   dict_root_dirs: {
-    'imagenet': '/lustre/orion/nro108/world-shared/enzhi/dataset/imagenet/train',
+    'imagenet': '/lustre/orion/stf006/proj-shared/irl1/imagenet_data_2',
   }
   num_channels: {
     'imagenet': 3,
