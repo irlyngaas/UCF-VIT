@@ -282,6 +282,15 @@ def process_root_dirs(dataset, dict_root_dirs, data_par_size):
             classes = sorted(os.listdir(root_dir))
             if len(classes) > data_par_size:
                 classes_to_combine = int(len(classes) // data_par_size)
+            else:
+                # Fewer classes than requested buckets: one class per
+                # bucket (don't combine), giving len(classes) buckets
+                # instead of data_par_size -- matches this function's own
+                # docstring ("data_par_size (or fewer) buckets"). Previously
+                # unset in this branch, raising UnboundLocalError as soon as
+                # the loop below made its first classes_counter ==
+                # classes_to_combine check.
+                classes_to_combine = 1
             img_list = []
             classes_counter = 0
             num_data_roots = 0

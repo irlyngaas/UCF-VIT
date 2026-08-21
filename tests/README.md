@@ -71,7 +71,7 @@ pytest tests/test_config_validation.py -v
 | `tests/dataloaders/test_dataset.py` | `TileDataIter` (2D, 3D-full, and 3D-twoD-sliced tiling, with/without labels, overlap), `ShuffleIterableDataset` (no data loss/duplication across buffer sizes), `ProcessChannels` (batching, adaptive-patching wiring, `separate_channels`), `FileReader` (DDP-rank + dataloader-worker sharding disjointness/coverage up to `num_workers=7`, `keys_to_add` replication) |
 | `tests/dataloaders/test_datamodule.py` | `collate_fn` across `adaptive_patching`/`return_label`/`separate_channels`/`return_qdt`/dataset-type combinations, built from real `ProcessChannels` output rather than hand-fabricated tuples |
 | `tests/datasets/test_catsdogs.py` | `CatsDogsDataset` (label-from-filename, resize/channel-first conversion, adaptive-patching shapes) and `CatsDogsCollate`, against small real JPEG files written to a temp dir — `catsdogs` is the only shipped dataset using `dataloader.type: "dataloader"` (a plain `Dataset` + `DistributedSampler`, not the `iterative_dataloader` stack the two rows above cover) |
-| `tests/utils/test_misc.py` | `is_power_of_two`, `calculate_tile_overlap`, `patchify`/`unpatchify` roundtrips |
+| `tests/utils/test_misc.py` | `is_power_of_two`, `calculate_tile_overlap`, `patchify`/`unpatchify` roundtrips, `process_root_dirs` (`imagenet` per-class bucketing — evenly/non-evenly-divisible `> data_par_size`, `<= data_par_size`, bucket-content correctness — and the non-`imagenet` branch) |
 | `tests/utils/test_pos_embed.py` | 1D/2D/3D sin-cos position embeddings, `SinusoidalEmbeddings` |
 | `tests/utils/test_lr_scheduler.py` | `LinearWarmupCosineAnnealingLR` warmup/annealing shape |
 | `tests/utils/test_metrics.py` | `masked_mse`, `DiceBLoss` |
@@ -154,6 +154,23 @@ immediately compared with `if self.num_channels > 1`, raising `TypeError:
 active failure — confirmed fixed by constructing `CatsDogsDataset` and
 `Patchify` directly (bypassing `train.py`) with real fabricated JPEGs and
 `adaptive_patching=True` end to end.
+
+`tests/utils/test_misc.py`'s new `process_root_dirs` coverage fixed a real,
+if long-dormant, bug: for `imagenet`-format datasets with `<= data_par_size`
+classes, `classes_to_combine` was only assigned inside an `if len(classes) >
+data_par_size:` block, so `UnboundLocalError` on the very next line. Never
+hit by any shipped config (real ImageNet-1k's 1000 classes are far above any
+realistic `data_par_size`), but a real crash waiting for the first small
+custom classification dataset in `imagenet` format. Fixed to combine 1 class
+per bucket in that case (`len(classes)` buckets rather than `data_par_size`
+— matches the function's own "`data_par_size` (or fewer) buckets"
+docstring). The new tests also document, without fixing, a separate,
+pre-existing, self-flagged limitation in the `> data_par_size` branch: when
+`len(classes)` doesn't divide evenly by `data_par_size`, the leftover
+classes past `data_par_size * classes_to_combine` are silently dropped —
+already called out by its own `# TODO: Add shuffling for data_par_size if it
+doesn't divide 1000 equally` comment, so left as-is here rather than folded
+into this fix.
 
 `tests/dataloaders/test_dataset_speed.py` has informational-only throughput
 measurements (buffer_size, num_workers) for the same pipeline — no
