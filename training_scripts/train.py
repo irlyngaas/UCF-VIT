@@ -183,7 +183,7 @@ def main():
             dkey_train = list(conf["data"]["dict_root_dirs"])[0]
             train_list = glob.glob(os.path.join(conf["data"]["dict_root_dirs"][dkey_train],'*.jpg'))
 
-            train_data = conf["dataloader"]["dataset_module"](train_list, conf["data"]["dict_in_variables"][dkey_train], conf["data"]["tile_size"], adaptive_patching=conf["ap"]["do_ap"], fixed_length=conf["ap"]["fixed_length"], patch_size=conf["data"]["patch_size"], num_channels=conf["data"]["num_channels"], dataset=conf["data"]["dataset"])
+            train_data = conf["dataloader"]["dataset_module"](train_list, conf["data"]["dict_in_variables"][dkey_train], conf["data"]["tile_size"], adaptive_patching=conf["ap"]["do_ap"], fixed_length=conf["ap"]["fixed_length"], patch_size=conf["data"]["patch_size"], num_channels=conf["data"]["num_channels"][dkey_train], dataset=conf["data"]["dataset"])
 
             train_sampler = torch.utils.data.distributed.DistributedSampler(train_data, shuffle=True, num_replicas=conf["parallelism"]["data_par_size"],rank=world_rank)
 

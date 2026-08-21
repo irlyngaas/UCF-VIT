@@ -70,6 +70,7 @@ pytest tests/test_config_validation.py -v
 | `tests/dataloaders/test_octree.py` | `Cube` geometry, `FixedOctTree` subdivision |
 | `tests/dataloaders/test_dataset.py` | `TileDataIter` (2D, 3D-full, and 3D-twoD-sliced tiling, with/without labels, overlap), `ShuffleIterableDataset` (no data loss/duplication across buffer sizes), `ProcessChannels` (batching, adaptive-patching wiring, `separate_channels`), `FileReader` (DDP-rank + dataloader-worker sharding disjointness/coverage up to `num_workers=7`, `keys_to_add` replication) |
 | `tests/dataloaders/test_datamodule.py` | `collate_fn` across `adaptive_patching`/`return_label`/`separate_channels`/`return_qdt`/dataset-type combinations, built from real `ProcessChannels` output rather than hand-fabricated tuples |
+| `tests/datasets/test_catsdogs.py` | `CatsDogsDataset` (label-from-filename, resize/channel-first conversion, adaptive-patching shapes) and `CatsDogsCollate`, against small real JPEG files written to a temp dir — `catsdogs` is the only shipped dataset using `dataloader.type: "dataloader"` (a plain `Dataset` + `DistributedSampler`, not the `iterative_dataloader` stack the two rows above cover) |
 | `tests/utils/test_misc.py` | `is_power_of_two`, `calculate_tile_overlap`, `patchify`/`unpatchify` roundtrips |
 | `tests/utils/test_pos_embed.py` | 1D/2D/3D sin-cos position embeddings, `SinusoidalEmbeddings` |
 | `tests/utils/test_lr_scheduler.py` | `LinearWarmupCosineAnnealingLR` warmup/annealing shape |
@@ -137,6 +138,21 @@ all four are fixed. See `tests/dataloaders/test_datamodule.py`'s module
 docstring for the full detail on each, and
 `test_dataset.py::test_processchannels_separate_channels_does_not_crash` for
 the `ProcessChannels`-level regression test on #1.
+
+Writing `tests/datasets/test_catsdogs.py`'s `adaptive_patching=True` tests
+surfaced a real bug too, this time in `training_scripts/train.py` rather
+than in `catsdogs.py` itself: it constructed `CatsDogsDataset` with
+`num_channels=conf["data"]["num_channels"]` — the whole `{key: count}`
+dict — instead of the per-key int
+`conf["data"]["num_channels"][dkey_train]`. Harmless when
+`adaptive_patching` is `False` (`num_channels` goes unused then), but with
+`adaptive_patching: True` it's stored as `Patchify.num_channels` and
+immediately compared with `if self.num_channels > 1`, raising `TypeError:
+'>' not supported between instances of 'dict' and 'int'`. The shipped
+`catsdogs` config ships with `ap.do_ap: False`, so this was dormant, not an
+active failure — confirmed fixed by constructing `CatsDogsDataset` and
+`Patchify` directly (bypassing `train.py`) with real fabricated JPEGs and
+`adaptive_patching=True` end to end.
 
 `tests/dataloaders/test_dataset_speed.py` has informational-only throughput
 measurements (buffer_size, num_workers) for the same pipeline — no
