@@ -254,18 +254,17 @@ change, `test_smoke.py`'s result tells you whether to look at the
 environment or at the specific collective's logic.
 
 `test_dataloader_real_data.py` (added later, alongside the `FileReader`
-`num_workers=0` DDP-sharding fix) hasn't been run on Frontier yet — not yet
-included in that 14-test count above, and it bumps the sbatch time limit to
-10 minutes (from 5) since it's now 2 datasets x 3 `num_workers` x 3
-`buffer_size` = 18 parametrized cases. It covers both `basic_ct` (where the
-`num_workers=0` fix specifically mattered — `basic_ct/sap` and
-`basic_ct/unetr` both ship with `num_workers: 0`) and `imagenet` (a
-meaningfully different code path in `process_root_dirs`, per-class bucketing
-rather than a flat file listing, though every shipped `imagenet` config uses
-`num_workers: 1` so wasn't actually broken); `imagenet`'s real directory can
-be on the order of a million files, so its file list here is deliberately
-narrowed to the first few real class subdirectories (`IMAGENET_MAX_CLASSES`
-in the test file) — same "real data, just less of it" principle as Tier 3's
+`num_workers=0` DDP-sharding fix) bumps the sbatch time limit to 10 minutes
+(from 5) since it's 2 datasets x 3 `num_workers` x 3 `buffer_size` = 18
+parametrized cases. It covers both `basic_ct` (where the `num_workers=0` fix
+specifically mattered — `basic_ct/sap` and `basic_ct/unetr` both ship with
+`num_workers: 0`) and `imagenet` (a meaningfully different code path in
+`process_root_dirs`, per-class bucketing rather than a flat file listing,
+though every shipped `imagenet` config uses `num_workers: 1` so wasn't
+actually broken); `imagenet`'s real directory can be on the order of a
+million files, so its file list here is deliberately narrowed to the first
+few real class subdirectories (`IMAGENET_MAX_CLASSES` in the test file) —
+same "real data, just less of it" principle as Tier 3's
 `create_narrow_catsdogs_dir`. `num_workers > 0` combines a real DDP rank
 with a *simulated* per-worker split (monkeypatched
 `torch.utils.data.get_worker_info`, same technique as Tier 1), rather than
@@ -278,12 +277,13 @@ round-trips this rank's real shard through `ShuffleIterableDataset` at the
 given `buffer_size` and checks the result is set-identical to the
 unshuffled shard (no loss/duplication), reusing Tier 1's synthetic-data
 invariant against real files instead. If a given `(num_workers,
-buffer_size)` combination needs more real files than are actually available
-(e.g. `basic_ct`'s `Tr8_Training` is a small, ~8-volume demo dataset), that
-combination is skipped rather than failed — see the test's docstring.
+buffer_size)` combination needs more real files than are actually available,
+that combination is skipped rather than failed — see the test's docstring
+(in practice this doesn't trigger: `Tr8_Training` turned out to have 852
+real file pairs, not the ~8 its name suggests).
 
-`test_catsdogs_real_data.py` (added later, also not yet run on Frontier) is
-a different kind of check: `catsdogs` is the only shipped dataset using
+`test_catsdogs_real_data.py` is a different kind of check: `catsdogs` is the
+only shipped dataset using
 `dataloader.type: "dataloader"`, sharded by PyTorch's own
 `DistributedSampler` rather than any UCF_VIT-custom logic like
 `FileReader`'s — so there's no known bug to regression-test the way there
@@ -303,6 +303,10 @@ unambiguous. File reads are *not* stubbed here, unlike
 `test_dataloader_real_data.py` — `CatsDogsDataset.__getitem__` has no
 meaningful decode-free path, and real decode against a handful of narrowed
 files is fast enough not to need it.
+
+Both files verified with a real 1-node/8-GPU run on Frontier (job 5321217):
+all 36 tests passed on all 8 ranks (the original 14 plus these two files'
+18 + 4 new parametrized cases) in 28s.
 
 ## Running the training smoke test (Tier 3)
 
