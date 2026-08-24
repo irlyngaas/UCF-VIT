@@ -79,7 +79,7 @@ pytest tests/test_config_validation.py -v
 | `tests/dataloaders/test_dataset.py` | `TileDataIter` (2D, 3D-full, and 3D-twoD-sliced tiling, with/without labels, overlap), `ShuffleIterableDataset` (no data loss/duplication across buffer sizes), `ProcessChannels` (batching, adaptive-patching wiring, `separate_channels`), `FileReader` (DDP-rank + dataloader-worker sharding disjointness/coverage up to `num_workers=7`, `keys_to_add` replication) |
 | `tests/dataloaders/test_datamodule.py` | `collate_fn` across `adaptive_patching`/`return_label`/`separate_channels`/`return_qdt`/dataset-type combinations, built from real `ProcessChannels` output rather than hand-fabricated tuples |
 | `tests/datasets/test_catsdogs.py` | `CatsDogsDataset` (label-from-filename, resize/channel-first conversion, adaptive-patching shapes) and `CatsDogsCollate`, against small real JPEG files written to a temp dir — `catsdogs` is the only shipped dataset using `dataloader.type: "dataloader"` (a plain `Dataset` + `DistributedSampler`, not the `iterative_dataloader` stack the two rows above cover) |
-| `tests/utils/test_misc.py` | `is_power_of_two`, `calculate_tile_overlap`, `patchify`/`unpatchify` roundtrips, `process_root_dirs` (`imagenet` per-class bucketing — evenly/non-evenly-divisible `> data_par_size`, `<= data_par_size`, bucket-content correctness — and the non-`imagenet` branch) |
+| `tests/utils/test_misc.py` | `is_power_of_two`, `calculate_tile_overlap`, `patchify`/`unpatchify` roundtrips, `process_root_dirs` (`imagenet` per-class bucketing — evenly/non-evenly-divisible `> data_par_size`, `<= data_par_size`, bucket-content correctness — and the non-`imagenet` branch), `shard_mlp_state_dict`/`shard_attention_state_dict` (weight-slice reconstruction, `fc2.bias`/`proj.bias` summing back to the original exactly, `qk_norm` rejection) |
 | `tests/utils/test_pos_embed.py` | 1D/2D/3D sin-cos position embeddings, `SinusoidalEmbeddings` |
 | `tests/utils/test_lr_scheduler.py` | `LinearWarmupCosineAnnealingLR` warmup/annealing shape |
 | `tests/utils/test_metrics.py` | `masked_mse`, `DiceBLoss` |
@@ -264,10 +264,19 @@ tests of their own before this) is the regression test.
 
 ## What isn't covered yet
 
-- `UCF_VIT.model.arch` / `UCF_VIT.model.building_blocks` (needs `timm`,
+- `UCF_VIT.model.arch` — the full `VIT` forward pass (patch embedding,
+  positional embedding, `Block` stacking) has no dedicated test yet, only
+  indirect coverage via Tier 3/3b's real training runs.
+  `UCF_VIT.model.building_blocks`'s `Mlp`/`Attention` tensor-parallel
+  forward correctness and `Block`-level FSDP (`sharding_strategy=
+  FULL_SHARD`) forward correctness *are* now covered — see
+  `tests/distributed/test_tensor_parallel_correctness.py` and
+  `tests/distributed/test_fsdp_correctness.py` below (needs `timm`,
   `monai`, and `xformers` — the last is GPU/build-toolchain-sensitive, so
-  forward-pass tests for these are better verified directly in the
-  `forge-vit` env on Frontier than guessed at in a generic dev environment).
+  both files `importorskip` cleanly rather than erroring at collection
+  when they're not installed). Combined `fsdp_size > 1` +
+  `tensor_par_size > 1` (production's `HYBRID_SHARD` branch) is not yet
+  covered — deferred follow-up once both of the above are proven.
 - `training.py`'s `process_batch` tensor-parallel broadcasts specifically
   (as opposed to the rest of a training run, which Tier 3 now covers
   end-to-end) — would need its own live distributed setup like Tier 2's.
@@ -298,6 +307,8 @@ is needed. Output lands in `pytest-distributed-<jobid>.out` in that directory.
 | `tests/distributed/test_smoke.py` | Basic connectivity: rank/world_size sanity, a plain `all_reduce`. Check this first if anything else fails — it isolates launch/environment problems from actual `UCF_VIT` bugs. |
 | `tests/distributed/test_init_par_groups.py` | `init_par_groups`'s process-group membership (world size and this rank's local rank within each of the 5 returned groups), across several `tensor_par_size`/`fsdp_size`/`simple_ddp_size` splits of the job's actual world size. |
 | `tests/distributed/test_dist_functions.py` | Forward (and, for `all_reduce`/`broadcast`, backward) correctness of the collective autograd ops most exercised by tensor parallelism: `all_reduce`, `broadcast`, `all_gather`, `gather`, `F_Identity_B_AllReduce`, `F_AllReduce_B_Identity`. |
+| `tests/distributed/test_tensor_parallel_correctness.py` | Numerical correctness of `Mlp`/`Attention`'s real `tensor_par_size > 1` forward pass: given weights sliced from an identical `tensor_par_size=1` reference module (via `UCF_VIT.utils.misc.shard_mlp_state_dict`/`shard_attention_state_dict`) and an identical input, checks the sharded forward pass (across real 2/4/8-rank tensor-parallel groups, using real `F_Identity_B_AllReduce`/`F_AllReduce_B_Identity`/`dist.all_reduce` collectives) matches the reference's output within `float32` tolerance. Model-level only (not the full training loop/FSDP/checkpointing pipeline) — deliberately targets the exact class of bug found earlier this session in `training.py`'s `process_batch` and `arch.py`'s `_pos_embed`, which only a real multi-rank launch can exercise. |
+| `tests/distributed/test_fsdp_correctness.py` | Numerical correctness of a small stack of real `Block`s wrapped in PyTorch's own FSDP with `sharding_strategy=FULL_SHARD` (`fsdp_size > 1`, `tensor_par_size=1`) against an identically-seeded, unwrapped reference — mirrors `model/utils.py`'s `get_model` `FULL_SHARD` branch exactly (same `FSDP(...)` call shape, `transformer_auto_wrap_policy` targeting `Block`), but with a `float32` `MixedPrecision` policy for a tight tolerance instead of production's `bfloat16`. Combined `fsdp_size > 1` + `tensor_par_size > 1` (`HYBRID_SHARD`) is a deferred follow-up. |
 | `tests/distributed/test_dataloader_real_data.py` | `FileReader`'s DDP-rank sharding and `ShuffleIterableDataset`'s no-loss/no-duplication guarantee, against real `basic_ct` and `imagenet` file lists on Frontier and `torch.distributed.get_rank()` for real (not simulated) across all `world_size` ranks, across `num_workers` (0/1/4) and `buffer_size` (1/20/100) — the real-scale counterpart to `tests/dataloaders/test_dataset.py`'s simulated-rank coverage of the same `num_workers=0` fix. File I/O itself is stubbed out (`FileReader.read_process_file` monkeypatched to a no-op) so this stays fast and focused on correctness, not decode speed. |
 | `tests/distributed/test_catsdogs_real_data.py` | The real production `DistributedSampler` + `DataLoader` + `CatsDogsDataset`/`CatsDogsCollate` wiring, against real CatsDogs JPEGs and real ranks — disjoint/complete file sharding across `num_workers` (0/1/4), and `adaptive_patching=True` against real photo content (not synthetic random-noise JPEGs, unlike `tests/datasets/test_catsdogs.py`), which actually exercises Canny edge detection on real image structure. Unlike the row above, file I/O is *not* stubbed — `CatsDogsDataset.__getitem__` has no meaningful decode-free path. |
 | `tests/distributed/test_dataloader_real_pipeline.py` | The full real pipeline — decode, tile, (for `basic_ct`) adaptive patch, collate — for `basic_ct`/`unetr`, `imagenet`/`classification`, and `catsdogs`/`classification`, each built via the exact real construction `train.py` itself uses for that dataloader type (`parse_config` + `calculate_load_balancing_on_the_fly` + `NativePytorchDataModule` for `basic_ct`/`imagenet`'s `iterative_dataloader`; a plain `CatsDogsDataset` + `DistributedSampler` + `DataLoader` for `catsdogs`'s `dataloader` type, which never touches the other two calls in production either). No stubbing anywhere; checks the actual decoded/collated batch (shapes, finite values, normalized ranges, valid label ranges, one-hot `seq_label` correctness for `basic_ct`'s real segmentation masks) rather than just sharding math. |
@@ -441,6 +452,15 @@ the real directories (single-process, `parallelism` scaled to
 needing 8 real ranks) before ever touching real Frontier data — all three
 configs' full chain (decode through collate) produces correctly-shaped,
 finite, correctly-ranged batches.
+
+`test_tensor_parallel_correctness.py` and `test_fsdp_correctness.py` (added
+later, real multi-rank numerical-correctness checks for `tensor_par_size >
+1` and `fsdp_size > 1` respectively — see their own module docstrings and
+their `tests/utils/test_misc.py` weight-slicing-helper coverage above) —
+**not yet run against real Frontier data.** Both `importorskip` cleanly in
+any environment without `timm`/`monai`/`xformers` installed, confirmed
+locally. Run `run_distributed_tests.sh` to exercise them for real; if either
+file's tolerance (`rtol`/`atol`) turns out too tight, retune and rerun.
 
 ## Running the training smoke test (Tier 3)
 

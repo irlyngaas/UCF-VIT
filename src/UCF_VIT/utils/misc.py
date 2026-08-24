@@ -258,6 +258,136 @@ def init_par_groups(world_rank, data_par_size, tensor_par_size, fsdp_size, simpl
 
     return ddp_group, tensor_par_group, data_seq_ort_group, fsdp_group, simple_ddp_group
 
+def shard_mlp_state_dict(full_state_dict, tensor_par_size, tp_rank):
+    """Slices a full (tensor_par_size=1) UCF_VIT.model.building_blocks.Mlp
+    state_dict into the shard TP rank `tp_rank` of a `tensor_par_size`-way
+    tensor-parallel group should load.
+
+    Mirrors Mlp's actual sharding: `fc1`'s hidden dimension (dim 0 of its
+    weight/bias) is row-sliced into `tensor_par_size` contiguous chunks, and
+    `fc2`'s hidden dimension (dim 1 of its weight) is column-sliced the same
+    way, matching `fc1 = Linear(in_features, hidden_features //
+    tensor_par_size)` / `fc2 = Linear(hidden_features // tensor_par_size,
+    out_features)`.
+
+    `fc2.bias` is a special case: Mlp does not shard it (every rank's `fc2`
+    keeps a full-size `out_features` bias, since `out_features` itself is
+    never divided by `tensor_par_size`), and Mlp.forward's post-fc2
+    all-reduce (`F_AllReduce_B_Identity(..., op=SUM, ...)`) sums every
+    rank's fc2 output -- including that bias -- across the group. To
+    reconstruct the reference bias exactly (not `tensor_par_size` copies of
+    it), only `tp_rank == 0` keeps the real bias; every other rank's shard
+    gets a zero bias of the same shape, so the sum across the group is
+    unaffected. This is purely a test-construction technique for comparing
+    a sharded forward pass against a known reference.
+
+    Args:
+        full_state_dict: `state_dict()` of an `Mlp` built with
+            `tensor_par_size=1` (i.e. unsharded, "reference" weights).
+        tensor_par_size: Number of tensor-parallel ranks to shard across.
+        tp_rank: This rank's index within its tensor-parallel group
+            (`0 <= tp_rank < tensor_par_size`).
+
+    Returns:
+        A dict with the same keys as `full_state_dict`, sliced (or, for
+        `fc2.bias` on `tp_rank != 0`, zeroed) for TP rank `tp_rank`.
+    """
+    hidden_features = full_state_dict["fc1.weight"].shape[0]
+    assert hidden_features % tensor_par_size == 0, (
+        f"hidden_features ({hidden_features}) must be divisible by tensor_par_size ({tensor_par_size})"
+    )
+    shard = hidden_features // tensor_par_size
+    start, end = tp_rank * shard, (tp_rank + 1) * shard
+
+    sharded = {}
+    sharded["fc1.weight"] = full_state_dict["fc1.weight"][start:end].clone()
+    if "fc1.bias" in full_state_dict:
+        sharded["fc1.bias"] = full_state_dict["fc1.bias"][start:end].clone()
+    sharded["fc2.weight"] = full_state_dict["fc2.weight"][:, start:end].clone()
+    if "fc2.bias" in full_state_dict:
+        if tp_rank == 0:
+            sharded["fc2.bias"] = full_state_dict["fc2.bias"].clone()
+        else:
+            sharded["fc2.bias"] = torch.zeros_like(full_state_dict["fc2.bias"])
+    return sharded
+
+
+def shard_attention_state_dict(full_state_dict, tensor_par_size, tp_rank):
+    """Slices a full (tensor_par_size=1) UCF_VIT.model.building_blocks.Attention
+    state_dict into the shard TP rank `tp_rank` of a `tensor_par_size`-way
+    tensor-parallel group should load.
+
+    Mirrors Attention's actual sharding: `qkv`'s output dimension (dim 0 of
+    its weight/bias, `dim * 3`) is row-sliced into `tensor_par_size`
+    contiguous chunks, and `proj`'s input dimension (dim 1 of its weight,
+    `dim`) is column-sliced the same way, matching `qkv = Linear(dim, dim *
+    3 // tensor_par_size)` / `proj = Linear(dim // tensor_par_size, dim)`.
+
+    `proj.bias` is a special case, exactly like Mlp's `fc2.bias` (see
+    `shard_mlp_state_dict`): Attention does not shard it (`proj`'s output
+    dimension, `dim`, is never divided by `tensor_par_size`), and
+    Attention.forward's post-proj `dist.all_reduce(..., op=SUM, ...)` sums
+    every rank's proj output -- including that bias -- across the group.
+    Only `tp_rank == 0` keeps the real bias; every other rank's shard gets a
+    zero bias.
+
+    Only supports `qk_norm=False` (the default): `q_norm`/`k_norm` are then
+    `nn.Identity` with no parameters, so there is nothing to shard or copy.
+    If `full_state_dict` contains `q_norm.*`/`k_norm.*` keys, this raises
+    rather than silently dropping them -- those parameters operate on
+    `head_dim`, which tensor parallelism does not shard (only `num_heads`
+    is sharded), so they would need to be copied verbatim, not sliced; not
+    implemented here since no shipped config currently uses `qk_norm=True`.
+
+    Args:
+        full_state_dict: `state_dict()` of an `Attention` built with
+            `tensor_par_size=1` (i.e. unsharded, "reference" weights).
+        tensor_par_size: Number of tensor-parallel ranks to shard across.
+        tp_rank: This rank's index within its tensor-parallel group
+            (`0 <= tp_rank < tensor_par_size`).
+
+    Returns:
+        A dict with the same keys as `full_state_dict`, sliced (or, for
+        `proj.bias` on `tp_rank != 0`, zeroed) for TP rank `tp_rank`.
+
+    Raises:
+        NotImplementedError: If `full_state_dict` has `q_norm.*`/`k_norm.*`
+            keys (i.e. came from an `Attention` built with `qk_norm=True`).
+    """
+    unsupported = [k for k in full_state_dict if k.startswith("q_norm.") or k.startswith("k_norm.")]
+    if unsupported:
+        raise NotImplementedError(
+            f"shard_attention_state_dict only supports qk_norm=False (no q_norm/k_norm "
+            f"parameters); got keys {unsupported}"
+        )
+
+    qkv_out = full_state_dict["qkv.weight"].shape[0]  # dim * 3 at tensor_par_size=1
+    assert qkv_out % tensor_par_size == 0, (
+        f"qkv output dim ({qkv_out}) must be divisible by tensor_par_size ({tensor_par_size})"
+    )
+    qkv_shard = qkv_out // tensor_par_size
+    qkv_start, qkv_end = tp_rank * qkv_shard, (tp_rank + 1) * qkv_shard
+
+    dim = full_state_dict["proj.weight"].shape[1]  # proj.weight is (dim, dim) at tensor_par_size=1
+    assert dim % tensor_par_size == 0, (
+        f"dim ({dim}) must be divisible by tensor_par_size ({tensor_par_size})"
+    )
+    proj_shard = dim // tensor_par_size
+    proj_start, proj_end = tp_rank * proj_shard, (tp_rank + 1) * proj_shard
+
+    sharded = {}
+    sharded["qkv.weight"] = full_state_dict["qkv.weight"][qkv_start:qkv_end].clone()
+    if "qkv.bias" in full_state_dict:
+        sharded["qkv.bias"] = full_state_dict["qkv.bias"][qkv_start:qkv_end].clone()
+    sharded["proj.weight"] = full_state_dict["proj.weight"][:, proj_start:proj_end].clone()
+    if "proj.bias" in full_state_dict:
+        if tp_rank == 0:
+            sharded["proj.bias"] = full_state_dict["proj.bias"].clone()
+        else:
+            sharded["proj.bias"] = torch.zeros_like(full_state_dict["proj.bias"])
+    return sharded
+
+
 def process_root_dirs(dataset, dict_root_dirs, data_par_size):
     """Builds per-data-parallel-group lists of image file paths for a dataset.
 

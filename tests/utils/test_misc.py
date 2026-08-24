@@ -3,7 +3,15 @@ import os
 import pytest
 import torch
 
-from UCF_VIT.utils.misc import calculate_tile_overlap, is_power_of_two, patchify, process_root_dirs, unpatchify
+from UCF_VIT.utils.misc import (
+    calculate_tile_overlap,
+    is_power_of_two,
+    patchify,
+    process_root_dirs,
+    shard_attention_state_dict,
+    shard_mlp_state_dict,
+    unpatchify,
+)
 
 
 @pytest.mark.parametrize(
@@ -150,3 +158,87 @@ def test_process_root_dirs_non_imagenet_lists_imagesTr(tmp_path):
 
     assert set(result.keys()) == {"ct1"}  # keyed by dict_root_dirs key, not bucket index
     assert len(result["ct1"]) == 3
+
+
+# ---------------------------------------------------------------------------
+# shard_mlp_state_dict / shard_attention_state_dict
+# ---------------------------------------------------------------------------
+
+
+def _fake_mlp_state_dict(in_features, hidden_features, out_features):
+    torch.manual_seed(0)
+    return {
+        "fc1.weight": torch.randn(hidden_features, in_features),
+        "fc1.bias": torch.randn(hidden_features),
+        "fc2.weight": torch.randn(out_features, hidden_features),
+        "fc2.bias": torch.randn(out_features),
+    }
+
+
+@pytest.mark.parametrize("tensor_par_size", [1, 2, 4])
+def test_shard_mlp_state_dict_reconstructs_full_weights(tensor_par_size):
+    full = _fake_mlp_state_dict(in_features=8, hidden_features=16, out_features=8)
+
+    shards = [shard_mlp_state_dict(full, tensor_par_size, r) for r in range(tensor_par_size)]
+
+    torch.testing.assert_close(torch.cat([s["fc1.weight"] for s in shards], dim=0), full["fc1.weight"])
+    torch.testing.assert_close(torch.cat([s["fc1.bias"] for s in shards], dim=0), full["fc1.bias"])
+    torch.testing.assert_close(torch.cat([s["fc2.weight"] for s in shards], dim=1), full["fc2.weight"])
+
+
+@pytest.mark.parametrize("tensor_par_size", [1, 2, 4])
+def test_shard_mlp_state_dict_fc2_bias_sums_back_to_full(tensor_par_size):
+    """The property Mlp.forward's post-fc2 all-reduce relies on: summing every
+    shard's fc2.bias across the tensor-parallel group must reproduce the
+    original, unsharded bias exactly (not tensor_par_size copies of it).
+    """
+    full = _fake_mlp_state_dict(in_features=8, hidden_features=16, out_features=8)
+
+    shards = [shard_mlp_state_dict(full, tensor_par_size, r) for r in range(tensor_par_size)]
+
+    summed_bias = sum(s["fc2.bias"] for s in shards)
+    torch.testing.assert_close(summed_bias, full["fc2.bias"])
+    # exactly one shard carries the real values, the rest are exactly zero
+    nonzero = [r for r, s in enumerate(shards) if not torch.all(s["fc2.bias"] == 0)]
+    assert nonzero == [0]
+
+
+def _fake_attention_state_dict(dim):
+    torch.manual_seed(0)
+    return {
+        "qkv.weight": torch.randn(dim * 3, dim),
+        "qkv.bias": torch.randn(dim * 3),
+        "proj.weight": torch.randn(dim, dim),
+        "proj.bias": torch.randn(dim),
+    }
+
+
+@pytest.mark.parametrize("tensor_par_size", [1, 2, 4])
+def test_shard_attention_state_dict_reconstructs_full_weights(tensor_par_size):
+    full = _fake_attention_state_dict(dim=16)
+
+    shards = [shard_attention_state_dict(full, tensor_par_size, r) for r in range(tensor_par_size)]
+
+    torch.testing.assert_close(torch.cat([s["qkv.weight"] for s in shards], dim=0), full["qkv.weight"])
+    torch.testing.assert_close(torch.cat([s["qkv.bias"] for s in shards], dim=0), full["qkv.bias"])
+    torch.testing.assert_close(torch.cat([s["proj.weight"] for s in shards], dim=1), full["proj.weight"])
+
+
+@pytest.mark.parametrize("tensor_par_size", [1, 2, 4])
+def test_shard_attention_state_dict_proj_bias_sums_back_to_full(tensor_par_size):
+    full = _fake_attention_state_dict(dim=16)
+
+    shards = [shard_attention_state_dict(full, tensor_par_size, r) for r in range(tensor_par_size)]
+
+    summed_bias = sum(s["proj.bias"] for s in shards)
+    torch.testing.assert_close(summed_bias, full["proj.bias"])
+    nonzero = [r for r, s in enumerate(shards) if not torch.all(s["proj.bias"] == 0)]
+    assert nonzero == [0]
+
+
+def test_shard_attention_state_dict_rejects_qk_norm_params():
+    full = _fake_attention_state_dict(dim=16)
+    full["q_norm.weight"] = torch.randn(4)
+
+    with pytest.raises(NotImplementedError):
+        shard_attention_state_dict(full, tensor_par_size=2, tp_rank=0)
