@@ -307,6 +307,38 @@ FEATURE_MATRIX = [
         # TP-rank-0-pulls-then-broadcasts logic still behaves correctly
         # when twoD inflates the per-rank sample count.
     ),
+
+    # --- Completing model-type coverage: every cell above uses UNETR, MAE,
+    # or VIT -- SAP and DiffusionVIT never appear anywhere in this matrix.
+    # Neither has a free do_ap choice (SAP is always do_ap:True, DiffusionVIT
+    # always do_ap:False -- both hard-required by parse.py, not config
+    # choices), so neither needed a do_ap cell, but that's not true of
+    # tensor_par_size: it's orthogonal to model type, and both SAP and
+    # DiffusionVIT have their own model-specific broadcast code in
+    # training.py's process_batch (SAP: seq_label; DiffusionVIT: the t/e
+    # diffusion noise terms) that no cell above has ever exercised with a
+    # real forward+loss. One tensor_par_size cell each closes that gap
+    # without re-testing do_tiling/twoD, which are generic dataloader-level
+    # mechanics already proven independent of model type above.
+    FeatureMatrixCell(
+        "basic_ct/sap/base_config.yaml", "basic_ct-sap+tensor_par",
+        {"parallelism": {"fsdp_size": 1, "simple_ddp_size": 4, "tensor_par_size": 2}},
+        # SAP's baseline already keeps patch_size:4 (its own decoder-memory
+        # exception), so tensor_par_size doesn't compound with any known
+        # memory risk here. Exercises training.py's seq_label broadcast
+        # (only taken for UNETR/SAP) under tensor_par_size > 1 for the
+        # first time.
+    ),
+    FeatureMatrixCell(
+        "catsdogs/diffusion/base_config.yaml", "catsdogs-diffusion+tensor_par",
+        {"parallelism": {"fsdp_size": 1, "simple_ddp_size": 4, "tensor_par_size": 2}},
+        # catsdogs is otherwise underrepresented in this matrix (2 cells,
+        # both VIT) -- pairing DiffusionVIT with catsdogs here covers a new
+        # (dataset, model) combination too, not just a new model type.
+        # Exercises training.py's t/e diffusion-noise broadcast (only taken
+        # for DiffusionVIT, which is always do_ap:False) under
+        # tensor_par_size > 1 for the first time.
+    ),
 ]
 
 

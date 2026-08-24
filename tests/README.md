@@ -936,8 +936,18 @@ the exact overrides and reasoning behind each cell):
 | `ap.do_ap:True` | `basic_ct/unetr`, `basic_ct/mae`, `imagenet/classification`, `catsdogs/classification` |
 | `tiling.do_tiling:True` | `basic_ct/unetr`, `imagenet/classification` (`catsdogs` excluded — its `dataloader.type: "dataloader"` never invokes `TileDataIter`; `tile_size` there is purely a resize target, not a tiling grid) |
 | `data.twoD:True` | `basic_ct/unetr` only (`imagenet`/`catsdogs` always run `twoD:True` already — `parse.py` forces it whenever `img_size` has 2 entries) |
-| `parallelism.tensor_par_size:2` | `imagenet/classification` (+ resume cycle), `basic_ct/mae`, `catsdogs/classification` |
+| `parallelism.tensor_par_size:2` | `imagenet/classification` (+ resume cycle), `basic_ct/mae`, `catsdogs/classification`, `basic_ct/sap`, `catsdogs/diffusion` |
 | Multi-feature combinations | `basic_ct/unetr` (`do_ap`+`do_tiling`, `do_ap`+`twoD`, `twoD`+`tensor_par_size`), `basic_ct/mae` (`twoD`+`do_tiling`), `imagenet/classification` (`do_ap`+`tensor_par_size`, `do_tiling`+`tensor_par_size`) |
+
+Every dataset (`basic_ct`/`imagenet`/`catsdogs`) and every model type
+(`VIT`/`MAE`/`SAP`/`UNETR`/`DiffusionVIT`) appears in at least one cell.
+`SAP`/`DiffusionVIT` only get a `tensor_par_size` cell each (neither has a
+free `do_ap` choice — `parse.py` hard-requires `do_ap:True` for `SAP` and
+`do_ap:False` for `DiffusionVIT`, and `SAP`'s own shipped baseline already
+proves its case), chosen because both have their own model-specific
+broadcast code in `training.py`'s `process_batch` (`SAP`: `seq_label`;
+`DiffusionVIT`: the diffusion noise terms `t`/`e`) that no other cell
+exercises.
 
 Every cell runs fresh-only except `imagenet/classification`'s solo
 tensor-parallel cell, which also resumes — closing a real, otherwise
@@ -981,7 +991,7 @@ own overrides, exactly as `make_smoke_config` would build it) is fed
 through the real `UCF_VIT.parse.parse_config` with
 `load_balance_offline=True` (skips the `data_par_size*tensor_par_size==
 world_size` assertion, so even the `tensor_par_size:2` cells validate with
-zero real GPUs). All 15 cells pass this locally before ever touching real
+zero real GPUs). All 18 cells pass this locally before ever touching real
 Frontier data.
 
 **Real runs on Frontier so far:**
@@ -1071,6 +1081,17 @@ Frontier data.
    are exercisable without a real multi-rank `tensor_par_size > 1` launch,
    so — like the `VIT`+`do_ap` fix above — not yet re-verified against a
    real Frontier run.
+4. Auditing the matrix afterward found a real coverage gap: every cell used
+   `UNETR`, `MAE`, or `VIT` — `SAP` and `DiffusionVIT` never appeared
+   anywhere. Added one `tensor_par_size:2` cell each
+   (`basic_ct-sap+tensor_par`, `catsdogs-diffusion+tensor_par`) — the axis
+   most likely to matter for them specifically, since both have their own
+   model-specific broadcast code in `process_batch` (`SAP`'s `seq_label`,
+   `DiffusionVIT`'s `t`/`e` noise terms) that no other cell exercises;
+   `do_ap` doesn't apply to either (both hard-required to a fixed value by
+   `parse.py`). Now every dataset and every model type appears in at least
+   one of the matrix's 18 cells. Both new cells pass the local
+   `parse_config` dry-run; not yet run against real Frontier data.
 
 ## Validating a config file by hand
 

@@ -56,11 +56,12 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 # basic_ct-unetr+do_ap+do_tiling, basic_ct-mae+twoD+do_tiling,
 # imagenet-classification+do_ap+tensor_par, basic_ct-unetr+do_ap+twoD,
 # imagenet-classification+do_tiling+tensor_par,
-# basic_ct-unetr+twoD+tensor_par
+# basic_ct-unetr+twoD+tensor_par, basic_ct-sap+tensor_par,
+# catsdogs-diffusion+tensor_par
 
 if [ -z "$1" ]; then
     echo "Usage: sbatch run_feature_matrix_smoke_single.sh <label> [extra run_feature_matrix_smoke.py args...]"
-    echo "Known labels: basic_ct-unetr+do_ap, basic_ct-mae+do_ap, imagenet-classification+do_ap, catsdogs-classification+do_ap, basic_ct-unetr+do_tiling, imagenet-classification+do_tiling, basic_ct-unetr+twoD, imagenet-classification+tensor_par, basic_ct-mae+tensor_par, catsdogs-classification+tensor_par, basic_ct-unetr+do_ap+do_tiling, basic_ct-mae+twoD+do_tiling, imagenet-classification+do_ap+tensor_par, basic_ct-unetr+do_ap+twoD, imagenet-classification+do_tiling+tensor_par, basic_ct-unetr+twoD+tensor_par"
+    echo "Known labels: basic_ct-unetr+do_ap, basic_ct-mae+do_ap, imagenet-classification+do_ap, catsdogs-classification+do_ap, basic_ct-unetr+do_tiling, imagenet-classification+do_tiling, basic_ct-unetr+twoD, imagenet-classification+tensor_par, basic_ct-mae+tensor_par, catsdogs-classification+tensor_par, basic_ct-unetr+do_ap+do_tiling, basic_ct-mae+twoD+do_tiling, imagenet-classification+do_ap+tensor_par, basic_ct-unetr+do_ap+twoD, imagenet-classification+do_tiling+tensor_par, basic_ct-unetr+twoD+tensor_par, basic_ct-sap+tensor_par, catsdogs-diffusion+tensor_par"
     exit 1
 fi
 
