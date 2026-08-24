@@ -991,8 +991,22 @@ Frontier data.
    cell (its `min_files:8`/`timeout:1800` were reasoned from historical
    numbers, not measured): **PASS (280s)** — comfortably under its 1800s
    timeout, no retuning needed. Confirms the z-slice-multiplication cost
-   estimate for this cell was accurate. The full matrix (all 15 cells,
-   `run_feature_matrix_smoke.sh`) hasn't been run yet.
+   estimate for this cell was accurate.
+2. Running the full matrix surfaced a real, previously-dormant bug in
+   `src/UCF_VIT/training.py`'s `train_step`, in the `MAE` + `do_ap:True`
+   branch — the exact code path `basic_ct-mae+do_ap` exercises for the
+   first time ever (no shipped config used `do_ap:True` for MAE before
+   Tier 3b). Two bugs stacked in one line:
+   `target = rearrange(seq, 'b c s p -> b s (p c)')` — `rearrange` was
+   never imported bare (the file only does `import einops`, not
+   `from einops import rearrange`, unlike `model/arch.py` which does), and
+   `seq` was never defined in this branch at all (the actual sequence data
+   is `batch["seq"]`, as used one line above to compute `output`). Fixed to
+   `target = einops.rearrange(batch["seq"], 'b c s p -> b s (p c)')`. A
+   real regression this session's Tier 1 tests couldn't catch (they don't
+   exercise `train_step` against real batch dicts), only findable by
+   actually running MAE with `do_ap:True` end to end — exactly what Tier 3b
+   is for.
 
 ## Validating a config file by hand
 

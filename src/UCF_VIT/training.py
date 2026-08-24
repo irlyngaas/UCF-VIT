@@ -91,7 +91,7 @@ def train_step(conf, batch, model):
             if conf["model"]["loss_fn"] == "MSE":
                 output, _ = model.forward(batch["seq"], batch["variables"], batch["seq_ps"])
                 criterion = nn.MSELoss()
-                target = rearrange(seq, 'b c s p -> b s (p c)')
+                target = einops.rearrange(batch["seq"], 'b c s p -> b s (p c)')
                 loss = criterion(output, target)
             #TODO: elif conf["model"]["kwargs"]["loss_fn"] == "maskMSE":
 
