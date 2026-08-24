@@ -984,11 +984,15 @@ world_size` assertion, so even the `tensor_par_size:2` cells validate with
 zero real GPUs). All 15 cells pass this locally before ever touching real
 Frontier data.
 
-**Real runs on Frontier so far:** none yet — this is new, unrun
-infrastructure as of this write-up. `basic_ct-unetr+twoD` is expected to be
-the highest-risk cell (see its `FEATURE_MATRIX` entry's comment) and should
-be run single-cell first via `run_feature_matrix_smoke_single.sh` before
-ever launching the full matrix.
+**Real runs on Frontier so far:**
+
+1. `basic_ct-unetr+twoD` (job 5337762), run single-cell first via
+   `run_feature_matrix_smoke_single.sh` as the deliberately highest-risk
+   cell (its `min_files:8`/`timeout:1800` were reasoned from historical
+   numbers, not measured): **PASS (280s)** — comfortably under its 1800s
+   timeout, no retuning needed. Confirms the z-slice-multiplication cost
+   estimate for this cell was accurate. The full matrix (all 15 cells,
+   `run_feature_matrix_smoke.sh`) hasn't been run yet.
 
 ## Validating a config file by hand
 
