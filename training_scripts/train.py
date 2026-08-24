@@ -171,11 +171,22 @@ def main():
                 dataset = conf["data"]["dataset"],
                 resize = conf["dataset_options"]["resize"],
                 num_classes = conf["model"]["kwargs"]["num_classes"] if conf["model"]["type"] in ["UNETR", "SAP"] else None,
+                ddp_group = ddp_group,
             ).to(device)
 
             data_module.setup()
 
             train_dataloader = data_module.train_dataloader()
+        else:
+            # Only tensor_par_group-rank-0 reads real data (see
+            # UCF_VIT.training.process_batch's docstring); the rest of each
+            # tensor-parallel group never touches train_dataloader/
+            # data_module directly (process_batch only dereferences them on
+            # tensor_par_group-rank-0), but both names must still be bound
+            # to *something* since train_epoch()/the per-epoch reset below
+            # reference them unconditionally for every rank.
+            data_module = None
+            train_dataloader = None
 
     elif conf["dataloader"]["type"] == "dataloader":
         if dist.get_rank(tensor_par_group) == 0:
@@ -185,9 +196,20 @@ def main():
 
             train_data = conf["dataloader"]["dataset_module"](train_list, conf["data"]["dict_in_variables"][dkey_train], conf["data"]["tile_size"], adaptive_patching=conf["ap"]["do_ap"], fixed_length=conf["ap"]["fixed_length"], patch_size=conf["data"]["patch_size"], num_channels=conf["data"]["num_channels"][dkey_train], dataset=conf["data"]["dataset"])
 
-            train_sampler = torch.utils.data.distributed.DistributedSampler(train_data, shuffle=True, num_replicas=conf["parallelism"]["data_par_size"],rank=world_rank)
+            # rank=world_rank is only correct when tensor_par_size == 1 (world_rank
+            # then equals this replica's position among data_par_size replicas).
+            # With tensor_par_size > 1, DistributedSampler needs the rank *within
+            # the data-parallel dimension* -- dist.get_rank(ddp_group) gives
+            # exactly that (ddp_group, from init_par_groups, contains one rank per
+            # data-parallel replica at this tensor-parallel index), and reduces to
+            # world_rank when tensor_par_size == 1 since ddp_group then spans the
+            # whole world.
+            train_sampler = torch.utils.data.distributed.DistributedSampler(train_data, shuffle=True, num_replicas=conf["parallelism"]["data_par_size"],rank=dist.get_rank(ddp_group))
 
             train_dataloader = DataLoader(dataset = train_data, sampler=train_sampler, num_workers=conf["dataloader"]["num_workers"], pin_memory=conf["dataloader"]["pin_memory"], batch_size=conf["dataloader"]["batch_size"], drop_last=True, collate_fn=lambda batch: conf["dataloader"]["collate_fn"](batch, adaptive_patching=conf["ap"]["do_ap"], return_label=conf["dataloader"]["return_label"]))
+        else:
+            # Same reasoning as the iterative_dataloader branch above.
+            train_dataloader = None
 
 #4. Training Loop
 ##############################################################################################################
@@ -199,7 +221,18 @@ def main():
                 iterations_per_epoch = batches_per_rank_epoch[k]
 
     elif conf["dataloader"]["type"] == "dataloader":
-        iterations_per_epoch = len(train_dataloader)
+        # Only tensor_par_group-rank-0 built a real train_dataloader above, but
+        # every rank needs the *same* iterations_per_epoch to loop in lockstep
+        # (process_batch's per-tensor-parallel-group broadcasts require every
+        # rank in a group to call it the same number of times) -- broadcast it
+        # from each group's rank-0 the same way process_batch broadcasts batch
+        # tensors. Reduces to a same-value no-op broadcast when
+        # tensor_par_size == 1.
+        iterations_per_epoch_tensor = torch.tensor(
+            len(train_dataloader) if dist.get_rank(tensor_par_group) == 0 else 0, device=device
+        )
+        dist.broadcast(iterations_per_epoch_tensor, src=(dist.get_rank()//conf["parallelism"]["tensor_par_size"]*conf["parallelism"]["tensor_par_size"]), group=tensor_par_group)
+        iterations_per_epoch = iterations_per_epoch_tensor.item()
 
     if conf["model"]["type"] == "DiffusionVIT":
         ddpm_scheduler = DDPM_Scheduler(num_time_steps=conf["model"]["kwargs"]["time_steps"]).to(device)
@@ -210,8 +243,9 @@ def main():
         #Reset dataloader module every epoch to ensure all files get used
         if epoch != epoch_start:
             if conf["dataloader"]["type"] == "iterative_dataloader":
-                data_module.reset()
-                train_dataloader = data_module.train_dataloader()
+                if dist.get_rank(tensor_par_group) == 0:
+                    data_module.reset()
+                    train_dataloader = data_module.train_dataloader()
 
         #tell the model that we are in train mode. Matters because we have the dropout
         model.train()

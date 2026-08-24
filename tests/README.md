@@ -1007,6 +1007,70 @@ Frontier data.
    exercise `train_step` against real batch dicts), only findable by
    actually running MAE with `do_ap:True` end to end — exactly what Tier 3b
    is for.
+3. The same full-matrix run surfaced five more real, previously-dormant
+   bugs, all in code paths no shipped config ever exercised before (every
+   one requires either `do_ap:True` on `VIT`, or `tensor_par_size > 1`):
+   - `src/UCF_VIT/training.py`'s `train_step`, `VIT` branch: unconditionally
+     called `model.forward(batch["data"], ...)`, never checking
+     `conf["ap"]["do_ap"]` at all (unlike the `SAP`/`UNETR`/`MAE` branches,
+     which all correctly switch to `batch["seq"]` when adaptive patching is
+     on). `model/arch.py`'s `VIT.__init__` even documents
+     `#ASSUMES INPUT HAS ALREADY BEEN ADAPTIVELY PATCHED` when
+     `adaptive_patching` is set — feeding it raw image data instead produced
+     a token-count mismatch (`RuntimeError: The size of tensor a (257) must
+     match the size of tensor b (196)`) in `_pos_embed`, hit by both
+     `imagenet-classification+do_ap` and `catsdogs-classification+do_ap`.
+     Fixed to mirror the other branches: `batch["seq"]` when `do_ap:True`,
+     `batch["data"]` otherwise.
+   - `training_scripts/train.py`: `NativePytorchDataModule` was never passed
+     `ddp_group=ddp_group`, so it silently fell back to the *global* world
+     rank instead of this rank's position within its data-parallel
+     replica group — `NativePytorchDataModule` already supported a
+     `ddp_group` parameter for exactly this, it just was never wired up.
+     Broke as `IndexError: index 0 is out of bounds for axis 0 with size 0`
+     inside `datamodule.py`'s `train_dataloader()` for any rank whose world
+     rank exceeded `data_par_size` (e.g. ranks 4/6 with
+     `tensor_par_size:2`/`data_par_size:4`) — `basic_ct-mae+tensor_par` and
+     `basic_ct-unetr+twoD+tensor_par`.
+   - `training_scripts/train.py`: the `"dataloader"`-type (`catsdogs`)
+     branch's `DistributedSampler(..., rank=world_rank)` has the same bug --
+     `world_rank` only equals the correct data-parallel-relative rank when
+     `tensor_par_size:1`. Broke as `ValueError: Invalid rank 6, rank should
+     be in the interval [0, 3]` for `catsdogs-classification+tensor_par`.
+     Fixed both to `dist.get_rank(ddp_group)`, which reduces to `world_rank`
+     exactly when `tensor_par_size:1` (so no behavior change for any
+     existing config) but gives the correct per-replica rank otherwise.
+   - `training_scripts/train.py`: `train_dataloader`/`data_module` are only
+     ever constructed on `tensor_par_group`-rank-0 (by design --
+     `UCF_VIT.training.process_batch`'s docstring: only that rank reads
+     real data, then broadcasts it to the rest of its tensor-parallel
+     group), but `train_epoch(...)` references `train_dataloader`
+     unconditionally for *every* rank, and the per-epoch dataloader reset
+     did too. With `tensor_par_size:1` every rank trivially satisfies
+     `tensor_par_group`-rank-0, so this was never exercised. Broke as
+     `UnboundLocalError: cannot access local variable 'train_dataloader'`
+     on every non-tensor_par_group-rank-0 process, across every
+     `+tensor_par` cell. Fixed by explicitly binding
+     `train_dataloader = None` (and `data_module = None`) on the `else`
+     branch in both dataloader-type cases, and gating the per-epoch reset
+     the same way.
+   - `training_scripts/train.py`: for the `"dataloader"` type specifically,
+     `iterations_per_epoch = len(train_dataloader)` has the same
+     unconditional-reference problem, but unlike `train_dataloader` itself
+     (never touched by non-rank-0 processes inside `process_batch`), every
+     rank *does* need a valid `iterations_per_epoch` — it's the training
+     loop's iteration count, and `process_batch`'s per-tensor-parallel-group
+     broadcasts require every rank in a group to call it the same number of
+     times. Fixed by broadcasting it from each tensor-parallel group's
+     rank-0 to the rest of that group, reusing the exact
+     `dist.broadcast(..., src=(dist.get_rank()//tensor_par_size*
+     tensor_par_size), group=tensor_par_group)` idiom `process_batch`
+     already uses for batch tensors.
+
+   All five fixed locally (syntax + full Tier 1 suite, `pytest -q`); none
+   are exercisable without a real multi-rank `tensor_par_size > 1` launch,
+   so — like the `VIT`+`do_ap` fix above — not yet re-verified against a
+   real Frontier run.
 
 ## Validating a config file by hand
 

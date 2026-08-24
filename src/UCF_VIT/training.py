@@ -62,7 +62,10 @@ def train_step(conf, batch, model):
     """
 
     if conf["model"]["type"] == "VIT":
-        output = model.forward(batch["data"], batch["variables"], batch["seq_ps"])
+        if conf["ap"]["do_ap"]:
+            output = model.forward(batch["seq"], batch["variables"], batch["seq_ps"])
+        else:
+            output = model.forward(batch["data"], batch["variables"], batch["seq_ps"])
         criterion = nn.CrossEntropyLoss()
         loss = criterion(output, batch["label"])
 
