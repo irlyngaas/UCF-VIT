@@ -323,11 +323,23 @@ FEATURE_MATRIX = [
     FeatureMatrixCell(
         "basic_ct/sap/base_config.yaml", "basic_ct-sap+tensor_par",
         {"parallelism": {"fsdp_size": 1, "simple_ddp_size": 4, "tensor_par_size": 2}},
+        min_files_override=8,
+        timeout_override=1800,
         # SAP's baseline already keeps patch_size:4 (its own decoder-memory
         # exception), so tensor_par_size doesn't compound with any known
         # memory risk here. Exercises training.py's seq_label broadcast
         # (only taken for UNETR/SAP) under tensor_par_size > 1 for the
-        # first time.
+        # first time -- and, since SAP is the only model requiring
+        # do_ap:True, also the first time the do_ap:True Segmentation
+        # `label` placeholder branch runs under tensor_par_size > 1 at all.
+        # min_files:8/timeout:1800 mirror basic_ct-unetr+twoD above, not
+        # because of any sample-count multiplication here (SAP's baseline
+        # keeps twoD:False), but because job 5339608 found a real
+        # sender/receiver dtype mismatch on that `label` broadcast (fixed
+        # in training.py) that hung until the shared DEFAULT_TIMEOUT(600s)
+        # -- the raised timeout is a safety margin while that fix gets its
+        # first real-Frontier verification, not a known cost driver like
+        # the twoD cells.
     ),
     FeatureMatrixCell(
         "catsdogs/diffusion/base_config.yaml", "catsdogs-diffusion+tensor_par",

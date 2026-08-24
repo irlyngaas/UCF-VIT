@@ -1228,6 +1228,64 @@ Frontier data.
    Both fixed locally (full Tier 1 suite green, 153 passed); not yet
    re-verified against a real Frontier run.
 
+7. Reran the full matrix (job 5339608) against item 6's fixes: **16 PASS, 2
+   FAIL** — both remaining failures reduced to real, previously-dormant
+   bugs, both now fixed (not yet re-verified against a real Frontier run):
+   - `basic_ct-unetr+twoD+tensor_par`: `KeyError: ''` at
+     `num_channels[dict_key]` — the 1EB-OOM crash from item 6 was gone
+     (confirming that fix helped), but `dict_key` still arrived empty on
+     the receiving rank. Root cause: the previous `dict_key` broadcast
+     scheme (broadcast its length as a separate tensor, then broadcast a
+     `[None]*length` list of individual characters via `list(dict_key)`,
+     then `''.join(...)` to reconstruct) was fragile — even with the
+     `str`-vs-`list` and missing-`device` bugs already fixed, it still
+     occasionally produced an empty string for reasons never fully
+     isolated. Replaced entirely with a much simpler design in both the
+     `do_ap:True` and `do_ap:False` branches: broadcast `dict_key` itself
+     as a single-element list (`dict_key_holder = [dict_key] if
+     dist.get_rank(tensor_par_group) == 0 else [None]`) via one
+     `broadcast_object_list` call — `broadcast_object_list` already
+     natively supports a variable-length pickled object directly, so the
+     separate length-broadcast-then-characters dance was never needed.
+   - `basic_ct-sap+tensor_par`: `TIMEOUT (600s)`, no crash. Traced to a
+     real sender/receiver `dtype` mismatch on the `label` broadcast in the
+     Segmentation (`UNETR`/`SAP`) branch of `process_batch`: the real
+     `batch["label"]` is `uint8` (do_ap:True, basic_ct — see `dataset.py`'s
+     `np.asarray(np_label, dtype=np.uint8)`) or `int64` (do_ap:False — see
+     `dataset.py`'s `np.array(label.dataobj).astype(np.int64)`), never
+     cast to `precision_dt` on the sender side, but the non-rank-0
+     placeholder declared `dtype=precision_dt` (a float type) in all four
+     spots (`do_ap:True`/`twoD`, `do_ap:True`/3D, `do_ap:False`/`twoD`,
+     `do_ap:False`/3D). NCCL requires identical dtype/byte-size across
+     ranks for a collective to complete (the same reasoning already
+     documented next to the `DiffusionVIT` `t`/`e` placeholders); a
+     mismatch here manifests as a hang until the watchdog times out,
+     rather than an immediate crash — consistent with the observed
+     `TIMEOUT` instead of a `RuntimeError`. This exact code path
+     (do_ap:True + Segmentation + `tensor_par_size > 1`) had never been
+     exercised before `basic_ct-sap+tensor_par` (`SAP` is the only model
+     requiring `do_ap:True`), and `basic_ct-unetr+twoD+tensor_par`
+     (do_ap:False + Segmentation) never reached this broadcast either,
+     since it was crashing earlier on the `dict_key` bug above. Fixed all
+     four placeholders to the correct integer dtype (`torch.uint8` for
+     do_ap:True, `torch.int64` for do_ap:False). While auditing this,
+     also fixed a related latent bug one step earlier: the rank-0 sender's
+     `seq_label = batch["seq_label"].to(device)` was missing a
+     `.to(precision_dt)` cast (its receiver placeholder is
+     `dtype=precision_dt`) — harmless today only because `basic_ct/sap`'s
+     baseline happens to use `data_type: float32` already (matching
+     `seq_label`'s native `float32` from `datamodule.py`'s
+     `seq_mask.permute(2, 0, 1).float()`), but would hit the identical
+     hang under a `bfloat16` config. `run_feature_matrix_smoke.py`'s
+     `basic_ct-sap+tensor_par` cell also picked up `min_files_override=8`/
+     `timeout_override=1800` (mirroring `basic_ct-unetr+twoD`'s existing
+     margin) as a safety buffer while this fix gets its first real run —
+     not because SAP's baseline has any known sample-count multiplication
+     cost (`twoD` stays `False`).
+
+   Both fixed locally (full Tier 1 suite green, 153 passed); not yet
+   re-verified against a real Frontier run.
+
 ## Validating a config file by hand
 
 `utils/validate_config.py` is a standalone utility — the same one

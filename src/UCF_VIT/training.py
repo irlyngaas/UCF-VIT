@@ -286,42 +286,43 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
                 if conf["dataloader"]["return_label"]:
                     label = batch["label"].to(device)
                     if conf["model"]["type"] in ["UNETR", "SAP"]:
-                        seq_label = batch["seq_label"].to(device)
+                        # Must match the receiver's dtype=precision_dt
+                        # placeholder below -- real seq_label is float32
+                        # (datamodule.py's seq_mask.permute(2,0,1).float()),
+                        # which only happens to already match precision_dt
+                        # when data_type:float32 is configured; explicit here
+                        # so bfloat16 configs don't hit the same
+                        # sender/receiver dtype mismatch just fixed for
+                        # label above.
+                        seq_label = batch["seq_label"].to(precision_dt).to(device)
 
-                if dataset != "imagenet":
-                    dict_key_len = torch.tensor(len(dict_key)).to(device)
-                else:
+                if dataset == "imagenet":
                     dict_key = "imagenet"
             else:
-                if dataset != "imagenet":
-                    dict_key_len = torch.tensor(0).to(device)
-                else: 
+                if dataset == "imagenet":
                     dict_key = "imagenet"
 
             if dataset != "imagenet":
-                dist.broadcast(dict_key_len, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group = tensor_par_group)
-                # broadcast_object_list requires object_list to actually be a
-                # list on every rank -- dict_key on the source rank is a bare
-                # str (e.g. "ct1"), which isn't a valid object_list argument
-                # (only the receiver's placeholder was ever a real list),
-                # producing corrupted pickle framing. list(dict_key) gives a
-                # real list of single-character strings on the source rank
-                # too, matching the receivers' [None]*len placeholder.
+                # broadcast_object_list already handles a variable-length
+                # pickled object directly (that's the whole point of the
+                # "object" collectives, unlike dist.broadcast which needs a
+                # fixed pre-known tensor shape) -- broadcasting dict_key
+                # itself as a single-element list is simpler and more robust
+                # than the previous character-splitting scheme (a separate
+                # length broadcast + list(dict_key) + ''.join(...)), which
+                # was fragile and, even after fixing its str-vs-list and
+                # missing-device bugs, still occasionally produced an empty
+                # dict_key on the receiver for reasons never fully isolated.
                 # device=device: broadcast_object_list's own docs warn that
                 # for NCCL groups its internal object-size/pickled-bytes
                 # tensors must live on this rank's GPU, and without an
                 # explicit device it falls back to
                 # torch.cuda.current_device() -- relying on that global
                 # implicitly (rather than the device this function already
-                # has in hand) is exactly the kind of thing that produced a
-                # "Tried to allocate more than 1EB memory" corruption on a
-                # real multi-rank run.
-                if dist.get_rank(tensor_par_group) == 0:
-                    dict_key_list = list(dict_key)
-                else:
-                    dict_key_list = [None] * dict_key_len.item()
-                dist.broadcast_object_list(dict_key_list, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group, device=device)
-                dict_key = ''.join(dict_key_list)
+                # has in hand) risks the same kind of corruption.
+                dict_key_holder = [dict_key] if dist.get_rank(tensor_par_group) == 0 else [None]
+                dist.broadcast_object_list(dict_key_holder, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group, device=device)
+                dict_key = dict_key_holder[0]
 
             if dist.get_rank(tensor_par_group) != 0:
                 if twoD:
@@ -354,7 +355,18 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
                             # reshaping/casting it.
                             label = torch.zeros(batch_size, dtype=torch.int64).to(device)
                         else: #Segmentation
-                            label = torch.zeros(batch_size, 1, tile_size[0], tile_size[1], dtype=precision_dt).to(device)
+                            # Real basic_ct label is uint8 (see dataset.py's
+                            # np.asarray(np_label, dtype=np.uint8)), not
+                            # precision_dt -- dist.broadcast fills values into
+                            # the existing tensor without casting, so a
+                            # dtype mismatch between sender and receiver here
+                            # (previously precision_dt, a float type) silently
+                            # corrupts the transfer -- this exact
+                            # do_ap:True + Segmentation + tensor_par_size>1
+                            # combination was never exercised before
+                            # basic_ct-sap+tensor_par (SAP is the only model
+                            # requiring do_ap:True).
+                            label = torch.zeros(batch_size, 1, tile_size[0], tile_size[1], dtype=torch.uint8).to(device)
                             if conf["model"]["type"] in ["UNETR", "SAP"]:
                                 seq_label = torch.zeros(batch_size, conf["model"]["kwargs"]["num_classes"], fixed_length, patch_size*patch_size, dtype=precision_dt).to(device)
                 else:
@@ -375,7 +387,9 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
                             # Same reasoning as the twoD branch above.
                             label = torch.zeros(batch_size, dtype=torch.int64).to(device)
                         else: #Segmentation
-                            label = torch.zeros(batch_size, 1, tile_size[0], tile_size[1], tile_size[2], dtype=precision_dt).to(device)
+                            # Same real-uint8-vs-precision_dt reasoning as
+                            # the twoD branch above.
+                            label = torch.zeros(batch_size, 1, tile_size[0], tile_size[1], tile_size[2], dtype=torch.uint8).to(device)
                             if conf["model"]["type"] in ["UNETR", "SAP"]:
                                 seq_label = torch.zeros(batch_size, conf["model"]["kwargs"]["num_classes"], fixed_length, patch_size*patch_size*patch_size, dtype=precision_dt).to(device)
                 variables = [None] * num_channels[dict_key]
@@ -410,27 +424,18 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
                     t = t.to(device)
                     data = (torch.sqrt(a)*data) + (torch.sqrt(1-a)*e)
 
-                if dataset != "imagenet":
-                    dict_key_len = torch.tensor(len(dict_key)).to(device)
-                else:
+                if dataset == "imagenet":
                     dict_key = "imagenet"
             else:
-                if dataset != "imagenet":
-                    dict_key_len = torch.tensor(0).to(device)
-                else:
+                if dataset == "imagenet":
                     dict_key = "imagenet"
 
             if dataset != "imagenet":
-                dist.broadcast(dict_key_len, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group = tensor_par_group)
-
-                # Same fix as the do_ap:True branch above -- object_list must
-                # be a real list on every rank, not a bare str on the source.
-                if dist.get_rank(tensor_par_group) == 0:
-                    dict_key_list = list(dict_key)
-                else:
-                    dict_key_list = [None] * dict_key_len.item()
-                dist.broadcast_object_list(dict_key_list, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group, device=device)
-                dict_key = ''.join(dict_key_list)
+                # Same simplified single-object broadcast as the do_ap:True
+                # branch above -- see its comment for why.
+                dict_key_holder = [dict_key] if dist.get_rank(tensor_par_group) == 0 else [None]
+                dist.broadcast_object_list(dict_key_holder, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group, device=device)
+                dict_key = dict_key_holder[0]
 
             if dist.get_rank(tensor_par_group) != 0:
                 if twoD:
@@ -442,14 +447,23 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
                             # int64, not (batch_size, 1) float.
                             label = torch.zeros(batch_size, dtype=torch.int64).to(device)
                         else: #Segmentation
-                            label = torch.zeros(batch_size, 1, tile_size[0], tile_size[1], dtype=precision_dt).to(device)
+                            # Real basic_ct label (do_ap:False) is int64 (see
+                            # dataset.py's
+                            # np.array(label.dataobj).astype(np.int64)), not
+                            # precision_dt -- same NCCL dtype/byte-size
+                            # requirement as the t/e placeholders below and
+                            # the do_ap:True Segmentation label placeholder
+                            # above.
+                            label = torch.zeros(batch_size, 1, tile_size[0], tile_size[1], dtype=torch.int64).to(device)
                 else:
                     data = torch.zeros(batch_size, num_channels[dict_key], tile_size[0], tile_size[1], tile_size[2], dtype=precision_dt).to(device)
                     if conf["dataloader"]["return_label"]:
                         if conf["model"]["type"] == "VIT": #Classification
                             label = torch.zeros(batch_size, dtype=torch.int64).to(device)
                         else: #Segmentation
-                            label = torch.zeros(batch_size, 1, tile_size[0], tile_size[1], tile_size[2], dtype=precision_dt).to(device)
+                            # Same real-int64-vs-precision_dt reasoning as
+                            # the twoD branch above.
+                            label = torch.zeros(batch_size, 1, tile_size[0], tile_size[1], tile_size[2], dtype=torch.int64).to(device)
                 if conf["model"]["type"] == "DiffusionVIT":
                     # torch.randint's default dtype is int64, not int32
                     # ("torch.int") -- must match exactly for the broadcast
