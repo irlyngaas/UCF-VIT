@@ -1189,6 +1189,44 @@ Frontier data.
    re-verified against a real Frontier run. Given how many of these were
    only reachable after clearing an earlier one, expect this to need at
    least one more real-run/fix cycle.
+6. Reran the full matrix (job 5339018) against item 5's fixes: **15 PASS, 3
+   FAIL** — the biggest jump yet, including `imagenet-classification+
+   tensor_par`'s resume cycle passing for the first time. The 3 remaining
+   failures reduced to two distinct, well-understood bugs:
+   - `training.py`'s `process_batch`: the `separate_channels=False`
+     placeholder for `seq_pos` was missing its trailing coordinate
+     dimension entirely (`torch.zeros(batch_size, 1, fixed_length, 1, 1,
+     ...)` instead of `torch.zeros(batch_size, 1, fixed_length, 2, ...)`
+     for `twoD`, `3` for 3D) — confirmed against the real per-sample
+     construction in `datamodule.py` (`np.expand_dims(batch[i][3],
+     axis=0)`, where the raw per-patch position is a 2- or 3-element
+     coordinate, not a scalar). The `seq_size` placeholder had the
+     opposite problem, one spurious extra trailing dim
+     (`(batch_size, 1, fixed_length, 1)` instead of `(batch_size, 1,
+     fixed_length)`, `seq_size` being a scalar per patch with no
+     coordinate dim at all). Broke as `RuntimeError: Tensors must have
+     same number of dimensions: got 3 and 2` in the final `seq_ps =
+     torch.concat([seq_size, seq_pos], dim=-1)` — hit by
+     `imagenet-classification+do_ap+tensor_par` and
+     `basic_ct-sap+tensor_par`. Fixed both placeholder blocks (`twoD` and
+     3D) to the correct shapes.
+   - `training.py`'s `process_batch`: all four `dist.broadcast_object_list`
+     calls (`dict_key_list` x2, `variables` x2) never passed a `device`
+     argument. `broadcast_object_list`'s own docs warn that for NCCL
+     groups its internal object-size/pickled-bytes tensors must live on
+     this rank's GPU, and without an explicit `device` it falls back to
+     the global `torch.cuda.current_device()` — relying on that
+     implicitly, rather than the `device` `process_batch` already has in
+     hand as a parameter, is exactly the kind of thing that can produce
+     the `torch.OutOfMemoryError: Tried to allocate more than 1EB memory`
+     corruption `basic_ct-unetr+twoD+tensor_par` hit here (the same
+     symptom as an earlier, different bug this session — that one was a
+     genuine `str`-vs-`list` type mismatch, already fixed; this is a
+     second, distinct cause producing the identical crash signature).
+     Fixed by passing `device=device` explicitly to all four calls.
+
+   Both fixed locally (full Tier 1 suite green, 153 passed); not yet
+   re-verified against a real Frontier run.
 
 ## Validating a config file by hand
 

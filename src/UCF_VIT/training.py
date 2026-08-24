@@ -307,11 +307,20 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
                 # producing corrupted pickle framing. list(dict_key) gives a
                 # real list of single-character strings on the source rank
                 # too, matching the receivers' [None]*len placeholder.
+                # device=device: broadcast_object_list's own docs warn that
+                # for NCCL groups its internal object-size/pickled-bytes
+                # tensors must live on this rank's GPU, and without an
+                # explicit device it falls back to
+                # torch.cuda.current_device() -- relying on that global
+                # implicitly (rather than the device this function already
+                # has in hand) is exactly the kind of thing that produced a
+                # "Tried to allocate more than 1EB memory" corruption on a
+                # real multi-rank run.
                 if dist.get_rank(tensor_par_group) == 0:
                     dict_key_list = list(dict_key)
                 else:
                     dict_key_list = [None] * dict_key_len.item()
-                dist.broadcast_object_list(dict_key_list, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+                dist.broadcast_object_list(dict_key_list, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group, device=device)
                 dict_key = ''.join(dict_key_list)
 
             if dist.get_rank(tensor_par_group) != 0:
@@ -322,8 +331,16 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
                         seq_size = torch.zeros(batch_size, num_channels[dict_key], fixed_length, dtype=precision_dt).to(device)
                         seq_pos = torch.zeros(batch_size, num_channels[dict_key], fixed_length, 2, dtype=precision_dt).to(device)
                     else:
-                        seq_size = torch.zeros(batch_size, 1, fixed_length, 1, dtype=precision_dt).to(device)
-                        seq_pos = torch.zeros(batch_size, 1, fixed_length, 1, 1, dtype=precision_dt).to(device)
+                        # Real seq_size is (batch_size, 1, fixed_length) --
+                        # a scalar per-patch side length, no trailing
+                        # coordinate dim (see datamodule.py's
+                        # np.expand_dims(batch[i][2], axis=0)-based
+                        # construction). Real seq_pos is (batch_size, 1,
+                        # fixed_length, 2) for twoD -- a per-patch (x, y)
+                        # center position, so the trailing dim must be 2,
+                        # not 1.
+                        seq_size = torch.zeros(batch_size, 1, fixed_length, dtype=precision_dt).to(device)
+                        seq_pos = torch.zeros(batch_size, 1, fixed_length, 2, dtype=precision_dt).to(device)
 
                     if conf["dataloader"]["return_label"]:
                         if conf["model"]["type"] == "VIT": #Classification
@@ -347,8 +364,11 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
                         seq_size = torch.zeros(batch_size, num_channels[dict_key], fixed_length, dtype=precision_dt).to(device)
                         seq_pos = torch.zeros(batch_size, num_channels[dict_key], fixed_length, 3, dtype=precision_dt).to(device)
                     else:
-                        seq_size = torch.zeros(batch_size, 1, fixed_length, 1, dtype=precision_dt).to(device)
-                        seq_pos = torch.zeros(batch_size, 1, fixed_length, 1, 1, 1, dtype=precision_dt).to(device)
+                        # Same reasoning as the twoD branch above -- real
+                        # seq_pos for 3D has a trailing (x, y, z) coordinate
+                        # dim of 3, not 1.
+                        seq_size = torch.zeros(batch_size, 1, fixed_length, dtype=precision_dt).to(device)
+                        seq_pos = torch.zeros(batch_size, 1, fixed_length, 3, dtype=precision_dt).to(device)
 
                     if conf["dataloader"]["return_label"]:
                         if conf["model"]["type"] == "VIT": #Classification
@@ -365,7 +385,7 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
             dist.broadcast(seq, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
             dist.broadcast(seq_size, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
             dist.broadcast(seq_pos, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
-            dist.broadcast_object_list(variables, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+            dist.broadcast_object_list(variables, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group, device=device)
 
             if conf["dataloader"]["return_label"]:
                 dist.broadcast(label, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
@@ -409,7 +429,7 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
                     dict_key_list = list(dict_key)
                 else:
                     dict_key_list = [None] * dict_key_len.item()
-                dist.broadcast_object_list(dict_key_list, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+                dist.broadcast_object_list(dict_key_list, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group, device=device)
                 dict_key = ''.join(dict_key_list)
 
             if dist.get_rank(tensor_par_group) != 0:
@@ -441,7 +461,7 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
 
             #Broadcast data batch to the rest of the tensor parallel group
             dist.broadcast(data, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
-            dist.broadcast_object_list(variables, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+            dist.broadcast_object_list(variables, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group, device=device)
 
             if conf["dataloader"]["return_label"]:
                 dist.broadcast(label, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
