@@ -452,6 +452,19 @@ class VIT(nn.Module):
 
         if self.use_adaptive_pos_emb:
             pos_embed = self.adaptive_pos_dep_emb(seq_ps)
+            if self.cls_token is not None:
+                # adaptive_pos_dep_emb computes one position embedding per real
+                # patch from seq_ps, with no row for the class token (it has no
+                # spatial position of its own) -- pos_embed is otherwise one
+                # token short once the class token gets prepended to x below.
+                # Prepending a zero row mirrors get_2d_sincos_pos_embed/
+                # get_3d_sincos_pos_embed's own cls_token handling (utils/
+                # pos_embed.py) for the non-adaptive case: "prepend a zero
+                # embedding row for a class token".
+                cls_pos_embed = torch.zeros(
+                    pos_embed.shape[0], 1, pos_embed.shape[-1], device=pos_embed.device, dtype=pos_embed.dtype
+                )
+                pos_embed = torch.cat([cls_pos_embed, pos_embed], dim=1)
         else:
             pos_embed = self.pos_embed
 

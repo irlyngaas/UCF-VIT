@@ -1092,6 +1092,83 @@ Frontier data.
    `parse.py`). Now every dataset and every model type appears in at least
    one of the matrix's 18 cells. Both new cells pass the local
    `parse_config` dry-run; not yet run against real Frontier data.
+5. Reran the full matrix (job 5338382) against all the item-3 fixes: **8
+   PASS, 8 FAIL** — real progress (`basic_ct-mae+do_ap`,
+   `basic_ct-mae+tensor_par`, and `catsdogs-diffusion+tensor_par` now pass),
+   but surfaced a whole second wave of bugs, every one only reachable once
+   the item-3 fixes cleared the way to exercise it for the first time:
+   - `model/arch.py`'s `_pos_embed`: the item-3 `VIT`+`do_ap` fix was
+     necessary but not sufficient — `self.adaptive_pos_dep_emb(seq_ps)`
+     computes one position embedding per real patch (no cls-token row),
+     but `x` gets the cls token prepended before the add, so `VIT`
+     (the only model type with `class_token=True` — `UNETR`/`MAE`/`SAP`/
+     `DiffusionVIT` all construct with `class_token=False`, per
+     `model/utils.py`'s `get_model`) is one token short:
+     `RuntimeError: size of tensor a (197) must match size of tensor b
+     (196)`. Fixed by prepending a zero row to the adaptive `pos_embed` for
+     the cls token, mirroring `get_2d_sincos_pos_embed`/
+     `get_3d_sincos_pos_embed`'s own documented convention for the
+     non-adaptive case ("prepend a zero embedding row for a class token").
+   - `training.py`'s `process_batch`: the `VIT` classification `label`
+     placeholder (4 occurrences, `do_ap` x `twoD`) was
+     `torch.zeros(batch_size, 1, dtype=precision_dt)` -- shape
+     `(batch_size, 1)` float, but the real label (from `get_batch`) is
+     `(batch_size,)` int64 (a flat class index). `dist.broadcast` fills
+     values into the existing placeholder without reshaping/recasting it,
+     so non-rank-0 processes ended up with a 2D float target:
+     `RuntimeError: 0D or 1D target tensor expected, multi-target not
+     supported` from `nn.CrossEntropyLoss`. Fixed all 4 to
+     `torch.zeros(batch_size, dtype=torch.int64)`.
+   - `training.py`'s `process_batch`: `tile_size` was only assigned in the
+     `do_ap:False` branch of the setup code, but the `do_ap:True` branch's
+     placeholder construction still needs it to shape `data` (the raw,
+     pre-patchification image, needed regardless of `do_ap`) --
+     `UnboundLocalError: cannot access local variable 'tile_size'`. Fixed
+     by moving the assignment out of the `if`/`else` so it's unconditional.
+   - `training.py`'s `process_batch`: the `dict_key` broadcast passed a
+     bare Python `str` (e.g. `"ct1"`) as `dist.broadcast_object_list`'s
+     `object_list` argument on the source rank, while every receiver
+     correctly pre-allocated a real `list`. That API requires an actual
+     list on every rank -- the type mismatch corrupted the pickle framing:
+     `_pickle.UnpicklingError: invalid load key` and (on a different rank)
+     `torch.OutOfMemoryError: HIP out of memory. Tried to allocate more
+     than 1EB memory` (a garbage size read from the corrupted buffer).
+     Fixed by using `list(dict_key)` on the source rank too, matching the
+     receivers' `[None] * dict_key_len` placeholder exactly.
+   - `training.py`'s `process_batch`: `seq_size`/`seq_pos` were read
+     straight off `batch["seq_size"]`/`batch["seq_pos"]` with no
+     `.to(precision_dt).to(device)` on the source rank, unlike every other
+     broadcast field (`data`, `seq`, `label`) -- since NCCL has no CPU
+     backend, broadcasting a CPU tensor into GPU-resident receivers failed
+     outright: `RuntimeError: No backend type associated with device type
+     cpu`. Fixed to match `data`/`seq`'s existing pattern.
+   - `training.py`'s `process_batch`: found by inspection, not yet hit by
+     any real run -- the final "convert `seq_size`/`seq_pos` into `seq_ps`"
+     block (used for adaptive position embeddings) unconditionally read
+     `batch["seq_size"]`/`batch["seq_pos"]`, but `batch` is only ever
+     assigned on `tensor_par_group`-rank-0 when `tensor_par_size > 1` --
+     every other rank would hit `UnboundLocalError` here, even though the
+     correct, already-broadcast values were sitting right there in the
+     local `seq_size`/`seq_pos` variables. Fixed to read those locals
+     instead (and assigned them as locals in the `tensor_par_size == 1`
+     branch too, for consistency, since previously only the dict entries
+     existed there).
+   - `training.py`'s `process_batch`: also found by inspection --
+     `DiffusionVIT`'s `t` placeholder used `dtype=torch.int` (int32), but
+     `torch.randint`'s real default dtype is `int64` -- a byte-size
+     mismatch that should break an NCCL broadcast, though
+     `catsdogs-diffusion+tensor_par` passed anyway in job 5338382 (possibly
+     silent corruption rather than a hard failure, or NCCL tolerating it
+     for this particular tensor shape -- not fully understood). Fixed
+     defensively to `int64` regardless, since the mismatch is real either
+     way.
+
+   All fixed locally (syntax + full Tier 1 suite, `pytest -q`, 140 passed);
+   none exercisable without a real multi-rank `tensor_par_size > 1` launch
+   (or, for the `_pos_embed` fix, `VIT`+`do_ap:True`), so not yet
+   re-verified against a real Frontier run. Given how many of these were
+   only reachable after clearing an earlier one, expect this to need at
+   least one more real-run/fix cycle.
 
 ## Validating a config file by hand
 

@@ -224,6 +224,11 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
             batch = get_batch(conf, it_loader)
             data = batch["data"].to(precision_dt).to(device)
             seq = batch["seq"].to(precision_dt).to(device)
+            # Assigned as locals (not just left inside `batch`) so the
+            # seq_ps conversion below can read them the same way regardless
+            # of tensor_par_size -- see that block's comment.
+            seq_size = batch["seq_size"]
+            seq_pos = batch["seq_pos"]
             dict_key = batch["dict_key"]
             variables = batch["variables"]
             if conf["dataloader"]["return_label"]:
@@ -251,12 +256,15 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
         batch_size = conf["dataloader"]["batch_size"]
         num_channels = conf["data"]["num_channels"]
         twoD = conf["data"]["twoD"]
+        # tile_size is needed unconditionally below (it shapes the raw
+        # `data` placeholder for non-rank-0 processes regardless of do_ap --
+        # `data` is always the pre-patchification image), not just when
+        # do_ap is False.
+        tile_size = conf["data"]["tile_size"]
         if conf["ap"]["do_ap"]:
             fixed_length = conf["ap"]["fixed_length"]
             patch_size = conf["data"]["patch_size"]
             separate_channels = conf["ap"]["separate_channels"]
-        else:
-            tile_size = conf["data"]["tile_size"]
 
         if dist.get_rank(tensor_par_group) == 0:
             it_loader = iter(train_dataloader)
@@ -266,8 +274,13 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
                 batch = get_batch(conf, it_loader)
                 data = batch["data"].to(precision_dt).to(device)
                 seq = batch["seq"].to(precision_dt).to(device)
-                seq_size = batch["seq_size"]
-                seq_pos = batch["seq_pos"]
+                # Must match the receivers' placeholder (dtype=precision_dt,
+                # .to(device)) exactly, or the broadcast below either fails
+                # outright (NCCL has no CPU backend -- "No backend type
+                # associated with device type cpu") or silently mismatches
+                # dtype across ranks.
+                seq_size = batch["seq_size"].to(precision_dt).to(device)
+                seq_pos = batch["seq_pos"].to(precision_dt).to(device)
                 variables = batch["variables"]
                 dict_key = batch["dict_key"]
                 if conf["dataloader"]["return_label"]:
@@ -287,12 +300,19 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
 
             if dataset != "imagenet":
                 dist.broadcast(dict_key_len, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group = tensor_par_group)
-                if dist.get_rank(tensor_par_group) != 0:
-                    dict_key = [None] * dict_key_len.item()
-                dist.broadcast_object_list(dict_key, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
-
-                if dist.get_rank(tensor_par_group) != 0:
-                    dict_key = ''.join(dict_key)
+                # broadcast_object_list requires object_list to actually be a
+                # list on every rank -- dict_key on the source rank is a bare
+                # str (e.g. "ct1"), which isn't a valid object_list argument
+                # (only the receiver's placeholder was ever a real list),
+                # producing corrupted pickle framing. list(dict_key) gives a
+                # real list of single-character strings on the source rank
+                # too, matching the receivers' [None]*len placeholder.
+                if dist.get_rank(tensor_par_group) == 0:
+                    dict_key_list = list(dict_key)
+                else:
+                    dict_key_list = [None] * dict_key_len.item()
+                dist.broadcast_object_list(dict_key_list, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+                dict_key = ''.join(dict_key_list)
 
             if dist.get_rank(tensor_par_group) != 0:
                 if twoD:
@@ -307,7 +327,15 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
 
                     if conf["dataloader"]["return_label"]:
                         if conf["model"]["type"] == "VIT": #Classification
-                            label = torch.zeros(batch_size, 1, dtype=precision_dt).to(device)
+                            # Real classification labels are flat per-sample
+                            # class indices (shape (batch_size,), int64 --
+                            # see e.g. datamodule.py's
+                            # torch.tensor(batch[i][4])-based construction),
+                            # not (batch_size, 1) floats -- this placeholder
+                            # must match exactly, since dist.broadcast fills
+                            # values into the existing tensor without
+                            # reshaping/casting it.
+                            label = torch.zeros(batch_size, dtype=torch.int64).to(device)
                         else: #Segmentation
                             label = torch.zeros(batch_size, 1, tile_size[0], tile_size[1], dtype=precision_dt).to(device)
                             if conf["model"]["type"] in ["UNETR", "SAP"]:
@@ -324,7 +352,8 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
 
                     if conf["dataloader"]["return_label"]:
                         if conf["model"]["type"] == "VIT": #Classification
-                            label = torch.zeros(batch_size, 1, dtype=precision_dt).to(device)
+                            # Same reasoning as the twoD branch above.
+                            label = torch.zeros(batch_size, dtype=torch.int64).to(device)
                         else: #Segmentation
                             label = torch.zeros(batch_size, 1, tile_size[0], tile_size[1], tile_size[2], dtype=precision_dt).to(device)
                             if conf["model"]["type"] in ["UNETR", "SAP"]:
@@ -374,30 +403,39 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
             if dataset != "imagenet":
                 dist.broadcast(dict_key_len, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group = tensor_par_group)
 
-                if dist.get_rank(tensor_par_group) != 0:
-                    dict_key = [None] * dict_key_len.item()
-                dist.broadcast_object_list(dict_key, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
-
-                if dist.get_rank(tensor_par_group) != 0:
-                    dict_key = ''.join(dict_key)
+                # Same fix as the do_ap:True branch above -- object_list must
+                # be a real list on every rank, not a bare str on the source.
+                if dist.get_rank(tensor_par_group) == 0:
+                    dict_key_list = list(dict_key)
+                else:
+                    dict_key_list = [None] * dict_key_len.item()
+                dist.broadcast_object_list(dict_key_list, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
+                dict_key = ''.join(dict_key_list)
 
             if dist.get_rank(tensor_par_group) != 0:
                 if twoD:
                     data = torch.zeros(batch_size, num_channels[dict_key], tile_size[0], tile_size[1], dtype=precision_dt).to(device)
                     if conf["dataloader"]["return_label"]:
                         if conf["model"]["type"] == "VIT": #Classification
-                            label = torch.zeros(batch_size, 1, dtype=precision_dt).to(device)
+                            # Same reasoning as the do_ap:True branch above:
+                            # real classification labels are (batch_size,)
+                            # int64, not (batch_size, 1) float.
+                            label = torch.zeros(batch_size, dtype=torch.int64).to(device)
                         else: #Segmentation
                             label = torch.zeros(batch_size, 1, tile_size[0], tile_size[1], dtype=precision_dt).to(device)
                 else:
                     data = torch.zeros(batch_size, num_channels[dict_key], tile_size[0], tile_size[1], tile_size[2], dtype=precision_dt).to(device)
                     if conf["dataloader"]["return_label"]:
                         if conf["model"]["type"] == "VIT": #Classification
-                            label = torch.zeros(batch_size, 1, dtype=precision_dt).to(device)
+                            label = torch.zeros(batch_size, dtype=torch.int64).to(device)
                         else: #Segmentation
                             label = torch.zeros(batch_size, 1, tile_size[0], tile_size[1], tile_size[2], dtype=precision_dt).to(device)
                 if conf["model"]["type"] == "DiffusionVIT":
-                    t = torch.zeros(batch_size, dtype=torch.int).to(device)
+                    # torch.randint's default dtype is int64, not int32
+                    # ("torch.int") -- must match exactly for the broadcast
+                    # below (NCCL requires identical dtype/byte-size across
+                    # ranks).
+                    t = torch.zeros(batch_size, dtype=torch.int64).to(device)
                     e = torch.zeros_like(data, requires_grad=False)
                 variables = [None] * num_channels[dict_key]
 
@@ -419,10 +457,18 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
             #TODO: Move seq_size and seq_pos to a single channel
             seq_ps = None
         else:
-            seq_size = torch.squeeze(batch["seq_size"])
+            # Reads the local seq_size/seq_pos (not batch["seq_size"]/
+            # batch["seq_pos"]) since `batch` is only ever assigned on
+            # tensor_par_group-rank-0 when tensor_par_size > 1 -- every other
+            # rank would hit UnboundLocalError here otherwise. The local
+            # variables already hold the right values on every rank
+            # regardless of tensor_par_size: for tensor_par_size == 1 they're
+            # assigned straight from batch[...] above; for tensor_par_size > 1
+            # they're each rank's own already-broadcast copy.
+            seq_size = torch.squeeze(seq_size)
             seq_size = seq_size.to(torch.float32)
             seq_size = seq_size.to(device)
-            seq_pos = torch.squeeze(batch["seq_pos"])
+            seq_pos = torch.squeeze(seq_pos)
             seq_pos = seq_pos.to(torch.float32)
             seq_pos = seq_pos.to(device)
             seq_size = seq_size.unsqueeze(-1)
