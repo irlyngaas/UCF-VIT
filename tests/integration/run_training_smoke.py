@@ -59,6 +59,15 @@ Usage (from anywhere, inside an sbatch job with GPUs already allocated):
 With no config arguments, runs every configs/**/base_config.yaml. Prints a
 per-config, per-stage PASS/FAIL/TIMEOUT summary at the end and exits nonzero
 if anything failed.
+
+make_smoke_config's `extra_overrides` parameter and the
+deep_merge_config_overrides helper (both otherwise unused here -- every call
+in this file's own main() passes extra_overrides=None) exist for
+tests/integration/run_feature_matrix_smoke.py, the sibling Tier 3b driver
+that turns individual advanced features (adaptive patching, tiling, twoD,
+tensor parallelism) back on one at a time against real shipped configs,
+reusing this file's real-data-narrowing and fresh/resume-run machinery
+(run_fresh_phase/run_resume_phase in particular) rather than duplicating it.
 """
 
 import argparse
@@ -208,6 +217,49 @@ def compute_narrow_dict_idx(conf, min_files):
     return {k: frac_for(len(v)) for k, v in dict_lister_trains.items()}
 
 
+def deep_merge_config_overrides(conf, overrides):
+    """Recursively merges `overrides` into `conf` in place, returning `conf`.
+
+    For each key in `overrides`: if both `conf[key]` and `overrides[key]` are
+    dicts, recurses (so e.g. {"ap": {"do_ap": True}} only touches
+    conf["ap"]["do_ap"], leaving conf["ap"]["fixed_length"]/etc. untouched).
+    Otherwise, `conf[key]` is replaced wholesale with `overrides[key]` --
+    this is a *replace*, not an element-wise merge, deliberately: it applies
+    to lists/tuples too, not just scalars.
+
+    Used by make_smoke_config's `extra_overrides` parameter (see
+    run_feature_matrix_smoke.py) to flip individual advanced-feature flags
+    (ap.do_ap, tiling.do_tiling, data.twoD, parallelism.tensor_par_size, ...)
+    on top of a real shipped config, without hand-writing a full copy of
+    that config's every field for each variant.
+
+    Gotcha this deliberately does NOT protect against: parse_config
+    (parse.py's tiling-overlap handling) only recognizes an
+    already-multi-dimensional tiling.tile_overlap if it's a Python *tuple*
+    -- YAML has no tuple literal, so writing e.g.
+    {"tiling": {"tile_overlap": [0, 0]}} here loads back (and round-trips
+    through yaml.dump/yaml.load) as a *list*, which parse_config silently
+    mishandles (wraps the whole list twice instead of treating it as
+    already-2D, then fails a downstream int-only assert). Every shipped
+    config avoids this by using a bare scalar int (e.g. `tile_overlap: 0`),
+    which parse_config *does* correctly expand to a 2- or 3-tuple based on
+    twoD -- do the same in any override that touches tile_overlap.
+
+    Args:
+        conf: Config dict to merge into, modified in place.
+        overrides: Dict of values to merge on top of `conf`.
+
+    Returns:
+        `conf`, for convenience chaining.
+    """
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(conf.get(key), dict):
+            deep_merge_config_overrides(conf[key], value)
+        else:
+            conf[key] = value
+    return conf
+
+
 def create_narrow_catsdogs_dir(conf, scratch_dir, min_files):
     """Narrows a "dataloader"-type config's real data by symlinking a subset of real files.
 
@@ -270,15 +322,16 @@ def create_narrow_catsdogs_dir(conf, scratch_dir, min_files):
     return dkey_train, narrowed_dir
 
 
-def make_smoke_config(base_config_path, scratch_dir, min_files=DEFAULT_MIN_FILES):
+def make_smoke_config(base_config_path, scratch_dir, min_files=DEFAULT_MIN_FILES, extra_overrides=None):
     """Loads a real config and writes a tiny/fast, freshly-training smoke-test variant.
 
     Only overrides model size, epoch count, checkpoint location,
-    resume_from_checkpoint, and (see compute_narrow_dict_idx /
+    resume_from_checkpoint, (see compute_narrow_dict_idx /
     create_narrow_catsdogs_dir) the real-data-narrowing fields appropriate to
-    this config's dataloader type. Everything else -- data paths (beyond
-    narrowing), tiling, adaptive patching, batch size, load-balancing
-    settings -- is left exactly as in the real config.
+    this config's dataloader type, and (if given) `extra_overrides`.
+    Everything else -- data paths (beyond narrowing), tiling, adaptive
+    patching, batch size, load-balancing settings -- is left exactly as in
+    the real config.
 
     Args:
         base_config_path: Path to the real config YAML to base this on.
@@ -286,6 +339,15 @@ def make_smoke_config(base_config_path, scratch_dir, min_files=DEFAULT_MIN_FILES
             any narrowed-data symlinks, and this generated config file into.
         min_files: Passed through to compute_narrow_dict_idx /
             create_narrow_catsdogs_dir.
+        extra_overrides: Optional dict merged onto the loaded real config via
+            deep_merge_config_overrides, applied immediately after loading
+            it and before anything else -- in particular, before
+            data_par_size is computed for the min_files cap below, so a
+            parallelism.tensor_par_size/fsdp_size/simple_ddp_size override
+            here correctly affects that cap. Used by
+            run_feature_matrix_smoke.py to flip individual advanced-feature
+            flags on top of a real shipped config; run_training_smoke.py's
+            own main() never passes this (None).
 
     Returns:
         Path to the written smoke-test config file.
@@ -296,6 +358,9 @@ def make_smoke_config(base_config_path, scratch_dir, min_files=DEFAULT_MIN_FILES
     """
     with open(base_config_path) as f:
         conf = yaml.load(f, Loader=yaml.FullLoader)
+
+    if extra_overrides:
+        deep_merge_config_overrides(conf, extra_overrides)
 
     # DEFAULT_MIN_FILES (or an explicit --min-files) is a ceiling, not a
     # target: it's sized for the shared batch_size=32 most configs use, but
@@ -385,6 +450,82 @@ def rank0_checkpoint_exists(scratch_dir):
     return os.path.isfile(os.path.join(scratch_dir, "epoch_0_rank_0.ckpt"))
 
 
+def run_fresh_phase(smoke_config, slug, ntasks, timeout, scratch_dir):
+    """Runs one fresh training run against `smoke_config` and classifies the result.
+
+    Factored out of main()'s loop so run_feature_matrix_smoke.py's own loop
+    can reuse the exact same PASS/FAIL/TIMEOUT/checkpoint-written
+    classification and logging, instead of a second, independently
+    maintained copy of the same logic.
+
+    Args:
+        smoke_config: Path to a smoke-test config, as written by
+            make_smoke_config.
+        slug: Short label for this run, used only in printed output.
+        ntasks: Number of srun tasks (passed through to run_training).
+        timeout: Per-run timeout in seconds (passed through to run_training).
+        scratch_dir: The same scratch_dir make_smoke_config wrote this
+            config's checkpoint_path to, used to check whether a rank-0
+            checkpoint was actually produced.
+
+    Returns:
+        A dict: {"status": one of "PASS"/"FAIL"/"TIMEOUT"/
+        "FAIL (no checkpoint written)", "elapsed": float, "log": str}.
+    """
+    print(f"[{slug}] fresh run: srun -n {ntasks} python train.py {smoke_config}", flush=True)
+    t0 = time.time()
+    fresh = run_training(smoke_config, ntasks, timeout)
+    elapsed = time.time() - t0
+
+    status = "TIMEOUT" if fresh["returncode"] is None else ("PASS" if fresh["returncode"] == 0 else "FAIL")
+    if status != "PASS":
+        print(fresh["log"][-4000:], flush=True)
+    elif not rank0_checkpoint_exists(scratch_dir):
+        status = "FAIL (no checkpoint written)"
+        print(fresh["log"][-4000:], flush=True)
+    print(f"[{slug}] fresh run: {status} ({elapsed:.0f}s)", flush=True)
+
+    return {"status": status, "elapsed": elapsed, "log": fresh["log"]}
+
+
+def run_resume_phase(smoke_config, slug, ntasks, timeout):
+    """Runs the resume half of a fresh->resume cycle against an existing checkpoint.
+
+    Factored out of main()'s loop for the same reason as run_fresh_phase --
+    reused by run_feature_matrix_smoke.py for the one tensor-parallel cell
+    that also exercises resume (see that file's module docstring for why
+    just that one cell).
+
+    Precondition: the fresh run smoke_config came from already passed and
+    produced a checkpoint (callers are responsible for checking this, same
+    as main() does today).
+
+    Args:
+        smoke_config: Path to the smoke-test config that already ran (and
+            passed) a fresh run.
+        slug: Short label for this run, used only in printed output.
+        ntasks: Number of srun tasks (passed through to run_training).
+        timeout: Per-run timeout in seconds (passed through to run_training).
+
+    Returns:
+        A dict: {"status": one of "PASS"/"FAIL"/"TIMEOUT", "elapsed": float,
+        "log": str}.
+    """
+    set_resume(smoke_config, resume=True)
+    print(f"[{slug}] resume run: srun -n {ntasks} python train.py {smoke_config}", flush=True)
+    t0 = time.time()
+    resume = run_training(smoke_config, ntasks, timeout)
+    elapsed = time.time() - t0
+
+    status = "TIMEOUT" if resume["returncode"] is None else ("PASS" if resume["returncode"] == 0 else "FAIL")
+    if status != "PASS":
+        print(resume["log"][-4000:], flush=True)
+    print(f"[{slug}] resume run: {status} ({elapsed:.0f}s)", flush=True)
+
+    set_resume(smoke_config, resume=False)
+    return {"status": status, "elapsed": elapsed, "log": resume["log"]}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("configs", nargs="*", help="Specific config file(s) to test; default is every configs/**/base_config.yaml")
@@ -424,34 +565,16 @@ def main():
             shutil.rmtree(scratch_dir, ignore_errors=True)
             continue
 
-        print(f"[{slug}] fresh run: srun -n {args.ntasks} python train.py {smoke_config}", flush=True)
-        t0 = time.time()
-        fresh = run_training(smoke_config, args.ntasks, timeout)
-        fresh_elapsed = time.time() - t0
-
-        fresh_status = "TIMEOUT" if fresh["returncode"] is None else ("PASS" if fresh["returncode"] == 0 else "FAIL")
-        if fresh_status != "PASS":
-            print(fresh["log"][-4000:], flush=True)
-        elif not rank0_checkpoint_exists(scratch_dir):
-            fresh_status = "FAIL (no checkpoint written)"
-            print(fresh["log"][-4000:], flush=True)
-        print(f"[{slug}] fresh run: {fresh_status} ({fresh_elapsed:.0f}s)", flush=True)
+        fresh = run_fresh_phase(smoke_config, slug, args.ntasks, timeout, scratch_dir)
+        fresh_status = fresh["status"]
+        fresh_elapsed = fresh["elapsed"]
 
         resume_status = "SKIPPED (fresh run didn't produce a checkpoint)"
         resume_elapsed = None
         if fresh_status == "PASS":
-            set_resume(smoke_config, resume=True)
-            print(f"[{slug}] resume run: srun -n {args.ntasks} python train.py {smoke_config}", flush=True)
-            t0 = time.time()
-            resume = run_training(smoke_config, args.ntasks, timeout)
-            resume_elapsed = time.time() - t0
-
-            resume_status = "TIMEOUT" if resume["returncode"] is None else ("PASS" if resume["returncode"] == 0 else "FAIL")
-            if resume_status != "PASS":
-                print(resume["log"][-4000:], flush=True)
-            print(f"[{slug}] resume run: {resume_status} ({resume_elapsed:.0f}s)", flush=True)
-
-            set_resume(smoke_config, resume=False)
+            resume = run_resume_phase(smoke_config, slug, args.ntasks, timeout)
+            resume_status = resume["status"]
+            resume_elapsed = resume["elapsed"]
 
         results.append({
             "slug": slug,

@@ -21,6 +21,14 @@ mirroring the layout of `src/UCF_VIT/`.
   `sbatch launch/tests/run_training_smoke.sh` — see "Running the training
   smoke test (Tier 3)" below. Not pytest-based, and not a single local
   process either — see that section for why.
+- **Tier 3b** (`tests/integration/run_feature_matrix_smoke.py`): same
+  mechanics as Tier 3, but for a different purpose — Tier 3 proves the 10
+  shipped configs' shared baseline (advanced features off by default) still
+  works; Tier 3b proves those advanced features (adaptive patching, tiling,
+  `twoD`, tensor parallelism) still work when turned back on, one
+  representative config per feature. Launched via
+  `sbatch launch/tests/run_feature_matrix_smoke.sh` — see "Running the
+  feature-matrix smoke test (Tier 3b)" below.
 
 ## Setup
 
@@ -76,7 +84,8 @@ pytest tests/test_config_validation.py -v
 | `tests/utils/test_lr_scheduler.py` | `LinearWarmupCosineAnnealingLR` warmup/annealing shape |
 | `tests/utils/test_metrics.py` | `masked_mse`, `DiceBLoss` |
 | `tests/test_config_validation.py` | Every YAML under `configs/` actually parses via `parse_config` |
-| `tests/integration/test_run_training_smoke_helpers.py` | `run_training_smoke.py`'s `compute_narrow_dict_idx` (real-data-found narrowing, empty-but-existing-dir and nonexistent-dir both raising `NoRealDataFoundError`, no-op for non-`iterative_dataloader` configs) |
+| `tests/integration/test_run_training_smoke_helpers.py` | `run_training_smoke.py`'s `compute_narrow_dict_idx` (real-data-found narrowing, empty-but-existing-dir and nonexistent-dir both raising `NoRealDataFoundError`, no-op for non-`iterative_dataloader` configs) and `deep_merge_config_overrides` (nested-key merge, wholesale-replace of non-dict values, new-key insertion, multiple independent sections) |
+| `tests/integration/test_feature_matrix_smoke_helpers.py` | `run_feature_matrix_smoke.py`'s `FEATURE_MATRIX` well-formedness (unique labels, real base-config paths, no accidental list-valued `tile_overlap` overrides) and — the most valuable check — every cell's tiny-model config surviving a real `parse_config` call |
 
 `tests/dataloaders/test_dataset.py`'s `TileDataIter` coverage is deliberately
 thorough: that class is where a real, live bug was found and fixed this
@@ -895,6 +904,91 @@ by its own `# TODO: Add shuffling for data_par_size if it doesn't divide
 1000 equally` comment), the `<= data_par_size` regression case parametrized
 across several class counts, bucket-content correctness (not just counts),
 and the non-`imagenet` (`basic_ct`-style) branch.
+
+## Running the feature-matrix smoke test (Tier 3b)
+
+```bash
+cd launch/tests
+sbatch run_feature_matrix_smoke.sh
+```
+
+Tier 3 verifies all 10 shipped configs still work under this session's
+shared baseline (tensor parallelism, adaptive patching, tiling, and — for
+`basic_ct` — `twoD` all off by default, with `basic_ct/sap`'s and
+`basic_ct/unetr`'s three documented architecture-driven exceptions). Tier 3b
+verifies the advanced features *themselves* still work now that they're
+opt-in: for one representative (model, dataset) combination per feature —
+not a full combinatorial sweep, see
+`tests/integration/run_feature_matrix_smoke.py`'s module docstring for why —
+it flips that one feature back on and runs the same kind of tiny/fast
+real-data training run Tier 3 does.
+
+Same "not run under a top-level `srun`" structure as Tier 3, for the same
+reason (see Tier 3's section above) — this script also spawns its own
+`srun` subprocess per run. Output lands in
+`feature-matrix-smoke-<jobid>.out`.
+
+**Covered today** (see `run_feature_matrix_smoke.py`'s `FEATURE_MATRIX` for
+the exact overrides and reasoning behind each cell):
+
+| Feature | Cell(s) |
+| --- | --- |
+| `ap.do_ap:True` | `basic_ct/unetr`, `basic_ct/mae`, `imagenet/classification`, `catsdogs/classification` |
+| `tiling.do_tiling:True` | `basic_ct/unetr`, `imagenet/classification` (`catsdogs` excluded — its `dataloader.type: "dataloader"` never invokes `TileDataIter`; `tile_size` there is purely a resize target, not a tiling grid) |
+| `data.twoD:True` | `basic_ct/unetr` only (`imagenet`/`catsdogs` always run `twoD:True` already — `parse.py` forces it whenever `img_size` has 2 entries) |
+| `parallelism.tensor_par_size:2` | `imagenet/classification` (+ resume cycle), `basic_ct/mae`, `catsdogs/classification` |
+| Multi-feature combinations | `basic_ct/unetr` (`do_ap`+`do_tiling`, `do_ap`+`twoD`, `twoD`+`tensor_par_size`), `basic_ct/mae` (`twoD`+`do_tiling`), `imagenet/classification` (`do_ap`+`tensor_par_size`, `do_tiling`+`tensor_par_size`) |
+
+Every cell runs fresh-only except `imagenet/classification`'s solo
+tensor-parallel cell, which also resumes — closing a real, otherwise
+permanent coverage gap: no shipped config ships `tensor_par_size > 1`, so
+nothing else in this suite (Tier 1, 2, or baseline Tier 3) ever exercises
+the per-tensor-parallel-rank checkpoint file loop in `parse.py`'s
+pre-flight check or `model/utils.py`'s resume loading.
+
+The 6 multi-feature cells cover every pairwise combination among the 4 axes
+where it's architecturally meaningful (`do_ap`+`do_tiling`, `do_tiling`+
+`twoD`, `do_ap`+`tensor_par_size`, `do_ap`+`twoD`, `do_tiling`+
+`tensor_par_size`, `twoD`+`tensor_par_size`), each with a single fixed value
+per feature (one `tensor_par_size`, one `div`) rather than a sweep, so this
+stays as cheap as every single-feature cell. Two of them aren't
+hypothetical: `basic_ct/unetr`'s `do_ap`+`do_tiling` cell mirrors that
+config's actual pre-baseline settings (`do_ap:True, do_tiling:True, div:4,
+twoD:False`) — a combination that already passed real Frontier runs earlier
+this session, so it's a real regression check, not new territory.
+`basic_ct/mae`'s `twoD`+`do_tiling` cell mirrors the exact combination
+behind this session's original `basic_ct-mae` timeout that started the
+whole baseline reconfiguration effort — deliberately re-exercised here, but
+controlled (`div:2` instead of the original `div:4`, `min_files` pinned to
+the floor, `timeout:1800s`) rather than accidental.
+
+For iterating on a single failing cell:
+
+```bash
+cd launch/tests
+sbatch run_feature_matrix_smoke_single.sh basic_ct-unetr+twoD
+```
+
+`tests/integration/test_feature_matrix_smoke_helpers.py` sanity-checks
+`FEATURE_MATRIX` itself before any of this ever touches Frontier: unique
+labels, every `base_config_relpath` resolves to a real file, no
+accidentally-empty `overrides`, no accidentally-list-valued
+`tiling.tile_overlap` override (a real gotcha in
+`deep_merge_config_overrides` — see its docstring in
+`run_training_smoke.py`), and — the most valuable check — every cell's
+tiny-model config (real base config + `TINY_MODEL_OVERRIDES` + the cell's
+own overrides, exactly as `make_smoke_config` would build it) is fed
+through the real `UCF_VIT.parse.parse_config` with
+`load_balance_offline=True` (skips the `data_par_size*tensor_par_size==
+world_size` assertion, so even the `tensor_par_size:2` cells validate with
+zero real GPUs). All 15 cells pass this locally before ever touching real
+Frontier data.
+
+**Real runs on Frontier so far:** none yet — this is new, unrun
+infrastructure as of this write-up. `basic_ct-unetr+twoD` is expected to be
+the highest-risk cell (see its `FEATURE_MATRIX` entry's comment) and should
+be run single-cell first via `run_feature_matrix_smoke_single.sh` before
+ever launching the full matrix.
 
 ## Validating a config file by hand
 

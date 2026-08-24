@@ -1,4 +1,5 @@
-"""Correctness tests for run_training_smoke.py's real-data-narrowing helpers.
+"""Correctness tests for run_training_smoke.py's real-data-narrowing and
+config-override helpers.
 
 run_training_smoke.py itself isn't a pytest file (no test_ prefix, and it
 has its own if __name__ == "__main__" entry point -- see its module
@@ -6,6 +7,8 @@ docstring for why it's a plain script, not pytest), but its narrowing
 helpers are plain, unit-testable functions, and are reused directly by
 tests/distributed/test_dataloader_real_pipeline.py and
 tests/dataloaders/test_dataset_speed_real_data.py, not just Tier 3 itself.
+deep_merge_config_overrides is reused by
+tests/integration/run_feature_matrix_smoke.py (Tier 3b).
 """
 
 import os
@@ -13,7 +16,7 @@ import tempfile
 
 import pytest
 
-from run_training_smoke import NoRealDataFoundError, compute_narrow_dict_idx
+from run_training_smoke import NoRealDataFoundError, compute_narrow_dict_idx, deep_merge_config_overrides
 
 
 def _base_conf(dict_root_dirs, dataset="basic_ct"):
@@ -64,3 +67,38 @@ def test_compute_narrow_dict_idx_nonexistent_dir_raises():
 def test_compute_narrow_dict_idx_non_iterative_dataloader_is_noop():
     conf = {"dataloader": {"type": "dataloader"}}
     assert compute_narrow_dict_idx(conf, min_files=5) is None
+
+
+# ---------------------------------------------------------------------------
+# deep_merge_config_overrides
+# ---------------------------------------------------------------------------
+
+
+def test_deep_merge_config_overrides_nested_key():
+    conf = {"ap": {"do_ap": False, "fixed_length": 196}}
+    result = deep_merge_config_overrides(conf, {"ap": {"do_ap": True}})
+
+    assert result is conf  # returns conf for chaining, doesn't copy
+    assert conf["ap"]["do_ap"] is True
+    assert conf["ap"]["fixed_length"] == 196  # untouched
+
+
+def test_deep_merge_config_overrides_replaces_non_dict_wholesale():
+    conf = {"tiling": {"tile_overlap": [1, 2, 3]}}
+    deep_merge_config_overrides(conf, {"tiling": {"tile_overlap": [0, 0]}})
+
+    assert conf["tiling"]["tile_overlap"] == [0, 0]  # replaced, not merged/extended
+
+
+def test_deep_merge_config_overrides_adds_new_key():
+    conf = {"parallelism": {"tensor_par_size": 1}}
+    deep_merge_config_overrides(conf, {"parallelism": {"fsdp_size": 1, "simple_ddp_size": 4}})
+
+    assert conf["parallelism"] == {"tensor_par_size": 1, "fsdp_size": 1, "simple_ddp_size": 4}
+
+
+def test_deep_merge_config_overrides_multiple_sections_no_cross_talk():
+    conf = {"tiling": {"do_tiling": False}, "data": {"twoD": False}}
+    deep_merge_config_overrides(conf, {"tiling": {"do_tiling": True}, "data": {"twoD": True}})
+
+    assert conf == {"tiling": {"do_tiling": True}, "data": {"twoD": True}}
