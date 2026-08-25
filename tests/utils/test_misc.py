@@ -7,6 +7,7 @@ import torch
 from PIL import Image
 
 from UCF_VIT.utils.misc import (
+    calculate_tile_bounds,
     calculate_tile_overlap,
     detect_img_size,
     detect_num_channels,
@@ -43,6 +44,41 @@ def test_calculate_tile_overlap_zero():
     start, end = calculate_tile_overlap((0, 0, 0))
     assert start == [0, 0, 0]
     assert end == [0, 0, 0]
+
+
+def test_calculate_tile_bounds_div_one_returns_full_dimension():
+    """div == 1 means no tiling -- (0, tile_size) regardless of tile_idx or
+    overlap, exercised by both UCF_VIT.dataloaders.dataset.TileDataIter and
+    UCF_VIT.datasets.catsdogs.CatsDogsDataset as their shared "no tiling"
+    default.
+    """
+    assert calculate_tile_bounds(tile_idx=0, div=1, tile_size=64, overlap_start=4, overlap_end=4) == (0, 64)
+
+
+def test_calculate_tile_bounds_no_overlap():
+    div = 4
+    tile_size = 16
+    bounds = [calculate_tile_bounds(i, div, tile_size, 0, 0) for i in range(div)]
+    assert bounds == [(0, 16), (16, 32), (32, 48), (48, 64)]
+
+
+def test_calculate_tile_bounds_with_overlap_first_middle_last():
+    """First tile only gets extra overlap on its right/end edge, the last
+    tile only on its left/start edge, and middle tiles get it on both --
+    matching adjacent tiles' edges without extending past the image on the
+    outer edges.
+    """
+    div = 3
+    tile_size = 10
+    overlap_start, overlap_end = 2, 3
+
+    first = calculate_tile_bounds(0, div, tile_size, overlap_start, overlap_end)
+    middle = calculate_tile_bounds(1, div, tile_size, overlap_start, overlap_end)
+    last = calculate_tile_bounds(2, div, tile_size, overlap_start, overlap_end)
+
+    assert first == (0, 10 + overlap_start * 2)
+    assert middle == (10 - overlap_start, 20 + overlap_end)
+    assert last == (20 - overlap_end * 2, 30)
 
 
 def test_patchify_unpatchify_roundtrip_2d():

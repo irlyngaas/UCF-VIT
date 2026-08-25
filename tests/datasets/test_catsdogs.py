@@ -37,15 +37,17 @@ FIXED_LENGTH = 16
 NUM_CHANNELS = 3
 
 
-def _write_fake_images(tmp_path, names):
+def _write_fake_images(tmp_path, names, size=(32, 32)):
     """Writes one small, real, random RGB JPEG per name (e.g. "dog.0.jpg")
-    and returns their paths, in the given order.
+    and returns their paths, in the given order. `size` is `(height,
+    width)` (matches `np.random.randint`'s own array-shape convention, as
+    opposed to `img_size`/`resize`'s `[width, height]`).
     """
     paths = []
     rng = np.random.RandomState(0)
     for name in names:
         path = tmp_path / name
-        img = Image.fromarray(rng.randint(0, 256, size=(32, 32, 3), dtype=np.uint8))
+        img = Image.fromarray(rng.randint(0, 256, size=(size[0], size[1], 3), dtype=np.uint8))
         img.save(path)
         paths.append(str(path))
     return paths
@@ -102,6 +104,82 @@ def test_catsdogs_dataset_resize_none_leaves_native_size(tmp_path):
     )
     image, label, returned_variables, dataset_name = ds[0]
     assert image.shape == (NUM_CHANNELS, 32, 32)
+
+
+def test_catsdogs_dataset_div_one_is_untiled_default():
+    """div's default (1) must reproduce today's exact behavior: __len__
+    unchanged (not multiplied by 1*1, but literally the same value/code
+    path), matching every pre-existing catsdogs config (which never set
+    div/tile_overlap at all before this feature).
+    """
+    ds = CatsDogsDataset([f"/fake/{i}.jpg" for i in range(5)], variables=("r", "g", "b"), tile_size=TILE_SIZE, num_channels=NUM_CHANNELS)
+    assert len(ds) == 5
+
+
+def test_catsdogs_dataset_tiling_len_scales_by_div_squared(tmp_path):
+    paths = _write_fake_images(tmp_path, ["dog.0.jpg", "cat.1.jpg"])
+    div = 2
+    ds = CatsDogsDataset(
+        paths, variables=("r", "g", "b"), tile_size=(16, 16), num_channels=NUM_CHANNELS,
+        resize=(32, 32), div=div, tile_overlap=(0, 0),
+    )
+    assert len(ds) == len(paths) * div * div
+
+
+def test_catsdogs_dataset_tiling_non_square_full_coverage_no_overlap(tmp_path):
+    """Regression test mirroring tests/dataloaders/test_dataset.py's
+    test_tiledataiter_2d_non_square_tile_size_axes_arent_swapped: uses a
+    deliberately non-square image (height != width) so a swapped
+    width/height axis mapping (the exact bug just fixed in TileDataIter's
+    own 2D branch) would produce truncated/incomplete tiles instead of
+    full coverage, rather than passing trivially on a square fixture.
+
+    Native image: height=24, width=36 (np.random.randint shape
+    convention). resize=(36, 24) is [width, height] (a no-op resize to
+    the same native size, just exercising the resize path too). div=3,
+    tile_overlap=(0, 0) -> tile_size is the *per-tile* [width, height]
+    (36 // 3, 24 // 3) = (12, 8) -- matches parse.py's own tile_size
+    computation (already divided by div, not divided again internally) --
+    i.e. each tile is (8, 12) as a channel-first (C, H, W) array.
+    """
+    paths = _write_fake_images(tmp_path, ["dog.0.jpg"], size=(24, 36))  # (height, width)
+    div = 3
+    ds = CatsDogsDataset(
+        paths, variables=("r", "g", "b"), tile_size=(12, 8), num_channels=NUM_CHANNELS,
+        resize=(36, 24), div=div, tile_overlap=(0, 0),
+    )
+    assert len(ds) == div * div
+
+    covered = np.zeros((24, 36), dtype=bool)
+    for idx in range(len(ds)):
+        image, label, variables, dataset_name = ds[idx]
+        assert image.shape == (NUM_CHANNELS, 24 // div, 36 // div)  # (C, H, W)
+        w_idx, h_idx = divmod(idx, div)
+        sh, sw = h_idx * (24 // div), w_idx * (36 // div)
+        covered[sh:sh + 24 // div, sw:sw + 36 // div] = True
+        assert label == 1
+        assert dataset_name == "catsdogs"
+    assert covered.all()  # every pixel covered; would fail under a swapped-axis bug
+
+
+def test_catsdogs_dataset_tiling_with_adaptive_patching(tmp_path):
+    """Tiling composes with adaptive_patching -- Patchify runs on each
+    tile individually, not the whole image (matching imagenet's own
+    tile-then-patchify pipeline order via TileDataIter -> ProcessChannels).
+    """
+    paths = _write_fake_images(tmp_path, ["cat.0.jpg"], size=(32, 32))
+    div = 2
+    ds = CatsDogsDataset(
+        paths, variables=("r", "g", "b"), tile_size=(16, 16), adaptive_patching=True,
+        fixed_length=FIXED_LENGTH, patch_size=PATCH_SIZE, num_channels=NUM_CHANNELS,
+        dataset="catsdogs", resize=(32, 32), div=div, tile_overlap=(0, 0),
+    )
+    assert len(ds) == div * div
+    for idx in range(len(ds)):
+        image, seq_img, seq_size, seq_pos, label, variables, dataset_name = ds[idx]
+        assert image.shape == (NUM_CHANNELS, 16, 16)  # one tile, not the whole 32x32 image
+        assert seq_img.shape == (NUM_CHANNELS, FIXED_LENGTH, PATCH_SIZE * PATCH_SIZE)
+        assert label == 0
 
 
 def test_catsdogs_dataset_adaptive_patching_shapes(tmp_path):

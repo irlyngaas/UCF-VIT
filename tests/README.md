@@ -78,8 +78,8 @@ pytest tests/test_config_validation.py -v
 | `tests/dataloaders/test_octree.py` | `Cube` geometry, `FixedOctTree` subdivision |
 | `tests/dataloaders/test_dataset.py` | `TileDataIter` (2D, 3D-full, and 3D-twoD-sliced tiling, with/without labels, overlap), `ShuffleIterableDataset` (no data loss/duplication across buffer sizes), `ProcessChannels` (batching, adaptive-patching wiring, `separate_channels`), `FileReader` (DDP-rank + dataloader-worker sharding disjointness/coverage up to `num_workers=7`, `keys_to_add` replication) |
 | `tests/dataloaders/test_datamodule.py` | `collate_fn` across `adaptive_patching`/`return_label`/`separate_channels`/`return_qdt`/dataset-type combinations, built from real `ProcessChannels` output rather than hand-fabricated tuples |
-| `tests/datasets/test_catsdogs.py` | `CatsDogsDataset` (label-from-filename, resize/channel-first conversion, adaptive-patching shapes) and `CatsDogsCollate`, against small real JPEG files written to a temp dir — `catsdogs` is the only shipped dataset using `dataloader.type: "dataloader"` (a plain `Dataset` + `DistributedSampler`, not the `iterative_dataloader` stack the two rows above cover) |
-| `tests/utils/test_misc.py` | `is_power_of_two`, `calculate_tile_overlap`, `patchify`/`unpatchify` roundtrips, `process_root_dirs` (`imagenet` per-class bucketing — evenly/non-evenly-divisible `> data_par_size`, `<= data_par_size`, bucket-content correctness — and the non-`imagenet` branch), `detect_num_channels` (`imagenet` hardcoding with no filesystem touched, `catsdogs`/PIL real-file band-count detection across RGB/`L`/RGBA, `basic_ct`/nibabel real-file 3D-shape detection, the 4D-shape-raises case, missing-`imagesTr`-raises, and independent per-key detection), `detect_img_size` (`basic_ct`/nibabel real-file native-shape detection, `imagenet`/`catsdogs`/PIL real-file native-pixel-size detection using a deliberately non-square fixture to verify the `[width, height]` order isn't accidentally swapped, first-`dict_root_dirs`-key-only sampling, missing-`imagesTr`-raises, empty-`dict_root_dirs`-raises), `shard_mlp_state_dict`/`shard_attention_state_dict` (weight-slice reconstruction, `fc2.bias`/`proj.bias` summing back to the original exactly, `qk_norm` rejection) |
+| `tests/datasets/test_catsdogs.py` | `CatsDogsDataset` (label-from-filename, resize/channel-first conversion, adaptive-patching shapes, `div x div` tiling — `__len__` scaling, a deliberately non-square full-coverage regression test, and tiling composed with adaptive_patching) and `CatsDogsCollate`, against small real JPEG files written to a temp dir — `catsdogs` is the only shipped dataset using `dataloader.type: "dataloader"` (a plain `Dataset` + `DistributedSampler`, not the `iterative_dataloader` stack the two rows above cover), and previously had no tiling capability at all (`tiling.div` was silently ignored) |
+| `tests/utils/test_misc.py` | `is_power_of_two`, `calculate_tile_overlap`, `calculate_tile_bounds` (`div==1` passthrough, no-overlap tiling, overlap at first/middle/last tile boundaries — extracted from `TileDataIter` so `CatsDogsDataset`'s tiling can reuse the exact same math), `patchify`/`unpatchify` roundtrips, `process_root_dirs` (`imagenet` per-class bucketing — evenly/non-evenly-divisible `> data_par_size`, `<= data_par_size`, bucket-content correctness — and the non-`imagenet` branch), `detect_num_channels` (`imagenet` hardcoding with no filesystem touched, `catsdogs`/PIL real-file band-count detection across RGB/`L`/RGBA, `basic_ct`/nibabel real-file 3D-shape detection, the 4D-shape-raises case, missing-`imagesTr`-raises, and independent per-key detection), `detect_img_size` (`basic_ct`/nibabel real-file native-shape detection, `imagenet`/`catsdogs`/PIL real-file native-pixel-size detection using a deliberately non-square fixture to verify the `[width, height]` order isn't accidentally swapped, first-`dict_root_dirs`-key-only sampling, missing-`imagesTr`-raises, empty-`dict_root_dirs`-raises), `shard_mlp_state_dict`/`shard_attention_state_dict` (weight-slice reconstruction, `fc2.bias`/`proj.bias` summing back to the original exactly, `qk_norm` rejection) |
 | `tests/utils/test_pos_embed.py` | 1D/2D/3D sin-cos position embeddings, `SinusoidalEmbeddings` |
 | `tests/utils/test_lr_scheduler.py` | `LinearWarmupCosineAnnealingLR` warmup/annealing shape |
 | `tests/utils/test_metrics.py` | `masked_mse`, `DiceBLoss` |
@@ -339,6 +339,45 @@ Added `test_tiledataiter_2d_non_square_tile_size_axes_arent_swapped` to
 other `TileDataIter` test in that file is square, and so can't
 distinguish the two possible index-to-axis mappings) — confirmed it fails
 without the fix and passes with it.
+
+### Added tiling to `catsdogs`
+
+`catsdogs` previously had no tiling capability at all — `CatsDogsDataset`
+had no `div`/`tile_overlap` parameters, and `train.py`'s construction call
+never passed `conf["tiling"]["div"]`/`tile_overlap`, so they were silently
+ignored for any `catsdogs` config. `imagenet`/`basic_ct` get tiling via
+`TileDataIter` (an `IterableDataset` that expands one sample into `div *
+div` yielded tiles), but `CatsDogsDataset` is a **map-style** `Dataset`
+(`__len__`/`__getitem__`) used with a real `DistributedSampler` +
+`DataLoader` — a different mechanism was needed: `__len__` now reports
+`len(file_list) * div * div`, and `__getitem__(idx)` maps `idx` →
+`(file_idx, tile_idx)` → `(w_idx, h_idx)` and slices out just that one
+tile. `DistributedSampler`/`DataLoader`/`CatsDogsCollate` needed no
+changes — they only ever see `len(dataset)` and whatever `__getitem__`
+returns.
+
+`TileDataIter.calculate_tile_bounds` (the per-axis tile-bounds math) was
+extracted into a standalone `UCF_VIT.utils.misc.calculate_tile_bounds` so
+`CatsDogsDataset` could reuse the exact same logic instead of duplicating
+it a second time — `TileDataIter` now calls the extracted function too
+(passing `self.div` explicitly instead of reading it implicitly via
+`self`).
+
+Deliberately avoided repeating the width/height axis-order bug just fixed
+above: the new tile-slicing code uses explicit `start_h/end_h`,
+`start_w/end_w` names (not `x`/`y`), and was verified against a
+deliberately non-square fake image
+(`test_catsdogs_dataset_tiling_non_square_full_coverage_no_overlap`) —
+confirmed it fails when the width/height mapping is swapped and passes
+with the correct mapping, the same discipline used for the `TileDataIter`
+fix.
+
+`div` defaults to `1` (already `parse.py`'s own no-tiling default — see
+`"div": conf["tiling"]["div"] if do_tiling else 1`), so this is purely
+additive — zero behavior change for every existing `catsdogs` config,
+none of which set `tiling.do_tiling: True` today. Not yet exercised by a
+`run_feature_matrix_smoke.py` cell or real Frontier data — a natural
+follow-up.
 
 ## Running the distributed (Tier 2) tests
 

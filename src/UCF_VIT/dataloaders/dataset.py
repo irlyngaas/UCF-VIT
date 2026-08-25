@@ -13,7 +13,7 @@ from .transform import Patchify, Patchify_3D
 from PIL import Image
 import cv2 as cv
 
-from UCF_VIT.utils.misc import calculate_tile_overlap
+from UCF_VIT.utils.misc import calculate_tile_bounds, calculate_tile_overlap
 
 class FileReader(IterableDataset):
     """Iterable dataset that reads and preprocesses raw data files, sharded across DDP ranks and dataloader workers.
@@ -260,38 +260,6 @@ class TileDataIter(IterableDataset):
 
         self.classification = classification
 
-    def calculate_tile_bounds(
-        self, tile_idx, tile_size, overlap_start, overlap_end
-):
-        """Calculate boundaries for a single tile including overlap.
-        Args:
-            tile_idx: Index of current tile (0-based)
-            tile_size: Size of tile in the dimension
-            overlap_start: Overlap size at start of tile
-            overlap_end: Overlap size at end of tile
-        Returns:
-            tuple: (start, end) coordinates for this tile
-        """
-        if self.div == 1:
-            # No tiling: use full dimension
-            return 0, tile_size
-        # Base tile boundaries without overlap
-        start = tile_size * tile_idx
-        end = tile_size * (tile_idx + 1)
-
-        # Add overlap based on tile position
-        if tile_idx == 0:
-            # First tile: only overlap on right
-            end += overlap_start*2
-        elif tile_idx == self.div - 1:
-            # Last tile: only overlap on left
-            start -= overlap_end*2
-        else:
-            # Middle tiles: overlap on both sides
-            start -= overlap_start
-            end += overlap_end
-        return start, end
-
     def __iter__(self):
         """Yields one tile at a time from every sample produced by `self.dataset`.
 
@@ -319,8 +287,8 @@ class TileDataIter(IterableDataset):
                         for z_idx in range(self.tile_size[2]):
                             for x_idx in range(self.div):
                                 for y_idx in range(self.div):
-                                    start_x, end_x = self.calculate_tile_bounds(x_idx, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
-                                    start_y, end_y = self.calculate_tile_bounds(y_idx, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
+                                    start_x, end_x = calculate_tile_bounds(x_idx, self.div, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
+                                    start_y, end_y = calculate_tile_bounds(y_idx, self.div, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
                                     if self.classification:
                                         yield data[:, start_x:end_x, start_y:end_y, z_idx], label, variables
                                     else:
@@ -330,9 +298,9 @@ class TileDataIter(IterableDataset):
                         for x_idx in range(self.div):
                             for y_idx in range(self.div):
                                 for z_idx in range(self.div):
-                                    start_x, end_x = self.calculate_tile_bounds(x_idx, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
-                                    start_y, end_y = self.calculate_tile_bounds(y_idx, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
-                                    start_z, end_z = self.calculate_tile_bounds(z_idx, self.tile_size_no_overlap[2], self.start_overlap[2], self.end_overlap[2])
+                                    start_x, end_x = calculate_tile_bounds(x_idx, self.div, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
+                                    start_y, end_y = calculate_tile_bounds(y_idx, self.div, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
+                                    start_z, end_z = calculate_tile_bounds(z_idx, self.div, self.tile_size_no_overlap[2], self.start_overlap[2], self.end_overlap[2])
                                     if self.classification:
                                         yield data[:, start_x:end_x, start_y:end_y, start_z:end_z], label, variables
                                     else:
@@ -350,17 +318,17 @@ class TileDataIter(IterableDataset):
                         for z_idx in range(self.tile_size[2]):
                             for x_idx in range(self.div):
                                 for y_idx in range(self.div):
-                                    start_x, end_x = self.calculate_tile_bounds(x_idx, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
-                                    start_y, end_y = self.calculate_tile_bounds(y_idx, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
+                                    start_x, end_x = calculate_tile_bounds(x_idx, self.div, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
+                                    start_y, end_y = calculate_tile_bounds(y_idx, self.div, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
                                     yield data[:, start_x:end_x, start_y:end_y, z_idx], variables
 
                     else: #Loop through full 3D
                         for x_idx in range(self.div):
                             for y_idx in range(self.div):
                                 for z_idx in range(self.div):
-                                    start_x, end_x = self.calculate_tile_bounds(x_idx, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
-                                    start_y, end_y = self.calculate_tile_bounds(y_idx, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
-                                    start_z, end_z = self.calculate_tile_bounds(z_idx, self.tile_size_no_overlap[2], self.start_overlap[2], self.end_overlap[2])
+                                    start_x, end_x = calculate_tile_bounds(x_idx, self.div, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
+                                    start_y, end_y = calculate_tile_bounds(y_idx, self.div, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
+                                    start_z, end_z = calculate_tile_bounds(z_idx, self.div, self.tile_size_no_overlap[2], self.start_overlap[2], self.end_overlap[2])
                                     yield data[:, start_x:end_x, start_y:end_y, start_z:end_z], variables
 
         else: #Data is 2D -- imagenet only in practice (the only
@@ -384,8 +352,8 @@ class TileDataIter(IterableDataset):
                 for (data,label,variables) in self.dataset:
                     for x_idx in range(self.div):
                         for y_idx in range(self.div):
-                            start_x, end_x = self.calculate_tile_bounds(x_idx, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
-                            start_y, end_y = self.calculate_tile_bounds(y_idx, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
+                            start_x, end_x = calculate_tile_bounds(x_idx, self.div, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
+                            start_y, end_y = calculate_tile_bounds(y_idx, self.div, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
                             if self.classification:
                                 yield data[:, start_x:end_x, start_y:end_y], label, variables
                             else:
@@ -395,8 +363,8 @@ class TileDataIter(IterableDataset):
                 for (data,variables) in self.dataset:
                     for x_idx in range(self.div):
                         for y_idx in range(self.div):
-                            start_x, end_x = self.calculate_tile_bounds(x_idx, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
-                            start_y, end_y = self.calculate_tile_bounds(y_idx, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
+                            start_x, end_x = calculate_tile_bounds(x_idx, self.div, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
+                            start_y, end_y = calculate_tile_bounds(y_idx, self.div, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
                             yield data[:, start_x:end_x, start_y:end_y], variables
 
 class ShuffleIterableDataset(IterableDataset):

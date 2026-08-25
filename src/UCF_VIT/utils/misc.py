@@ -872,3 +872,47 @@ def calculate_tile_overlap(overlap):
             end_overlap.append(overlap[i] // 2 + 1)
 
     return start_overlap, end_overlap
+
+def calculate_tile_bounds(tile_idx, div, tile_size, overlap_start, overlap_end):
+    """Calculates the [start, end) bounds of one tile along a single dimension.
+
+    Extracted from `UCF_VIT.dataloaders.dataset.TileDataIter` (an
+    `IterableDataset`, which expands one sample into `div * div` tiles on
+    the fly) so the exact same tile-bounds math can also be reused by
+    `UCF_VIT.datasets.catsdogs.CatsDogsDataset` (a map-style `Dataset`,
+    which instead maps a flat `__getitem__` index to one `(file, tile)`
+    pair -- see its own docstring for why tiling needs a different
+    mechanism there).
+
+    Args:
+        tile_idx: Index of this tile along this dimension (0-based).
+        div: Number of tiles this dimension is divided into. `div == 1`
+            means no tiling -- the whole dimension is returned unchanged.
+        tile_size: Size of one tile in this dimension, excluding overlap.
+        overlap_start: Overlap amount to add at the start of this
+            dimension's tile grid.
+        overlap_end: Overlap amount to add at the end of this dimension's
+            tile grid.
+
+    Returns:
+        A `(start, end)` tuple of bounds for this tile.
+    """
+    if div == 1:
+        # No tiling: use full dimension
+        return 0, tile_size
+    # Base tile boundaries without overlap
+    start = tile_size * tile_idx
+    end = tile_size * (tile_idx + 1)
+
+    # Add overlap based on tile position
+    if tile_idx == 0:
+        # First tile: only overlap on right
+        end += overlap_start * 2
+    elif tile_idx == div - 1:
+        # Last tile: only overlap on left
+        start -= overlap_end * 2
+    else:
+        # Middle tiles: overlap on both sides
+        start -= overlap_start
+        end += overlap_end
+    return start, end
