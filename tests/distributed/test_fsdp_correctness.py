@@ -13,9 +13,10 @@ FSDP.summon_full_params(..., with_grads=True) -- see
 test_fsdp_full_shard_backward_matches_reference's own docstring.
 
 Deliberately scoped to fsdp_size > 1 alone (tensor_par_size=1) -- combined
-fsdp_size > 1 + tensor_par_size > 1 (closer to production's HYBRID_SHARD
-branch) is a deferred follow-up once this and
-test_tensor_parallel_correctness.py are both proven independently.
+fsdp_size > 1 + tensor_par_size > 1 (production's real HYBRID_SHARD
+branch) is covered separately by test_hybrid_shard_correctness.py, once
+this and test_tensor_parallel_correctness.py were both proven
+independently.
 
 Requires timm/monai/xformers (building_blocks.py's real, unconditional
 top-level imports) -- see test_tensor_parallel_correctness.py's module
