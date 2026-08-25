@@ -415,7 +415,7 @@ class ProcessChannels(IterableDataset):
     with the same quadtree/octree used for the image).
     """
 
-    def __init__(self, dataset, num_channels: int, batch_size: int, return_label: bool, adaptive_patching: bool, separate_channels: bool, patch_size: int, fixed_length: int, twoD: bool, _dataset: str, return_qdt: bool) -> None:
+    def __init__(self, dataset, num_channels: int, batch_size: int, return_label: bool, adaptive_patching: bool, separate_channels: bool, interp_size: int, fixed_length: int, twoD: bool, _dataset: str, return_qdt: bool) -> None:
         """Initializes the batching buffer and, if needed, the adaptive-patching transform.
 
         Args:
@@ -430,7 +430,7 @@ class ProcessChannels(IterableDataset):
             separate_channels: Whether adaptive patching is done independently per
                 channel (True, using a `num_channels=1` patcher applied per
                 channel) or jointly across all channels (False).
-            patch_size: Leaf patch size used by the adaptive-patching transform.
+            interp_size: Leaf patch size used by the adaptive-patching transform.
             fixed_length: Fixed output sequence length for adaptive patching.
             twoD: Whether samples are 2D (`Patchify`) or 3D (`Patchify_3D`).
             _dataset: Dataset name, e.g. "imagenet" or "basic_ct"; determines label
@@ -445,21 +445,21 @@ class ProcessChannels(IterableDataset):
         self.return_label = return_label
         self.adaptive_patching = adaptive_patching
         self.separate_channels = separate_channels
-        self.patch_size = patch_size
+        self.interp_size = interp_size
         self.twoD = twoD
         self._dataset = _dataset
         self.return_qdt = return_qdt
         if self.adaptive_patching:
             if self.separate_channels:
                 if self.twoD:
-                    self.patchify = Patchify(fixed_length=fixed_length, patch_size=patch_size, num_channels=1, dataset=self._dataset)
+                    self.patchify = Patchify(fixed_length=fixed_length, interp_size=interp_size, num_channels=1, dataset=self._dataset)
                 else:
-                    self.patchify = Patchify_3D(fixed_length=fixed_length, patch_size=patch_size, num_channels=1, dataset=self._dataset)
+                    self.patchify = Patchify_3D(fixed_length=fixed_length, interp_size=interp_size, num_channels=1, dataset=self._dataset)
             else:
                 if self.twoD:
-                    self.patchify = Patchify(fixed_length=fixed_length, patch_size=patch_size, num_channels=num_channels, dataset=self._dataset)
+                    self.patchify = Patchify(fixed_length=fixed_length, interp_size=interp_size, num_channels=num_channels, dataset=self._dataset)
                 else:
-                    self.patchify = Patchify_3D(fixed_length=fixed_length, patch_size=patch_size, num_channels=num_channels, dataset=self._dataset)
+                    self.patchify = Patchify_3D(fixed_length=fixed_length, interp_size=interp_size, num_channels=num_channels, dataset=self._dataset)
 
     def __iter__(self):
         """Buffers `self.batch_size` upstream samples, then yields them one by one, patchified if configured.
@@ -524,22 +524,22 @@ class ProcessChannels(IterableDataset):
                                 for j in range(np_label.shape[0]):
                                     if self.twoD:
                                         if self._dataset == "basic_ct":
-                                            seq_label, _, _ = qdt_.serialize_labels(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,1))
+                                            seq_label, _, _ = qdt_.serialize_labels(np.expand_dims(np_label[j],axis=-1), size=(self.interp_size,self.interp_size,1))
                                             seq_label = np.asarray(seq_label)
-                                            seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size, -1, 1])
+                                            seq_label = np.reshape(seq_label, [self.interp_size*self.interp_size, -1, 1])
                                         else:
-                                            seq_label, _, _ = qdt_.serialize(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,1))
+                                            seq_label, _, _ = qdt_.serialize(np.expand_dims(np_label[j],axis=-1), size=(self.interp_size,self.interp_size,1))
                                             seq_label = np.asarray(seq_label, dtype=np.float32)
-                                            seq_label = np.reshape(seq_label, [-1, self.patch_size*self.patch_size])
+                                            seq_label = np.reshape(seq_label, [-1, self.interp_size*self.interp_size])
                                     else:
                                         if self._dataset == "basic_ct":
-                                            seq_label, _, _ = qdt_.serialize_labels(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,self.patch_size, 1))
+                                            seq_label, _, _ = qdt_.serialize_labels(np.expand_dims(np_label[j],axis=-1), size=(self.interp_size,self.interp_size,self.interp_size, 1))
                                             seq_label = np.asarray(seq_label)
-                                            seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size*self.patch_size, -1, 1])
+                                            seq_label = np.reshape(seq_label, [self.interp_size*self.interp_size*self.interp_size, -1, 1])
                                         else:
-                                            seq_label, _, _ = qdt_.serialize(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,self.patch_size, 1))
+                                            seq_label, _, _ = qdt_.serialize(np.expand_dims(np_label[j],axis=-1), size=(self.interp_size,self.interp_size,self.interp_size, 1))
                                             seq_label = np.asarray(seq_label, dtype=np.float32)
-                                            seq_label = np.reshape(seq_label, [-1, self.patch_size*self.patch_size*self.patch_size])
+                                            seq_label = np.reshape(seq_label, [-1, self.interp_size*self.interp_size*self.interp_size])
                                     seq_label_list.append(seq_label)
 
                             if self._dataset == "imagenet":

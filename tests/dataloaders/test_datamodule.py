@@ -75,7 +75,7 @@ def _basic_ct_batch(batch_size, num_channels, return_label, num_classes=4, separ
             samples.append((img, tuple(f"ct_res{c}" for c in range(num_channels))))
     pc = ProcessChannels(
         _FakeSource(samples), num_channels=num_channels, batch_size=batch_size, return_label=return_label,
-        adaptive_patching=True, separate_channels=separate_channels, patch_size=PATCH_SIZE,
+        adaptive_patching=True, separate_channels=separate_channels, interp_size=PATCH_SIZE,
         fixed_length=FIXED_LENGTH, twoD=True, _dataset="basic_ct", return_qdt=False,
     )
     return list(pc)
@@ -91,7 +91,7 @@ def _imagenet_batch(batch_size, return_label):
             samples.append((img, ("r", "g", "b")))
     pc = ProcessChannels(
         _FakeSource(samples), num_channels=3, batch_size=batch_size, return_label=return_label,
-        adaptive_patching=True, separate_channels=False, patch_size=PATCH_SIZE,
+        adaptive_patching=True, separate_channels=False, interp_size=PATCH_SIZE,
         fixed_length=FIXED_LENGTH, twoD=True, _dataset="imagenet", return_qdt=False,
     )
     return list(pc)
@@ -176,7 +176,7 @@ def test_collate_fn_return_qdt_includes_qdt_list():
     ]
     pc = ProcessChannels(
         _FakeSource(samples), num_channels=1, batch_size=batch_size, return_label=False,
-        adaptive_patching=True, separate_channels=False, patch_size=PATCH_SIZE,
+        adaptive_patching=True, separate_channels=False, interp_size=PATCH_SIZE,
         fixed_length=FIXED_LENGTH, twoD=True, _dataset="basic_ct", return_qdt=True,
     )
     batch = list(pc)
@@ -208,7 +208,7 @@ def test_collate_fn_separate_channels_true_no_label():
 
 def test_collate_fn_separate_channels_true_with_label_basic_ct():
     """Regression test for the seq expand_dims bug (see module docstring):
-    seq must come out 4D (B, num_channels, fixed_length, patch_size**2), not
+    seq must come out 4D (B, num_channels, fixed_length, interp_size**2), not
     5D with a spurious extra axis.
     """
     batch_size, num_channels, num_classes = 2, 2, 3
@@ -242,7 +242,7 @@ def test_collate_fn_non_adaptive_with_label_basic_ct():
     ]
     pc = ProcessChannels(
         _FakeSource(samples), num_channels=1, batch_size=batch_size, return_label=True,
-        adaptive_patching=False, separate_channels=False, patch_size=PATCH_SIZE,
+        adaptive_patching=False, separate_channels=False, interp_size=PATCH_SIZE,
         fixed_length=FIXED_LENGTH, twoD=True, _dataset="basic_ct", return_qdt=False,
     )
     batch = list(pc)
@@ -270,7 +270,7 @@ def test_collate_fn_non_adaptive_no_label_imagenet():
     ]
     pc = ProcessChannels(
         _FakeSource(samples), num_channels=3, batch_size=batch_size, return_label=False,
-        adaptive_patching=False, separate_channels=False, patch_size=PATCH_SIZE,
+        adaptive_patching=False, separate_channels=False, interp_size=PATCH_SIZE,
         fixed_length=FIXED_LENGTH, twoD=True, _dataset="imagenet", return_qdt=False,
     )
     batch = list(pc)

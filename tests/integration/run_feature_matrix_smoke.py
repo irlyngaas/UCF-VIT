@@ -99,28 +99,36 @@ FEATURE_MATRIX = [
     # DiffusionVIT is excluded: parse.py hard-requires do_ap:False for it.
     FeatureMatrixCell(
         "basic_ct/unetr/base_config.yaml", "basic_ct-unetr+do_ap",
-        {"ap": {"do_ap": True}},
+        # interp_size:32 matches this config's own (otherwise-unused once
+        # do_ap:True) data.patch_size:32 -- preserves the exact numerics this
+        # cell exercised before interp_size existed and patch_size was
+        # silently reused for adaptive-patching sizing.
+        {"ap": {"do_ap": True, "interp_size": 32}},
         # fixed_length:512 already valid (512 % 7 == 1, octree; cube root 8
         # is a whole number, satisfying UNETR's extra sqrt_len constraint) --
         # no override needed.
     ),
     FeatureMatrixCell(
         "basic_ct/mae/base_config.yaml", "basic_ct-mae+do_ap",
-        {"ap": {"do_ap": True, "fixed_length": 512}},
+        {"ap": {"do_ap": True, "fixed_length": 512, "interp_size": 32}},
         # shipped fixed_length:196 is invalid for the octree check
         # (196 % 7 == 0, not 1) now that mae is twoD:False -- override to
         # 512, the same value basic_ct/sap's shipped config already proves
         # works on real Frontier data for this exact twoD:False/octree case.
+        # interp_size:32 matches this config's own data.patch_size:32, same
+        # reasoning as basic_ct-unetr+do_ap above.
     ),
     FeatureMatrixCell(
         "imagenet/classification/base_config.yaml", "imagenet-classification+do_ap",
-        {"ap": {"do_ap": True}},
+        # interp_size:16 matches this config's own data.patch_size:16.
+        {"ap": {"do_ap": True, "interp_size": 16}},
         # fixed_length:196 already valid (196 % 3 == 1, quadtree) -- no
         # override needed.
     ),
     FeatureMatrixCell(
         "catsdogs/classification/base_config.yaml", "catsdogs-classification+do_ap",
-        {"ap": {"do_ap": True}},
+        # interp_size:16 matches this config's own data.patch_size:16.
+        {"ap": {"do_ap": True, "interp_size": 16}},
         # Also the only cell exercising do_ap:True through the "dataloader"
         # (not "iterative_dataloader") code path -- CatsDogsDataset's own
         # adaptive-patching branch, not TileDataIter/ProcessChannels.
@@ -220,7 +228,8 @@ FEATURE_MATRIX = [
     # worked in this repo's history.
     FeatureMatrixCell(
         "basic_ct/unetr/base_config.yaml", "basic_ct-unetr+do_ap+do_tiling",
-        {"ap": {"do_ap": True}, "tiling": {"do_tiling": True, "div": 4, "tile_overlap": 0}},
+        # interp_size:32 matches this config's own data.patch_size:32.
+        {"ap": {"do_ap": True, "interp_size": 32}, "tiling": {"do_tiling": True, "div": 4, "tile_overlap": 0}},
         min_files_override=16,
         # Mirrors basic_ct/unetr's original pre-baseline config almost
         # exactly (do_ap:True, do_tiling:True, div:4, twoD:False) -- that
@@ -255,7 +264,8 @@ FEATURE_MATRIX = [
     ),
     FeatureMatrixCell(
         "imagenet/classification/base_config.yaml", "imagenet-classification+do_ap+tensor_par",
-        {"ap": {"do_ap": True}, "parallelism": {"fsdp_size": 1, "simple_ddp_size": 4, "tensor_par_size": 2}},
+        # interp_size:16 matches this config's own data.patch_size:16.
+        {"ap": {"do_ap": True, "interp_size": 16}, "parallelism": {"fsdp_size": 1, "simple_ddp_size": 4, "tensor_par_size": 2}},
         # Neither do_ap nor tensor_par_size multiplies sample count, so no
         # min_files/timeout override needed beyond the shared defaults.
     ),
@@ -269,7 +279,8 @@ FEATURE_MATRIX = [
     # cheap as every other cell here.
     FeatureMatrixCell(
         "basic_ct/unetr/base_config.yaml", "basic_ct-unetr+do_ap+twoD",
-        {"ap": {"do_ap": True, "fixed_length": 196}, "data": {"twoD": True}},
+        # interp_size:32 matches this config's own data.patch_size:32.
+        {"ap": {"do_ap": True, "fixed_length": 196, "interp_size": 32}, "data": {"twoD": True}},
         min_files_override=8,
         timeout_override=1800,
         # fixed_length:512 (unetr's baseline, valid for the twoD:False/
@@ -324,7 +335,7 @@ FEATURE_MATRIX = [
         "basic_ct/sap/base_config.yaml", "basic_ct-sap+tensor_par",
         {"parallelism": {"fsdp_size": 1, "simple_ddp_size": 4, "tensor_par_size": 2}},
         timeout_override=1800,
-        # SAP's baseline already keeps patch_size:4 (its own decoder-memory
+        # SAP's baseline already keeps interp_size:4 (its own decoder-memory
         # exception), so tensor_par_size doesn't compound with any known
         # memory risk here. Exercises training.py's seq_label broadcast
         # (only taken for UNETR/SAP) under tensor_par_size > 1 for the

@@ -174,7 +174,8 @@ class NativePytorchDataModule(torch.nn.Module):
         batch_size (int, optional): Batch size.
         num_workers (int, optional): Number of workers.
         pin_memory (bool, optional): Whether to pin memory.
-        patch_size (int, optional): Patch size used by the adaptive-patching transform
+        interp_size (int, optional): Side length each adaptive leaf patch is
+            interpolated to, used by the adaptive-patching transform
             (`Patchify`/`Patchify_3D`), when `adaptive_patching` is True.
         tile_size (tuple[int,...], optional): the tile size in each dimension
         twoD (bool, optional): Variable for indicating two or three dimensionsal input, if False, three dimensional input.
@@ -218,7 +219,7 @@ class NativePytorchDataModule(torch.nn.Module):
         batch_size: int = 64,
         num_workers: int = 0,
         pin_memory: bool = False,
-        patch_size: int = 16,
+        interp_size: int = 16,
         tile_size: tuple[int, ...] = (64, 64),
         twoD: bool = True,
         dataset_group_list: str = '',
@@ -261,7 +262,7 @@ class NativePytorchDataModule(torch.nn.Module):
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.pin_memory = pin_memory
-        self.patch_size = patch_size
+        self.interp_size = interp_size
         self.tile_size = tile_size
         self.twoD = twoD
         self.return_label = return_label
@@ -401,7 +402,7 @@ class NativePytorchDataModule(torch.nn.Module):
                 return_label,
                 self.adaptive_patching,
                 self.separate_channels,
-                self.patch_size,
+                self.interp_size,
                 self.fixed_length,
                 self.twoD,
                 self.dataset,
@@ -436,7 +437,7 @@ class NativePytorchDataModule(torch.nn.Module):
                 return_label,
                 self.adaptive_patching,
                 self.separate_channels,
-                self.patch_size,
+                self.interp_size,
                 self.fixed_length,
                 self.twoD,
                 self.dataset,

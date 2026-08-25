@@ -497,12 +497,28 @@ def parse_config(args, load_balance_offline=False):
         for i in range(len(tile_size)):
             assert effective_size[0] // tiling_conf["div"], "The image cannot be evenly divided into tiles. This assertion can be commented out and ignored if this was intended, however be aware not all of the image will be used in training"
         
-    patch_size = conf['data']['patch_size']
-    #If doing standard patching, check if img_size/tile_size is divisible by patch_size
+    #patch_size is unused when do_ap:True (interp_size takes over its role
+    #entirely, see below), so it's only required in the config in that case.
     if not ap_conf["do_ap"]:
+        patch_size = conf['data']['patch_size']
+        #If doing standard patching, check if img_size/tile_size is divisible by patch_size
         checkDims = 2 if twoD else 3
         for i in range(checkDims):
             assert tile_size[i] % patch_size == 0, "img_size/tile_size not divisible by patch_size which is required when doing standard patching"
+    else:
+        patch_size = conf['data'].get('patch_size')
+
+    #interp_size replaces patch_size as the size every adaptive (quadtree/octree)
+    #leaf patch is interpolated to, and the size every dependent model-layer
+    #calculation is based on -- required whenever do_ap:True so patch_size is
+    #never silently reused for that purpose; unused/absent otherwise.
+    if ap_conf["do_ap"]:
+        try:
+            interp_size = conf['ap']['interp_size']
+        except KeyError:
+            sys.exit("ap.interp_size is required when adaptive patching (ap.do_ap) is turned on")
+    else:
+        interp_size = None
 
 
     #num_channels required because we aren't requiring dict_in_variables to be specified.
@@ -582,6 +598,7 @@ def parse_config(args, load_balance_offline=False):
         "img_size": img_size,
         "tile_size": tile_size,
         "patch_size": patch_size,
+        "interp_size": interp_size,
         "default_vars": default_vars,
         "twoD": twoD,
         "dict_root_dirs": conf['data']['dict_root_dirs'],
@@ -782,8 +799,17 @@ def parse_pretrained_config(args, conf):
         for i in range(len(pretrained_tile_size)):
             assert pretrained_tile_size[i] == conf["data"]["tile_size"][i], "Image/Tile size does not match between pretrained model and this model"
 
-        pretrained_patch_size=pretrained_conf["data"]["patch_size"]
-        assert pretrained_patch_size == conf["data"]["patch_size"], "Patch size does not match between pretrained model and this model"
+        #patch_size is unused (and not required in the config) when do_ap:True.
+        if not pretrained_do_ap:
+            pretrained_patch_size=pretrained_conf["data"]["patch_size"]
+            assert pretrained_patch_size == conf["data"]["patch_size"], "Patch size does not match between pretrained model and this model"
+
+        if pretrained_do_ap:
+            try:
+                pretrained_interp_size = pretrained_conf["ap"]["interp_size"]
+            except KeyError:
+                sys.exit("ap.interp_size is required in the pretrained config when adaptive patching (ap.do_ap) is turned on")
+            assert pretrained_interp_size == conf["data"]["interp_size"], "Interp size does not match between pretrained model and this model"
 
         try:
             use_channel_aggregation = pretrained_conf['model']['use_channel_aggregation']

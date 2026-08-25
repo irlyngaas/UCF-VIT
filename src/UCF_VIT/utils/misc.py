@@ -660,7 +660,10 @@ def calculate_load_balancing_on_the_fly(conf, VERBOSE=False):
     twoD = conf['data']['twoD']
     batch_size = conf['dataloader']['batch_size']
     div = conf['tiling']['div']
-    patch_size =  conf['data']['patch_size']
+    # patch_size is unused (None) when do_ap:True -- interp_size takes over
+    # its role in that mode, same as everywhere else that dispatches on
+    # adaptive_patching (see UCF_VIT.model.arch.VIT.effective_patch_size).
+    effective_patch_size = conf['data']['interp_size'] if conf['ap']['do_ap'] else conf['data']['patch_size']
     dataset = conf['data']['dataset']
     num_total_ddp_ranks = conf['parallelism']['data_par_size']
     num_workers = conf['dataloader']['num_workers']
@@ -711,9 +714,9 @@ def calculate_load_balancing_on_the_fly(conf, VERBOSE=False):
         print("Total Tiles per Dataset", num_total_tiles)
         print("Total Tiles", sum(num_total_tiles))
         if twoD:
-            print("Total Tokens", sum(num_total_tiles)*(tile_size[0]/patch_size)*(tile_size[1]/patch_size))
+            print("Total Tokens", sum(num_total_tiles)*(tile_size[0]/effective_patch_size)*(tile_size[1]/effective_patch_size))
         else:
-            print("Total Tokens", sum(num_total_tiles)*(tile_size[0]/patch_size)*(tile_size[1]/patch_size)*(tile_size[2]/patch_size))
+            print("Total Tokens", sum(num_total_tiles)*(tile_size[0]/effective_patch_size)*(tile_size[1]/effective_patch_size)*(tile_size[2]/effective_patch_size))
         
     total_tiles_all_data = sum(num_total_tiles)
         

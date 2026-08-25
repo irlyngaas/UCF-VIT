@@ -286,7 +286,7 @@ def test_processchannels_no_ap_no_label_passes_tiles_through():
     source = _FakeSource([(tile, ("v0",)) for tile in tiles])
     pc = ProcessChannels(
         source, num_channels=1, batch_size=batch_size, return_label=False,
-        adaptive_patching=False, separate_channels=False, patch_size=4,
+        adaptive_patching=False, separate_channels=False, interp_size=4,
         fixed_length=16, twoD=True, _dataset="basic_ct", return_qdt=False,
     )
     results = list(pc)
@@ -306,7 +306,7 @@ def test_processchannels_drops_incomplete_trailing_internal_batch():
     source = _FakeSource([(tile, ("v0",)) for tile in tiles])
     pc = ProcessChannels(
         source, num_channels=1, batch_size=batch_size, return_label=False,
-        adaptive_patching=False, separate_channels=False, patch_size=4,
+        adaptive_patching=False, separate_channels=False, interp_size=4,
         fixed_length=16, twoD=True, _dataset="basic_ct", return_qdt=False,
     )
     results = list(pc)
@@ -320,7 +320,7 @@ def test_processchannels_no_ap_with_label_basic_ct():
     source = _FakeSource([(t, l, ("v0",)) for t, l in zip(tiles, labels)])
     pc = ProcessChannels(
         source, num_channels=1, batch_size=batch_size, return_label=True,
-        adaptive_patching=False, separate_channels=False, patch_size=4,
+        adaptive_patching=False, separate_channels=False, interp_size=4,
         fixed_length=16, twoD=True, _dataset="basic_ct", return_qdt=False,
     )
     results = list(pc)
@@ -331,18 +331,18 @@ def test_processchannels_no_ap_with_label_basic_ct():
 
 
 def test_processchannels_adaptive_patching_produces_fixed_length_sequence():
-    patch_size = 4
+    interp_size = 4
     fixed_length = 16
     img = np.random.RandomState(0).uniform(0, 1, size=(1, 32, 32)).astype(np.float32)
     source = _FakeSource([(img, ("ct_res1",))])
     pc = ProcessChannels(
         source, num_channels=1, batch_size=1, return_label=False,
-        adaptive_patching=True, separate_channels=False, patch_size=patch_size,
+        adaptive_patching=True, separate_channels=False, interp_size=interp_size,
         fixed_length=fixed_length, twoD=True, _dataset="basic_ct", return_qdt=False,
     )
     (np_image, seq_image, seq_size, seq_pos, variables), = list(pc)
     assert np_image.shape == img.shape
-    assert seq_image.shape == (fixed_length, patch_size * patch_size)
+    assert seq_image.shape == (fixed_length, interp_size * interp_size)
     assert seq_size.shape[0] == fixed_length
     assert seq_pos.shape[0] == fixed_length
     assert variables == ("ct_res1",)
@@ -357,17 +357,17 @@ def test_processchannels_separate_channels_does_not_crash():
     True sibling branch does.
     """
     num_channels = 2
-    patch_size = 4
+    interp_size = 4
     fixed_length = 16
     img = np.random.RandomState(0).uniform(0, 1, size=(num_channels, 16, 16)).astype(np.float32)
     source = _FakeSource([(img, ("ct_res1", "ct_res2"))])
     pc = ProcessChannels(
         source, num_channels=num_channels, batch_size=1, return_label=False,
-        adaptive_patching=True, separate_channels=True, patch_size=patch_size,
+        adaptive_patching=True, separate_channels=True, interp_size=interp_size,
         fixed_length=fixed_length, twoD=True, _dataset="basic_ct", return_qdt=False,
     )
     (np_image, seq_image, seq_size, seq_pos, variables), = list(pc)
-    assert seq_image.shape == (num_channels, fixed_length, patch_size * patch_size)
+    assert seq_image.shape == (num_channels, fixed_length, interp_size * interp_size)
     assert seq_size.shape == (num_channels, fixed_length)
     assert seq_pos.shape[:2] == (num_channels, fixed_length)
 

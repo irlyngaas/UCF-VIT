@@ -181,7 +181,7 @@ def _build_data_module(config_path):
         batch_size=conf["dataloader"]["batch_size"],
         num_workers=conf["dataloader"]["num_workers"],
         pin_memory=conf["dataloader"]["pin_memory"],
-        patch_size=conf["data"]["patch_size"],
+        interp_size=conf["data"]["interp_size"],
         tile_size=conf["data"]["tile_size"],
         twoD=conf["data"]["twoD"],
         return_label=conf["dataloader"]["return_label"],
@@ -292,7 +292,7 @@ def _build_catsdogs_loader(config_path, world_rank):
     train_data = conf["dataloader"]["dataset_module"](
         train_list, conf["data"]["dict_in_variables"][dkey_train], conf["data"]["tile_size"],
         adaptive_patching=conf["ap"]["do_ap"], fixed_length=conf["ap"]["fixed_length"],
-        patch_size=conf["data"]["patch_size"], num_channels=conf["data"]["num_channels"][dkey_train],
+        interp_size=conf["data"]["interp_size"], num_channels=conf["data"]["num_channels"][dkey_train],
         dataset=conf["data"]["dataset"], resize=conf["dataset_options"]["resize"].get(conf["data"]["dataset"]),
     )
     train_sampler = DistributedSampler(

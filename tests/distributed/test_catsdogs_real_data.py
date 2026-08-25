@@ -139,7 +139,7 @@ def test_catsdogs_adaptive_patching_against_real_images(dist_info):
 
     ds = CatsDogsDataset(
         file_list, variables=("red", "green", "blue"), tile_size=TILE_SIZE, adaptive_patching=True,
-        fixed_length=FIXED_LENGTH, patch_size=PATCH_SIZE, num_channels=NUM_CHANNELS, dataset="catsdogs",
+        fixed_length=FIXED_LENGTH, interp_size=PATCH_SIZE, num_channels=NUM_CHANNELS, dataset="catsdogs",
         resize=TILE_SIZE,
     )
     sampler = DistributedSampler(ds, num_replicas=world_size, rank=world_rank, shuffle=False)

@@ -171,7 +171,7 @@ def test_catsdogs_dataset_tiling_with_adaptive_patching(tmp_path):
     div = 2
     ds = CatsDogsDataset(
         paths, variables=("r", "g", "b"), tile_size=(16, 16), adaptive_patching=True,
-        fixed_length=FIXED_LENGTH, patch_size=PATCH_SIZE, num_channels=NUM_CHANNELS,
+        fixed_length=FIXED_LENGTH, interp_size=PATCH_SIZE, num_channels=NUM_CHANNELS,
         dataset="catsdogs", resize=(32, 32), div=div, tile_overlap=(0, 0),
     )
     assert len(ds) == div * div
@@ -186,7 +186,7 @@ def test_catsdogs_dataset_adaptive_patching_shapes(tmp_path):
     paths = _write_fake_images(tmp_path, ["cat.0.jpg"])
     ds = CatsDogsDataset(
         paths, variables=("red", "green", "blue"), tile_size=TILE_SIZE, adaptive_patching=True,
-        fixed_length=FIXED_LENGTH, patch_size=PATCH_SIZE, num_channels=NUM_CHANNELS, dataset="catsdogs",
+        fixed_length=FIXED_LENGTH, interp_size=PATCH_SIZE, num_channels=NUM_CHANNELS, dataset="catsdogs",
         resize=TILE_SIZE,
     )
     image, seq_img, seq_size, seq_pos, label, variables, dataset_name = ds[0]
@@ -212,7 +212,7 @@ def _adaptive_batch(tmp_path, names):
     paths = _write_fake_images(tmp_path, names)
     ds = CatsDogsDataset(
         paths, variables=("red", "green", "blue"), tile_size=TILE_SIZE, adaptive_patching=True,
-        fixed_length=FIXED_LENGTH, patch_size=PATCH_SIZE, num_channels=NUM_CHANNELS, resize=TILE_SIZE,
+        fixed_length=FIXED_LENGTH, interp_size=PATCH_SIZE, num_channels=NUM_CHANNELS, resize=TILE_SIZE,
     )
     return [ds[i] for i in range(len(paths))]
 

@@ -156,7 +156,7 @@ def main():
                 batch_size = conf["dataloader"]["batch_size"],
                 num_workers = conf["dataloader"]["num_workers"],
                 pin_memory = conf["dataloader"]["pin_memory"],
-                patch_size = conf["data"]["patch_size"],
+                interp_size = conf["data"]["interp_size"],
                 tile_size = conf["data"]["tile_size"],
                 twoD = conf["data"]["twoD"],
                 return_label = conf["dataloader"]["return_label"],
@@ -194,7 +194,7 @@ def main():
             dkey_train = list(conf["data"]["dict_root_dirs"])[0]
             train_list = glob.glob(os.path.join(conf["data"]["dict_root_dirs"][dkey_train],'*.jpg'))
 
-            train_data = conf["dataloader"]["dataset_module"](train_list, conf["data"]["dict_in_variables"][dkey_train], conf["data"]["tile_size"], adaptive_patching=conf["ap"]["do_ap"], fixed_length=conf["ap"]["fixed_length"], patch_size=conf["data"]["patch_size"], num_channels=conf["data"]["num_channels"][dkey_train], dataset=conf["data"]["dataset"], resize=conf["dataset_options"]["resize"].get(conf["data"]["dataset"]), div=conf["tiling"]["div"], tile_overlap=conf["tiling"]["tile_overlap"])
+            train_data = conf["dataloader"]["dataset_module"](train_list, conf["data"]["dict_in_variables"][dkey_train], conf["data"]["tile_size"], adaptive_patching=conf["ap"]["do_ap"], fixed_length=conf["ap"]["fixed_length"], interp_size=conf["data"]["interp_size"], num_channels=conf["data"]["num_channels"][dkey_train], dataset=conf["data"]["dataset"], resize=conf["dataset_options"]["resize"].get(conf["data"]["dataset"]), div=conf["tiling"]["div"], tile_overlap=conf["tiling"]["tile_overlap"])
 
             # rank=world_rank is only correct when tensor_par_size == 1 (world_rank
             # then equals this replica's position among data_par_size replicas).

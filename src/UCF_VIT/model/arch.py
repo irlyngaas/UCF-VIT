@@ -142,6 +142,7 @@ class VIT(nn.Module):
             self,
             img_size: Union[int, Tuple[int, int], Tuple[int,int,int]] = 224,
             patch_size: Union[int, Tuple[int, int], Tuple[int,int,int]] = 16,
+            interp_size: Optional[int] = None,
             in_chans: int = 3,
             num_classes: Optional[int] = None,
             embed_dim: int = 768,
@@ -180,7 +181,13 @@ class VIT(nn.Module):
 
         Args:
             img_size: Input image size.
-            patch_size: Patch size.
+            patch_size: Patch size. Only used when `adaptive_patching` is False;
+                when `adaptive_patching` is True, `interp_size` is used instead
+                (see `effective_patch_size`).
+            interp_size: Side length each adaptive (quadtree/octree) leaf patch
+                is interpolated to, and the size every dependent model-layer
+                calculation is based on. Required when `adaptive_patching` is
+                True; unused otherwise.
             in_chans: Number of image input channels.
             num_classes: Number of classes for classification head; if None, no
                 head is created (used when this class is a base for another head).
@@ -241,6 +248,7 @@ class VIT(nn.Module):
 
         self.in_chans = in_chans
         self.patch_size = patch_size
+        self.interp_size = interp_size
         self.twoD = twoD
         self.qkv_bias = qkv_bias
         self.qk_norm = qk_norm
@@ -264,6 +272,9 @@ class VIT(nn.Module):
         self.use_adaptive_pos_emb = use_adaptive_pos_emb
         self.sqrt_len_method = sqrt_len_method
 
+        if self.adaptive_patching:
+            assert self.interp_size is not None, "interp_size is required when adaptive_patching is turned on"
+
         #ASSUMES INPUT HAS ALREADY BEEN ADAPTIVELY PATCHED
         if self.adaptive_patching and not self.sqrt_len_method:
             num_patches = self.fixed_length
@@ -272,7 +283,7 @@ class VIT(nn.Module):
             if self.use_varemb:
                 self.patch_embed = embed_layer(
                     img_size=img_size,
-                    patch_size=patch_size,
+                    patch_size=self.effective_patch_size,
                     in_chans=1,
                     embed_dim=embed_dim,
                     twoD=twoD,
@@ -281,7 +292,7 @@ class VIT(nn.Module):
             else:
                 self.patch_embed = embed_layer(
                     img_size=img_size,
-                    patch_size=patch_size,
+                    patch_size=self.effective_patch_size,
                     in_chans=in_chans,
                     embed_dim=embed_dim,
                     twoD=twoD,
@@ -336,11 +347,11 @@ class VIT(nn.Module):
 
         #ASSUMES INPUT HAS ALREADY BEEN ADAPTIVELY PATCHED
         if self.twoD:
-            self.patch_dim = self.in_chans*self.patch_size**2
-            self.patch_dim_woc = self.patch_size**2
+            self.patch_dim = self.in_chans*self.effective_patch_size**2
+            self.patch_dim_woc = self.effective_patch_size**2
         else:
-            self.patch_dim = self.in_chans*self.patch_size**3
-            self.patch_dim_woc = self.patch_size**3
+            self.patch_dim = self.in_chans*self.effective_patch_size**3
+            self.patch_dim_woc = self.effective_patch_size**3
 
         if self.adaptive_patching and not self.sqrt_len_method:
             #TODO: Find a way to do convolutional patch embedding with adaptive token input, PatchEmbed doesn't work correctly
@@ -383,6 +394,17 @@ class VIT(nn.Module):
         if weight_init != 'skip':
             self.init_weights('')
 
+    @property
+    def effective_patch_size(self):
+        """The size every patch/token-sizing calculation should actually use.
+
+        `interp_size` when `adaptive_patching` is True (the size adaptive
+        leaf patches are interpolated to, which every dependent model-layer
+        size must match), `patch_size` otherwise. Keeps `self.patch_size`/
+        `self.interp_size` themselves truthful to their raw config values.
+        """
+        return self.interp_size if self.adaptive_patching else self.patch_size
+
     def init_weights(self, mode: str = '') -> None:
         """Initializes positional embeddings, cls token, patch embedding weights, and all submodules.
 
@@ -401,23 +423,23 @@ class VIT(nn.Module):
                 if self.twoD:
                     pos_embed = get_2d_sincos_pos_embed(
                         self.pos_embed.shape[-1],
-                        int(self.img_size[0] / self.patch_size),
-                        int(self.img_size[1] / self.patch_size),
+                        int(self.img_size[0] / self.effective_patch_size),
+                        int(self.img_size[1] / self.effective_patch_size),
                         cls_token=self.class_token,
                     )
                 else: #3D
                     pos_embed = get_3d_sincos_pos_embed(
                         self.pos_embed.shape[-1],
-                        int(self.img_size[0] / self.patch_size),
-                        int(self.img_size[1] / self.patch_size),
-                        int(self.img_size[2] / self.patch_size),
+                        int(self.img_size[0] / self.effective_patch_size),
+                        int(self.img_size[1] / self.effective_patch_size),
+                        int(self.img_size[2] / self.effective_patch_size),
                         cls_token=self.class_token,
                     )
                 self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
         if self.cls_token is not None:
             nn.init.normal_(self.cls_token, std=1e-6)
-    
+
         if not self.adaptive_patching:
             if self.use_varemb:
                 for i in range(len(self.token_embeds)):
@@ -706,8 +728,8 @@ class SAP(VIT):
                     nn.ConvTranspose2d(
                         self.embed_dim,
                         256,
-                        kernel_size=(self.patch_size, self.patch_size),
-                        stride=(self.patch_size, self.patch_size),
+                        kernel_size=(self.effective_patch_size, self.effective_patch_size),
+                        stride=(self.effective_patch_size, self.effective_patch_size),
                         bias=False,
                     )
             )
@@ -717,8 +739,8 @@ class SAP(VIT):
                     nn.ConvTranspose3d(
                         self.embed_dim,
                         256,
-                        kernel_size=(self.patch_size, self.patch_size, self.patch_size),
-                        stride=(self.patch_size, self.patch_size, self.patch_size),
+                        kernel_size=(self.effective_patch_size, self.effective_patch_size, self.effective_patch_size),
+                        stride=(self.effective_patch_size, self.effective_patch_size, self.effective_patch_size),
                         bias=False,
                     )
             )
@@ -1306,9 +1328,9 @@ class UNETR(VIT):
         else: #Use Linear Decoder
             self.mlp_head = nn.Linear(self.embed_dim, self.num_classes) 
             if self.twoD:
-                self.upsample = nn.Upsample(scale_factor=self.patch_size,mode='bilinear',align_corners=True)
+                self.upsample = nn.Upsample(scale_factor=self.effective_patch_size,mode='bilinear',align_corners=True)
             else:
-                self.upsample = nn.Upsample(scale_factor=self.patch_size,mode='trilinear',align_corners=True)
+                self.upsample = nn.Upsample(scale_factor=self.effective_patch_size,mode='trilinear',align_corners=True)
 
         self.init_weights('')
 

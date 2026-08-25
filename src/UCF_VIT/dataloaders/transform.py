@@ -14,7 +14,7 @@ class Patchify(torch.nn.Module):
     variable-sized patches concentrated around detected edges.
     """
 
-    def __init__(self, sths=[0,1,3,5], fixed_length=196, cannys=[50, 100], patch_size=16, num_channels=3, dataset="imagenet", return_edges=False) -> None:
+    def __init__(self, sths=[0,1,3,5], fixed_length=196, cannys=[50, 100], interp_size=16, num_channels=3, dataset="imagenet", return_edges=False) -> None:
         """Initializes the randomization ranges and patch parameters for the transform.
 
         Args:
@@ -24,7 +24,7 @@ class Patchify(torch.nn.Module):
             fixed_length: Fixed number of patches the image is serialized into.
             cannys: `[low, high)` range of Canny lower thresholds to randomly choose
                 from; the corresponding upper threshold is `low + 50`.
-            patch_size: Side length of the (square) leaf patches.
+            interp_size: Side length each (square) leaf patch is interpolated to.
             num_channels: Number of image channels.
             dataset: Dataset name; controls how edges are computed/normalized
                 ("imagenet"/"catsdogs" vs. other datasets).
@@ -35,7 +35,7 @@ class Patchify(torch.nn.Module):
         self.sths = sths
         self.fixed_length = fixed_length
         self.cannys = [x for x in range(cannys[0], cannys[1], 1)]
-        self.patch_size = patch_size
+        self.interp_size = interp_size
         self.num_channels = num_channels
         self.dataset = dataset
         self.return_edges = return_edges
@@ -72,14 +72,14 @@ class Patchify(torch.nn.Module):
                 edges = cv.Canny((grey_img*255).astype(np.uint8), self.canny[0], self.canny[1])
 
         qdt = FixedQuadTree(domain=edges, fixed_length=self.fixed_length)
-        seq_img, seq_size, seq_pos = qdt.serialize(img, size=(self.patch_size,self.patch_size,self.num_channels))
+        seq_img, seq_size, seq_pos = qdt.serialize(img, size=(self.interp_size,self.interp_size,self.num_channels))
         seq_size = np.asarray(seq_size)
         seq_img = np.asarray(seq_img, dtype=np.float32)
 
         if self.num_channels > 1:
-            seq_img = np.reshape(seq_img, [self.num_channels, -1, self.patch_size*self.patch_size])
+            seq_img = np.reshape(seq_img, [self.num_channels, -1, self.interp_size*self.interp_size])
         else:
-            seq_img = np.reshape(seq_img, [-1, self.patch_size*self.patch_size])
+            seq_img = np.reshape(seq_img, [-1, self.interp_size*self.interp_size])
 
         seq_pos = np.asarray(seq_pos)
         if self.return_edges:
@@ -97,7 +97,7 @@ class Patchify_3D(torch.nn.Module):
     """
 
     #TODO: Pass dtype for preferred return dtype
-    def __init__(self, sths=[0,1,3,5], fixed_length=196, cannys=[50, 100], patch_size=16, num_channels=3, dataset="basic_ct", return_edges=False) -> None:
+    def __init__(self, sths=[0,1,3,5], fixed_length=196, cannys=[50, 100], interp_size=16, num_channels=3, dataset="basic_ct", return_edges=False) -> None:
         """Initializes the randomization ranges and patch parameters for the transform.
 
         Args:
@@ -106,7 +106,7 @@ class Patchify_3D(torch.nn.Module):
             fixed_length: Fixed number of patches the volume is serialized into.
             cannys: `[low, high)` range of Canny lower thresholds to randomly choose
                 from; the corresponding upper threshold is `low + 50`.
-            patch_size: Side length of the (cubic) leaf patches.
+            interp_size: Side length each (cubic) leaf patch is interpolated to.
             num_channels: Number of volume channels.
             dataset: Dataset name; kept for interface compatibility with `Patchify`.
             return_edges: If True, also return the computed edge volume from
@@ -117,7 +117,7 @@ class Patchify_3D(torch.nn.Module):
         self.sths = sths
         self.fixed_length = fixed_length
         self.cannys = [x for x in range(cannys[0], cannys[1], 1)]
-        self.patch_size = patch_size
+        self.interp_size = interp_size
         self.num_channels = num_channels
         self.dataset = dataset
         self.return_edges = return_edges
@@ -185,13 +185,13 @@ class Patchify_3D(torch.nn.Module):
 
         octtree = FixedOctTree(domain=edges, fixed_length=self.fixed_length, norm_factor=norm_factor)
 
-        seq_img, seq_size, seq_pos = octtree.serialize(img, size=(self.patch_size,self.patch_size,self.patch_size, self.num_channels))
+        seq_img, seq_size, seq_pos = octtree.serialize(img, size=(self.interp_size,self.interp_size,self.interp_size, self.num_channels))
         seq_size = np.asarray(seq_size)
         seq_img = np.asarray(seq_img, dtype=np.float32)
         if self.num_channels > 1:
-            seq_img = np.reshape(seq_img, [self.num_channels, -1, self.patch_size*self.patch_size*self.patch_size])
+            seq_img = np.reshape(seq_img, [self.num_channels, -1, self.interp_size*self.interp_size*self.interp_size])
         else:
-            seq_img = np.reshape(seq_img, [-1, self.patch_size*self.patch_size*self.patch_size])
+            seq_img = np.reshape(seq_img, [-1, self.interp_size*self.interp_size*self.interp_size])
 
         seq_pos = np.asarray(seq_pos)
         if self.return_edges:

@@ -83,7 +83,8 @@ pytest tests/test_config_validation.py -v
 | `tests/utils/test_pos_embed.py` | 1D/2D/3D sin-cos position embeddings, `SinusoidalEmbeddings` |
 | `tests/utils/test_lr_scheduler.py` | `LinearWarmupCosineAnnealingLR` warmup/annealing shape |
 | `tests/utils/test_metrics.py` | `masked_mse`, `DiceBLoss` |
-| `tests/test_config_validation.py` | Every YAML under `configs/` actually parses via `parse_config` |
+| `tests/test_config_validation.py` | Every YAML under `configs/` actually parses via `parse_config`, plus a negative-case regression test that `ap.do_ap:True` with no `ap.interp_size` set fails with a clear error, not a bare `KeyError` |
+| `tests/model/test_arch.py` | `VIT.effective_patch_size` (`interp_size` used when `adaptive_patching`, `patch_size` otherwise, `patch_size`/`interp_size` themselves never overwritten, missing-`interp_size`-under-`adaptive_patching` raises clearly) — needs the real `timm`/`monai`/`xformers` stack (`UCF_VIT.model.arch`'s own imports), skips cleanly via `importorskip` otherwise |
 | `tests/integration/test_run_training_smoke_helpers.py` | `run_training_smoke.py`'s `compute_narrow_dict_idx` (real-data-found narrowing, empty-but-existing-dir and nonexistent-dir both raising `NoRealDataFoundError`, no-op for non-`iterative_dataloader` configs) and `deep_merge_config_overrides` (nested-key merge, wholesale-replace of non-dict values, new-key insertion, multiple independent sections) |
 | `tests/integration/test_feature_matrix_smoke_helpers.py` | `run_feature_matrix_smoke.py`'s `FEATURE_MATRIX` well-formedness (unique labels, real base-config paths, no accidental list-valued `tile_overlap` overrides) and — the most valuable check — every cell's tiny-model config surviving a real `parse_config` call |
 
@@ -378,6 +379,50 @@ additive — zero behavior change for every existing `catsdogs` config,
 none of which set `tiling.do_tiling: True` today. Not yet exercised by a
 `run_feature_matrix_smoke.py` cell or real Frontier data — a natural
 follow-up.
+
+### Added `interp_size`, retired `patch_size` reuse under adaptive patching
+
+`patch_size` used to be overloaded: with `do_ap:False` it's the standard
+conv-patching stride/kernel size; with `do_ap:True` the *same* config value
+was silently reused as the target size each adaptive (quadtree/octree) leaf
+patch gets interpolated to, both in the dataloader (`Patchify`/`Patchify_3D`)
+and in every dependent model-layer size calc (`VIT.token_embeds`,
+`SAP.neck`, `UNETR`'s linear-decoder upsample, the sin-cos pos-embed grid
+calc, `training.py`'s SAP/UNETR sequence-reshape `einops.rearrange` calls
+and their tensor-parallel placeholder-tensor sizing). A new `interp_size`
+config value (under `ap:`, required whenever `ap.do_ap:True`) now takes over
+every one of those roles, so `patch_size` is never read at all once
+adaptive patching is turned on.
+
+`UCF_VIT.model.arch.VIT` gained an `effective_patch_size` property
+(`self.interp_size if self.adaptive_patching else self.patch_size`) — the
+single place this dispatch happens, inherited unchanged by `SAP`/`UNETR`/
+`MAE`/`DiffusionVIT` rather than repeating the ternary at each of the ~6
+call sites across those classes. `self.patch_size`/`self.interp_size`
+themselves are never overwritten, so both stay truthful to their raw config
+values.
+
+`basic_ct/sap`'s shipped config moved its `data.patch_size: 4` to
+`ap.interp_size: 4` (SAP always requires `do_ap:True`, so `patch_size` was
+already unused for it in practice — this just makes that explicit). Every
+`run_feature_matrix_smoke.py` cell that turns `do_ap:True` on via override
+for a base config shipping `do_ap:False` (and thus no `interp_size`) got an
+explicit `ap.interp_size` override added, set to that base config's own
+`data.patch_size` value to preserve exact prior numerics.
+
+Verified locally: the full local suite (`tests/model/test_arch.py`'s new
+`effective_patch_size` dispatch tests, `tests/test_config_validation.py`'s
+new missing-`interp_size`-under-`do_ap` negative test, and every shipped
+config including `basic_ct/sap`) and `tests/integration/
+test_feature_matrix_smoke_helpers.py::test_feature_matrix_cells_parse`
+(exercises every new `interp_size` override through the real
+`parse_config`). `tests/model/test_arch.py` needs the real
+`timm`/`monai`/`xformers` stack (`UCF_VIT.model.arch`'s own imports) and
+skips cleanly via `importorskip` otherwise, matching the existing
+`tests/distributed/test_*_correctness.py` convention — not yet run against
+real Frontier training (no dedicated Tier 2/3 cell exercises `basic_ct/sap`
+training end-to-end beyond `basic_ct-sap+tensor_par`'s parse-level check,
+which already covers the new config shape).
 
 ## Running the distributed (Tier 2) tests
 

@@ -107,6 +107,13 @@ def main():
     with open(config_path, 'r') as f:
         raw_conf = yaml.load(f, Loader=yaml.FullLoader)
     fixed_length = raw_conf['ap']['fixed_length']
+    # Same reasoning as fixed_length above: interp_size is also
+    # do_ap-gated-to-None in the parsed conf, so read it raw too. Falls back
+    # to data.patch_size for configs that don't ship ap.interp_size at all
+    # (i.e. every do_ap:False baseline this script can still be pointed at
+    # to preview what adaptive patching would look like) -- interp_size is
+    # only required in the config once do_ap:True is actually turned on.
+    interp_size = raw_conf['ap'].get('interp_size', raw_conf['data'].get('patch_size'))
 
     dataset = conf['data']['dataset']
 
@@ -119,7 +126,6 @@ def main():
     assert twoD, "This script only supports 2D visualization (FixedOctTree has no draw() method for 3D)"
     variables = conf['data']['dict_in_variables']
     tile_size = conf['data']['tile_size']
-    patch_size = conf['data']['patch_size']
     assert fixed_length % 3 == 1 % 3, "Quadtree fixed length needs to be 3n+1, where n is some integer"
 
     tile_size_x = tile_size[0]
@@ -141,7 +147,7 @@ def main():
     canny1 = 50
     canny2 = 51
 
-    patchify = Patchify(sths=smooth_factor,cannys=[canny1,canny2],fixed_length=fixed_length, patch_size=patch_size, num_channels=len(variables[dict_key]), dataset=dataset, return_edges = True)
+    patchify = Patchify(sths=smooth_factor,cannys=[canny1,canny2],fixed_length=fixed_length, interp_size=interp_size, num_channels=len(variables[dict_key]), dataset=dataset, return_edges = True)
 
     seq_image, seq_size, seq_pos, qdt, edges = patchify(np.moveaxis(np_image,0,-1))
     print(seq_size)

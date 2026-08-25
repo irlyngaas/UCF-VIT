@@ -58,7 +58,7 @@ class CatsDogsDataset(Dataset):
     image.
     """
 
-    def __init__(self, file_list, variables, tile_size, twoD = True, adaptive_patching = False, fixed_length=196, patch_size=16, num_channels=3, dataset="catsdogs", resize=None, div=1, tile_overlap=(0, 0)):
+    def __init__(self, file_list, variables, tile_size, twoD = True, adaptive_patching = False, fixed_length=196, interp_size=16, num_channels=3, dataset="catsdogs", resize=None, div=1, tile_overlap=(0, 0)):
         """Initializes the dataset over a list of image file paths.
 
         Args:
@@ -77,7 +77,7 @@ class CatsDogsDataset(Dataset):
             adaptive_patching: Whether to also compute an adaptive-patching sequence
                 for each (possibly tiled) image.
             fixed_length: Fixed output sequence length for adaptive patching.
-            patch_size: Patch size used by the adaptive patcher.
+            interp_size: Side length each adaptive leaf patch is interpolated to.
             num_channels: Number of image channels.
             dataset: Dataset name to attach to each returned sample.
             resize: `(width, height)` to resize each image to (matches cv2's own
@@ -94,7 +94,7 @@ class CatsDogsDataset(Dataset):
         self.tile_size = tile_size
         self.adaptive_patching = adaptive_patching
         self.fixed_length = fixed_length
-        self.patch_size = patch_size
+        self.interp_size = interp_size
         self.num_channels = num_channels
         self.dataset = dataset
         self.twoD = twoD
@@ -113,9 +113,9 @@ class CatsDogsDataset(Dataset):
 
         if self.adaptive_patching:
             if self.twoD:
-                self.patchify = Patchify(fixed_length=fixed_length, patch_size=patch_size, num_channels=num_channels, dataset=self.dataset)
+                self.patchify = Patchify(fixed_length=fixed_length, interp_size=interp_size, num_channels=num_channels, dataset=self.dataset)
             else:
-                self.patchify = Patchify_3D(fixed_length=fixed_length, patch_size=patch_size, num_channels=num_channels, dataset=self.dataset)
+                self.patchify = Patchify_3D(fixed_length=fixed_length, interp_size=interp_size, num_channels=num_channels, dataset=self.dataset)
 
     def __len__(self):
         """Returns the number of (file, tile) samples in the dataset.

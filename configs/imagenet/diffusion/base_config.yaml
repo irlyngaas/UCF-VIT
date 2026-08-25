@@ -70,13 +70,14 @@ ap:
   fixed_length: 196
   separate_channels: False
   use_adaptive_pos_emb: True
+  interp_size: 16 # Side length each adaptive leaf patch is interpolated to (see UCF_VIT.model.arch.VIT.effective_patch_size); only used when do_ap:True, ignored otherwise. Not used by this baseline (do_ap:False) -- shown here so it's easy to find if you turn adaptive patching on.
   
 # ---------------------------- DATA ----------------------------------------------
 data:
   dataset: "imagenet"
   img_size: [256, 256] #Can be 2D or 3D. Optional -- if omitted, auto-detected from the real data files under dict_root_dirs (see UCF_VIT.utils.misc.detect_img_size). Always the actual/native size of the data, never a resize target.
   twoD: True #If true when img_size is 3D, dataloader slices on the z dimension. If data is 2D, this variable will be ignored and default to True
-  patch_size: 16 #If non-adaptive patching this will change sequence length, if adaptive patching this will determine the common representation across all adaptive patches
+  patch_size: 16 #Only used when do_ap:False (standard patching); changes sequence length. Ignored when do_ap:True -- see ap.interp_size for that case's equivalent.
   dict_root_dirs: {
     'imagenet': '/lustre/orion/stf006/proj-shared/irl1/imagenet_data_2',
   }

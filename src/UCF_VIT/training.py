@@ -74,15 +74,15 @@ def train_step(conf, batch, model):
     elif conf["model"]["type"] == "SAP":
         if conf["data"]["twoD"]:
             #seq = torch.reshape(seq, shape=(-1,in_chans,patch_size*sqrt_len, patch_size*sqrt_len))
-            seq = einops.rearrange(batch["seq"], 'b c (s1 s2) (ps1 ps2)-> b c (s1 ps1) (s2 ps2)', s1=conf["model"]["kwargs"]["sqrt_len"], s2=conf["model"]["kwargs"]["sqrt_len"], ps1=conf["data"]["patch_size"], ps2=conf["data"]["patch_size"])
+            seq = einops.rearrange(batch["seq"], 'b c (s1 s2) (ps1 ps2)-> b c (s1 ps1) (s2 ps2)', s1=conf["model"]["kwargs"]["sqrt_len"], s2=conf["model"]["kwargs"]["sqrt_len"], ps1=conf["data"]["interp_size"], ps2=conf["data"]["interp_size"])
             #seq_label = torch.reshape(seq_label, shape=(-1,num_classes,patch_size*sqrt_len, patch_size*sqrt_len))
-            seq_label = einops.rearrange(batch["seq_label"], 'b c (ps1 ps2) (s1 s2)-> b c (s1 ps1) (s2 ps2)', s1=conf["model"]["kwargs"]["sqrt_len"], s2=conf["model"]["kwargs"]["sqrt_len"], ps1=conf["data"]["patch_size"], ps2=conf["data"]["patch_size"])
+            seq_label = einops.rearrange(batch["seq_label"], 'b c (ps1 ps2) (s1 s2)-> b c (s1 ps1) (s2 ps2)', s1=conf["model"]["kwargs"]["sqrt_len"], s2=conf["model"]["kwargs"]["sqrt_len"], ps1=conf["data"]["interp_size"], ps2=conf["data"]["interp_size"])
 
         else:
             #seq = torch.reshape(seq, shape=(-1,in_chans,patch_size*sqrt_len, patch_size*sqrt_len, patch_size*sqrt_len))
-            seq = einops.rearrange(batch["seq"], 'b c (s1 s2 s3) (ps1 ps2 ps3)-> b c (s1 ps1) (s2 ps2) (s3 ps3)', s1=conf["model"]["kwargs"]["sqrt_len"], s2=conf["model"]["kwargs"]["sqrt_len"], s3=conf["model"]["kwargs"]["sqrt_len"], ps1=conf["data"]["patch_size"], ps2=conf["data"]["patch_size"], ps3=conf["data"]["patch_size"])
+            seq = einops.rearrange(batch["seq"], 'b c (s1 s2 s3) (ps1 ps2 ps3)-> b c (s1 ps1) (s2 ps2) (s3 ps3)', s1=conf["model"]["kwargs"]["sqrt_len"], s2=conf["model"]["kwargs"]["sqrt_len"], s3=conf["model"]["kwargs"]["sqrt_len"], ps1=conf["data"]["interp_size"], ps2=conf["data"]["interp_size"], ps3=conf["data"]["interp_size"])
             #seq_label = torch.reshape(seq_label, shape=(-1,num_classes,patch_size*sqrt_len, patch_size*sqrt_len, patch_size*sqrt_len))
-            seq_label = einops.rearrange(batch["seq_label"], 'b c (ps1 ps2 ps3) (s1 s2 s3)-> b c (s1 ps1) (s2 ps2) (s3 ps3)', s1=conf["model"]["kwargs"]["sqrt_len"], s2=conf["model"]["kwargs"]["sqrt_len"], s3=conf["model"]["kwargs"]["sqrt_len"], ps1=conf["data"]["patch_size"], ps2=conf["data"]["patch_size"], ps3=conf["data"]["patch_size"])
+            seq_label = einops.rearrange(batch["seq_label"], 'b c (ps1 ps2 ps3) (s1 s2 s3)-> b c (s1 ps1) (s2 ps2) (s3 ps3)', s1=conf["model"]["kwargs"]["sqrt_len"], s2=conf["model"]["kwargs"]["sqrt_len"], s3=conf["model"]["kwargs"]["sqrt_len"], ps1=conf["data"]["interp_size"], ps2=conf["data"]["interp_size"], ps3=conf["data"]["interp_size"])
         
         output = model.forward(seq, batch["variables"], batch["seq_ps"])
         criterion = DiceBLoss(num_class=conf["model"]["kwargs"]["num_classes"])
@@ -115,9 +115,9 @@ def train_step(conf, batch, model):
     elif conf["model"]["type"] == "UNETR":
         if conf["ap"]["do_ap"]:
             if conf["data"]["twoD"]:
-                seq = einops.rearrange(batch["seq"], 'b c (s1 s2) (ps1 ps2)-> b c (s1 ps1) (s2 ps2)', s1=conf["model"]["kwargs"]["sqrt_len"], s2=conf["model"]["kwargs"]["sqrt_len"], ps1=conf["data"]["patch_size"], ps2=conf["data"]["patch_size"])
+                seq = einops.rearrange(batch["seq"], 'b c (s1 s2) (ps1 ps2)-> b c (s1 ps1) (s2 ps2)', s1=conf["model"]["kwargs"]["sqrt_len"], s2=conf["model"]["kwargs"]["sqrt_len"], ps1=conf["data"]["interp_size"], ps2=conf["data"]["interp_size"])
             else:
-                seq = einops.rearrange(batch["seq"], 'b c (s1 s2 s3) (ps1 ps2 ps3)-> b c (s1 ps1) (s2 ps2) (s3 ps3)', s1=conf["model"]["kwargs"]["sqrt_len"], s2=conf["model"]["kwargs"]["sqrt_len"], s3=conf["model"]["kwargs"]["sqrt_len"], ps1=conf["data"]["patch_size"], ps2=conf["data"]["patch_size"], ps3=conf["data"]["patch_size"])
+                seq = einops.rearrange(batch["seq"], 'b c (s1 s2 s3) (ps1 ps2 ps3)-> b c (s1 ps1) (s2 ps2) (s3 ps3)', s1=conf["model"]["kwargs"]["sqrt_len"], s2=conf["model"]["kwargs"]["sqrt_len"], s3=conf["model"]["kwargs"]["sqrt_len"], ps1=conf["data"]["interp_size"], ps2=conf["data"]["interp_size"], ps3=conf["data"]["interp_size"])
 
             output = model.forward(batch["data"], batch["variables"], batch["seq_ps"], seq)
 
@@ -263,7 +263,7 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
         tile_size = conf["data"]["tile_size"]
         if conf["ap"]["do_ap"]:
             fixed_length = conf["ap"]["fixed_length"]
-            patch_size = conf["data"]["patch_size"]
+            interp_size = conf["data"]["interp_size"]
             separate_channels = conf["ap"]["separate_channels"]
 
         if dist.get_rank(tensor_par_group) == 0:
@@ -327,7 +327,7 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
             if dist.get_rank(tensor_par_group) != 0:
                 if twoD:
                     data = torch.zeros(batch_size, num_channels[dict_key], tile_size[0], tile_size[1], dtype=precision_dt).to(device)
-                    seq = torch.zeros(batch_size, num_channels[dict_key], fixed_length, patch_size*patch_size, dtype=precision_dt).to(device)
+                    seq = torch.zeros(batch_size, num_channels[dict_key], fixed_length, interp_size*interp_size, dtype=precision_dt).to(device)
                     if separate_channels:
                         seq_size = torch.zeros(batch_size, num_channels[dict_key], fixed_length, dtype=precision_dt).to(device)
                         seq_pos = torch.zeros(batch_size, num_channels[dict_key], fixed_length, 2, dtype=precision_dt).to(device)
@@ -385,10 +385,10 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
                                 # shape, so it broadcast fine but then failed
                                 # downstream with einops.EinopsError: Shape
                                 # mismatch on non-rank-0 processes.
-                                seq_label = torch.zeros(batch_size, conf["model"]["kwargs"]["num_classes"], patch_size*patch_size, fixed_length, dtype=precision_dt).to(device)
+                                seq_label = torch.zeros(batch_size, conf["model"]["kwargs"]["num_classes"], interp_size*interp_size, fixed_length, dtype=precision_dt).to(device)
                 else:
                     data = torch.zeros(batch_size, num_channels[dict_key], tile_size[0], tile_size[1], tile_size[2], dtype=precision_dt).to(device)
-                    seq = torch.zeros(batch_size, num_channels[dict_key], fixed_length, patch_size*patch_size*patch_size, dtype=precision_dt).to(device)
+                    seq = torch.zeros(batch_size, num_channels[dict_key], fixed_length, interp_size*interp_size*interp_size, dtype=precision_dt).to(device)
                     if separate_channels:
                         seq_size = torch.zeros(batch_size, num_channels[dict_key], fixed_length, dtype=precision_dt).to(device)
                         seq_pos = torch.zeros(batch_size, num_channels[dict_key], fixed_length, 3, dtype=precision_dt).to(device)
@@ -410,7 +410,7 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
                             if conf["model"]["type"] in ["UNETR", "SAP"]:
                                 # Same patch-volume-before-fixed_length
                                 # reasoning as the twoD branch above.
-                                seq_label = torch.zeros(batch_size, conf["model"]["kwargs"]["num_classes"], patch_size*patch_size*patch_size, fixed_length, dtype=precision_dt).to(device)
+                                seq_label = torch.zeros(batch_size, conf["model"]["kwargs"]["num_classes"], interp_size*interp_size*interp_size, fixed_length, dtype=precision_dt).to(device)
                 variables = [None] * num_channels[dict_key]
 
             #Broadcast data batch to the rest of the tensor parallel group
