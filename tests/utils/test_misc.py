@@ -213,14 +213,67 @@ def _fake_attention_state_dict(dim):
     }
 
 
+def _expected_qkv_shard(full_qkv, dim, num_heads, tensor_par_size, tp_rank):
+    """Reference reimplementation of the head-range slicing
+    shard_attention_state_dict's qkv.weight/qkv.bias must match: reshape the
+    flat (3 * dim, ...) tensor into (3, num_heads, head_dim, ...), select
+    this rank's head range from every one of the 3 (Q/K/V) blocks, and
+    flatten back -- the inverse of Attention.forward's own per-rank
+    `.reshape(B, N, 3, num_heads // tensor_par_size, head_dim)` of a
+    *sharded* qkv output.
+    """
+    head_dim = dim // num_heads
+    heads_per_shard = num_heads // tensor_par_size
+    head_start, head_end = tp_rank * heads_per_shard, (tp_rank + 1) * heads_per_shard
+    trailing_shape = full_qkv.shape[1:]
+    reshaped = full_qkv.reshape(3, num_heads, head_dim, *trailing_shape)
+    sliced = reshaped[:, head_start:head_end]
+    return sliced.reshape(3 * heads_per_shard * head_dim, *trailing_shape)
+
+
 @pytest.mark.parametrize("tensor_par_size", [1, 2, 4])
-def test_shard_attention_state_dict_reconstructs_full_weights(tensor_par_size):
-    full = _fake_attention_state_dict(dim=16)
+def test_shard_attention_state_dict_slices_qkv_by_head_range_not_flat_chunk(tensor_par_size):
+    """Regression test for a real bug found on a real Frontier run (job
+    5341031): shard_attention_state_dict used to take one flat contiguous
+    row-slice of qkv's (dim * 3)-sized output. qkv's output is actually 3
+    contiguous dim-sized blocks (Q, K, V), each internally split into
+    num_heads head-groups -- a flat row-slice mixes head ranges across
+    Q/K/V for tensor_par_size > 1 (e.g. all of Q plus part of K on early
+    ranks, part of K plus all of V on late ranks) instead of the SAME head
+    range from each of Q, K, and V independently, which is exactly what
+    Attention.forward's own per-rank reshape(..., 3, num_heads //
+    tensor_par_size, head_dim) requires. This produced a 99.9%-of-elements
+    mismatch in test_tensor_parallel_correctness.py's real multi-rank
+    Attention check before being fixed.
+    """
+    dim = 16
+    num_heads = 4
+    full = _fake_attention_state_dict(dim=dim)
 
-    shards = [shard_attention_state_dict(full, tensor_par_size, r) for r in range(tensor_par_size)]
+    for tp_rank in range(tensor_par_size):
+        shard = shard_attention_state_dict(full, num_heads, tensor_par_size, tp_rank)
+        torch.testing.assert_close(
+            shard["qkv.weight"],
+            _expected_qkv_shard(full["qkv.weight"], dim, num_heads, tensor_par_size, tp_rank),
+        )
+        torch.testing.assert_close(
+            shard["qkv.bias"],
+            _expected_qkv_shard(full["qkv.bias"], dim, num_heads, tensor_par_size, tp_rank),
+        )
 
-    torch.testing.assert_close(torch.cat([s["qkv.weight"] for s in shards], dim=0), full["qkv.weight"])
-    torch.testing.assert_close(torch.cat([s["qkv.bias"] for s in shards], dim=0), full["qkv.bias"])
+
+@pytest.mark.parametrize("tensor_par_size", [1, 2, 4])
+def test_shard_attention_state_dict_reconstructs_full_proj_weight(tensor_par_size):
+    """proj's input-dim column-slice IS a plain contiguous chunk (unlike
+    qkv's row-slice) -- see shard_attention_state_dict's docstring for why
+    head ranges and contiguous column ranges coincide there.
+    """
+    dim = 16
+    num_heads = 4
+    full = _fake_attention_state_dict(dim=dim)
+
+    shards = [shard_attention_state_dict(full, num_heads, tensor_par_size, r) for r in range(tensor_par_size)]
+
     torch.testing.assert_close(torch.cat([s["proj.weight"] for s in shards], dim=1), full["proj.weight"])
 
 
@@ -228,7 +281,7 @@ def test_shard_attention_state_dict_reconstructs_full_weights(tensor_par_size):
 def test_shard_attention_state_dict_proj_bias_sums_back_to_full(tensor_par_size):
     full = _fake_attention_state_dict(dim=16)
 
-    shards = [shard_attention_state_dict(full, tensor_par_size, r) for r in range(tensor_par_size)]
+    shards = [shard_attention_state_dict(full, num_heads=4, tensor_par_size=tensor_par_size, tp_rank=r) for r in range(tensor_par_size)]
 
     summed_bias = sum(s["proj.bias"] for s in shards)
     torch.testing.assert_close(summed_bias, full["proj.bias"])
@@ -241,4 +294,4 @@ def test_shard_attention_state_dict_rejects_qk_norm_params():
     full["q_norm.weight"] = torch.randn(4)
 
     with pytest.raises(NotImplementedError):
-        shard_attention_state_dict(full, tensor_par_size=2, tp_rank=0)
+        shard_attention_state_dict(full, num_heads=4, tensor_par_size=2, tp_rank=0)

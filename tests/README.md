@@ -486,6 +486,45 @@ alphabetically) got to run at all in that job — the whole `srun` step was
 cancelled once one rank aborted. Fixed locally (full Tier 1 suite green,
 153 passed); not yet re-verified against a real Frontier run.
 
+Second real run (job 5341031), after that fix: `test_fsdp_correctness.py`
+passed for real (all `fsdp_size` values, no more abort), and
+`test_mlp_tensor_parallel_forward_matches_reference` passed too, but
+`test_attention_tensor_parallel_forward_matches_reference` failed for
+every `tensor_par_size` (2, 4, 8) with ~99.9% of elements mismatched
+(`Greatest relative difference: 719...`) — not a tolerance problem, a real
+correctness bug. Found in `UCF_VIT.utils.misc.shard_attention_state_dict`
+itself (not production `Attention` code, which never needs to convert a
+`tensor_par_size=1` reference's weights into a sharded set — only this
+test's helper does): `qkv`'s output (dim 0, size `dim * 3`) is 3
+contiguous `dim`-sized blocks (Q, K, V), each internally split into
+`num_heads` head-groups, and `Attention.forward` reshapes each rank's own
+`qkv` output as `(3, num_heads // tensor_par_size, head_dim)` — meaning
+every rank's shard must be the *same* head range from each of Q, K, and V
+independently. `shard_attention_state_dict` instead took one flat
+contiguous row-slice of the whole `dim * 3`-sized output, which — for
+`tensor_par_size:2`, `dim:64` — gives rank 0 all of Q plus the first half
+of K, and rank 1 the second half of K plus all of V: a completely
+different (and wrong) partition. `proj`'s column-slice (dim 1) was
+already correct as a plain contiguous chunk, since head ranges are
+assigned to ranks in contiguous order and `proj`'s input columns are
+head-major, so the two coincide there — only `qkv` needed the fix. Fixed
+by adding a required `num_heads` parameter (not derivable from the state
+dict's shapes alone) and slicing each of the 3 Q/K/V blocks by head range
+before re-concatenating. `tests/utils/test_misc.py`'s
+`test_shard_attention_state_dict_reconstructs_full_weights` had not
+caught this: concatenating any contiguous partition back together always
+reconstructs the original tensor via `torch.cat`, regardless of whether
+the partition boundaries have the right *semantic* meaning, so it exercised
+none of the actual bug. Replaced with
+`test_shard_attention_state_dict_slices_qkv_by_head_range_not_flat_chunk`,
+which reimplements the expected head-range reshape independently and
+checks each shard against it directly, and
+`test_shard_attention_state_dict_reconstructs_full_proj_weight` (the old
+test's still-valid `proj.weight` assertion, split out on its own since
+`proj`'s slicing didn't need the same treatment). Fixed locally (full
+Tier 1 suite green, 156 passed — the extra 3 vs the previous 153 are this
+new coverage); not yet re-verified against a real Frontier run.
+
 ## Running the training smoke test (Tier 3)
 
 ```bash

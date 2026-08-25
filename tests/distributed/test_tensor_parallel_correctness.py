@@ -168,7 +168,7 @@ def test_attention_tensor_parallel_forward_matches_reference(tensor_par_size, di
         tensor_par_size=tensor_par_size,
         tensor_par_group=tensor_par_group,
     )
-    sharded.load_state_dict(shard_attention_state_dict(reference_state, tensor_par_size, tp_rank))
+    sharded.load_state_dict(shard_attention_state_dict(reference_state, NUM_HEADS, tensor_par_size, tp_rank))
     sharded = sharded.to(device).eval()
 
     with torch.no_grad():

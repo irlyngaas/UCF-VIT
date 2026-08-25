@@ -312,16 +312,27 @@ def shard_mlp_state_dict(full_state_dict, tensor_par_size, tp_rank):
     return sharded
 
 
-def shard_attention_state_dict(full_state_dict, tensor_par_size, tp_rank):
+def shard_attention_state_dict(full_state_dict, num_heads, tensor_par_size, tp_rank):
     """Slices a full (tensor_par_size=1) UCF_VIT.model.building_blocks.Attention
     state_dict into the shard TP rank `tp_rank` of a `tensor_par_size`-way
     tensor-parallel group should load.
 
-    Mirrors Attention's actual sharding: `qkv`'s output dimension (dim 0 of
-    its weight/bias, `dim * 3`) is row-sliced into `tensor_par_size`
-    contiguous chunks, and `proj`'s input dimension (dim 1 of its weight,
-    `dim`) is column-sliced the same way, matching `qkv = Linear(dim, dim *
-    3 // tensor_par_size)` / `proj = Linear(dim // tensor_par_size, dim)`.
+    Mirrors Attention's actual sharding, which shards `num_heads`, not a
+    flat row range of `qkv`'s output: `qkv`'s output (dim 0 of its
+    weight/bias, size `dim * 3`) is laid out as 3 contiguous blocks (Q, K,
+    V, each size `dim`), and Attention.forward reshapes each rank's *own*
+    `qkv` output as `(3, num_heads // tensor_par_size, head_dim)` -- i.e.
+    every rank's shard must contain the SAME contiguous range of heads
+    from each of Q, K, and V, not one contiguous slice of the flattened
+    `dim * 3` vector (which would span all of Q plus part of K for low
+    tensor_par_size, and part of K plus all of V for the last rank --
+    completely wrong). `proj`'s input dimension (dim 1 of its weight,
+    `dim`) IS just a plain contiguous column-slice by head range, though:
+    Attention.forward's `x.reshape(B, N, C // tensor_par_size)` before
+    `self.proj(x)` flattens this rank's own `num_heads // tensor_par_size`
+    heads head-major, and head ranges are assigned to ranks in contiguous
+    order, so `tp_rank`'s head range and its `dim // tensor_par_size`-sized
+    contiguous column range of the reference `proj.weight` coincide.
 
     `proj.bias` is a special case, exactly like Mlp's `fc2.bias` (see
     `shard_mlp_state_dict`): Attention does not shard it (`proj`'s output
@@ -342,6 +353,11 @@ def shard_attention_state_dict(full_state_dict, tensor_par_size, tp_rank):
     Args:
         full_state_dict: `state_dict()` of an `Attention` built with
             `tensor_par_size=1` (i.e. unsharded, "reference" weights).
+        num_heads: Number of attention heads (the same value the reference
+            `Attention` was built with) -- needed to locate head boundaries
+            within `qkv`'s output; not derivable from `full_state_dict`'s
+            shapes alone (`dim = num_heads * head_dim` has no unique
+            factorization).
         tensor_par_size: Number of tensor-parallel ranks to shard across.
         tp_rank: This rank's index within its tensor-parallel group
             (`0 <= tp_rank < tensor_par_size`).
@@ -361,25 +377,30 @@ def shard_attention_state_dict(full_state_dict, tensor_par_size, tp_rank):
             f"parameters); got keys {unsupported}"
         )
 
-    qkv_out = full_state_dict["qkv.weight"].shape[0]  # dim * 3 at tensor_par_size=1
-    assert qkv_out % tensor_par_size == 0, (
-        f"qkv output dim ({qkv_out}) must be divisible by tensor_par_size ({tensor_par_size})"
-    )
-    qkv_shard = qkv_out // tensor_par_size
-    qkv_start, qkv_end = tp_rank * qkv_shard, (tp_rank + 1) * qkv_shard
-
     dim = full_state_dict["proj.weight"].shape[1]  # proj.weight is (dim, dim) at tensor_par_size=1
-    assert dim % tensor_par_size == 0, (
-        f"dim ({dim}) must be divisible by tensor_par_size ({tensor_par_size})"
+    assert dim % num_heads == 0, f"dim ({dim}) must be divisible by num_heads ({num_heads})"
+    head_dim = dim // num_heads
+    assert num_heads % tensor_par_size == 0, (
+        f"num_heads ({num_heads}) must be divisible by tensor_par_size ({tensor_par_size})"
     )
-    proj_shard = dim // tensor_par_size
-    proj_start, proj_end = tp_rank * proj_shard, (tp_rank + 1) * proj_shard
+    heads_per_shard = num_heads // tensor_par_size
+    head_start, head_end = tp_rank * heads_per_shard, (tp_rank + 1) * heads_per_shard
+    elem_start, elem_end = head_start * head_dim, head_end * head_dim  # == tp_rank/(tp_rank+1) * (dim // tensor_par_size)
+
+    def _qkv_head_slice(full_tensor):
+        # full_tensor's dim 0 is 3 contiguous dim-sized blocks (Q, K, V);
+        # take the same head range out of each block, then re-concatenate
+        # in Q, K, V order -- matching Attention.forward's own (3,
+        # num_heads // tensor_par_size, head_dim) reshape of this rank's
+        # qkv output.
+        blocks = [full_tensor[block_idx * dim:(block_idx + 1) * dim][elem_start:elem_end] for block_idx in range(3)]
+        return torch.cat(blocks, dim=0)
 
     sharded = {}
-    sharded["qkv.weight"] = full_state_dict["qkv.weight"][qkv_start:qkv_end].clone()
+    sharded["qkv.weight"] = _qkv_head_slice(full_state_dict["qkv.weight"]).clone()
     if "qkv.bias" in full_state_dict:
-        sharded["qkv.bias"] = full_state_dict["qkv.bias"][qkv_start:qkv_end].clone()
-    sharded["proj.weight"] = full_state_dict["proj.weight"][:, proj_start:proj_end].clone()
+        sharded["qkv.bias"] = _qkv_head_slice(full_state_dict["qkv.bias"]).clone()
+    sharded["proj.weight"] = full_state_dict["proj.weight"][:, elem_start:elem_end].clone()
     if "proj.bias" in full_state_dict:
         if tp_rank == 0:
             sharded["proj.bias"] = full_state_dict["proj.bias"].clone()
