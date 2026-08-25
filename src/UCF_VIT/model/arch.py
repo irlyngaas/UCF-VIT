@@ -608,6 +608,24 @@ class VIT(nn.Module):
 
         if self.tensor_par_size > 1:
             src_rank = dist.get_rank() - dist.get_rank(group=self.tensor_par_group)
+            # dist.broadcast requires a contiguous tensor, and fills it
+            # in place -- must reassign x = x.contiguous() first (not just
+            # pass x.contiguous() inline), since .contiguous() returns a
+            # NEW tensor whenever x isn't already contiguous; broadcasting
+            # that unassigned copy would silently leave the original x
+            # variable un-updated on every non-src rank. _pos_embed's
+            # cls-token torch.cat (which would otherwise produce a fresh,
+            # contiguous tensor) only runs when self.cls_token is not None
+            # -- i.e. only for model_type "VIT" (get_model's
+            # class_token=True if conf["model"]["type"] == "VIT" else
+            # False). For every other model type, x here is whatever
+            # self.token_embeds(x) produced, typically PatchEmbed's own
+            # flatten+transpose, which is non-contiguous. Real Frontier
+            # runs (basic_ct-unetr+twoD+tensor_par, basic_ct-sap+tensor_par)
+            # hit "ValueError: Tensors must be contiguous" here once
+            # get_model actually started wiring tensor_par_size into the
+            # model (this branch was previously dead code).
+            x = x.contiguous()
             dist.broadcast(x, src_rank, group=self.tensor_par_group)
 
         x = self.blocks(x)
@@ -1436,6 +1454,11 @@ class UNETR(VIT):
 
         if self.tensor_par_size > 1:
             src_rank = dist.get_rank() - dist.get_rank(group=self.tensor_par_group)
+            # Same non-contiguous-x fix as VIT.forward_features above --
+            # this method has the identical _pos_embed -> patch_drop ->
+            # broadcast shape with no gather/cat step in between to clean
+            # up contiguity, and UNETR (the only caller) is class_token=False.
+            x = x.contiguous()
             dist.broadcast(x, src_rank, group=self.tensor_par_group)
 
         if torch.jit.is_scripting() or not stop_early:  # can't slice blocks in torchscript
@@ -1709,7 +1732,15 @@ class DiffusionVIT(VIT):
 
         if self.tensor_par_size > 1:
             src_rank = dist.get_rank() - dist.get_rank(group=self.tensor_par_group)
-            dist.broadcast(x.contiguous(), src_rank, group=self.tensor_par_group)
+            # Must reassign x = x.contiguous() (not pass x.contiguous()
+            # inline) -- dist.broadcast fills its argument in place, and
+            # .contiguous() returns a NEW tensor whenever x isn't already
+            # contiguous, so broadcasting an unassigned copy would silently
+            # leave this rank's own x un-updated. x here can be
+            # non-contiguous even after x + time_emb (elementwise ops can
+            # preserve a non-contiguous input's memory layout).
+            x = x.contiguous()
+            dist.broadcast(x, src_rank, group=self.tensor_par_group)
 
         x = self.blocks(x)
         x = self.norm(x)

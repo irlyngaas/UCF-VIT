@@ -1475,6 +1475,79 @@ Frontier data.
    Fixed locally (full Tier 1 suite green, 153 passed); not yet
    re-verified against a real Frontier run.
 
+10. Reran the full matrix (job 5341245), now against `get_model`'s
+    `tensor_par_size`/`tensor_par_group` wiring fix (see "Major finding"
+    above) actually shipping: **16 PASS, 2 FAIL** — `imagenet-
+    classification+tensor_par`, `basic_ct-mae+tensor_par`, `catsdogs-
+    classification+tensor_par`, `imagenet-classification+do_ap+tensor_par`,
+    `imagenet-classification+do_tiling+tensor_par`, and `catsdogs-
+    diffusion+tensor_par` all still passed with real sharding actually
+    active for the first time — a good sign for the sharding logic itself
+    (consistent with `test_tensor_parallel_correctness.py`/
+    `test_fsdp_correctness.py` already passing on real data). But two
+    cells that were previously passing under the old (never-sharded)
+    behavior broke: `basic_ct-unetr+twoD+tensor_par` (regression) and
+    `basic_ct-sap+tensor_par` (still unresolved), both with the identical
+    error: `ValueError: Tensors must be contiguous` in `arch.py`'s
+    `forward_features`, at `dist.broadcast(x, src_rank,
+    group=self.tensor_par_group)` right after `_pos_embed`/`patch_drop`.
+
+    Root cause: `_pos_embed`'s `torch.cat` step (prepending the class
+    token), which happens to also produce a fresh contiguous tensor as a
+    side effect, only runs when `self.cls_token is not None` — i.e. only
+    for `model_type == "VIT"` (`get_model`'s `class_token=True if
+    conf["model"]["type"] == "VIT" else False`). For every other model
+    type (`UNETR`, `SAP`, `MAE`, `DiffusionVIT`), that step is skipped, so
+    `x`'s contiguity depends entirely on `self.token_embeds(x)`'s raw
+    output — typically `PatchEmbed`'s own flatten+transpose, which is
+    non-contiguous. This code path was dead until item "Major finding"'s
+    `get_model` fix, so it had never been exercised by any real run
+    before. One instance of this exact bug (`DiffusionVIT.forward_features`)
+    had apparently already been found and fixed at some earlier point
+    (`dist.broadcast(x.contiguous(), ...)`), but the identical pattern was
+    never applied to the other four analogous broadcasts.
+
+    Audited every `dist.broadcast(x, ...)`/`dist.broadcast(x.contiguous(),
+    ...)` call in `arch.py` (6 total) rather than patching only the two
+    confirmed failures, checking each one's actual upstream contiguity:
+    - `VIT.forward_features` (shared by `VIT`/`SAP`/`UNETR`) and
+      `UNETR.forward_intermediates`: same `_pos_embed` → `patch_drop` →
+      broadcast shape with no cleanup step in between — fixed.
+    - `DiffusionVIT.forward_features`: `x = x + time_emb` right before the
+      broadcast does *not* reliably produce a contiguous result (an
+      elementwise op can preserve a non-contiguous input's memory layout)
+      — already had `.contiguous()`, but as an unassigned inline copy (see
+      below) — fixed properly.
+    - `MAE.random_masking`'s noise broadcast, `MAE.mask_head`'s decoder
+      broadcast, and `DiffusionVIT.forward_head`'s decoder broadcast: `x`
+      immediately before each is the output of `torch.rand`/`torch.cat`/
+      `torch.gather` (always produces a fresh, contiguous tensor) or a
+      full-range slice of an already-contiguous tensor — confirmed safe
+      both by this reasoning and empirically (both `basic_ct-mae+
+      tensor_par` and `catsdogs-diffusion+tensor_par` passed in this same
+      job with `linear_decoder: False`, i.e. their decoder-broadcast
+      branches were genuinely exercised). Left unchanged.
+
+    Also fixed a latent correctness bug while doing this, present in both
+    the already-shipped `DiffusionVIT` instance and my own first pass at
+    the `VIT`/`UNETR` fixes: `dist.broadcast` fills its tensor argument in
+    place, but `.contiguous()` returns a *new* tensor whenever the input
+    isn't already contiguous — passing `x.contiguous()` inline without
+    reassigning `x = x.contiguous()` first would broadcast-fill that
+    throwaway copy while leaving the original `x` variable (used by the
+    very next line) silently un-updated on every non-src rank. This never
+    caused a visible failure only because every rank already computes an
+    (almost) bit-identical `x` independently from identical
+    data/weights, so the broadcast's result and each rank's own local
+    value coincide in practice — but it defeats the broadcast's actual
+    purpose (forcing bit-identical values before the sharded blocks) and
+    is a real latent bug if that assumption ever doesn't hold exactly
+    (e.g. kernel-level floating-point non-determinism). All fixed
+    instances now do `x = x.contiguous()` then `dist.broadcast(x, ...)`.
+
+    Fixed locally (full Tier 1 suite green, 156 passed); not yet
+    re-verified against a real Frontier run.
+
 ## Validating a config file by hand
 
 `utils/validate_config.py` is a standalone utility — the same one
