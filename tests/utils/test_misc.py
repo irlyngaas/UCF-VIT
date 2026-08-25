@@ -1,10 +1,14 @@
 import os
 
+import nibabel as nib
+import numpy as np
 import pytest
 import torch
+from PIL import Image
 
 from UCF_VIT.utils.misc import (
     calculate_tile_overlap,
+    detect_num_channels,
     is_power_of_two,
     patchify,
     process_root_dirs,
@@ -158,6 +162,77 @@ def test_process_root_dirs_non_imagenet_lists_imagesTr(tmp_path):
 
     assert set(result.keys()) == {"ct1"}  # keyed by dict_root_dirs key, not bucket index
     assert len(result["ct1"]) == 3
+
+
+# ---------------------------------------------------------------------------
+# detect_num_channels
+# ---------------------------------------------------------------------------
+
+
+def test_detect_num_channels_imagenet_hardcodes_three_without_touching_filesystem(tmp_path):
+    """imagenet always forces 3 channels via dataset.py's
+    Image.open(path).convert("RGB") -- no file needs to exist for this to
+    return the right answer.
+    """
+    result = detect_num_channels("imagenet", {"imagenet": str(tmp_path / "does-not-exist")})
+    assert result == {"imagenet": 3}
+
+
+@pytest.mark.parametrize("mode,expected_channels", [("RGB", 3), ("L", 1), ("RGBA", 4)])
+def test_detect_num_channels_catsdogs_reads_real_file_band_count(tmp_path, mode, expected_channels):
+    images_dir = tmp_path / "imagesTr"
+    images_dir.mkdir()
+    Image.new(mode, (4, 4)).save(images_dir / "image0.png")
+
+    result = detect_num_channels("catsdogs", {"catsdogs": str(tmp_path)})
+
+    assert result == {"catsdogs": expected_channels}
+
+
+def test_detect_num_channels_basic_ct_reads_real_3d_file_as_one_channel(tmp_path):
+    images_dir = tmp_path / "imagesTr"
+    images_dir.mkdir()
+    nib.save(nib.Nifti1Image(np.zeros((8, 8, 8), dtype=np.float32), affine=np.eye(4)), images_dir / "image0.nii")
+
+    result = detect_num_channels("basic_ct", {"ct1": str(tmp_path)})
+
+    assert result == {"ct1": 1}
+
+
+def test_detect_num_channels_basic_ct_raises_for_ambiguous_4d_shape(tmp_path):
+    """No shipped config or test exercises basic_ct with num_channels > 1,
+    so there's no verified channel-axis convention to infer a 4D+ shape
+    from -- must raise rather than silently guess.
+    """
+    images_dir = tmp_path / "imagesTr"
+    images_dir.mkdir()
+    nib.save(nib.Nifti1Image(np.zeros((8, 8, 8, 2), dtype=np.float32), affine=np.eye(4)), images_dir / "image0.nii")
+
+    with pytest.raises(RuntimeError, match="ambiguous"):
+        detect_num_channels("basic_ct", {"ct1": str(tmp_path)})
+
+
+def test_detect_num_channels_raises_for_missing_imagesTr_dir(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        detect_num_channels("catsdogs", {"catsdogs": str(tmp_path)})
+
+
+def test_detect_num_channels_multiple_keys_detected_independently(tmp_path):
+    """Different dataset keys can genuinely have different channel counts
+    (e.g. one grayscale source, one RGB source) -- each key's detection
+    must be independent, not short-circuited by the first key checked.
+    """
+    grey_dir = tmp_path / "grey"
+    (grey_dir / "imagesTr").mkdir(parents=True)
+    Image.new("L", (4, 4)).save(grey_dir / "imagesTr" / "image0.png")
+
+    rgb_dir = tmp_path / "rgb"
+    (rgb_dir / "imagesTr").mkdir(parents=True)
+    Image.new("RGB", (4, 4)).save(rgb_dir / "imagesTr" / "image0.png")
+
+    result = detect_num_channels("catsdogs", {"grey": str(grey_dir), "rgb": str(rgb_dir)})
+
+    assert result == {"grey": 1, "rgb": 3}
 
 
 # ---------------------------------------------------------------------------

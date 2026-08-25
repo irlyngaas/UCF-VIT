@@ -79,7 +79,7 @@ pytest tests/test_config_validation.py -v
 | `tests/dataloaders/test_dataset.py` | `TileDataIter` (2D, 3D-full, and 3D-twoD-sliced tiling, with/without labels, overlap), `ShuffleIterableDataset` (no data loss/duplication across buffer sizes), `ProcessChannels` (batching, adaptive-patching wiring, `separate_channels`), `FileReader` (DDP-rank + dataloader-worker sharding disjointness/coverage up to `num_workers=7`, `keys_to_add` replication) |
 | `tests/dataloaders/test_datamodule.py` | `collate_fn` across `adaptive_patching`/`return_label`/`separate_channels`/`return_qdt`/dataset-type combinations, built from real `ProcessChannels` output rather than hand-fabricated tuples |
 | `tests/datasets/test_catsdogs.py` | `CatsDogsDataset` (label-from-filename, resize/channel-first conversion, adaptive-patching shapes) and `CatsDogsCollate`, against small real JPEG files written to a temp dir — `catsdogs` is the only shipped dataset using `dataloader.type: "dataloader"` (a plain `Dataset` + `DistributedSampler`, not the `iterative_dataloader` stack the two rows above cover) |
-| `tests/utils/test_misc.py` | `is_power_of_two`, `calculate_tile_overlap`, `patchify`/`unpatchify` roundtrips, `process_root_dirs` (`imagenet` per-class bucketing — evenly/non-evenly-divisible `> data_par_size`, `<= data_par_size`, bucket-content correctness — and the non-`imagenet` branch), `shard_mlp_state_dict`/`shard_attention_state_dict` (weight-slice reconstruction, `fc2.bias`/`proj.bias` summing back to the original exactly, `qk_norm` rejection) |
+| `tests/utils/test_misc.py` | `is_power_of_two`, `calculate_tile_overlap`, `patchify`/`unpatchify` roundtrips, `process_root_dirs` (`imagenet` per-class bucketing — evenly/non-evenly-divisible `> data_par_size`, `<= data_par_size`, bucket-content correctness — and the non-`imagenet` branch), `detect_num_channels` (`imagenet` hardcoding with no filesystem touched, `catsdogs`/PIL real-file band-count detection across RGB/`L`/RGBA, `basic_ct`/nibabel real-file 3D-shape detection, the 4D-shape-raises case, missing-`imagesTr`-raises, and independent per-key detection), `shard_mlp_state_dict`/`shard_attention_state_dict` (weight-slice reconstruction, `fc2.bias`/`proj.bias` summing back to the original exactly, `qk_norm` rejection) |
 | `tests/utils/test_pos_embed.py` | 1D/2D/3D sin-cos position embeddings, `SinusoidalEmbeddings` |
 | `tests/utils/test_lr_scheduler.py` | `LinearWarmupCosineAnnealingLR` warmup/annealing shape |
 | `tests/utils/test_metrics.py` | `masked_mse`, `DiceBLoss` |
@@ -283,7 +283,17 @@ tests of their own before this) is the regression test.
 - `UCF_VIT.parse` itself only has indirect coverage today, through
   `test_config_validation.py` running real shipped configs end to end
   (rather than unit tests of individual branches) — this is what caught the
-  config vs. parser mismatches below.
+  config vs. parser mismatches below. One exception: `conf['data']
+  ['num_channels']` is now optional — if omitted, `parse_config` falls back
+  to `UCF_VIT.utils.misc.detect_num_channels`, which reads one real file per
+  dataset key to auto-detect the channel count (`imagenet` is hardcoded to
+  3, no read needed — `dataset.py` always forces `.convert("RGB")`; other
+  datasets read a real file's PIL band count or, for `basic_ct`, its NIfTI
+  header shape via nibabel's lazy `ArrayProxy`, cheap even for large
+  volumes). Every shipped config already specifies `num_channels`
+  explicitly, so this is purely additive — the detection logic itself has
+  direct Tier 1 coverage in `test_misc.py` (see the table above), separate
+  from `parse_config`'s own still-indirect-only coverage.
 
 ## Running the distributed (Tier 2) tests
 

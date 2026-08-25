@@ -465,6 +465,84 @@ def process_root_dirs(dataset, dict_root_dirs, data_par_size):
         dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in dict_root_dirs.items() }
     return dict_lister_trains
 
+def detect_num_channels(dataset, dict_root_dirs):
+    """Auto-detects the number of channels for each dataset key by reading
+    one real representative data file, for use when
+    conf['data']['num_channels'] is omitted from a training config.
+
+    Behavior is dataset-type-specific, matching how each dataset's own
+    dataset.py.read_process_file (or datasets/catsdogs.py's __getitem__)
+    actually decodes files:
+      - "imagenet": always 3, no file read needed -- dataset.py's
+        read_process_file always calls Image.open(path).convert("RGB"),
+        forcing 3 channels regardless of the source file.
+      - Every other dataset (e.g. "catsdogs", "basic_ct"): reads one real
+        file, found the same way process_root_dirs lists non-imagenet
+        datasets (the first file under dict_root_dirs[k]/imagesTr/).
+        - "basic_ct": reads the file's shape via nibabel's lazy
+          ArrayProxy (nib.load(path).shape reads only the NIfTI header,
+          not the voxel data, so this is cheap even for large volumes).
+          A 3D shape means 1 channel, matching dataset.py's
+          read_process_file num_channels_available==1 branch (which
+          prepends a channel dim via np.expand_dims). A 4D+ shape is
+          ambiguous: dataset.py's own handling of num_channels_available
+          > 1 assumes the raw array is already channel-first with no
+          verified real-file example anywhere in this repo (no shipped
+          config or test exercises basic_ct with num_channels > 1), so
+          this raises rather than guessing a channel-axis convention.
+        - Other datasets (e.g. "catsdogs"): reads the file's band count
+          via PIL (Image.open(path).getbands()), a cheap, lazy read that
+          doesn't decode full pixel data and works regardless of the
+          file's mode (RGB, RGBA, grayscale, ...).
+
+    Args:
+        dataset: Dataset name ("imagenet", "catsdogs", "basic_ct", ...).
+        dict_root_dirs: Dict mapping each dataset key to its root
+            directory path.
+
+    Returns:
+        Dict mapping each dataset key to its detected channel count,
+        shaped like conf['data']['num_channels'].
+
+    Raises:
+        FileNotFoundError: If a key's imagesTr/ directory is missing or
+            empty.
+        RuntimeError: If a basic_ct file's shape doesn't unambiguously
+            imply a channel count (4 or more dimensions).
+    """
+    if dataset == "imagenet":
+        return {k: 3 for k in dict_root_dirs}
+
+    num_channels = {}
+    for k, root_dir in dict_root_dirs.items():
+        images_dir = os.path.join(root_dir, "imagesTr")
+        try:
+            filename = sorted(os.listdir(images_dir))[0]
+        except (FileNotFoundError, IndexError) as e:
+            raise FileNotFoundError(
+                f"Could not auto-detect num_channels for dataset key '{k}': "
+                f"no files found under {images_dir}. Set num_channels manually "
+                f"in the config for this key instead."
+            ) from e
+        path = os.path.join(images_dir, filename)
+
+        if dataset == "basic_ct":
+            shape = nib.load(path).shape
+            if len(shape) == 3:
+                num_channels[k] = 1
+            else:
+                raise RuntimeError(
+                    f"Could not auto-detect num_channels for dataset key '{k}': "
+                    f"{path} has shape {shape} (not 3D), so the channel axis is "
+                    f"ambiguous -- no verified convention for multi-channel "
+                    f"basic_ct files exists in this repo yet. Set num_channels "
+                    f"manually in the config for this key instead."
+                )
+        else:
+            num_channels[k] = len(Image.open(path).getbands())
+
+    return num_channels
+
 def calculate_load_balancing_on_the_fly(conf, VERBOSE=False):
     """Computes how many DDP ranks and batches-per-epoch each dataset should get.
 

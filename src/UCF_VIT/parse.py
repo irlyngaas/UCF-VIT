@@ -4,7 +4,7 @@ import sys
 import math
 import numpy as np
 import torch.distributed as dist
-from UCF_VIT.utils.misc import is_power_of_two
+from UCF_VIT.utils.misc import detect_num_channels, is_power_of_two
 
 def get_kwargs(model_type, conf):
     """Build the architecture-specific keyword arguments for a given model type.
@@ -431,7 +431,6 @@ def parse_config(args, load_balance_offline=False):
     assert dataset in ["imagenet", "catsdogs", "basic_ct"], "This training script only supports the following datasets: imagenet, catsdogs, basic_ct"
 
     #To remove the need for specifying img_size in the config can add check_data_size function. The issue with automating this process is that raw data files come in various forms that are not consistent. This requires special functionality for each different dataset. Additionaly, it can be expensive to read individual datafiles that are very large on the fly.
-    #TODO: Put assert with sys.exit around num_channels since its required
     img_size = conf['data']['img_size']
 
     assert len(img_size) == 2 or len(img_size) == 3, "Img_size needs to be 2D or 3D"
@@ -485,9 +484,19 @@ def parse_config(args, load_balance_offline=False):
             assert tile_size[i] % patch_size == 0, "img_size/tile_size not divisible by patch_size which is required when doing standard patching"
 
 
-    #num_channels required because we aren't requiring dict_in_variables to be specified
-    #TODO: Put assert with sys.exit around num_channels since its required
-    num_channels = conf['data']['num_channels']
+    #num_channels required because we aren't requiring dict_in_variables to be specified.
+    #If omitted, auto-detect it by reading one real file per dataset key
+    #(see detect_num_channels's own docstring for per-dataset-type behavior
+    #and why basic_ct raises rather than guessing for multi-channel files).
+    try:
+        num_channels = conf['data']['num_channels']
+    except KeyError:
+        if dist.get_rank() == 0:
+            print("num_channels is not set, auto-detecting from the real data files under dict_root_dirs...")
+        num_channels = detect_num_channels(dataset, conf['data']['dict_root_dirs'])
+        if dist.get_rank() == 0:
+            print(f"Detected num_channels: {num_channels}")
+
     for i,k in enumerate(num_channels):
         if i == 0:
             num_chan = num_channels[k]
@@ -756,8 +765,17 @@ def parse_pretrained_config(args, conf):
         assert use_channel_aggregation == conf['model']['use_channel_aggregation'], "Use_channel_aggregation needs to match between pretrained model and this model"
 
         ##############################
-        #num_channels required because we aren't requiring dict_in_variables to be specified
-        num_channels = pretrained_conf['data']['num_channels']
+        #num_channels required because we aren't requiring dict_in_variables to be specified.
+        #Same optional/auto-detect fallback as parse_config's own num_channels handling.
+        try:
+            num_channels = pretrained_conf['data']['num_channels']
+        except KeyError:
+            if dist.get_rank() == 0:
+                print("num_channels is not set in the pretrained config, auto-detecting from the real data files under dict_root_dirs...")
+            num_channels = detect_num_channels(pretrained_conf['data']['dataset'], pretrained_conf['data']['dict_root_dirs'])
+            if dist.get_rank() == 0:
+                print(f"Detected num_channels: {num_channels}")
+
         for i,k in enumerate(num_channels):
             if i == 0:
                 num_chan = num_channels[k]
