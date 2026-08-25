@@ -1286,6 +1286,34 @@ Frontier data.
    Both fixed locally (full Tier 1 suite green, 153 passed); not yet
    re-verified against a real Frontier run.
 
+8. Reran the full matrix (job 5340104) against item 7's fixes: **17 PASS, 1
+   FAIL**. Both item 7 fixes verified working on real Frontier data:
+   `basic_ct-unetr+twoD+tensor_par` now passes (`dict_key` broadcast
+   redesign fixed), and `basic_ct-sap+tensor_par` no longer times out —
+   it now fails fast at 22s instead of hanging for 600s, confirming the
+   `label`-dtype broadcast fix resolved the hang. But it still failed, with
+   a new, different error: `ZeroDivisionError: division by zero` at
+   `datamodule.py`'s `setup()` (`keys_to_add =
+   int(np.ceil(self.max_balance/self.batches_per_rank_epoch[k]))`), coming
+   from `calculate_load_balancing_on_the_fly` (`misc.py`) computing
+   `batches_per_rank_epoch["ct1"] = 0`. Root cause was a mistake in item
+   7's own `run_feature_matrix_smoke.py` change, not `training.py`:
+   `basic_ct-sap+tensor_par` had copied `min_files_override=8` from
+   `basic_ct-unetr+twoD`, but that value only works there because
+   `twoD:True` multiplies each real file into up to `div*div*img_size[2]`
+   tiles — SAP has `twoD:False` and no tiling, so `tiles_per_image` is `1`.
+   With only 8 real files split across `data_par_size:4` ranks, each rank
+   gets just 2 images (`tiles_per_image:1`, so 2 samples) — far below
+   the baseline's `batch_size:32` — so `calculate_load_balancing_on_the_fly`
+   floors `batches_per_rank` to `0`. This cell previously ran fine at
+   `DEFAULT_MIN_FILES:256` (64 images/rank, well above `batch_size:32`);
+   the fix is simply to drop the `min_files_override` for this cell
+   (kept `timeout_override=1800` as a harmless safety margin — the actual
+   failure now surfaces in 22s, well under even the shared 600s default).
+
+   Fixed locally (full Tier 1 suite green, 153 passed); not yet
+   re-verified against a real Frontier run.
+
 ## Validating a config file by hand
 
 `utils/validate_config.py` is a standalone utility — the same one
