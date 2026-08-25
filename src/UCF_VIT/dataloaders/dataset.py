@@ -37,7 +37,7 @@ class FileReader(IterableDataset):
         return_label: bool = False,
         keys_to_add: int = 1,
         dataset: str = "imagenet",
-        resize: Optional[list] = [256,256],
+        resize: Optional[list] = None,
     ) -> None:
         """Initializes the reader over the `[start_idx, end_idx)` fraction of `file_list`.
 
@@ -58,8 +58,11 @@ class FileReader(IterableDataset):
                 file list per epoch, used to balance dataset sizes.
             dataset: Dataset name, e.g. "imagenet" or "basic_ct"; determines how
                 files are read in `read_process_file`.
-            resize: `[height, width]` to resize images to; only used for
-                `dataset == "imagenet"`.
+            resize: `[height, width]` to resize images to, only used for
+                `dataset == "imagenet"`. If None, images are left at their
+                native size (every file under this dataset key must then
+                already share the same size, since samples in a batch
+                must have matching shapes).
         """
         super().__init__()
         self.num_channels_available = len(variables)
@@ -97,8 +100,16 @@ class FileReader(IterableDataset):
         """
         if self.dataset == "imagenet":
             data = Image.open(path).convert("RGB")
-            data = np.array(data) 
-            data = cv.resize(data, dsize=[self.resize[0],self.resize[1]])
+            data = np.array(data)
+            if self.resize is not None:
+                # dsize=[self.resize[0], self.resize[1]] unchanged from
+                # before resize became optional -- cv2's dsize is (width,
+                # height), so despite datamodule.py's own resize docstring
+                # claiming [height, width], the convention this call has
+                # actually always used (untouched here) is [width, height].
+                # detect_img_size's output matches this actual convention,
+                # not the docstring -- see its own docstring.
+                data = cv.resize(data, dsize=[self.resize[0], self.resize[1]])
             data = np.moveaxis(data,-1,0)
 
 
@@ -352,13 +363,29 @@ class TileDataIter(IterableDataset):
                                     start_z, end_z = self.calculate_tile_bounds(z_idx, self.tile_size_no_overlap[2], self.start_overlap[2], self.end_overlap[2])
                                     yield data[:, start_x:end_x, start_y:end_y, start_z:end_z], variables
 
-        else: #Data is 2D 
+        else: #Data is 2D -- imagenet only in practice (the only
+              #iterative_dataloader dataset with a 2D img_size); catsdogs
+              #never reaches TileDataIter at all (no tiling capability).
+              #img_size/tile_size are stored [width, height] (matching
+              #cv2's own dsize convention -- see dataset.py's
+              #FileReader.read_process_file), but imagenet's real array
+              #here is (C, H, W): cv.resize(dsize=(W, H)) returns a
+              #(H, W, C) array (OpenCV's own convention), then
+              #np.moveaxis(-1, 0) makes it channel-first without touching
+              #H/W order. So tile_size[0] (width-derived) must bound dim 1
+              #(H) via start_x, and tile_size[1] (height-derived) must
+              #bound dim 2 (W) via start_y -- indices 0/1 swapped relative
+              #to tile_size_no_overlap/start_overlap/end_overlap's own
+              #storage order. basic_ct's 3D branch above needs no such
+              #swap (no resize step, so img_size's axes already match the
+              #array's axes directly) -- this reversal is specific to the
+              #resize+moveaxis path.
             if self.return_label:
                 for (data,label,variables) in self.dataset:
                     for x_idx in range(self.div):
                         for y_idx in range(self.div):
-                            start_x, end_x = self.calculate_tile_bounds(x_idx, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
-                            start_y, end_y = self.calculate_tile_bounds(y_idx, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
+                            start_x, end_x = self.calculate_tile_bounds(x_idx, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
+                            start_y, end_y = self.calculate_tile_bounds(y_idx, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
                             if self.classification:
                                 yield data[:, start_x:end_x, start_y:end_y], label, variables
                             else:
@@ -368,8 +395,8 @@ class TileDataIter(IterableDataset):
                 for (data,variables) in self.dataset:
                     for x_idx in range(self.div):
                         for y_idx in range(self.div):
-                            start_x, end_x = self.calculate_tile_bounds(x_idx, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
-                            start_y, end_y = self.calculate_tile_bounds(y_idx, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
+                            start_x, end_x = self.calculate_tile_bounds(x_idx, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
+                            start_y, end_y = self.calculate_tile_bounds(y_idx, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
                             yield data[:, start_x:end_x, start_y:end_y], variables
 
 class ShuffleIterableDataset(IterableDataset):

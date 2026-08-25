@@ -4,7 +4,7 @@ import sys
 import math
 import numpy as np
 import torch.distributed as dist
-from UCF_VIT.utils.misc import detect_num_channels, is_power_of_two
+from UCF_VIT.utils.misc import detect_img_size, detect_num_channels, is_power_of_two
 
 def get_kwargs(model_type, conf):
     """Build the architecture-specific keyword arguments for a given model type.
@@ -430,14 +430,35 @@ def parse_config(args, load_balance_offline=False):
     dataset = conf['data']['dataset']
     assert dataset in ["imagenet", "catsdogs", "basic_ct"], "This training script only supports the following datasets: imagenet, catsdogs, basic_ct"
 
-    #To remove the need for specifying img_size in the config can add check_data_size function. The issue with automating this process is that raw data files come in various forms that are not consistent. This requires special functionality for each different dataset. Additionaly, it can be expensive to read individual datafiles that are very large on the fly.
-    img_size = conf['data']['img_size']
+    #img_size is always the real/native size of the data. If omitted,
+    #auto-detect it by reading one real file (see detect_img_size's own
+    #docstring). Resizing to a *different* size than native is a separate,
+    #optional step -- see resize_conf below -- not what img_size means.
+    try:
+        img_size = conf['data']['img_size']
+    except KeyError:
+        if dist.get_rank() == 0:
+            print("img_size is not set, auto-detecting from the real data files under dict_root_dirs...")
+        img_size = detect_img_size(dataset, conf['data']['dict_root_dirs'])
+        if dist.get_rank() == 0:
+            print(f"Detected img_size: {img_size}")
 
     assert len(img_size) == 2 or len(img_size) == 3, "Img_size needs to be 2D or 3D"
     if len(img_size) == 2:
         twoD = True
     elif len(img_size) == 3:
         twoD = conf['data']['twoD']
+
+    #resize is an optional, separate step -- for imagenet/catsdogs, resizes
+    #the real data from its native img_size to a different target size
+    #before training. Not supported for basic_ct (no resize step exists in
+    #its read path -- see dataset.py). Computed here (rather than down with
+    #the rest of dataset_options_conf) because tile_size below must be
+    #computed from whatever size the data actually is once resize (if any)
+    #has been applied, not from img_size directly.
+    resize_conf = conf.get('dataset_options', {}).get('resize', {}) or {}
+    assert "basic_ct" not in resize_conf, "resize is not supported for basic_ct -- it has no resize step (dataset.py reads NIfTI volumes at native resolution). Remove it from dataset_options.resize."
+    effective_size = resize_conf.get(dataset, img_size)
 
     if not isinstance(tiling_conf["tile_overlap"], tuple):
         if twoD:
@@ -458,7 +479,7 @@ def parse_config(args, load_balance_offline=False):
         # Genuinely 2D data (imagenet/catsdogs): a 2-tuple tile_size is both
         # correct and, via TileDataIter's `len(self.tile_size) == 3` check,
         # the signal that tells it there's no z-axis to slice at all.
-        tile_size = (img_size[0]//tiling_conf["div"]+tiling_conf["tile_overlap"][0], img_size[1]//tiling_conf["div"]+tiling_conf["tile_overlap"][1])
+        tile_size = (effective_size[0]//tiling_conf["div"]+tiling_conf["tile_overlap"][0], effective_size[1]//tiling_conf["div"]+tiling_conf["tile_overlap"][1])
     elif twoD:
         # 3D data (basic_ct) sliced into 2D z-planes: tile_size must still be
         # a 3-tuple -- collapsing it to 2D here (as if it were genuinely 2D
@@ -468,13 +489,13 @@ def parse_config(args, load_balance_offline=False):
         # time it reached PatchEmbed. The z entry itself isn't tiled (every
         # z-index is walked one at a time in TileDataIter's twoD branch), so
         # it's the raw, undivided depth.
-        tile_size = (img_size[0]//tiling_conf["div"]+tiling_conf["tile_overlap"][0], img_size[1]//tiling_conf["div"]+tiling_conf["tile_overlap"][1], img_size[2])
+        tile_size = (effective_size[0]//tiling_conf["div"]+tiling_conf["tile_overlap"][0], effective_size[1]//tiling_conf["div"]+tiling_conf["tile_overlap"][1], effective_size[2])
     else:
-        tile_size = (img_size[0]//tiling_conf["div"]+tiling_conf["tile_overlap"][0], img_size[1]//tiling_conf["div"]+tiling_conf["tile_overlap"][1], img_size[2]//tiling_conf["div"]+tiling_conf["tile_overlap"][2])
+        tile_size = (effective_size[0]//tiling_conf["div"]+tiling_conf["tile_overlap"][0], effective_size[1]//tiling_conf["div"]+tiling_conf["tile_overlap"][1], effective_size[2]//tiling_conf["div"]+tiling_conf["tile_overlap"][2])
 
     if tiling_conf["do_tiling"]:
         for i in range(len(tile_size)):
-            assert img_size[0] // tiling_conf["div"], "The image cannot be evenly divided into tiles. This assertion can be commented out and ignored if this was intended, however be aware not all of the image will be used in training"
+            assert effective_size[0] // tiling_conf["div"], "The image cannot be evenly divided into tiles. This assertion can be commented out and ignored if this was intended, however be aware not all of the image will be used in training"
         
     patch_size = conf['data']['patch_size']
     #If doing standard patching, check if img_size/tile_size is divisible by patch_size
@@ -609,7 +630,7 @@ def parse_config(args, load_balance_offline=False):
 # ---------------------------- DATASET SPECIFIC OPTIONS --------------------------
     #TODO: Move this to its own function
     dataset_options_conf = {
-        "resize": conf['dataset_options']['resize'] if dataset == "imagenet" else None, 
+        "resize": resize_conf,
     }
 
 
@@ -726,8 +747,17 @@ def parse_pretrained_config(args, conf):
         ###use_adaptive_pos_emb=conf["ap"]["use_adaptive_pos_emb"],
 
 # ---------------------------- DATA ----------------------------------------------
-        #Get and check data arguments
-        pretrained_img_size = pretrained_conf["data"]["img_size"]
+        #Get and check data arguments. Same optional/auto-detect fallback
+        #as parse_config's own img_size handling.
+        try:
+            pretrained_img_size = pretrained_conf["data"]["img_size"]
+        except KeyError:
+            if dist.get_rank() == 0:
+                print("img_size is not set in the pretrained config, auto-detecting from the real data files under dict_root_dirs...")
+            pretrained_img_size = detect_img_size(pretrained_conf["data"]["dataset"], pretrained_conf["data"]["dict_root_dirs"])
+            if dist.get_rank() == 0:
+                print(f"Detected img_size: {pretrained_img_size}")
+
         if len(pretrained_img_size) == 2:
             twoD = True
         elif len(pretrained_img_size) == 3:

@@ -8,6 +8,7 @@ from PIL import Image
 
 from UCF_VIT.utils.misc import (
     calculate_tile_overlap,
+    detect_img_size,
     detect_num_channels,
     is_power_of_two,
     patchify,
@@ -233,6 +234,78 @@ def test_detect_num_channels_multiple_keys_detected_independently(tmp_path):
     result = detect_num_channels("catsdogs", {"grey": str(grey_dir), "rgb": str(rgb_dir)})
 
     assert result == {"grey": 1, "rgb": 3}
+
+
+# ---------------------------------------------------------------------------
+# detect_img_size
+# ---------------------------------------------------------------------------
+
+
+def test_detect_img_size_basic_ct_reads_real_native_shape(tmp_path):
+    images_dir = tmp_path / "imagesTr"
+    images_dir.mkdir()
+    nib.save(nib.Nifti1Image(np.zeros((10, 20, 30), dtype=np.float32), affine=np.eye(4)), images_dir / "image0.nii")
+
+    result = detect_img_size("basic_ct", {"ct1": str(tmp_path)})
+
+    assert result == [10, 20, 30]
+
+
+def test_detect_img_size_imagenet_reads_real_file_native_pixel_size(tmp_path):
+    """Deliberately non-square (12x7, not e.g. 12x12) so this actually
+    verifies the [width, height] order rather than trivially passing on a
+    square fixture -- PIL's Image.size is (width, height), and that's the
+    order dataset.py's own cv.resize(..., dsize=[resize[0], resize[1]])
+    call already uses unswapped (cv2's dsize is itself (width, height)),
+    so detect_img_size must match it, not datamodule.py's own (incorrect)
+    docstring claim of [height, width].
+    """
+    images_dir = tmp_path / "imagesTr"
+    images_dir.mkdir()
+    Image.new("RGB", (12, 7)).save(images_dir / "image0.png")
+
+    result = detect_img_size("imagenet", {"imagenet": str(tmp_path)})
+
+    assert result == [12, 7]
+
+
+def test_detect_img_size_catsdogs_reads_real_file_native_pixel_size(tmp_path):
+    images_dir = tmp_path / "imagesTr"
+    images_dir.mkdir()
+    Image.new("RGB", (12, 7)).save(images_dir / "image0.png")
+
+    result = detect_img_size("catsdogs", {"catsdogs": str(tmp_path)})
+
+    assert result == [12, 7]
+
+
+def test_detect_img_size_uses_first_dict_root_dirs_key_only(tmp_path):
+    """img_size is a single value shared across the whole dataset (unlike
+    num_channels' per-key dict) -- detection samples only the first key,
+    mirroring parse.py's own "first key wins" num_channels-to-in_chans
+    convention.
+    """
+    first_dir = tmp_path / "first"
+    (first_dir / "imagesTr").mkdir(parents=True)
+    Image.new("RGB", (12, 7)).save(first_dir / "imagesTr" / "image0.png")
+
+    second_dir = tmp_path / "second"
+    (second_dir / "imagesTr").mkdir(parents=True)
+    Image.new("RGB", (99, 99)).save(second_dir / "imagesTr" / "image0.png")
+
+    result = detect_img_size("catsdogs", {"first": str(first_dir), "second": str(second_dir)})
+
+    assert result == [12, 7]
+
+
+def test_detect_img_size_raises_for_missing_imagesTr_dir(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        detect_img_size("catsdogs", {"catsdogs": str(tmp_path)})
+
+
+def test_detect_img_size_raises_for_empty_dict_root_dirs():
+    with pytest.raises(FileNotFoundError):
+        detect_img_size("catsdogs", {})
 
 
 # ---------------------------------------------------------------------------

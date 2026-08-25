@@ -74,7 +74,7 @@ ap:
 # ---------------------------- DATA ----------------------------------------------
 data:
   dataset: "imagenet"
-  img_size: [256, 256] #Can be 2D or 3D, on todo list create capability where this isn't required, but can be read determined base on the reading the raw data.
+  img_size: [256, 256] #Can be 2D or 3D. Optional -- if omitted, auto-detected from the real data files under dict_root_dirs (see UCF_VIT.utils.misc.detect_img_size). Always the actual/native size of the data, never a resize target.
   twoD: True #If true when img_size is 3D, dataloader slices on the z dimension. If data is 2D, this variable will be ignored and default to True
   patch_size: 16 #If non-adaptive patching this will change sequence length, if adaptive patching this will determine the common representation across all adaptive patches
   dict_root_dirs: {

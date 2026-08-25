@@ -79,7 +79,7 @@ pytest tests/test_config_validation.py -v
 | `tests/dataloaders/test_dataset.py` | `TileDataIter` (2D, 3D-full, and 3D-twoD-sliced tiling, with/without labels, overlap), `ShuffleIterableDataset` (no data loss/duplication across buffer sizes), `ProcessChannels` (batching, adaptive-patching wiring, `separate_channels`), `FileReader` (DDP-rank + dataloader-worker sharding disjointness/coverage up to `num_workers=7`, `keys_to_add` replication) |
 | `tests/dataloaders/test_datamodule.py` | `collate_fn` across `adaptive_patching`/`return_label`/`separate_channels`/`return_qdt`/dataset-type combinations, built from real `ProcessChannels` output rather than hand-fabricated tuples |
 | `tests/datasets/test_catsdogs.py` | `CatsDogsDataset` (label-from-filename, resize/channel-first conversion, adaptive-patching shapes) and `CatsDogsCollate`, against small real JPEG files written to a temp dir — `catsdogs` is the only shipped dataset using `dataloader.type: "dataloader"` (a plain `Dataset` + `DistributedSampler`, not the `iterative_dataloader` stack the two rows above cover) |
-| `tests/utils/test_misc.py` | `is_power_of_two`, `calculate_tile_overlap`, `patchify`/`unpatchify` roundtrips, `process_root_dirs` (`imagenet` per-class bucketing — evenly/non-evenly-divisible `> data_par_size`, `<= data_par_size`, bucket-content correctness — and the non-`imagenet` branch), `detect_num_channels` (`imagenet` hardcoding with no filesystem touched, `catsdogs`/PIL real-file band-count detection across RGB/`L`/RGBA, `basic_ct`/nibabel real-file 3D-shape detection, the 4D-shape-raises case, missing-`imagesTr`-raises, and independent per-key detection), `shard_mlp_state_dict`/`shard_attention_state_dict` (weight-slice reconstruction, `fc2.bias`/`proj.bias` summing back to the original exactly, `qk_norm` rejection) |
+| `tests/utils/test_misc.py` | `is_power_of_two`, `calculate_tile_overlap`, `patchify`/`unpatchify` roundtrips, `process_root_dirs` (`imagenet` per-class bucketing — evenly/non-evenly-divisible `> data_par_size`, `<= data_par_size`, bucket-content correctness — and the non-`imagenet` branch), `detect_num_channels` (`imagenet` hardcoding with no filesystem touched, `catsdogs`/PIL real-file band-count detection across RGB/`L`/RGBA, `basic_ct`/nibabel real-file 3D-shape detection, the 4D-shape-raises case, missing-`imagesTr`-raises, and independent per-key detection), `detect_img_size` (`basic_ct`/nibabel real-file native-shape detection, `imagenet`/`catsdogs`/PIL real-file native-pixel-size detection using a deliberately non-square fixture to verify the `[width, height]` order isn't accidentally swapped, first-`dict_root_dirs`-key-only sampling, missing-`imagesTr`-raises, empty-`dict_root_dirs`-raises), `shard_mlp_state_dict`/`shard_attention_state_dict` (weight-slice reconstruction, `fc2.bias`/`proj.bias` summing back to the original exactly, `qk_norm` rejection) |
 | `tests/utils/test_pos_embed.py` | 1D/2D/3D sin-cos position embeddings, `SinusoidalEmbeddings` |
 | `tests/utils/test_lr_scheduler.py` | `LinearWarmupCosineAnnealingLR` warmup/annealing shape |
 | `tests/utils/test_metrics.py` | `masked_mse`, `DiceBLoss` |
@@ -293,7 +293,52 @@ tests of their own before this) is the regression test.
   volumes). Every shipped config already specifies `num_channels`
   explicitly, so this is purely additive — the detection logic itself has
   direct Tier 1 coverage in `test_misc.py` (see the table above), separate
-  from `parse_config`'s own still-indirect-only coverage.
+  from `parse_config`'s own still-indirect-only coverage. Same story for
+  `conf['data']['img_size']`, now also optional (falls back to
+  `UCF_VIT.utils.misc.detect_img_size`) — but with a bigger semantic change
+  alongside it: `img_size` now *always* means the real/native size of the
+  data (auto-detectable for every dataset type, unlike `num_channels`),
+  and resizing to a *different* size than native became a separate,
+  optional `dataset_options.resize` step for `imagenet`/`catsdogs` (`resize`
+  used to be required for `imagenet` and didn't exist at all for
+  `catsdogs`, where `tile_size` itself doubled as the resize target).
+  `basic_ct` still has no resize step at all (unchanged) — `parse_config`
+  raises a clear error if `dataset_options.resize` has a `basic_ct` entry.
+  Every shipped `imagenet`/`catsdogs` config picked up an explicit
+  `dataset_options.resize` entry matching its existing `img_size` (`catsdogs`
+  never had one before, since `tile_size` was its implicit resize target),
+  preserving today's exact behavior — zero behavior change for existing
+  configs.
+
+### Found and fixed a real width/height axis-order bug while reviewing this
+
+Auditing `img_size`/`resize`'s actual index order (to answer "does
+`cv.resize`'s output come back `(H, W)` or `(H, W, D)`?") surfaced a real,
+pre-existing bug, independent of the auto-detection work itself:
+`img_size`/`resize`/`tile_size` are stored `[width, height]` (confirmed via
+PIL's `Image.size`, cv2's own `dsize` convention, and `catsdogs.py`'s own
+docstring), but `dataset.py`'s `TileDataIter.__iter__`'s 2D branch (used
+only by `imagenet` in practice — `catsdogs` never reaches `TileDataIter`
+at all, see below) applied `tile_size[0]` (width-derived) to the array's
+height axis and `tile_size[1]` (height-derived) to its width axis. The
+real array `imagenet` produces is `(C, H, W)`: `cv.resize(...,
+dsize=(W, H))` returns `(H, W, C)` (OpenCV's own convention), and
+`np.moveaxis(-1, 0)` only moves the channel axis to the front, it doesn't
+touch H/W order. This was invisible because every shipped config is
+square (`W == H`, so swapping them is a no-op) — but `detect_img_size`
+makes a genuinely non-square `img_size` far more likely for real-world
+data, which would have immediately exposed it (truncated/incomplete
+tiles — numpy silently clips an out-of-bounds slice end rather than
+raising, so this wouldn't even have crashed loudly). Fixed by swapping
+which `tile_size_no_overlap`/`start_overlap`/`end_overlap` index feeds
+the array's first vs. second spatial slice, scoped to only the 2D branch
+(the 3D `basic_ct` branches need no such swap — `basic_ct` has no resize
+step, so its `img_size`'s axes already match the array's axes directly).
+Added `test_tiledataiter_2d_non_square_tile_size_axes_arent_swapped` to
+`tests/dataloaders/test_dataset.py`, deliberately using `H != W` (every
+other `TileDataIter` test in that file is square, and so can't
+distinguish the two possible index-to-axis mappings) — confirmed it fails
+without the fix and passes with it.
 
 ## Running the distributed (Tier 2) tests
 

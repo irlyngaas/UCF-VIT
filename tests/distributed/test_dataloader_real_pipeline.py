@@ -293,7 +293,7 @@ def _build_catsdogs_loader(config_path, world_rank):
         train_list, conf["data"]["dict_in_variables"][dkey_train], conf["data"]["tile_size"],
         adaptive_patching=conf["ap"]["do_ap"], fixed_length=conf["ap"]["fixed_length"],
         patch_size=conf["data"]["patch_size"], num_channels=conf["data"]["num_channels"][dkey_train],
-        dataset=conf["data"]["dataset"],
+        dataset=conf["data"]["dataset"], resize=conf["dataset_options"]["resize"].get(conf["data"]["dataset"]),
     )
     train_sampler = DistributedSampler(
         train_data, shuffle=True, num_replicas=conf["parallelism"]["data_par_size"], rank=world_rank,

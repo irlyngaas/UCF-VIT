@@ -85,7 +85,7 @@ def _rank_indices(file_list, world_size, world_rank, shuffle):
     # reorders each rank's assigned indices, it doesn't change the
     # partitioning itself -- disjointness/coverage hold identically either
     # way, and False keeps this test's expectations simple to state.
-    ds = CatsDogsDataset(file_list, variables=("red", "green", "blue"), tile_size=TILE_SIZE, num_channels=NUM_CHANNELS)
+    ds = CatsDogsDataset(file_list, variables=("red", "green", "blue"), tile_size=TILE_SIZE, num_channels=NUM_CHANNELS, resize=TILE_SIZE)
     sampler = DistributedSampler(ds, num_replicas=world_size, rank=world_rank, shuffle=shuffle)
     assert len(sampler) == FILES_PER_RANK  # exact multiple of world_size -- no drop_last padding
     return ds, sampler, list(sampler)
@@ -140,6 +140,7 @@ def test_catsdogs_adaptive_patching_against_real_images(dist_info):
     ds = CatsDogsDataset(
         file_list, variables=("red", "green", "blue"), tile_size=TILE_SIZE, adaptive_patching=True,
         fixed_length=FIXED_LENGTH, patch_size=PATCH_SIZE, num_channels=NUM_CHANNELS, dataset="catsdogs",
+        resize=TILE_SIZE,
     )
     sampler = DistributedSampler(ds, num_replicas=world_size, rank=world_rank, shuffle=False)
     loader = DataLoader(

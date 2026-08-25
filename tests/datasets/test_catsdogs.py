@@ -80,7 +80,7 @@ def test_catsdogs_dataset_non_adaptive_shape_and_passthrough(tmp_path):
     variables = ("red", "green", "blue")
     ds = CatsDogsDataset(
         paths, variables=variables, tile_size=TILE_SIZE, adaptive_patching=False,
-        num_channels=NUM_CHANNELS, dataset="catsdogs",
+        num_channels=NUM_CHANNELS, dataset="catsdogs", resize=TILE_SIZE,
     )
     image, label, returned_variables, dataset_name = ds[0]
     assert image.shape == (NUM_CHANNELS, TILE_SIZE[0], TILE_SIZE[1])  # channel-first, resized
@@ -90,11 +90,26 @@ def test_catsdogs_dataset_non_adaptive_shape_and_passthrough(tmp_path):
     assert dataset_name == "catsdogs"
 
 
+def test_catsdogs_dataset_resize_none_leaves_native_size(tmp_path):
+    """resize is now a separate, optional step (decoupled from tile_size,
+    which just drives tiling/patch-size math) -- when omitted, images stay
+    at their real native size instead of being forced to tile_size.
+    """
+    paths = _write_fake_images(tmp_path, ["dog.0.jpg"])  # fabricated at 32x32, see _write_fake_images
+    ds = CatsDogsDataset(
+        paths, variables=("red", "green", "blue"), tile_size=TILE_SIZE, adaptive_patching=False,
+        num_channels=NUM_CHANNELS, dataset="catsdogs",
+    )
+    image, label, returned_variables, dataset_name = ds[0]
+    assert image.shape == (NUM_CHANNELS, 32, 32)
+
+
 def test_catsdogs_dataset_adaptive_patching_shapes(tmp_path):
     paths = _write_fake_images(tmp_path, ["cat.0.jpg"])
     ds = CatsDogsDataset(
         paths, variables=("red", "green", "blue"), tile_size=TILE_SIZE, adaptive_patching=True,
         fixed_length=FIXED_LENGTH, patch_size=PATCH_SIZE, num_channels=NUM_CHANNELS, dataset="catsdogs",
+        resize=TILE_SIZE,
     )
     image, seq_img, seq_size, seq_pos, label, variables, dataset_name = ds[0]
     assert image.shape == (NUM_CHANNELS, TILE_SIZE[0], TILE_SIZE[1])
@@ -111,7 +126,7 @@ def test_catsdogs_dataset_adaptive_patching_shapes(tmp_path):
 
 def _non_adaptive_batch(tmp_path, names):
     paths = _write_fake_images(tmp_path, names)
-    ds = CatsDogsDataset(paths, variables=("red", "green", "blue"), tile_size=TILE_SIZE, num_channels=NUM_CHANNELS)
+    ds = CatsDogsDataset(paths, variables=("red", "green", "blue"), tile_size=TILE_SIZE, num_channels=NUM_CHANNELS, resize=TILE_SIZE)
     return [ds[i] for i in range(len(paths))]
 
 
@@ -119,7 +134,7 @@ def _adaptive_batch(tmp_path, names):
     paths = _write_fake_images(tmp_path, names)
     ds = CatsDogsDataset(
         paths, variables=("red", "green", "blue"), tile_size=TILE_SIZE, adaptive_patching=True,
-        fixed_length=FIXED_LENGTH, patch_size=PATCH_SIZE, num_channels=NUM_CHANNELS,
+        fixed_length=FIXED_LENGTH, patch_size=PATCH_SIZE, num_channels=NUM_CHANNELS, resize=TILE_SIZE,
     )
     return [ds[i] for i in range(len(paths))]
 

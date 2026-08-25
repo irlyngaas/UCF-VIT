@@ -465,6 +465,37 @@ def process_root_dirs(dataset, dict_root_dirs, data_par_size):
         dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in dict_root_dirs.items() }
     return dict_lister_trains
 
+def _find_representative_file(root_dir, key, what):
+    """Finds one real file to sample for auto-detecting a per-dataset-key
+    property (channel count, image size, ...), using the same
+    `imagesTr/`-listing convention `process_root_dirs` uses to list
+    non-imagenet datasets.
+
+    Args:
+        root_dir: Root directory for this dataset key (a
+            `dict_root_dirs` value).
+        key: The dataset key `root_dir` belongs to, only used to make the
+            error message specific.
+        what: Short description of what's being detected, only used to
+            make the error message specific (e.g. "num_channels").
+
+    Returns:
+        Path to one real file under `root_dir/imagesTr/`.
+
+    Raises:
+        FileNotFoundError: If `root_dir/imagesTr/` is missing or empty.
+    """
+    images_dir = os.path.join(root_dir, "imagesTr")
+    try:
+        filename = sorted(os.listdir(images_dir))[0]
+    except (FileNotFoundError, IndexError) as e:
+        raise FileNotFoundError(
+            f"Could not auto-detect {what} for dataset key '{key}': "
+            f"no files found under {images_dir}. Set {what} manually "
+            f"in the config for this key instead."
+        ) from e
+    return os.path.join(images_dir, filename)
+
 def detect_num_channels(dataset, dict_root_dirs):
     """Auto-detects the number of channels for each dataset key by reading
     one real representative data file, for use when
@@ -515,16 +546,7 @@ def detect_num_channels(dataset, dict_root_dirs):
 
     num_channels = {}
     for k, root_dir in dict_root_dirs.items():
-        images_dir = os.path.join(root_dir, "imagesTr")
-        try:
-            filename = sorted(os.listdir(images_dir))[0]
-        except (FileNotFoundError, IndexError) as e:
-            raise FileNotFoundError(
-                f"Could not auto-detect num_channels for dataset key '{k}': "
-                f"no files found under {images_dir}. Set num_channels manually "
-                f"in the config for this key instead."
-            ) from e
-        path = os.path.join(images_dir, filename)
+        path = _find_representative_file(root_dir, k, "num_channels")
 
         if dataset == "basic_ct":
             shape = nib.load(path).shape
@@ -542,6 +564,73 @@ def detect_num_channels(dataset, dict_root_dirs):
             num_channels[k] = len(Image.open(path).getbands())
 
     return num_channels
+
+def detect_img_size(dataset, dict_root_dirs):
+    """Auto-detects the real/native size of the data by reading one real
+    representative file, for use when conf['data']['img_size'] is
+    omitted from a training config.
+
+    Unlike num_channels (a per-dataset-key dict), img_size is a single
+    flat 2- or 3-element list shared across the whole dataset ([width,
+    height] for imagenet/catsdogs -- see the "Every other dataset" bullet
+    below for why; axis order as-is for basic_ct) -- parse.py reads it
+    once and uses it directly (e.g. for tile_size), never per
+    dict_root_dirs key. Detection therefore samples
+    just one representative file from the *first* dict_root_dirs key,
+    mirroring the same "first key wins" convention parse.py's own
+    num_channels-to-in_chans reduction already uses (dict iteration order
+    in Python 3.7+ is insertion order, so this is deterministic).
+
+    Unlike num_channels, img_size is meaningful to auto-detect for every
+    dataset type: it always represents the actual size of the real data,
+    never a resize target (resizing to a different size than native is a
+    separate, optional step -- see parse.py's dataset_options.resize
+    handling).
+
+    Behavior, using the same representative-file lookup as
+    detect_num_channels (dict_root_dirs[k]/imagesTr/):
+      - "basic_ct": the file's shape via nibabel's lazy ArrayProxy
+        (nib.load(path).shape reads only the NIfTI header, not the voxel
+        data, so this is cheap even for large volumes) -- returned as-is,
+        matching how img_size's elements are used directly as array axes
+        throughout tiling/patching code, with no axis reordering.
+      - Every other dataset (e.g. "imagenet", "catsdogs"): the file's
+        pixel dimensions via PIL (Image.open(path).size, a cheap, lazy
+        read that doesn't decode full pixel data). PIL's own .size is
+        (width, height), and that's the order returned here unchanged --
+        matching the convention dataset.py's/catsdogs.py's own
+        cv.resize(..., dsize=[resize[0], resize[1]]) calls actually use
+        (cv2's dsize parameter is itself (width, height), and neither
+        call reorders resize's elements before passing them through).
+        This is the opposite of what datamodule.py's own resize docstring
+        claims ("[height, width]") -- that docstring is wrong; the actual,
+        already-shipped runtime behavior (unchanged by this function) is
+        [width, height], and every shipped config being square (e.g.
+        [256, 256]) is why this was never caught.
+
+    Args:
+        dataset: Dataset name ("imagenet", "catsdogs", "basic_ct", ...).
+        dict_root_dirs: Dict mapping each dataset key to its root
+            directory path.
+
+    Returns:
+        The detected size as a list of ints, shaped like
+        conf['data']['img_size'].
+
+    Raises:
+        FileNotFoundError: If dict_root_dirs is empty, or its first key's
+            imagesTr/ directory is missing or empty.
+    """
+    try:
+        k, root_dir = next(iter(dict_root_dirs.items()))
+    except StopIteration:
+        raise FileNotFoundError("Could not auto-detect img_size: dict_root_dirs is empty.")
+    path = _find_representative_file(root_dir, k, "img_size")
+
+    if dataset == "basic_ct":
+        return list(nib.load(path).shape)
+    else:
+        return list(Image.open(path).size)
 
 def calculate_load_balancing_on_the_fly(conf, VERBOSE=False):
     """Computes how many DDP ranks and batches-per-epoch each dataset should get.

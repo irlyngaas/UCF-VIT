@@ -47,18 +47,21 @@ def CatsDogsCollate(batch, adaptive_patching, return_label):
 class CatsDogsDataset(Dataset):
     """Torch `Dataset` for the Kaggle cats-vs-dogs image classification dataset.
 
-    Loads and resizes each image to `tile_size`, derives a binary label from the
-    filename, and optionally adaptively patchifies the image.
+    Loads each image, optionally resizes it to `resize` (leaving it at native
+    size if `resize` is None), derives a binary label from the filename, and
+    optionally adaptively patchifies the image.
     """
 
-    def __init__(self, file_list, variables, tile_size, twoD = True, adaptive_patching = False, fixed_length=196, patch_size=16, num_channels=3, dataset="catsdogs"):
+    def __init__(self, file_list, variables, tile_size, twoD = True, adaptive_patching = False, fixed_length=196, patch_size=16, num_channels=3, dataset="catsdogs", resize=None):
         """Initializes the dataset over a list of image file paths.
 
         Args:
             file_list: List of image file paths, each named like ".../cat.123.jpg"
                 or ".../dog.123.jpg".
             variables: Variable/channel labels to attach to each returned sample.
-            tile_size: `(width, height)` to resize each image to.
+            tile_size: `(width, height)` tiling/patch-size math is based on --
+                the size the data actually is once `resize` (if any) has been
+                applied, i.e. `resize` when set, else the real native size.
             twoD: Whether to use the 2D (`Patchify`) or 3D (`Patchify_3D`) adaptive
                 patcher when `adaptive_patching` is True.
             adaptive_patching: Whether to also compute an adaptive-patching sequence
@@ -67,6 +70,10 @@ class CatsDogsDataset(Dataset):
             patch_size: Patch size used by the adaptive patcher.
             num_channels: Number of image channels.
             dataset: Dataset name to attach to each returned sample.
+            resize: `(width, height)` to resize each image to (matches cv2's own
+                `dsize` convention), or None to leave images at their native size
+                (every file must then already share the same size, since samples
+                in a batch must have matching shapes).
         """
         self.file_list = file_list
         self.variables = variables
@@ -77,6 +84,7 @@ class CatsDogsDataset(Dataset):
         self.num_channels = num_channels
         self.dataset = dataset
         self.twoD = twoD
+        self.resize = resize
 
         if self.adaptive_patching:
             if self.twoD:
@@ -108,7 +116,8 @@ class CatsDogsDataset(Dataset):
         img_path = self.file_list[idx]
         img = Image.open(img_path)
         img = np.array(img)
-        img = cv.resize(img, dsize=[self.tile_size[0],self.tile_size[1]])
+        if self.resize is not None:
+            img = cv.resize(img, dsize=[self.resize[0], self.resize[1]])
         label = img_path.split("/")[-1].split(".")[0]
         label = 1 if label == "dog" else 0
 
