@@ -615,6 +615,13 @@ math. Fixed locally (full Tier 1 suite green, 156 passed); **the actual
 gradient-value comparisons in this test have still never been reached —
 needs a fresh real run to know if they pass.**
 
+Second real run (job 5341295), after the `use_orig_params=True` fix:
+**all 8 ranks report 58 passed, 0 failed** — `test_fsdp_full_shard_
+backward_matches_reference` now passes for real across all `fsdp_size`
+values, alongside everything else in `tests/distributed/`. Both
+correctness test files' backward-pass coverage is now fully verified on
+real Frontier data, closing out this round of work.
+
 ## Running the training smoke test (Tier 3)
 
 ```bash
