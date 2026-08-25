@@ -91,6 +91,21 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
         use_adaptive_pos_emb=conf["ap"]["use_adaptive_pos_emb"],
         weight_init='' if conf["model"]["type"] == "VIT" else 'skip', #Choose ['' or 'skip'] If using VIT use '' otherwise use 'skip'. Option whether to use VITs weight initialization or use the one corresponding to the architecture you choose
         class_token=True if conf["model"]["type"] == "VIT" else False,
+        # Without these, VIT/SAP/MAE/UNETR/DiffusionVIT all fall back to
+        # their constructor defaults (tensor_par_size=1, tensor_par_group=
+        # None) regardless of conf["parallelism"]["tensor_par_size"] --
+        # conf['model']['kwargs'] (built by parse.py's get_kwargs) never
+        # sets them either. That silently built a full, unsharded model on
+        # every rank even when tensor_par_size > 1: every `if
+        # self.tensor_par_size > 1:` guard in arch.py/building_blocks.py
+        # (the real Attention/Mlp sharding, MAE's noise-mask broadcast,
+        # etc.) never fired, so tensor_par_size > 1 ran to completion (data
+        # was still correctly distributed by training.py's process_batch,
+        # which gets tensor_par_group directly from train.py, not through
+        # this function) but did zero actual model-parallel sharding --
+        # pure redundant compute, not real tensor parallelism.
+        tensor_par_size=conf["parallelism"]["tensor_par_size"],
+        tensor_par_group=tensor_par_group,
         **conf['model']['kwargs'],
     ).to(device)
 
@@ -131,6 +146,14 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
                 use_adaptive_pos_emb=conf["ap"]["use_adaptive_pos_emb"],
                 weight_init='' if p_conf["model_type"] == "VIT" else 'skip', #Choose ['' or 'skip'] If using VIT use '' otherwise use 'skip'. Option whether to use VITs weight initialization or use the one corresponding to the architecture you choose
                 class_token=True if p_conf["model_type"] == "VIT" else False,
+                # Same reasoning as the main model_arch(...) call above --
+                # parse_pretrained_config already asserts the pretrained
+                # model's own tensor_par_size matches conf's, and this
+                # model's state_dict() gets merged into `model`'s below, so
+                # it must be sharded the same way or the shapes won't
+                # match.
+                tensor_par_size=conf["parallelism"]["tensor_par_size"],
+                tensor_par_group=tensor_par_group,
                 **p_conf['kwargs'],
             ).to(device)
 

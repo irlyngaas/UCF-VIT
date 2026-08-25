@@ -532,6 +532,48 @@ of `tensor_par_size` 2/4/8), and every other file in `tests/distributed/`
 all pass cleanly on real Frontier data. Both new correctness test files
 are now fully verified for real, closing out this round of Tier 2 work.
 
+### Major finding while scoping a combined `fsdp_size > 1` + `tensor_par_size > 1` test
+
+While investigating how to build that deferred test (which needs to
+construct a real `Block`/`VIT`-family model with `tensor_par_size > 1` the
+same way production does, to wrap in `HYBRID_SHARD` FSDP), found that
+**`model/utils.py`'s `get_model` never actually wires `tensor_par_size`/
+`tensor_par_group` into the model it builds.** `model_arch(...)`'s
+constructor call (and the `use_pretrained_model` path's
+`pretrained_model_arch(...)` call) only passes `**conf['model']['kwargs']`
+plus a fixed list of other kwargs — never `tensor_par_size`/
+`tensor_par_group` — and `conf['model']['kwargs']` (built by `parse.py`'s
+`get_kwargs`) never sets them either. So every `VIT`/`SAP`/`MAE`/`UNETR`/
+`DiffusionVIT` instance built by `get_model` fell back to the class
+defaults (`tensor_par_size=1, tensor_par_group=None`) **regardless of
+`conf["parallelism"]["tensor_par_size"]`.**
+
+Practical effect: every `if self.tensor_par_size > 1:` guard throughout
+`arch.py`/`building_blocks.py` (the real `Attention`/`Mlp` sharding, MAE's
+noise-mask broadcast, etc.) never fired in production. The model was built
+at full, unsharded size on every rank — `training.py`'s `process_batch`
+still correctly distributed data according to the real `tensor_par_group`
+(wired directly from `train.py`, not through `get_model`), so
+`tensor_par_size > 1` configs ran to completion with no crash — which is
+exactly why every `+tensor_par` cell in the Tier 3b feature-matrix passed
+— but did **zero actual model-parallel sharding**: pure redundant compute
+plus broadcast overhead, not real tensor parallelism. This has presumably
+been true since tensor parallelism was first added to this repo, and is
+unrelated to any of this session's other fixes.
+
+Fixed by passing `tensor_par_size=conf["parallelism"]["tensor_par_size"]`
+and `tensor_par_group=tensor_par_group` (already an existing `get_model`
+parameter) to both `model_arch(...)` call sites. Fixed locally (full Tier
+1 suite green, 156 passed) — **not yet verified against real Frontier
+data.** This is a much bigger behavioral change than the earlier fixes in
+this file (those were data-plumbing bugs; this changes whether the model
+itself shards at all for the first time), so every `tensor_par_size > 1`
+config — including every already-passing `+tensor_par` Tier 3b cell and
+the whole Tier 2 distributed suite — needs a fresh real run to check for
+fallout: real sharded `Attention`/`Mlp` layers, actually exercised for the
+first time by the full `train.py` pipeline, may surface new bugs that
+running full-size unsharded models never could.
+
 ## Running the training smoke test (Tier 3)
 
 ```bash
