@@ -1338,6 +1338,37 @@ Frontier data.
    Fixed locally (full Tier 1 suite green, 153 passed); not yet
    re-verified against a real Frontier run.
 
+9. Reran the full matrix (job 5341029) against item 8's fix: **17 PASS, 1
+   FAIL**. The `min_files` fix worked — `basic_ct-sap+tensor_par` got well
+   past `setup()` this time (180s in, well into real training) — but still
+   failed, with yet another new, different error:
+   `einops.EinopsError: Shape mismatch, 512 != 64` in `training.py`'s
+   `train_step` (`seq_label = einops.rearrange(batch["seq_label"], 'b c
+   (ps1 ps2 ps3) (s1 s2 s3)-> ...')`), on a non-rank-0 process, with
+   `batch["seq_label"].shape == (32, 4, 512, 64)` where the pattern expected
+   `(..., 64, 512)` (`ps1*ps2*ps3=4*4*4=64`, `s1*s2*s3=8*8*8=512`) — the
+   last two dims were transposed. Traced to yet another placeholder-shape
+   bug in `process_batch`, in the exact same never-before-exercised
+   do_ap:True + Segmentation + `tensor_par_size>1` code path as items 7/8:
+   the `seq_label` placeholder (both `twoD` and 3D variants) declared shape
+   `(batch_size, num_classes, fixed_length, patch_size**N)`, but the real
+   per-sample construction (`dataset.py`'s `np.reshape(seq_label,
+   [patch_size**N, -1, 1])` composed with `datamodule.py`'s
+   `seq_mask.permute(2, 0, 1)` stacking) actually produces
+   `(batch_size, num_classes, patch_size**N, fixed_length)` — the two
+   trailing dims swapped. Since both orderings have the same total element
+   count, `dist.broadcast` (which fills a tensor's existing memory without
+   reshaping) copied the bytes without erroring, and the corruption only
+   surfaced later, downstream in `train_step`'s `einops.rearrange` (which
+   is why this bug survived items 7/8's local Tier 1 checks and the earlier
+   `label`/`seq_label` dtype fixes — dtype matched, only the shape was
+   wrong). Fixed both placeholders (`twoD`: `patch_size*patch_size,
+   fixed_length`; 3D: `patch_size*patch_size*patch_size, fixed_length`) to
+   match the real dim order.
+
+   Fixed locally (full Tier 1 suite green, 153 passed); not yet
+   re-verified against a real Frontier run.
+
 ## Validating a config file by hand
 
 `utils/validate_config.py` is a standalone utility — the same one

@@ -368,7 +368,24 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
                             # requiring do_ap:True).
                             label = torch.zeros(batch_size, 1, tile_size[0], tile_size[1], dtype=torch.uint8).to(device)
                             if conf["model"]["type"] in ["UNETR", "SAP"]:
-                                seq_label = torch.zeros(batch_size, conf["model"]["kwargs"]["num_classes"], fixed_length, patch_size*patch_size, dtype=precision_dt).to(device)
+                                # Real seq_label is (batch_size, num_classes,
+                                # patch_size*patch_size, fixed_length) -- the
+                                # patch-volume dim comes BEFORE fixed_length,
+                                # not after (see dataset.py's
+                                # np.reshape(seq_label, [patch_size**2, -1,
+                                # 1]) and datamodule.py's
+                                # seq_mask.permute(2, 0, 1) stacking, which
+                                # together put patch_size**2 ahead of
+                                # fixed_length). train_step's einops.rearrange
+                                # ('b c (ps1 ps2) (s1 s2) -> ...') relies on
+                                # this exact order -- the previous
+                                # (fixed_length, patch_size*patch_size)
+                                # ordering here matched the real tensor's
+                                # *total* element count but not its per-axis
+                                # shape, so it broadcast fine but then failed
+                                # downstream with einops.EinopsError: Shape
+                                # mismatch on non-rank-0 processes.
+                                seq_label = torch.zeros(batch_size, conf["model"]["kwargs"]["num_classes"], patch_size*patch_size, fixed_length, dtype=precision_dt).to(device)
                 else:
                     data = torch.zeros(batch_size, num_channels[dict_key], tile_size[0], tile_size[1], tile_size[2], dtype=precision_dt).to(device)
                     seq = torch.zeros(batch_size, num_channels[dict_key], fixed_length, patch_size*patch_size*patch_size, dtype=precision_dt).to(device)
@@ -391,7 +408,9 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
                             # the twoD branch above.
                             label = torch.zeros(batch_size, 1, tile_size[0], tile_size[1], tile_size[2], dtype=torch.uint8).to(device)
                             if conf["model"]["type"] in ["UNETR", "SAP"]:
-                                seq_label = torch.zeros(batch_size, conf["model"]["kwargs"]["num_classes"], fixed_length, patch_size*patch_size*patch_size, dtype=precision_dt).to(device)
+                                # Same patch-volume-before-fixed_length
+                                # reasoning as the twoD branch above.
+                                seq_label = torch.zeros(batch_size, conf["model"]["kwargs"]["num_classes"], patch_size*patch_size*patch_size, fixed_length, dtype=precision_dt).to(device)
                 variables = [None] * num_channels[dict_key]
 
             #Broadcast data batch to the rest of the tensor parallel group
