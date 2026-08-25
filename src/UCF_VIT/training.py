@@ -31,8 +31,12 @@ def load_optimizer_scheduler_from_checkpoint(conf, optimizer, scheduler, data_se
     """
     src_rank = dist.get_rank() - conf["parallelism"]["tensor_par_size"] * dist.get_rank(group=data_seq_ort_group)
 
-    map_location = 'cpu' #TODO: Choose cpu or cuda+str
-    #map_location = 'cuda:'+str(device)
+    # Loaded to CPU (not the target device) to avoid transiently doubling GPU
+    # memory (checkpoint + already-allocated model/optimizer state coexisting)
+    # and to stay portable across runs where rank->GPU mapping may differ --
+    # optimizer.load_state_dict below casts state tensors to each param's own
+    # device automatically, so this doesn't leave anything stranded on CPU.
+    map_location = 'cpu'
 
     checkpoint = torch.load(conf["trainer"]["checkpoint_path"]+"/"+conf["trainer"]["checkpoint_filename"]+"_rank_"+str(src_rank)+".ckpt",map_location=map_location)
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])

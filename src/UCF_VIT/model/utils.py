@@ -160,8 +160,10 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
             ).to(device)
 
             if world_rank< conf["parallelism"]["tensor_par_size"]:
-                map_location = 'cpu' #TODO: Choose cpu or cuda+str
-                #map_location = 'cuda:'+str(device)
+                # Loaded to CPU, not the target device -- see
+                # load_optimizer_scheduler_from_checkpoint's map_location
+                # comment in training.py for why.
+                map_location = 'cpu'
                 pretrained_checkpoint = torch.load(conf["pretrained_model"]["checkpoint_path"]+"/"+conf["trainer"]["pretrained_checkpoint_filename"]+"_rank_"+str(world_rank)+".ckpt",map_location=map_location)
                 pretrained_model.load_state_dict(pretrained_checkpoint['model_state_dict'])
 
@@ -207,8 +209,10 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
                #load initial model weights and synchronize model weights that are not in the training block among sequence parallel GPUs
                src_rank = dist.get_rank() - dist.get_rank(group=tensor_par_group)
 
-               map_location = 'cpu' #TODO: Choose cpu or cuda+str
-               #map_location = 'cuda:'+str(device)
+               # Loaded to CPU, not the target device -- see
+               # load_optimizer_scheduler_from_checkpoint's map_location
+               # comment in training.py for why.
+               map_location = 'cpu'
                model.load_state_dict(torch.load(conf["trainer"]["checkpoint_path"]+'/initial_'+str(0)+'.pth',map_location=map_location),strict=False)
 
     else: #Resume from checkpoint
@@ -216,8 +220,10 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
             if os.path.exists(conf["trainer"]["checkpoint_path"]+"/"+conf["trainer"]["checkpoint_filename"]+"_rank_"+str(world_rank)+".ckpt"):
                 print("resume from checkpoint was set to True. Checkpoint path found.",flush=True)
 
-                map_location = 'cpu' #TODO: Choose cpu or cuda+str
-                #map_location = 'cuda:'+str(device)
+                # Loaded to CPU, not the target device -- see
+                # load_optimizer_scheduler_from_checkpoint's map_location
+                # comment in training.py for why.
+                map_location = 'cpu'
 
                 checkpoint = torch.load(conf["trainer"]["checkpoint_path"]+"/"+conf["trainer"]["checkpoint_filename"]+"_rank_"+str(world_rank)+".ckpt",map_location=map_location)
                 model.load_state_dict(checkpoint['model_state_dict'])
