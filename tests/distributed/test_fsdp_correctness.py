@@ -97,16 +97,31 @@ def test_fsdp_full_shard_forward_matches_reference(fsdp_size, dist_info):
     with torch.no_grad():
         expected = reference(x)
 
-    # data_par_size == fsdp_size and simple_ddp_size == 1 is exactly the
-    # combination model/utils.py's get_model uses to select FULL_SHARD
-    # (fsdp_size > 1 and simple_ddp_size == 1) rather than HYBRID_SHARD or
-    # NO_SHARD.
+    # data_par_size must span the *entire* world (tensor_par_size=1 here,
+    # and production's own parse.py asserts data_par_size*tensor_par_size
+    # == world_size) -- NOT just fsdp_size. init_par_groups's dist.new_group
+    # calls only ever reference ranks inside range(data_par_size); passing
+    # data_par_size=fsdp_size (< WORLD_SIZE whenever fsdp_size is 2 or 4)
+    # left every rank >= fsdp_size with fsdp_group=None, so their FSDP(...,
+    # process_group=None, ...) call below silently fell back to the
+    # world-default 8-rank group -- a real, different-sized group than the
+    # fsdp_size-rank group ranks < fsdp_size got for the *same* nominal
+    # wrap call. That mismatch is exactly what caused a real Frontier run
+    # (job 5339980) to abort inside FSDP's own _move_states_to_device.
+    # simple_ddp_size = data_par_size // fsdp_size (not 1) is what actually
+    # partitions the full world into data_par_size/fsdp_size independent
+    # fsdp_size-rank FULL_SHARD groups, matching the FULL_SHARD selection
+    # in model/utils.py's get_model (fsdp_size > 1, simple_ddp_size == 1
+    # there refers to *one* replica's own config -- not a constraint this
+    # test's group construction needs to mirror literally).
+    data_par_size = WORLD_SIZE
+    simple_ddp_size = data_par_size // fsdp_size
     _, _, _, fsdp_group, _ = init_par_groups(
         world_rank=world_rank,
-        data_par_size=fsdp_size,
+        data_par_size=data_par_size,
         tensor_par_size=1,
         fsdp_size=fsdp_size,
-        simple_ddp_size=1,
+        simple_ddp_size=simple_ddp_size,
     )
 
     # Same seed as the reference -> bit-identical pre-wrap weights (same

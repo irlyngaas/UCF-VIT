@@ -456,11 +456,35 @@ finite, correctly-ranged batches.
 `test_tensor_parallel_correctness.py` and `test_fsdp_correctness.py` (added
 later, real multi-rank numerical-correctness checks for `tensor_par_size >
 1` and `fsdp_size > 1` respectively — see their own module docstrings and
-their `tests/utils/test_misc.py` weight-slicing-helper coverage above) —
-**not yet run against real Frontier data.** Both `importorskip` cleanly in
-any environment without `timm`/`monai`/`xformers` installed, confirmed
-locally. Run `run_distributed_tests.sh` to exercise them for real; if either
-file's tolerance (`rtol`/`atol`) turns out too tight, retune and rerun.
+their `tests/utils/test_misc.py` weight-slicing-helper coverage above). Both
+`importorskip` cleanly in any environment without `timm`/`monai`/`xformers`
+installed, confirmed locally. Run `run_distributed_tests.sh` to exercise
+them for real; if either file's tolerance (`rtol`/`atol`) turns out too
+tight, retune and rerun.
+
+First real run (job 5339980) found a real bug in `test_fsdp_correctness.py`
+itself, not production code: `init_par_groups` was called with
+`data_par_size=fsdp_size` for every `fsdp_size` value, but `data_par_size`
+must span the *entire* world when `tensor_par_size=1` (production's own
+`parse.py` asserts `data_par_size*tensor_par_size == world_size`) — passing
+just `fsdp_size` (2 or 4, both < `WORLD_SIZE:8`) left every rank outside
+`range(fsdp_size)` with `fsdp_group=None`, so those ranks' `FSDP(...,
+process_group=None, ...)` call silently fell back to the world-default
+8-rank group instead — a real size mismatch against the `fsdp_size`-rank
+group the other ranks got, for the *same* nominal wrap call. This aborted
+Frontier's real run with a fatal `Aborted` signal inside FSDP's own
+`_move_states_to_device`, mid-`fsdp_size=2` for most ranks (2 of 8 ranks —
+the ones inside the real subgroup — did print `PASSED` first). Fixed by
+passing `data_par_size=WORLD_SIZE` and `simple_ddp_size=WORLD_SIZE //
+fsdp_size` (not `1`), which makes `init_par_groups` actually partition the
+full 8-rank world into `WORLD_SIZE // fsdp_size` independent, symmetric
+`fsdp_size`-rank FULL_SHARD groups. `test_tensor_parallel_correctness.py`'s
+own `init_par_groups` call already derived `data_par_size = WORLD_SIZE //
+tensor_par_size` correctly and needed no change. Neither
+`test_init_par_groups.py` nor `test_tensor_parallel_correctness.py` (later
+alphabetically) got to run at all in that job — the whole `srun` step was
+cancelled once one rank aborted. Fixed locally (full Tier 1 suite green,
+153 passed); not yet re-verified against a real Frontier run.
 
 ## Running the training smoke test (Tier 3)
 
