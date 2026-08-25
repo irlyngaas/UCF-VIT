@@ -33,7 +33,6 @@ class FileReader(IterableDataset):
         gx,
         ddp_group,
         data_par_size: int = 1,
-        twoD: bool = False,
         return_label: bool = False,
         keys_to_add: int = 1,
         dataset: str = "imagenet",
@@ -52,7 +51,6 @@ class FileReader(IterableDataset):
                 `gx`.
             data_par_size: Total number of data-parallel ranks; overridden to 1 if
                 `torch.distributed` is not initialized.
-            twoD: Whether the data is 2D or 3D; stored but not directly used here.
             return_label: Whether to read and yield a label alongside the data.
             keys_to_add: Number of times to repeat iteration over the (sharded)
                 file list per epoch, used to balance dataset sizes.
@@ -71,7 +69,6 @@ class FileReader(IterableDataset):
         file_list = file_list[start_idx:end_idx]
         self.file_list = file_list
         self.data_par_size = data_par_size
-        self.twoD = twoD
         self.return_label = return_label
         self.variables = variables
         self.gx = gx
