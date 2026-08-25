@@ -222,6 +222,16 @@ def test_fsdp_full_shard_backward_matches_reference(fsdp_size, dist_info):
         mixed_precision=FLOAT32_POLICY,
         forward_prefetch=True,
         limit_all_gathers=False,
+        # Only needed for this backward test, not the forward test/
+        # production's own FSDP(...) call: summon_full_params(...,
+        # with_grads=True) below requires it -- PyTorch's own
+        # _validate_unshard_params_args raises NotImplementedError for
+        # with_grads=True unless use_orig_params=True (confirmed against
+        # a real Frontier run, job 5341269). Doesn't change FULL_SHARD's
+        # actual sharding/gradient math, just how parameters are exposed
+        # for access (original nn.Parameter objects vs. one internal
+        # FlatParameter).
+        use_orig_params=True,
     ).eval()
 
     x_actual = _build_input(local_rank).requires_grad_(True)

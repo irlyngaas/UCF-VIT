@@ -590,7 +590,30 @@ training, just silently corrupt gradients. Added
 table entries above and each test's own docstring for exactly what's
 compared and why. Fixed/added locally (full Tier 1 suite green, 156
 passed unchanged — these are all-new Tier 2 files that skip cleanly via
-`importorskip` locally); **not yet run against real Frontier data.**
+`importorskip` locally).
+
+First real run (job 5341269): `test_mlp_tensor_parallel_backward_
+matches_reference` and `test_attention_tensor_parallel_backward_
+matches_reference` both **passed for real** (all `tensor_par_size`
+values) — the gradient-slicing reuse of `shard_mlp_state_dict`/
+`shard_attention_state_dict` and the unsharded-bias/input-gradient
+reasoning both check out. `test_fsdp_full_shard_backward_matches_
+reference` failed for every `fsdp_size`, but at the
+`FSDP.summon_full_params(..., with_grads=True)` call itself, before ever
+reaching the actual gradient comparisons: `NotImplementedError:
+with_grads=True, use_orig_params=False, offload_to_cpu=False is not
+supported yet`. Traced directly to PyTorch's own
+`_validate_unshard_params_args` (`torch/distributed/fsdp/
+_unshard_param_utils.py`): `with_grads=True` requires
+`use_orig_params=True` on the `FSDP(...)` wrapper, which neither this
+test nor production's own `get_model` sets (both default to `False`).
+Fixed by adding `use_orig_params=True` to this backward test's `FSDP(...)`
+call only (not the forward test, not production) — it only changes how
+parameters are exposed for access (original `nn.Parameter` objects vs.
+one internal `FlatParameter`), not `FULL_SHARD`'s actual sharding/gradient
+math. Fixed locally (full Tier 1 suite green, 156 passed); **the actual
+gradient-value comparisons in this test have still never been reached —
+needs a fresh real run to know if they pass.**
 
 ## Running the training smoke test (Tier 3)
 
