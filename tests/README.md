@@ -484,7 +484,8 @@ tensor_par_size` correctly and needed no change. Neither
 `test_init_par_groups.py` nor `test_tensor_parallel_correctness.py` (later
 alphabetically) got to run at all in that job — the whole `srun` step was
 cancelled once one rank aborted. Fixed locally (full Tier 1 suite green,
-153 passed); not yet re-verified against a real Frontier run.
+153 passed) — verified against real Frontier data by job 5341031 below
+(confirmed working: no more abort, all `fsdp_size` values pass).
 
 Second real run (job 5341031), after that fix: `test_fsdp_correctness.py`
 passed for real (all `fsdp_size` values, no more abort), and
@@ -522,8 +523,14 @@ checks each shard against it directly, and
 `test_shard_attention_state_dict_reconstructs_full_proj_weight` (the old
 test's still-valid `proj.weight` assertion, split out on its own since
 `proj`'s slicing didn't need the same treatment). Fixed locally (full
-Tier 1 suite green, 156 passed — the extra 3 vs the previous 153 are this
-new coverage); not yet re-verified against a real Frontier run.
+Tier 1 suite green, 156 passed).
+
+Third real run (job 5341143), after the `shard_attention_state_dict` fix:
+**all 8 ranks report 49 passed, 0 failed** — `test_fsdp_correctness.py`,
+`test_tensor_parallel_correctness.py` (`Mlp` and now `Attention` too, all
+of `tensor_par_size` 2/4/8), and every other file in `tests/distributed/`
+all pass cleanly on real Frontier data. Both new correctness test files
+are now fully verified for real, closing out this round of Tier 2 work.
 
 ## Running the training smoke test (Tier 3)
 
