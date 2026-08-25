@@ -1578,6 +1578,17 @@ Frontier data.
     Fixed locally (full Tier 1 suite green, 156 passed); not yet
     re-verified against a real Frontier run.
 
+11. Reran the full matrix (job 5341294) against item 10's contiguous-
+    broadcast fixes: **18 PASS, 0 FAIL — every cell passes.** Both
+    `basic_ct-unetr+twoD+tensor_par` and `basic_ct-sap+tensor_par` (the
+    two that broke when `get_model`'s `tensor_par_size` wiring fix first
+    made real sharding active) now pass. This closes out the whole chain
+    of bugs surfaced by that fix — `get_model` now genuinely wires
+    `tensor_par_size`/`tensor_par_group` into the model, real sharded
+    `Attention`/`Mlp` layers run end-to-end through the full `train.py`
+    pipeline for every model type, and the full feature matrix is clean
+    again.
+
 ## Validating a config file by hand
 
 `utils/validate_config.py` is a standalone utility — the same one
