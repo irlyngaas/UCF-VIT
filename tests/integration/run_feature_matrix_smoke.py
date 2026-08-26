@@ -134,11 +134,14 @@ FEATURE_MATRIX = [
         # adaptive-patching branch, not TileDataIter/ProcessChannels.
     ),
 
-    # --- tiling.do_tiling:True -- catsdogs excluded: dataloader.type:
-    # "dataloader" never invokes TileDataIter at all (train.py routes it
-    # straight to CatsDogsDataset), and CatsDogsDataset's own tile_size is
-    # purely a cv.resize target, not a tiling grid -- "tiling" isn't a
-    # meaningful feature to exercise there at all.
+    # --- tiling.do_tiling:True. catsdogs is included even though
+    # dataloader.type: "dataloader" never invokes TileDataIter at all
+    # (train.py routes it straight to CatsDogsDataset) -- CatsDogsDataset
+    # gained its own div/tile_overlap tiling this session (a map-style
+    # __len__/__getitem__ mechanism, not TileDataIter's IterableDataset
+    # expansion), so tiling is now a meaningful, real feature to exercise
+    # there too, not just a resize target. Not yet run against real
+    # Frontier data before this cell existed.
     # min_files_override is deliberately small: do_tiling multiplies each
     # real file into div**N samples, which DEFAULT_MIN_FILES/
     # make_smoke_config's batch_size*data_par_size cap doesn't account for
@@ -159,6 +162,20 @@ FEATURE_MATRIX = [
         {"tiling": {"do_tiling": True, "div": 4, "tile_overlap": 0}},
         min_files_override=16,
         # tile_size becomes 64x64, still divisible by patch_size:16.
+    ),
+    FeatureMatrixCell(
+        "catsdogs/classification/base_config.yaml", "catsdogs-classification+do_tiling",
+        {"tiling": {"do_tiling": True, "div": 4, "tile_overlap": 0}},
+        min_files_override=16,
+        # dataset_options.resize['catsdogs']:[256,256] -> effective_size 256
+        # -> tile_size becomes 64x64, same shape as imagenet-classification+
+        # do_tiling above. Exercises CatsDogsDataset's own div*div __len__
+        # scaling and per-tile __getitem__ slicing (see catsdogs.py) against
+        # real photos for the first time -- Tier 1 (tests/datasets/
+        # test_catsdogs.py) already covers this against small synthetic
+        # JPEGs, including a deliberately non-square regression test for the
+        # width/height axis-order bug found and fixed elsewhere this session,
+        # but never against real Frontier data/DistributedSampler/DataLoader.
     ),
 
     # --- data.twoD:True -- basic_ct only; imagenet/catsdogs already always

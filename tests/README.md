@@ -1254,7 +1254,7 @@ the exact overrides and reasoning behind each cell):
 | Feature | Cell(s) |
 | --- | --- |
 | `ap.do_ap:True` | `basic_ct/unetr`, `basic_ct/mae`, `imagenet/classification`, `catsdogs/classification` |
-| `tiling.do_tiling:True` | `basic_ct/unetr`, `imagenet/classification` (`catsdogs` excluded — its `dataloader.type: "dataloader"` never invokes `TileDataIter`; `tile_size` there is purely a resize target, not a tiling grid) |
+| `tiling.do_tiling:True` | `basic_ct/unetr`, `imagenet/classification`, `catsdogs/classification` (the last via `CatsDogsDataset`'s own `div`/`tile_overlap` tiling added this session, not `TileDataIter` — `catsdogs`'s `dataloader.type: "dataloader"` never invokes that) |
 | `data.twoD:True` | `basic_ct/unetr` only (`imagenet`/`catsdogs` always run `twoD:True` already — `parse.py` forces it whenever `img_size` has 2 entries) |
 | `parallelism.tensor_par_size:2` | `imagenet/classification` (+ resume cycle), `basic_ct/mae`, `catsdogs/classification`, `basic_ct/sap`, `catsdogs/diffusion` |
 | Multi-feature combinations | `basic_ct/unetr` (`do_ap`+`do_tiling`, `do_ap`+`twoD`, `twoD`+`tensor_par_size`), `basic_ct/mae` (`twoD`+`do_tiling`), `imagenet/classification` (`do_ap`+`tensor_par_size`, `do_tiling`+`tensor_par_size`) |
@@ -1311,7 +1311,7 @@ own overrides, exactly as `make_smoke_config` would build it) is fed
 through the real `UCF_VIT.parse.parse_config` with
 `load_balance_offline=True` (skips the `data_par_size*tensor_par_size==
 world_size` assertion, so even the `tensor_par_size:2` cells validate with
-zero real GPUs). All 18 cells pass this locally before ever touching real
+zero real GPUs). All 19 cells pass this locally before ever touching real
 Frontier data.
 
 **Real runs on Frontier so far:**
