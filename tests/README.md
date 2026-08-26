@@ -762,6 +762,18 @@ values, alongside everything else in `tests/distributed/`. Both
 correctness test files' backward-pass coverage is now fully verified on
 real Frontier data, closing out this round of work.
 
+Third real run (job 5347343), after the `test_hybrid_shard_correctness.py`
+file was added and the `interp_size`/`img_size`/`resize`/catsdogs-tiling
+work landed: **all 8 ranks report 60 passed, 0 failed** —
+`test_hybrid_shard_forward_matches_reference[2-2-2]`/`test_hybrid_shard_
+backward_matches_reference[2-2-2]` pass for the first time ever (this file
+had only been `importorskip`-verified locally before), and
+`test_dataloader_real_pipeline.py`/`test_catsdogs_real_data.py` passing
+confirms the `img_size`/`resize` decoupling and the `TileDataIter`
+width/height axis-order fix work correctly against real data. Everything
+else in `tests/distributed/` still passes too — no regressions from any of
+that work.
+
 ## Running the training smoke test (Tier 3)
 
 ```bash
