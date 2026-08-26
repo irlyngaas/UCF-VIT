@@ -1,0 +1,265 @@
+"""Tests for pretrained-checkpoint loading at a different h:w[:d] resolution.
+
+Covers three things introduced/fixed together:
+
+1. `UCF_VIT.utils.pos_embed.interpolate_pos_embed`/`interpolate_pos_embed_3d` --
+   rewritten to take the original grid shape as an explicit argument instead of
+   guessing it from a hardcoded 2:1 width:height ratio (the old code was wrong
+   for every shipped config, all of which are square). Generalizes to any
+   independent height:width[:depth] ratio, for both the pretrained and the new
+   grid.
+2. `UCF_VIT.model.utils.extract_encoder_state_dict` -- an allowlist-based
+   generalization of the encoder-extraction step that previously only worked
+   for `model_type == "MAE"` (every other pretrained source silently
+   transplanted nothing at all).
+3. `UCF_VIT.model.utils._transplant_pos_embed` -- resizes the extracted
+   `pos_embed` entry to the new model's own shape, dispatching between the 2D/3D
+   grid case and the flat (adaptive, non-sqrt_len_method) case, and rejecting
+   `sqrt_len_method:True` (`SAP`/`UNETR+do_ap`) explicitly rather than silently
+   producing a wrong-shaped result (see this session's own investigation notes
+   for why that regime's `grid_size` doesn't reflect its real token count).
+
+Requires timm/monai/xformers (building_blocks.py's real, unconditional
+top-level imports, transitively pulled in by model/utils.py itself) -- see
+tests/distributed/test_tensor_parallel_correctness.py's module docstring for
+why this skips cleanly via importorskip instead of erroring at collection.
+"""
+
+import pytest
+
+pos_embed_mod = pytest.importorskip(
+    "UCF_VIT.utils.pos_embed",
+    reason="needs the real UCF_VIT.model.building_blocks deps (timm/monai/xformers) -- run in the forge-vit env",
+)
+model_utils_mod = pytest.importorskip(
+    "UCF_VIT.model.utils",
+    reason="needs the real UCF_VIT.model.building_blocks deps (timm/monai/xformers) -- run in the forge-vit env",
+)
+arch_mod = pytest.importorskip(
+    "UCF_VIT.model.arch",
+    reason="needs the real UCF_VIT.model.building_blocks deps (timm/monai/xformers) -- run in the forge-vit env",
+)
+
+interpolate_pos_embed = pos_embed_mod.interpolate_pos_embed
+interpolate_pos_embed_3d = pos_embed_mod.interpolate_pos_embed_3d
+extract_encoder_state_dict = model_utils_mod.extract_encoder_state_dict
+_transplant_pos_embed = model_utils_mod._transplant_pos_embed
+VIT = arch_mod.VIT
+MAE = arch_mod.MAE
+
+import torch
+
+
+# ---------------------------------------------------------------------------
+# interpolate_pos_embed / interpolate_pos_embed_3d
+# ---------------------------------------------------------------------------
+
+
+def test_interpolate_pos_embed_2d_non_square_independent_ratio():
+    embed_dim = 4
+    orig_grid = (8, 16)
+    new_grid = (16, 8)  # swapped ratio, not just a uniform rescale
+    pos_embed = torch.randn(1, orig_grid[0] * orig_grid[1], embed_dim)
+
+    resized = interpolate_pos_embed(pos_embed, orig_grid, new_grid)
+
+    assert resized.shape == (1, new_grid[0] * new_grid[1], embed_dim)
+
+
+def test_interpolate_pos_embed_2d_another_independent_ratio():
+    embed_dim = 4
+    orig_grid = (4, 8)
+    new_grid = (8, 4)
+    pos_embed = torch.randn(1, orig_grid[0] * orig_grid[1], embed_dim)
+
+    resized = interpolate_pos_embed(pos_embed, orig_grid, new_grid)
+
+    assert resized.shape == (1, new_grid[0] * new_grid[1], embed_dim)
+
+
+def test_interpolate_pos_embed_2d_same_size_is_a_true_noop():
+    embed_dim = 4
+    grid = (5, 7)
+    pos_embed = torch.randn(1, grid[0] * grid[1], embed_dim)
+
+    resized = interpolate_pos_embed(pos_embed, grid, grid)
+
+    assert resized is pos_embed
+
+
+def test_interpolate_pos_embed_2d_preserves_class_token_prefix():
+    embed_dim = 4
+    orig_grid = (4, 8)
+    new_grid = (8, 4)
+    cls_row = torch.full((1, 1, embed_dim), 99.0)
+    grid_tokens = torch.randn(1, orig_grid[0] * orig_grid[1], embed_dim)
+    pos_embed = torch.cat([cls_row, grid_tokens], dim=1)
+
+    resized = interpolate_pos_embed(pos_embed, orig_grid, new_grid, num_prefix_tokens=1)
+
+    assert resized.shape == (1, 1 + new_grid[0] * new_grid[1], embed_dim)
+    assert torch.equal(resized[:, :1], cls_row)
+
+
+def test_interpolate_pos_embed_3d_non_cubic_independent_ratio():
+    embed_dim = 4
+    orig_grid = (4, 8, 16)
+    new_grid = (8, 4, 4)
+    pos_embed = torch.randn(1, orig_grid[0] * orig_grid[1] * orig_grid[2], embed_dim)
+
+    resized = interpolate_pos_embed_3d(pos_embed, orig_grid, new_grid)
+
+    assert resized.shape == (1, new_grid[0] * new_grid[1] * new_grid[2], embed_dim)
+
+
+def test_interpolate_pos_embed_3d_same_size_is_a_true_noop():
+    embed_dim = 4
+    grid = (4, 6, 8)
+    pos_embed = torch.randn(1, grid[0] * grid[1] * grid[2], embed_dim)
+
+    resized = interpolate_pos_embed_3d(pos_embed, grid, grid)
+
+    assert resized is pos_embed
+
+
+# ---------------------------------------------------------------------------
+# extract_encoder_state_dict
+# ---------------------------------------------------------------------------
+
+
+def test_extract_encoder_state_dict_keeps_only_shared_vit_attrs():
+    fake_state_dict = {
+        "patch_embed.proj.weight": 1,
+        "pos_embed": 2,
+        "cls_token": 3,
+        "blocks.0.attn.qkv.weight": 4,
+        "norm.weight": 5,
+        "var_embed": 6,
+        "head.weight": 7,  # VIT's own classification head -- task-specific
+        "decoder_pred.weight": 8,  # MAE/DiffusionVIT decoder
+        "decoder_norm.weight": 9,
+        "mask_token": 10,
+        "neck.0.weight": 11,  # SAP decoder
+        "mask_header.0.weight": 12,  # SAP decoder
+        # UNETR's own skip-connection convs -- decoder-side, NOT the
+        # transformer encoder, despite the misleading "encoder" name. The
+        # exact case a substring-based ("decoder" not in k) denylist would
+        # get wrong; this is why extract_encoder_state_dict is an allowlist.
+        "encoder1.layer.conv1.weight": 13,
+        "out.conv.weight": 14,
+    }
+
+    result = extract_encoder_state_dict(fake_state_dict)
+
+    assert result == {
+        "patch_embed.proj.weight": 1,
+        "pos_embed": 2,
+        "cls_token": 3,
+        "blocks.0.attn.qkv.weight": 4,
+        "norm.weight": 5,
+        "var_embed": 6,
+    }
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: pretrain at one h:w ratio, load at a different h:w[:d] ratio
+# ---------------------------------------------------------------------------
+
+_COMMON_KWARGS = dict(
+    embed_dim=8, depth=1, num_heads=1, mlp_ratio=1.0, in_chans=1,
+    fixed_length=16, adaptive_patching=False,
+)
+
+
+def _load_pretrained_encoder(pretrained_model, model):
+    """Mirrors get_model's pretrained branch: extract + transplant + merge."""
+    encoder_dict = extract_encoder_state_dict(pretrained_model.state_dict())
+    _transplant_pos_embed(encoder_dict, pretrained_model, model)
+    model_dict = model.state_dict()
+    model_dict.update(encoder_dict)
+    model.load_state_dict(model_dict)
+
+
+def test_pretrained_loading_2d_non_square_ratio_change_same_architecture():
+    pretrained = VIT(
+        img_size=(16, 32), patch_size=4, twoD=True, num_classes=2,
+        class_token=True, pos_embed="learn", **_COMMON_KWARGS,
+    )
+    new_model = VIT(
+        img_size=(32, 16), patch_size=4, twoD=True, num_classes=3,
+        class_token=True, pos_embed="learn", **_COMMON_KWARGS,
+    )
+    fresh_new_pos_embed = new_model.pos_embed.clone()
+
+    _load_pretrained_encoder(pretrained, new_model)
+
+    assert new_model.pos_embed.shape == fresh_new_pos_embed.shape
+    # Actually replaced (interpolated from the pretrained checkpoint), not
+    # left at its own freshly-initialized values.
+    assert not torch.equal(new_model.pos_embed, fresh_new_pos_embed)
+    # head is task-specific (num_classes differs, 2 vs 3) -- must NOT have
+    # been overwritten by the pretrained model's own head.
+    assert new_model.head.out_features == 3
+
+
+def test_pretrained_loading_cross_architecture_mae_encoder_into_vit():
+    pretrained = MAE(
+        img_size=(32, 64), patch_size=4, twoD=True, class_token=False,
+        pos_embed="learn", mask_ratio=0.75, linear_decoder=True,
+        decoder_depth=None, decoder_embed_dim=None, decoder_num_heads=None,
+        decoder_mlp_ratio=None, num_classes=None,
+        # MAE.__init__ calls self.init_weights('') itself, after setting its
+        # own decoder_pos_embed -- weight_init must be 'skip' here or
+        # VIT.__init__'s own call to the same (polymorphic) init_weights
+        # fires first, before decoder_pos_embed exists at all. Matches
+        # get_model's own real construction (weight_init='skip' for every
+        # non-VIT type).
+        weight_init="skip",
+        **_COMMON_KWARGS,
+    )
+    new_model = VIT(
+        img_size=(64, 32), patch_size=4, twoD=True, num_classes=5,
+        class_token=True, pos_embed="learn", **_COMMON_KWARGS,
+    )
+
+    _load_pretrained_encoder(pretrained, new_model)
+
+    assert new_model.pos_embed.shape[1] == new_model.num_patches + new_model.num_prefix_tokens
+    # MAE's decoder must not have leaked into the VIT model at all.
+    assert not any(k.startswith("decoder") or k == "mask_token" for k in new_model.state_dict())
+
+
+def test_pretrained_loading_3d_non_cubic_ratio_change():
+    # embed_dim=12 (not _COMMON_KWARGS' 8): get_3d_sincos_pos_embed requires
+    # embed_dim % 3 == 0.
+    kwargs_3d = dict(_COMMON_KWARGS, embed_dim=12)
+    pretrained = VIT(
+        img_size=(8, 16, 32), patch_size=4, twoD=False, num_classes=2,
+        class_token=False, pos_embed="learn", **kwargs_3d,
+    )
+    new_model = VIT(
+        img_size=(32, 8, 16), patch_size=4, twoD=False, num_classes=2,
+        class_token=False, pos_embed="learn", **kwargs_3d,
+    )
+    fresh_new_pos_embed = new_model.pos_embed.clone()
+
+    _load_pretrained_encoder(pretrained, new_model)
+
+    assert new_model.pos_embed.shape == fresh_new_pos_embed.shape
+    assert not torch.equal(new_model.pos_embed, fresh_new_pos_embed)
+
+
+def test_pretrained_loading_sqrt_len_method_mismatch_raises_clearly():
+    # embed_dim=12: get_3d_sincos_pos_embed requires embed_dim % 3 == 0.
+    sqrt_len_kwargs = dict(
+        patch_size=4, interp_size=4, twoD=False, num_classes=2,
+        class_token=False, pos_embed="learn", adaptive_patching=True,
+        sqrt_len_method=True, fixed_length=8,
+        embed_dim=12, depth=1, num_heads=1, mlp_ratio=1.0, in_chans=1,
+    )
+    pretrained = VIT(img_size=(32, 32, 32), **sqrt_len_kwargs)
+    new_model = VIT(img_size=(64, 64, 64), **sqrt_len_kwargs)
+
+    encoder_dict = extract_encoder_state_dict(pretrained.state_dict())
+    with pytest.raises(NotImplementedError, match="sqrt_len_method"):
+        _transplant_pos_embed(encoder_dict, pretrained, new_model)

@@ -743,7 +743,17 @@ def parse_pretrained_config(args, conf):
             sys.exit("Checkpoint file does not exist")
 
         model_type = pretrained_conf["model"]["type"]
-        kwargs = get_kwargs(model_type, conf)
+        # pretrained_conf, not conf: kwargs here are for constructing
+        # pretrained_model at its own true architecture (model/utils.py's
+        # get_model pretrained branch), so its checkpoint loads without a
+        # shape mismatch -- reading conf's fields would be wrong whenever
+        # the downstream model type differs from the pretrained one (e.g.
+        # pretrained MAE -> downstream UNETR: conf["model"] wouldn't even
+        # have MAE's mask_ratio/decoder_* keys at all), and subtly wrong
+        # even when they match (the pretrained checkpoint's own decoder
+        # shape must match for the initial strict load_state_dict to
+        # succeed, even though only the encoder is kept afterward).
+        kwargs = get_kwargs(model_type, pretrained_conf)
 
 # ---------------------------- TILING ------------------------------------------
         pretrained_do_tiling = pretrained_conf["tiling"]["do_tiling"]
@@ -760,8 +770,12 @@ def parse_pretrained_config(args, conf):
             assert conf["ap"]["do_ap"], "If pretrained model was trained with adaptive patching, the downstream model needs to use adaptive patching"
         else:
             assert not conf["ap"]["do_ap"], "If pretrained model was trained with standard patching, this model needs to use standard patching"
-        ###fixed_length=conf["ap"]["fixed_length"],
-        ###use_adaptive_pos_emb=conf["ap"]["use_adaptive_pos_emb"],
+        # The pretrained model's own values (not conf's) -- needed so
+        # get_model's pretrained branch can build pretrained_model at
+        # exactly its own original architecture, or its checkpoint (saved
+        # with these settings) won't load into it without a shape mismatch.
+        pretrained_fixed_length = pretrained_conf['ap']['fixed_length'] if pretrained_do_ap else None
+        pretrained_use_adaptive_pos_emb = pretrained_conf['ap']['use_adaptive_pos_emb'] if pretrained_do_ap else False
 
 # ---------------------------- DATA ----------------------------------------------
         #Get and check data arguments. Same optional/auto-detect fallback
@@ -791,25 +805,30 @@ def parse_pretrained_config(args, conf):
         #float would otherwise silently turn pretrained_tile_size into floats downstream
         assert all(isinstance(v, int) for v in pretrained_tile_overlap), "tiling.tile_overlap must be an int (or tuple of ints) in the pretrained model's config, not a float"
 
+        # Deliberately NOT asserted equal to conf's own img_size/tile_size/
+        # patch_size/interp_size (unlike twoD/do_ap/in_chans/
+        # use_channel_aggregation below, which are still required to match):
+        # the whole point of pos_embed interpolation (see model/utils.py's
+        # get_model pretrained branch and _transplant_pos_embed) is to let
+        # the pretrained and new models differ in resolution. pretrained_*
+        # below are the pretrained model's own true values, used to build it
+        # at its own original size so its checkpoint loads without a shape
+        # mismatch, then its encoder gets resized into the new model's shape.
         if twoD:
             pretrained_tile_size = (pretrained_img_size[0]//pretrained_div+pretrained_tile_overlap[0], pretrained_img_size[1]//pretrained_div+pretrained_tile_overlap[1])
         else:
             pretrained_tile_size = (pretrained_img_size[0]//pretrained_div+pretrained_tile_overlap[0], pretrained_img_size[1]//pretrained_div+pretrained_tile_overlap[1], pretrained_img_size[2]//pretrained_div+pretrained_tile_overlap[2])
 
-        for i in range(len(pretrained_tile_size)):
-            assert pretrained_tile_size[i] == conf["data"]["tile_size"][i], "Image/Tile size does not match between pretrained model and this model"
-
         #patch_size is unused (and not required in the config) when do_ap:True.
-        if not pretrained_do_ap:
-            pretrained_patch_size=pretrained_conf["data"]["patch_size"]
-            assert pretrained_patch_size == conf["data"]["patch_size"], "Patch size does not match between pretrained model and this model"
+        pretrained_patch_size = pretrained_conf["data"].get("patch_size") if pretrained_do_ap else pretrained_conf["data"]["patch_size"]
 
         if pretrained_do_ap:
             try:
                 pretrained_interp_size = pretrained_conf["ap"]["interp_size"]
             except KeyError:
                 sys.exit("ap.interp_size is required in the pretrained config when adaptive patching (ap.do_ap) is turned on")
-            assert pretrained_interp_size == conf["data"]["interp_size"], "Interp size does not match between pretrained model and this model"
+        else:
+            pretrained_interp_size = None
 
         try:
             use_channel_aggregation = pretrained_conf['model']['use_channel_aggregation']
@@ -875,7 +894,17 @@ def parse_pretrained_config(args, conf):
         p_conf = {
             "model_type": model_type,
             "default_vars": default_vars,
-            "kwargs": kwargs
+            "kwargs": kwargs,
+            # The pretrained model's own original architecture-determining
+            # values -- see the comment above pretrained_tile_size for why
+            # these are deliberately not required to match conf's own.
+            "img_size": pretrained_img_size,
+            "tile_size": pretrained_tile_size,
+            "twoD": twoD,
+            "patch_size": pretrained_patch_size,
+            "interp_size": pretrained_interp_size,
+            "fixed_length": pretrained_fixed_length,
+            "use_adaptive_pos_emb": pretrained_use_adaptive_pos_emb,
         }
     else:
         p_conf = {}

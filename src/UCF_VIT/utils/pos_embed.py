@@ -161,41 +161,85 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 # References:
 # DeiT: https://github.com/facebookresearch/deit
 # --------------------------------------------------------
-def interpolate_pos_embed(model, checkpoint_model, new_size=(64, 128)):
-    """Interpolates a checkpoint's 2D positional embedding to a new grid resolution.
+def interpolate_pos_embed(pos_embed, orig_grid_size, new_grid_size, num_prefix_tokens=0):
+    """Interpolates a 2D grid positional embedding to a new grid resolution.
 
-    Resizes the "net.pos_embed" entry of `checkpoint_model` (in place) via bicubic
-    interpolation, assuming a fixed 2:1 width:height aspect ratio for the original
-    grid, so it can be loaded into a model with a different input resolution.
+    Reshapes the spatial part of `pos_embed` back into an `orig_grid_size` grid and
+    bicubic-resizes it to `new_grid_size`, independently per axis -- works for any
+    height:width ratio, not just square/fixed-ratio grids. `orig_grid_size` is taken
+    as an explicit argument rather than guessed from `pos_embed`'s flattened length,
+    since a flat count alone can't be decomposed back into two independent axis
+    sizes without assuming a ratio.
 
     Args:
-        model: Model providing `patch_size`, used to convert `new_size` from pixels
-            to grid units.
-        checkpoint_model: State dict loaded from a checkpoint; modified in place.
-        new_size: Target `(height, width)` in pixels for the new grid.
+        pos_embed: Positional embedding tensor, shape `(1, num_prefix_tokens +
+            orig_grid_size[0]*orig_grid_size[1], embed_dim)`.
+        orig_grid_size: `(h, w)` grid `pos_embed` was originally built for (e.g. the
+            pretrained model's own `grid_size`).
+        new_grid_size: `(h, w)` grid to resize to (e.g. the new model's own
+            `grid_size`).
+        num_prefix_tokens: Number of leading non-spatial tokens (e.g. 1 for a class
+            token) to leave untouched, ahead of the spatial grid.
+
+    Returns:
+        Resized positional embedding tensor, shape `(1, num_prefix_tokens +
+        new_grid_size[0]*new_grid_size[1], embed_dim)`, or `pos_embed` unchanged if
+        `orig_grid_size == new_grid_size`.
     """
-    if "net.pos_embed" in checkpoint_model:
-        pos_embed_checkpoint = checkpoint_model["net.pos_embed"]
-        embedding_size = pos_embed_checkpoint.shape[-1]
-        orig_num_patches = pos_embed_checkpoint.shape[-2]
-        patch_size = model.patch_size
-        w_h_ratio = 2
-        orig_h = int((orig_num_patches // w_h_ratio) ** 0.5)
-        orig_w = w_h_ratio * orig_h
-        orig_size = (orig_h, orig_w)
-        new_size = (new_size[0] // patch_size, new_size[1] // patch_size)
-        # print (orig_size)
-        # print (new_size)
-        if orig_size[0] != new_size[0]:
-            print("Interpolate PEs from %dx%d to %dx%d" % (orig_size[0], orig_size[1], new_size[0], new_size[1]))
-            pos_tokens = pos_embed_checkpoint.reshape(-1, orig_size[0], orig_size[1], embedding_size).permute(
-                0, 3, 1, 2
-            )
-            new_pos_tokens = torch.nn.functional.interpolate(
-                pos_tokens, size=(new_size[0], new_size[1]), mode="bicubic", align_corners=False
-            )
-            new_pos_tokens = new_pos_tokens.permute(0, 2, 3, 1).flatten(1, 2)
-            checkpoint_model["net.pos_embed"] = new_pos_tokens
+    orig_grid_size = tuple(orig_grid_size)
+    new_grid_size = tuple(new_grid_size)
+    if orig_grid_size == new_grid_size:
+        return pos_embed
+
+    embedding_size = pos_embed.shape[-1]
+    prefix_tokens = pos_embed[:, :num_prefix_tokens]
+    grid_tokens = pos_embed[:, num_prefix_tokens:]
+
+    pos_tokens = grid_tokens.reshape(-1, orig_grid_size[0], orig_grid_size[1], embedding_size).permute(0, 3, 1, 2)
+    new_pos_tokens = torch.nn.functional.interpolate(
+        pos_tokens, size=new_grid_size, mode="bicubic", align_corners=False
+    )
+    new_pos_tokens = new_pos_tokens.permute(0, 2, 3, 1).flatten(1, 2)
+    return torch.cat([prefix_tokens, new_pos_tokens], dim=1)
+
+
+def interpolate_pos_embed_3d(pos_embed, orig_grid_size, new_grid_size, num_prefix_tokens=0):
+    """Interpolates a 3D grid positional embedding to a new grid resolution.
+
+    Same as `interpolate_pos_embed`, but for a 3D `(h, w, d)` grid (trilinear
+    instead of bicubic) -- works for any height:width:depth ratio, independently
+    per axis.
+
+    Args:
+        pos_embed: Positional embedding tensor, shape `(1, num_prefix_tokens +
+            orig_grid_size[0]*orig_grid_size[1]*orig_grid_size[2], embed_dim)`.
+        orig_grid_size: `(h, w, d)` grid `pos_embed` was originally built for.
+        new_grid_size: `(h, w, d)` grid to resize to.
+        num_prefix_tokens: Number of leading non-spatial tokens (e.g. 1 for a class
+            token) to leave untouched, ahead of the spatial grid.
+
+    Returns:
+        Resized positional embedding tensor, shape `(1, num_prefix_tokens +
+        new_grid_size[0]*new_grid_size[1]*new_grid_size[2], embed_dim)`, or
+        `pos_embed` unchanged if `orig_grid_size == new_grid_size`.
+    """
+    orig_grid_size = tuple(orig_grid_size)
+    new_grid_size = tuple(new_grid_size)
+    if orig_grid_size == new_grid_size:
+        return pos_embed
+
+    embedding_size = pos_embed.shape[-1]
+    prefix_tokens = pos_embed[:, :num_prefix_tokens]
+    grid_tokens = pos_embed[:, num_prefix_tokens:]
+
+    pos_tokens = grid_tokens.reshape(
+        -1, orig_grid_size[0], orig_grid_size[1], orig_grid_size[2], embedding_size
+    ).permute(0, 4, 1, 2, 3)
+    new_pos_tokens = torch.nn.functional.interpolate(
+        pos_tokens, size=new_grid_size, mode="trilinear", align_corners=False
+    )
+    new_pos_tokens = new_pos_tokens.permute(0, 2, 3, 4, 1).flatten(1, 3)
+    return torch.cat([prefix_tokens, new_pos_tokens], dim=1)
 
 
 def interpolate_channel_embed(checkpoint_model, new_len):

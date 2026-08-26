@@ -85,6 +85,7 @@ pytest tests/test_config_validation.py -v
 | `tests/utils/test_metrics.py` | `masked_mse`, `DiceBLoss` |
 | `tests/test_config_validation.py` | Every YAML under `configs/` actually parses via `parse_config`, plus a negative-case regression test that `ap.do_ap:True` with no `ap.interp_size` set fails with a clear error, not a bare `KeyError` |
 | `tests/model/test_arch.py` | `VIT.effective_patch_size` (`interp_size` used when `adaptive_patching`, `patch_size` otherwise, `patch_size`/`interp_size` themselves never overwritten, missing-`interp_size`-under-`adaptive_patching` raises clearly) — needs the real `timm`/`monai`/`xformers` stack (`UCF_VIT.model.arch`'s own imports), skips cleanly via `importorskip` otherwise |
+| `tests/model/test_pretrained_loading.py` | `interpolate_pos_embed`/`interpolate_pos_embed_3d` (independent, non-1:1 height:width[:depth] ratio changes in both directions, class-token prefix preserved, same-size no-op), `extract_encoder_state_dict` (allowlist keeps only the shared `VIT` encoder — including the `UNETR.encoder1`-vs-`"decoder" not in k` collision case that motivated an allowlist over a denylist), and end-to-end pretrained-checkpoint transplant (same-architecture 2D and 3D non-cubic ratio changes, cross-architecture `MAE`→`VIT` with a class-token-count mismatch, `sqrt_len_method:True` raising a clear error instead of silently transplanting a wrong-shaped `pos_embed`) — same `importorskip` gating as `test_arch.py` |
 | `tests/integration/test_run_training_smoke_helpers.py` | `run_training_smoke.py`'s `compute_narrow_dict_idx` (real-data-found narrowing, empty-but-existing-dir and nonexistent-dir both raising `NoRealDataFoundError`, no-op for non-`iterative_dataloader` configs) and `deep_merge_config_overrides` (nested-key merge, wholesale-replace of non-dict values, new-key insertion, multiple independent sections) |
 | `tests/integration/test_feature_matrix_smoke_helpers.py` | `run_feature_matrix_smoke.py`'s `FEATURE_MATRIX` well-formedness (unique labels, real base-config paths, no accidental list-valued `tile_overlap` overrides) and — the most valuable check — every cell's tiny-model config surviving a real `parse_config` call |
 
@@ -423,6 +424,88 @@ skips cleanly via `importorskip` otherwise, matching the existing
 real Frontier training (no dedicated Tier 2/3 cell exercises `basic_ct/sap`
 training end-to-end beyond `basic_ct-sap+tensor_par`'s parse-level check,
 which already covers the new config shape).
+
+### Generalized pretrained-checkpoint loading to any h:w[:d] ratio
+
+The intended real workflow is: pretrain via `MAE`, then fine-tune its encoder
+into any downstream model type. Two real, independent bugs stood in the way
+of that actually working when the pretrained and downstream configs have
+*different* `img_size`/`tile_size`:
+
+1. `UCF_VIT.utils.pos_embed.interpolate_pos_embed` recovered the checkpoint's
+   original `(h, w)` grid from just its flattened patch count by *assuming a
+   hardcoded 2:1 width:height ratio* — wrong for every shipped config (all
+   square) and any non-2:1 volume. It also looked for checkpoint keys
+   `"net.pos_embed"`/`"net.channel_embed"`, which don't exist in this repo's
+   real state dicts (`self.pos_embed`, `self.var_embed`, no `.net` wrapper) —
+   a silent no-op even where reachable. Never actually called anywhere.
+2. `model/utils.py`'s encoder-extraction step only populated `encoder_dict`
+   when the pretrained source was `MAE` — for every other pretrained model
+   type it stayed empty, so `model.load_state_dict(model_dict)` was a no-op
+   and no pretrained weight was ever actually applied (there was already a
+   `#TODO: Add encoder_dict for different pretrained model types` comment
+   acknowledging this).
+
+Fixed both together. `interpolate_pos_embed` (and a new 3D
+`interpolate_pos_embed_3d`) now take the original grid shape as an **explicit
+parameter** instead of guessing it — any independent height:width[:depth]
+ratio works, for both the pretrained and the new grid, verified directly
+(`(8,16)→(16,8)`, `(4,8,16)→(8,4,4)`, etc. — deliberately swapped/non-uniform
+ratios, not just a uniform rescale). A new `extract_encoder_state_dict`
+replaces the `MAE`-only branch with a single **allowlist** of the top-level
+state-dict key prefixes `VIT.__init__` itself creates (`patch_embed`,
+`token_embeds`, `cls_token`, `pos_embed`, `var_embed`, `adaptive_pos_dep_emb`,
+`blocks`, `norm`) — verified against every subclass's own `__init__` to
+produce the identical result to the old MAE-only filter for MAE specifically,
+while also correctly generalizing to `VIT`/`SAP`/`UNETR`/`DiffusionVIT` as
+pretrained sources. Deliberately an allowlist, not a `"decoder" not in
+k`-style denylist: `UNETR` has its own `self.encoder1`/`encoder2`/`encoder3`/
+`encoder4` (U-Net skip-connection convs feeding its *decoder*, not the
+transformer encoder) that a denylist would mishandle — a fake `"encoder1.
+weight"` key is a direct regression test for exactly this in
+`test_extract_encoder_state_dict_keeps_only_shared_vit_attrs`.
+
+`model/utils.py`'s `get_model` now builds `pretrained_model` at the
+pretrained model's own true `img_size`/`twoD`/`patch_size`/`interp_size`/
+`fixed_length`/`use_adaptive_pos_emb` (from `parse_pretrained_config`'s
+`p_conf`, which previously only carried `model_type`/`default_vars`/
+`kwargs`) rather than the new model's — required for the checkpoint to load
+into it without a shape mismatch at all, regardless of any difference from
+the new model's own config. `parse_pretrained_config`'s hard equality asserts
+on `tile_size`/`patch_size`/`interp_size` between pretrained and new (which
+previously made a resolution difference impossible in the first place) are
+removed; `twoD`/`do_ap`/`in_chans`/`use_channel_aggregation` equality is
+still required (those genuinely can't differ). Also fixed, found while
+tracing this same path: `get_kwargs(model_type, conf)` was building the
+pretrained model's own decoder/head kwargs from the *new* model's config
+(`conf`) instead of the pretrained one's (`pretrained_conf`) — would crash
+outright the moment the pretrained and downstream model types actually
+differ (e.g. pretrained `MAE` → downstream `UNETR`: `conf["model"]` has no
+`mask_ratio` key at all), and an unimported `OrderedDict` (would have raised
+`NameError` the moment this code path executed for real, for any model
+type including `MAE`).
+
+**Found and explicitly excluded from this fix, not fixed**: for `SAP` and
+`UNETR+do_ap` (`sqrt_len_method:True`), `self.pos_embed` is allocated at
+`patch_embed`'s raw `img_size/effective_patch_size` grid size (`64×64×64 =
+262144` for `basic_ct/sap`'s shipped config) but the real runtime token
+count is `sqrt_len³` (`8³ = 512`) — a real, separate, pre-existing
+inconsistency, verified by directly constructing a real `SAP` instance.
+Silently harmless today only because every shipped `SAP`/`UNETR+do_ap`
+config also sets `use_adaptive_pos_emb:True`, so `self.pos_embed` is never
+actually read in the forward pass — dead, oversized, wasted memory, not a
+crash. `_transplant_pos_embed` raises a clear `NotImplementedError` for a
+pretrained/new size mismatch under `sqrt_len_method:True` rather than
+interpolating via a `grid_size` that doesn't reflect the real token count;
+`test_pretrained_loading_sqrt_len_method_mismatch_raises_clearly` covers
+this. Fixing the underlying `SAP`/`UNETR` sizing issue itself is a separate
+task.
+
+Verified locally only (Tier 1) — per the user, sufficient for the h:w[:d]
+ratio logic itself; a distributed run would mainly add confidence this
+doesn't regress under `tensor_par_size`/`fsdp_size` > 1 (every shipped
+config uses `tensor_par_size:1` today), a separate, lower-priority concern
+that can be a future feature-matrix cell if ever needed.
 
 ## Running the distributed (Tier 2) tests
 

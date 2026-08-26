@@ -1,4 +1,4 @@
-import os 
+import os
 import sys
 import torch
 import torch.distributed as dist
@@ -17,7 +17,111 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 
 from torch.nn import Sequential
 from UCF_VIT.model.building_blocks import Block
+from UCF_VIT.utils.misc import interpolate_pos_embed_adaptive
+from UCF_VIT.utils.pos_embed import interpolate_pos_embed, interpolate_pos_embed_3d
 from timm.layers import use_fused_attn
+
+# Top-level state_dict key prefixes that UCF_VIT.model.arch.VIT.__init__ itself
+# creates -- i.e. the shared transformer encoder, before any subclass
+# (SAP/MAE/UNETR/DiffusionVIT) adds its own task-specific decoder/head on top.
+# An allowlist rather than a "decoder"/"head"-name denylist: UNETR has its own
+# self.encoder1/encoder2/encoder3/encoder4 (U-Net skip-connection convs feeding
+# its *decoder*, not the transformer encoder) that a substring-based denylist
+# would mishandle. Matched against each key's first dotted component only, so
+# e.g. "encoder1.weight" (UNETR) can never collide with "encoder" (not even a
+# real prefix here) or "norm" (never collides with "decoder_norm.weight",
+# whose first component is "decoder_norm").
+ENCODER_STATE_DICT_PREFIXES = {
+    "patch_embed", "token_embeds", "cls_token", "pos_embed",
+    "var_embed", "adaptive_pos_dep_emb", "blocks", "norm",
+}
+
+
+def extract_encoder_state_dict(state_dict):
+    """Filters a model state dict down to just the shared VIT encoder.
+
+    Keeps only entries whose top-level attribute name (the part before the first
+    ".") is one VIT.__init__ itself creates -- see ENCODER_STATE_DICT_PREFIXES --
+    dropping every subclass-specific decoder/head/task-specific addition
+    (MAE/DiffusionVIT's decoder_*/mask_token, SAP's neck/mask_header, UNETR's
+    encoderN/decoderN/out/upsample/mlp_head, VIT's own classification head).
+    Works identically regardless of which model type the state dict came from.
+
+    Args:
+        state_dict: A model's state dict (e.g. a pretrained model's, after
+            loading a checkpoint into it).
+
+    Returns:
+        A new dict containing only the encoder entries.
+    """
+    return {k: v for k, v in state_dict.items() if k.split(".")[0] in ENCODER_STATE_DICT_PREFIXES}
+
+
+def _transplant_pos_embed(encoder_dict, pretrained_model, model):
+    """Resizes encoder_dict's "pos_embed" entry (in place) to match model's own shape.
+
+    A no-op if encoder_dict has no "pos_embed" entry (e.g. use_adaptive_pos_emb:True,
+    where pos_embed is None and never appears in a state dict at all) or if the
+    pretrained and new models already have the same pos_embed shape.
+
+    Args:
+        encoder_dict: Dict as returned by extract_encoder_state_dict, from the
+            pretrained model; modified in place.
+        pretrained_model: The constructed pretrained-model instance the checkpoint
+            was loaded into (at the pretrained model's own original size).
+        model: The constructed new model instance being fine-tuned (at its own,
+            possibly different, size).
+
+    Raises:
+        NotImplementedError: If either model has sqrt_len_method=True (SAP, or
+            UNETR with do_ap:True) and their pos_embed shapes differ. That regime's
+            pos_embed is sized from patch_embed's raw img_size/patch_size grid,
+            which does not actually match its real sqrt_len-based token count (a
+            separate, pre-existing issue) -- interpolating via grid_size there
+            would silently produce a wrong-shaped result, so this is rejected
+            explicitly rather than attempted.
+    """
+    if "pos_embed" not in encoder_dict:
+        return
+
+    pos_embed = encoder_dict["pos_embed"]
+    if tuple(pos_embed.shape) == tuple(model.pos_embed.shape):
+        return
+
+    if pretrained_model.sqrt_len_method or model.sqrt_len_method:
+        raise NotImplementedError(
+            "pos_embed interpolation for a pretrained/new size mismatch is not "
+            "supported when sqrt_len_method is True (SAP, or UNETR with "
+            "ap.do_ap:True) -- grid_size does not reflect the real sqrt_len-based "
+            "token count for this regime. Use a pretrained checkpoint with the "
+            "same size for these model types."
+        )
+
+    if hasattr(pretrained_model, "grid_size") and hasattr(model, "grid_size"):
+        interp = interpolate_pos_embed if model.twoD else interpolate_pos_embed_3d
+        # Sliced/re-prepended using the PRETRAINED model's own prefix count
+        # (how pos_embed itself is actually laid out), not the new model's --
+        # they can legitimately differ across a cross-architecture transplant
+        # (e.g. MAE's class_token=False -> VIT's class_token=True). When they
+        # do, there's no real pretrained data for the new model's own prefix
+        # row(s), so its own existing (freshly-initialized/sincos) prefix is
+        # kept instead of anything from the checkpoint.
+        resized = interp(
+            pos_embed, pretrained_model.grid_size, model.grid_size,
+            num_prefix_tokens=pretrained_model.num_prefix_tokens,
+        )
+        if model.num_prefix_tokens != pretrained_model.num_prefix_tokens:
+            resized = torch.cat(
+                [model.pos_embed[:, :model.num_prefix_tokens], resized[:, pretrained_model.num_prefix_tokens:]],
+                dim=1,
+            )
+        encoder_dict["pos_embed"] = resized
+    else:
+        # adaptive_patching and not sqrt_len_method: pos_embed is a flat
+        # fixed_length sequence, not a spatial grid -- see
+        # interpolate_pos_embed_adaptive's own docstring.
+        interpolate_pos_embed_adaptive(model, encoder_dict, new_size=model.fixed_length)
+
 
 def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, tensor_par_group):
     """Build the model architecture, load its initial weights, and wrap it with FSDP.
@@ -128,10 +232,19 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
             elif p_conf["model_type"] == "DiffusionVIT":
                 from UCF_VIT.model.arch import DiffusionVIT as pretrained_model_arch
 
+            # Built at the pretrained model's own original img_size/twoD/
+            # patch_size/interp_size/fixed_length/use_adaptive_pos_emb (from
+            # p_conf, computed by parse_pretrained_config from the pretrained
+            # model's own config file) -- not conf's (the new model's) --
+            # so its parameter shapes match the checkpoint being loaded into
+            # it below exactly, regardless of any difference from the new
+            # model's own size/config. The resulting encoder gets resized
+            # (pos_embed only, via _transplant_pos_embed) to the new model's
+            # shape afterward, not before loading the checkpoint.
             pretrained_model = pretrained_model_arch(
-                img_size=(conf["data"]["tile_size"][0],conf["data"]["tile_size"][1]) if conf["data"]["twoD"] else (conf["data"]["tile_size"][0],conf["data"]["tile_size"][1], conf["data"]["tile_size"][2]),
-                patch_size=conf["data"]["patch_size"],
-        interp_size=conf["data"].get("interp_size"),
+                img_size=(p_conf["tile_size"][0],p_conf["tile_size"][1]) if p_conf["twoD"] else (p_conf["tile_size"][0],p_conf["tile_size"][1], p_conf["tile_size"][2]),
+                patch_size=p_conf["patch_size"],
+                interp_size=p_conf["interp_size"],
                 in_chans=conf["data"]["in_chans"],
                 embed_dim=conf["model"]["embed_dim"],
                 depth=conf["model"]["depth"],
@@ -139,13 +252,13 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
                 mlp_ratio=conf["model"]["mlp_ratio"],
                 drop_path_rate=conf["model"]["drop_path"],
                 drop_rate=conf["model"]["drop_rate"],
-                twoD=conf["data"]["twoD"],
+                twoD=p_conf["twoD"],
                 default_vars=p_conf["default_vars"],
                 use_varemb=conf["model"]["use_channel_aggregation"], #TODO: Change use_varemb to use_channel_aggregation in arch.py
                 adaptive_patching=conf["ap"]["do_ap"],
-                fixed_length=conf["ap"]["fixed_length"],
+                fixed_length=p_conf["fixed_length"],
                 FusedAttn_option=FusedAttn_option,
-                use_adaptive_pos_emb=conf["ap"]["use_adaptive_pos_emb"],
+                use_adaptive_pos_emb=p_conf["use_adaptive_pos_emb"],
                 weight_init='' if p_conf["model_type"] == "VIT" else 'skip', #Choose ['' or 'skip'] If using VIT use '' otherwise use 'skip'. Option whether to use VITs weight initialization or use the one corresponding to the architecture you choose
                 class_token=True if p_conf["model_type"] == "VIT" else False,
                 # Same reasoning as the main model_arch(...) call above --
@@ -167,16 +280,11 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
                 pretrained_checkpoint = torch.load(conf["pretrained_model"]["checkpoint_path"]+"/"+conf["trainer"]["pretrained_checkpoint_filename"]+"_rank_"+str(world_rank)+".ckpt",map_location=map_location)
                 pretrained_model.load_state_dict(pretrained_checkpoint['model_state_dict'])
 
-            new_state_dict = OrderedDict()
-            encoder_dict = new_state_dict
-            model_dict = pretrained_model.state_dict()
-
-            #Taking out encoder states from pretrained model. The decoder to take out from the model dict is different depending on the pretrained model
-            #TODO: Add encoder_dict for different pretrained model types
-            if p_conf["model_type"] == "MAE":
-                #decoder_dict = {k: v for k, v in model_dict.items() if ('decoder_pred' in k or 'attn_layers_decoder' in k or 'mask_token' in k)}
-                encoder_dict = {k: v for k,v in model_dict.items() if ('decoder' not in k and 'mask_token' not in k)}
-                #state_dict.append(encoder_dict)
+            # Works for any pretrained model type (not just MAE) -- see
+            # extract_encoder_state_dict's own docstring for why an
+            # allowlist generalizes safely across all of them.
+            encoder_dict = extract_encoder_state_dict(pretrained_model.state_dict())
+            _transplant_pos_embed(encoder_dict, pretrained_model, model)
 
             #Load encoder states from pretrained model into the model we want to train
             model_dict = model.state_dict()
