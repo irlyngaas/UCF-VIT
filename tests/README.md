@@ -1823,6 +1823,18 @@ Frontier data.
     `Attention`/`Mlp` layers run end-to-end through the full `train.py`
     pipeline for every model type, and the full feature matrix is clean
     again.
+12. Reran the full matrix (job 5347454) after the `interp_size` refactor
+    (`patch_size` retired under `do_ap:True`) and the new
+    `catsdogs-classification+do_tiling` cell (19 cells total, up from 18):
+    **19 PASS, 0 FAIL — every cell passes**, including every `do_ap:True`
+    cell with its new `interp_size` override, `basic_ct-sap+tensor_par`
+    (`SAP`'s shipped `interp_size:4`), and `catsdogs-classification+
+    do_tiling` (74s) on its first-ever real Frontier run. Confirms the
+    `interp_size` model-sizing refactor (`VIT.effective_patch_size`,
+    `SAP.neck`, `UNETR`'s linear-decoder upsample, the sin-cos pos-embed
+    grid calc, `training.py`'s SAP/UNETR sequence reshapes) and the
+    catsdogs tiling addition both work correctly end to end, not just
+    through `parse_config`.
 
 ## Validating a config file by hand
 
