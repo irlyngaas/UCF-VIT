@@ -53,8 +53,8 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 CONFIGS_DIR = os.path.join(REPO_ROOT, "configs")
 BASE_CONFIG = os.path.join(CONFIGS_DIR, "catsdogs", "classification", "base_config.yaml")
 
-# Deliberately non-square, independently different from the shipped
-# [256, 256] on both axes -- not a uniform rescale.
+# [height, width]. Deliberately non-square, independently different from
+# the shipped [256, 256] on both axes -- not a uniform rescale.
 NEW_RESIZE = [128, 192]
 
 DEFAULT_TIMEOUT = 600

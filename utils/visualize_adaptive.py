@@ -44,7 +44,9 @@ def read_process_file(path, dataset, num_channels_available, variables, imagenet
     if dataset == "imagenet":
         data = Image.open(path).convert("RGB")
         data = np.array(data)
-        data = cv.resize(data, dsize=[imagenet_resize[0],imagenet_resize[1]])
+        # imagenet_resize is (height, width); cv2's dsize is natively
+        # (width, height), so swap locally right here.
+        data = cv.resize(data, dsize=[imagenet_resize[1],imagenet_resize[0]])
         data = np.moveaxis(data,-1,0)
 
 

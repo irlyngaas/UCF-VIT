@@ -79,13 +79,13 @@ pytest tests/test_config_validation.py -v
 | `tests/dataloaders/test_dataset.py` | `TileDataIter` (2D, 3D-full, and 3D-twoD-sliced tiling, with/without labels, overlap), `ShuffleIterableDataset` (no data loss/duplication across buffer sizes), `ProcessChannels` (batching, adaptive-patching wiring, `separate_channels`), `FileReader` (DDP-rank + dataloader-worker sharding disjointness/coverage up to `num_workers=7`, `keys_to_add` replication) |
 | `tests/dataloaders/test_datamodule.py` | `collate_fn` across `adaptive_patching`/`return_label`/`separate_channels`/`return_qdt`/dataset-type combinations, built from real `ProcessChannels` output rather than hand-fabricated tuples |
 | `tests/datasets/test_catsdogs.py` | `CatsDogsDataset` (label-from-filename, resize/channel-first conversion, adaptive-patching shapes, `div x div` tiling — `__len__` scaling, a deliberately non-square full-coverage regression test, and tiling composed with adaptive_patching) and `CatsDogsCollate`, against small real JPEG files written to a temp dir — `catsdogs` is the only shipped dataset using `dataloader.type: "dataloader"` (a plain `Dataset` + `DistributedSampler`, not the `iterative_dataloader` stack the two rows above cover), and previously had no tiling capability at all (`tiling.div` was silently ignored) |
-| `tests/utils/test_misc.py` | `is_power_of_two`, `calculate_tile_overlap`, `calculate_tile_bounds` (`div==1` passthrough, no-overlap tiling, overlap at first/middle/last tile boundaries — extracted from `TileDataIter` so `CatsDogsDataset`'s tiling can reuse the exact same math), `patchify`/`unpatchify` roundtrips, `process_root_dirs` (`imagenet` per-class bucketing — evenly/non-evenly-divisible `> data_par_size`, `<= data_par_size`, bucket-content correctness — and the non-`imagenet` branch), `detect_num_channels` (`imagenet` hardcoding with no filesystem touched, `catsdogs`/PIL real-file band-count detection across RGB/`L`/RGBA, `basic_ct`/nibabel real-file 3D-shape detection, the 4D-shape-raises case, missing-`imagesTr`-raises, and independent per-key detection), `detect_img_size` (`basic_ct`/nibabel real-file native-shape detection, `imagenet`/`catsdogs`/PIL real-file native-pixel-size detection using a deliberately non-square fixture to verify the `[width, height]` order isn't accidentally swapped, first-`dict_root_dirs`-key-only sampling, missing-`imagesTr`-raises, empty-`dict_root_dirs`-raises), `shard_mlp_state_dict`/`shard_attention_state_dict` (weight-slice reconstruction, `fc2.bias`/`proj.bias` summing back to the original exactly, `qk_norm` rejection) |
+| `tests/utils/test_misc.py` | `is_power_of_two`, `calculate_tile_overlap`, `calculate_tile_bounds` (`div==1` passthrough, no-overlap tiling, overlap at first/middle/last tile boundaries — extracted from `TileDataIter` so `CatsDogsDataset`'s tiling can reuse the exact same math), `patchify`/`unpatchify` roundtrips, `process_root_dirs` (`imagenet` per-class bucketing — evenly/non-evenly-divisible `> data_par_size`, `<= data_par_size`, bucket-content correctness — and the non-`imagenet` branch), `detect_num_channels` (`imagenet` hardcoding with no filesystem touched, `catsdogs`/PIL real-file band-count detection across RGB/`L`/RGBA, `basic_ct`/nibabel real-file 3D-shape detection, the 4D-shape-raises case, missing-`imagesTr`-raises, and independent per-key detection), `detect_img_size` (`basic_ct`/nibabel real-file native-shape detection, `imagenet`/`catsdogs`/PIL real-file native-pixel-size detection using a deliberately non-square fixture to verify PIL's native `(width, height)` `.size` is correctly swapped to the `[height, width]` convention, first-`dict_root_dirs`-key-only sampling, missing-`imagesTr`-raises, empty-`dict_root_dirs`-raises), `shard_mlp_state_dict`/`shard_attention_state_dict` (weight-slice reconstruction, `fc2.bias`/`proj.bias` summing back to the original exactly, `qk_norm` rejection) |
 | `tests/utils/test_pos_embed.py` | 1D/2D/3D sin-cos position embeddings, `SinusoidalEmbeddings` |
 | `tests/utils/test_lr_scheduler.py` | `LinearWarmupCosineAnnealingLR` warmup/annealing shape |
 | `tests/utils/test_metrics.py` | `masked_mse`, `DiceBLoss` |
 | `tests/test_config_validation.py` | Every YAML under `configs/` actually parses via `parse_config`, plus a negative-case regression test that `ap.do_ap:True` with no `ap.interp_size` set fails with a clear error, not a bare `KeyError` |
 | `tests/model/test_arch.py` | `VIT.effective_patch_size` (`interp_size` used when `adaptive_patching`, `patch_size` otherwise, `patch_size`/`interp_size` themselves never overwritten, missing-`interp_size`-under-`adaptive_patching` raises clearly) — needs the real `timm`/`monai`/`xformers` stack (`UCF_VIT.model.arch`'s own imports), skips cleanly via `importorskip` otherwise |
-| `tests/model/test_pretrained_loading.py` | `interpolate_pos_embed`/`interpolate_pos_embed_3d` (independent, non-1:1 height:width[:depth] ratio changes in both directions, class-token prefix preserved, same-size no-op), `extract_encoder_state_dict` against both a fake dict (allowlist keeps only the shared `VIT` encoder — including the `UNETR.encoder1`-vs-`"decoder" not in k` collision case that motivated an allowlist over a denylist) and every real model type's own real `state_dict()` as a pretrained source (`VIT`/`MAE`/`SAP`/`UNETR`/`DiffusionVIT` — not just the two types any shipped config actually uses, since nothing in `get_model` restricts which type the pretrained source is), and end-to-end pretrained-checkpoint transplant (same-architecture 2D and 3D non-cubic ratio changes, cross-architecture `MAE`→`VIT` *and* `VIT`→`MAE` — both class-token-count-mismatch directions, not just one — `sqrt_len_method:True` raising a clear error instead of silently transplanting a wrong-shaped `pos_embed`) — same `importorskip` gating as `test_arch.py`. The `VIT`→`MAE` direction caught a real bug: `extract_encoder_state_dict`'s allowlist includes `cls_token` (genuinely a shared `VIT.__init__` attribute when present), but a downstream model with no `cls_token` at all (any non-`VIT` type, or `class_token=False`) made `load_state_dict(strict=True)` raise `"Unexpected key(s): cls_token"` — unlike `pos_embed`, which always has *some* value to reconcile shapes against, `cls_token` can be entirely absent on one side. Fixed with a new `_prune_incompatible_cls_token`, called in `get_model` right after `_transplant_pos_embed`. Also covers `_patch_embed_img_size` (not pretrained-loading specific — swaps `tile_size`'s `[width, height]` order to `PatchEmbed`'s expected `(H, W)` for `imagenet`/`catsdogs`, no swap for `basic_ct`; a real bug caught by a real Tier 3 run, see the Tier 3c section below). |
+| `tests/model/test_pretrained_loading.py` | `interpolate_pos_embed`/`interpolate_pos_embed_3d` (independent, non-1:1 height:width[:depth] ratio changes in both directions, class-token prefix preserved, same-size no-op), `extract_encoder_state_dict` against both a fake dict (allowlist keeps only the shared `VIT` encoder — including the `UNETR.encoder1`-vs-`"decoder" not in k` collision case that motivated an allowlist over a denylist) and every real model type's own real `state_dict()` as a pretrained source (`VIT`/`MAE`/`SAP`/`UNETR`/`DiffusionVIT` — not just the two types any shipped config actually uses, since nothing in `get_model` restricts which type the pretrained source is), and end-to-end pretrained-checkpoint transplant (same-architecture 2D and 3D non-cubic ratio changes, cross-architecture `MAE`→`VIT` *and* `VIT`→`MAE` — both class-token-count-mismatch directions, not just one — `sqrt_len_method:True` raising a clear error instead of silently transplanting a wrong-shaped `pos_embed`) — same `importorskip` gating as `test_arch.py`. The `VIT`→`MAE` direction caught a real bug: `extract_encoder_state_dict`'s allowlist includes `cls_token` (genuinely a shared `VIT.__init__` attribute when present), but a downstream model with no `cls_token` at all (any non-`VIT` type, or `class_token=False`) made `load_state_dict(strict=True)` raise `"Unexpected key(s): cls_token"` — unlike `pos_embed`, which always has *some* value to reconcile shapes against, `cls_token` can be entirely absent on one side. Fixed with a new `_prune_incompatible_cls_token`, called in `get_model` right after `_transplant_pos_embed`. Used to also cover `_patch_embed_img_size` (a `tile_size`-to-`PatchEmbed`-`img_size` conversion, needed because `tile_size` was `[width, height]` for `imagenet`/`catsdogs`; a real bug caught by a real Tier 3 run, see the Tier 3c section below) — that function was later deleted once the config/data-loading layer itself was changed to store `img_size`/`resize`/`tile_size` as `[height, width]` (see "Flipped `img_size`/`resize`/`tile_size` to `[height, width]`" further down), which made it a true no-op for every dataset. |
 | `tests/test_parse_pretrained_config.py` | `parse_pretrained_config` (+ `get_kwargs`'s per-model-type branch) for `SAP`/`UNETR`/`DiffusionVIT` as the pretrained source specifically — `tests/model/test_pretrained_loading.py`/`test_pretrained_loading_real.py` only ever use `VIT`/`MAE`. Pure `parse.py`-level (no `UCF_VIT.model.arch` import at all), so no `importorskip` needed — runs in any environment. |
 | `tests/integration/test_run_training_smoke_helpers.py` | `run_training_smoke.py`'s `compute_narrow_dict_idx` (real-data-found narrowing, empty-but-existing-dir and nonexistent-dir both raising `NoRealDataFoundError`, no-op for non-`iterative_dataloader` configs) and `deep_merge_config_overrides` (nested-key merge, wholesale-replace of non-dict values, new-key insertion, multiple independent sections) |
 | `tests/integration/test_feature_matrix_smoke_helpers.py` | `run_feature_matrix_smoke.py`'s `FEATURE_MATRIX` well-formedness (unique labels, real base-config paths, no accidental list-valued `tile_overlap` overrides) and — the most valuable check — every cell's tiny-model config surviving a real `parse_config` call |
@@ -343,6 +343,12 @@ other `TileDataIter` test in that file is square, and so can't
 distinguish the two possible index-to-axis mappings) — confirmed it fails
 without the fix and passes with it.
 
+**Update:** the underlying storage convention was later flipped (see
+"Flipped `img_size`/`resize`/`tile_size` to `[height, width]`" below) —
+`img_size`/`resize`/`tile_size` are now `[height, width]`, matching the
+array's own axis order directly, so the index-swap described above has
+since been removed (not reintroduced) from `TileDataIter`'s 2D branch.
+
 ### Added tiling to `catsdogs`
 
 `catsdogs` previously had no tiling capability at all — `CatsDogsDataset`
@@ -594,6 +600,15 @@ only once cross-architecture coverage was widened beyond the one direction
    the pretrained model). `p_conf` gained a `"dataset"` key for the second
    call site.
 
+   **Later superseded:** once the root cause was traced further, the real
+   question was why the *config* layer alone used `[width, height]` when
+   every real tensor and even the tiling-bounds code already worked in
+   `(H, W)` terms — see "Flipped `img_size`/`resize`/`tile_size` to
+   `[height, width]`" below. That change made `_patch_embed_img_size` a
+   true no-op for every dataset, so it (and `p_conf["dataset"]`, which
+   existed only to feed it) were deleted; both `get_model` call sites now
+   just pass `tuple(tile_size)` straight through.
+
 Items 1-2 and 4 were verified together in one real run (job 5348693): all
 62 tests passed across all 8 ranks, including both
 `test_pretrained_loading_real.py` cases
@@ -602,6 +617,75 @@ Items 1-2 and 4 were verified together in one real run (job 5348693): all
 square `img_size`s, so item 5 (not yet found at that point) wouldn't have
 been caught there regardless. Items 3 and 5 were only caught by the Tier 3
 runs below, in sequence — see that section.
+
+### Flipped `img_size`/`resize`/`tile_size` to `[height, width]`
+
+Item 5 above (`_patch_embed_img_size`) was a compensating shim: `tile_size`
+was `[width, height]` at the config/data-loading layer, but every real
+tensor in the model (`PatchEmbed`'s `(B, C, H, W)` contract, all of
+`model/arch.py`) is `(H, W)`-ordered, so `get_model` needed a swap right
+before constructing `PatchEmbed`. Revisiting that boundary raised a
+broader question: since every real tensor, and even `catsdogs.py`'s/
+`dataset.py`'s own tile-bounds code (which indexes directly into the
+loaded `(H, W[, C])` numpy array), already work in `(H, W)` terms, why did
+the *config* layer alone use the opposite order? No reason was found to
+keep `[width, height]` — every shipped `imagenet`/`catsdogs` config is
+square (`[256, 256]`), so no real config's meaning silently changes — and
+an audit found only two genuinely *external*, width-first-native
+touchpoints in the whole pipeline: `cv2.resize`'s `dsize` argument and
+PIL's `Image.size` read. Everywhere else (the tiling-bounds math,
+`PatchEmbed`) is either order-agnostic elementwise arithmetic or already
+implicitly `(H, W)`-shaped.
+
+Flipped `img_size`/`resize`/`tile_size`/`tile_overlap` to `[height, width]`
+(2D) / `[height, width, depth]` (3D) throughout the config and
+data-loading layers for `imagenet`/`catsdogs`, isolating the two
+width-first-native calls to single-line local swaps right at their call
+sites:
+
+- `UCF_VIT.utils.misc.detect_img_size`: swaps PIL's native `(width,
+  height)` `.size` to `[height, width]` before returning, for
+  `imagenet`/`catsdogs` (`basic_ct` unchanged — its `img_size` is the raw
+  NIfTI array shape, no resize step, no width/height concept at all).
+- `UCF_VIT.datasets.catsdogs.CatsDogsDataset.__getitem__`: swaps
+  `self.resize` to `(width, height)` right before the `cv.resize` call;
+  the tile-bounds swap that previously compensated for `tile_size` being
+  width-first (`start_h`/`end_h` reading index 1, `start_w`/`end_w`
+  reading index 0) was removed — index 0 now bounds `H` and index 1 now
+  bounds `W` directly, no swap needed.
+- `UCF_VIT.dataloaders.dataset.FileReader.read_process_file` (`imagenet`
+  branch) and `TileDataIter`'s 2D branch (`imagenet`-only in practice):
+  the identical two changes, mirroring `catsdogs.py`'s.
+- `utils/visualize_adaptive.py` (a standalone repo-level script, not under
+  `src/UCF_VIT/`): same `cv.resize` swap, for consistency — it consumes
+  `dataset_options.resize` directly too.
+
+`_patch_embed_img_size` became a true identity function for every dataset
+once the config layer matched `PatchEmbed`'s own convention (its
+`imagenet`/`catsdogs` branch reduced to `return tuple(tile_size)`, already
+what the `basic_ct` branch did) — deleted entirely; both `get_model` call
+sites now just pass `tuple(conf["data"]["tile_size"])`/
+`tuple(p_conf["tile_size"])` straight through. `p_conf["dataset"]`
+(`parse.py`), which existed only to feed `_patch_embed_img_size`'s
+now-deleted `dataset` argument, was removed too — confirmed via grep no
+other code or test read it. `parse.py`'s own `tile_size` computation
+needed no functional change at all — it was always pure elementwise
+arithmetic (`effective_size[i] // div + tile_overlap[i]`) with no
+width/height-specific logic, only comments describing the old order.
+
+As a side effect, this also makes `training.py`'s tensor-parallel
+broadcast-placeholder construction (`torch.zeros(..., tile_size[0],
+tile_size[1], ...)`, already implicitly `(H, W)`-ordered, a pre-existing
+latent inconsistency never exercised by any non-square `imagenet` +
+`tensor_par_size > 1` combination) correct for the first time — no code
+change needed there, just a corroborating data point that the flip fixes
+a real inconsistency rather than introducing a new requirement.
+
+Needs a rerun of both `run_distributed_tests.sh` (Tier 2, re-covers
+`test_pretrained_loading_real.py` and the real dataloader tests) and
+`run_pretrained_smoke.sh` (Tier 3c, re-exercises the exact non-square
+`catsdogs` scenario end to end) to confirm the real training path still
+works after this convention flip.
 
 ## Running the distributed (Tier 2) tests
 
@@ -1993,6 +2077,15 @@ Third run (job 5350108), after that fix: phase 1 **PASS (76s)**, phase 2
 **PASS (49s)** — full end-to-end pass, confirming both bugs above are
 actually fixed and the pretrained-loading workflow genuinely works for a
 non-square resolution change (`[256, 256]` → `[128, 192]`).
+
+**Note:** this run was against the `[width, height]` convention described
+above (`NEW_RESIZE = [128, 192]` meant width=128, height=192 at the time).
+That convention was later flipped to `[height, width]` (see "Flipped
+`img_size`/`resize`/`tile_size` to `[height, width]`" earlier in this
+file) — `NEW_RESIZE`'s literal value is unchanged in
+`run_pretrained_smoke.py`, but it now means height=128, width=192, still
+a genuinely non-square case. Needs another real rerun to reconfirm phase 2
+still passes under the new convention.
 
 ## Validating a config file by hand
 

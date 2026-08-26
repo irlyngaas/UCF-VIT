@@ -11,10 +11,10 @@ bugs have been found and fixed this session (see tests/README.md):
   every tile and producing a 5D batch several layers downstream. The
   regression tests below (`test_tiledataiter_3d_twod_true_*`) exercise
   exactly that path.
-- The 2D branch's width/height axis mapping was swapped relative to the
-  real array imagenet produces (`tile_size`/`img_size` are `[width,
-  height]`, but the array after `cv.resize`+`np.moveaxis` is `(C, H,
-  W)`) -- invisible with square dimensions (every shipped config is
+- The 2D branch's height/width axis mapping was swapped relative to the
+  real array imagenet produces (`tile_size`/`img_size` are now `[height,
+  width]`, matching the array after `cv.resize`+`np.moveaxis`, `(C, H,
+  W)`, directly) -- invisible with square dimensions (every shipped config is
   square), which is exactly why `test_tiledataiter_2d_non_square_tile_size_axes_arent_swapped`
   deliberately uses `H != W`.
 """
@@ -73,29 +73,26 @@ def test_tiledataiter_2d_full_coverage_no_overlap():
 
 
 def test_tiledataiter_2d_non_square_tile_size_axes_arent_swapped():
-    """Regression test for a real width/height axis-order bug (found while
+    """Regression test for a real height/width axis-order bug (found while
     reviewing img_size auto-detection): img_size/tile_size are stored
-    [width, height] (matching cv2's own dsize convention -- see
-    dataset.py's FileReader.read_process_file), but the real array
-    imagenet produces is (C, H, W) (cv.resize(dsize=(W, H)) returns
-    (H, W, C), then np.moveaxis(-1, 0) only moves the channel axis, not
-    H/W). tile_size[0] (width-derived) must bound the array's H axis, and
-    tile_size[1] (height-derived) must bound its W axis. Every *other*
-    TileDataIter test in this file uses square dimensions, which can't
-    tell the two index-to-axis mappings apart -- this uses H != W
-    specifically so a swapped mapping would produce truncated/incomplete
-    tiles (numpy silently clips an out-of-bounds slice end rather than
-    raising) instead of full coverage.
+    [height, width], matching the real array imagenet produces directly
+    (C, H, W) -- see dataset.py's FileReader.read_process_file. tile_size[0]
+    (height) bounds the array's H axis, and tile_size[1] (width) bounds its
+    W axis. Every *other* TileDataIter test in this file uses square
+    dimensions, which can't tell the two index-to-axis mappings apart --
+    this uses H != W specifically so a swapped mapping would produce
+    truncated/incomplete tiles (numpy silently clips an out-of-bounds slice
+    end rather than raising) instead of full coverage.
     """
     H, W = 8, 12  # deliberately unequal
     div = 2
-    # img_size/tile_size convention: index 0 is width-derived, index 1 is
-    # height-derived -- matches what parse.py's own tile_size computation
-    # would produce from an [W, H] img_size of [12, 8].
+    # img_size/tile_size convention: index 0 is height, index 1 is width --
+    # matches what parse.py's own tile_size computation would produce from
+    # an [H, W] img_size of [8, 12].
     tile_w, tile_h = W // div, H // div
     data = np.arange(H * W, dtype=np.float32).reshape(1, H, W)
     source = _FakeSource([(data, ("v0",))])
-    tdi = TileDataIter(source, tile_size=(tile_w, tile_h), twoD=True, return_label=False, div=div, tile_overlap=(0, 0), classification=False)
+    tdi = TileDataIter(source, tile_size=(tile_h, tile_w), twoD=True, return_label=False, div=div, tile_overlap=(0, 0), classification=False)
 
     results = list(tdi)
     assert len(results) == div * div

@@ -65,7 +65,7 @@ class CatsDogsDataset(Dataset):
             file_list: List of image file paths, each named like ".../cat.123.jpg"
                 or ".../dog.123.jpg".
             variables: Variable/channel labels to attach to each returned sample.
-            tile_size: `(width, height)` size tiling/patch-size math is based
+            tile_size: `(height, width)` size tiling/patch-size math is based
                 on. When `div == 1` (no tiling), this is the size the whole
                 image actually is once `resize` (if any) has been applied.
                 When `div > 1`, this is the *per-tile* size (matches
@@ -80,13 +80,14 @@ class CatsDogsDataset(Dataset):
             interp_size: Side length each adaptive leaf patch is interpolated to.
             num_channels: Number of image channels.
             dataset: Dataset name to attach to each returned sample.
-            resize: `(width, height)` to resize each image to (matches cv2's own
-                `dsize` convention), or None to leave images at their native size
-                (every file must then already share the same size, since samples
-                in a batch must have matching shapes).
+            resize: `(height, width)` to resize each image to, or None to leave
+                images at their native size (every file must then already share
+                the same size, since samples in a batch must have matching
+                shapes). cv2's own `dsize` convention is `(width, height)`, so
+                this gets swapped locally right before the `cv.resize` call.
             div: Number of tiles to divide each image into per axis (`div * div`
                 tiles total). `1` (the default) means no tiling.
-            tile_overlap: `(width overlap, height overlap)` total overlap between
+            tile_overlap: `(height overlap, width overlap)` total overlap between
                 adjacent tiles per axis, only used when `div > 1`.
         """
         self.file_list = file_list
@@ -102,7 +103,7 @@ class CatsDogsDataset(Dataset):
         self.div = div
 
         # start_overlap/end_overlap and tile_size_no_overlap use the same
-        # [width, height]-ordered convention as tile_size/tile_overlap
+        # [height, width]-ordered convention as tile_size/tile_overlap
         # themselves (see calculate_tile_bounds's own docstring for how
         # this is combined with div/tile_idx into per-tile bounds) --
         # matches TileDataIter.__init__'s identical computation exactly.
@@ -152,22 +153,20 @@ class CatsDogsDataset(Dataset):
         img = Image.open(img_path)
         img = np.array(img)
         if self.resize is not None:
-            img = cv.resize(img, dsize=[self.resize[0], self.resize[1]])
+            # self.resize is (height, width); cv2's dsize is natively
+            # (width, height), so swap locally right here.
+            img = cv.resize(img, dsize=[self.resize[1], self.resize[0]])
 
         if self.div > 1:
             # img is still channel-last (H, W[, C]) here -- Patchify's own
             # docstring documents that as its expected input, and this
             # matches catsdogs.py's existing pipeline order (moveaxis to
             # channel-first only happens at the return lines below).
-            # tile_size/tile_overlap are [width, height]-ordered (matching
-            # cv2's own dsize convention -- see this class's docstring), so
-            # tile_size_no_overlap[0]/start_overlap[0]/end_overlap[0] (width)
-            # bound dim 1 (W) and index 1 (height) bound dim 0 (H) --
-            # deliberately explicit start_h/start_w naming (not x/y) to
-            # avoid repeating the axis-order bug this exact swap fixed in
-            # TileDataIter's own 2D branch.
-            start_h, end_h = calculate_tile_bounds(h_idx, self.div, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
-            start_w, end_w = calculate_tile_bounds(w_idx, self.div, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
+            # tile_size/tile_overlap are [height, width]-ordered, matching
+            # img's own (H, W[, C]) axis order directly -- index 0 bounds
+            # dim 0 (H), index 1 bounds dim 1 (W), no swap needed.
+            start_h, end_h = calculate_tile_bounds(h_idx, self.div, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
+            start_w, end_w = calculate_tile_bounds(w_idx, self.div, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
             img = img[start_h:end_h, start_w:end_w]
 
         label = img_path.split("/")[-1].split(".")[0]

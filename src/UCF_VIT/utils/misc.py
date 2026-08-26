@@ -571,8 +571,8 @@ def detect_img_size(dataset, dict_root_dirs):
     omitted from a training config.
 
     Unlike num_channels (a per-dataset-key dict), img_size is a single
-    flat 2- or 3-element list shared across the whole dataset ([width,
-    height] for imagenet/catsdogs -- see the "Every other dataset" bullet
+    flat 2- or 3-element list shared across the whole dataset ([height,
+    width] for imagenet/catsdogs -- see the "Every other dataset" bullet
     below for why; axis order as-is for basic_ct) -- parse.py reads it
     once and uses it directly (e.g. for tile_size), never per
     dict_root_dirs key. Detection therefore samples
@@ -597,16 +597,15 @@ def detect_img_size(dataset, dict_root_dirs):
       - Every other dataset (e.g. "imagenet", "catsdogs"): the file's
         pixel dimensions via PIL (Image.open(path).size, a cheap, lazy
         read that doesn't decode full pixel data). PIL's own .size is
-        (width, height), and that's the order returned here unchanged --
-        matching the convention dataset.py's/catsdogs.py's own
-        cv.resize(..., dsize=[resize[0], resize[1]]) calls actually use
-        (cv2's dsize parameter is itself (width, height), and neither
-        call reorders resize's elements before passing them through).
-        This is the opposite of what datamodule.py's own resize docstring
-        claims ("[height, width]") -- that docstring is wrong; the actual,
-        already-shipped runtime behavior (unchanged by this function) is
-        [width, height], and every shipped config being square (e.g.
-        [256, 256]) is why this was never caught.
+        natively (width, height); this function swaps it to (height,
+        width) before returning, matching the convention used everywhere
+        else in this codebase for real tensors/arrays (PyTorch's
+        (B,C,H,W), numpy's (H,W,C)) -- img_size/resize/tile_size are
+        height-first throughout the config and data-loading layers.
+        cv2's dsize parameter (used by dataset.py's/catsdogs.py's own
+        cv.resize calls) is the only place that still needs width-first
+        order, since that's cv2's own native convention -- those call
+        sites swap back to width-first locally, right at the cv2 call.
 
     Args:
         dataset: Dataset name ("imagenet", "catsdogs", "basic_ct", ...).
@@ -630,7 +629,8 @@ def detect_img_size(dataset, dict_root_dirs):
     if dataset == "basic_ct":
         return list(nib.load(path).shape)
     else:
-        return list(Image.open(path).size)
+        width, height = Image.open(path).size
+        return [height, width]
 
 def calculate_load_balancing_on_the_fly(conf, VERBOSE=False):
     """Computes how many DDP ranks and batches-per-epoch each dataset should get.

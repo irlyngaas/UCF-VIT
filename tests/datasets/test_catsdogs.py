@@ -40,8 +40,8 @@ NUM_CHANNELS = 3
 def _write_fake_images(tmp_path, names, size=(32, 32)):
     """Writes one small, real, random RGB JPEG per name (e.g. "dog.0.jpg")
     and returns their paths, in the given order. `size` is `(height,
-    width)` (matches `np.random.randint`'s own array-shape convention, as
-    opposed to `img_size`/`resize`'s `[width, height]`).
+    width)`, matching `np.random.randint`'s own array-shape convention --
+    same order as `img_size`/`resize`/`tile_size`.
     """
     paths = []
     rng = np.random.RandomState(0)
@@ -135,18 +135,18 @@ def test_catsdogs_dataset_tiling_non_square_full_coverage_no_overlap(tmp_path):
     full coverage, rather than passing trivially on a square fixture.
 
     Native image: height=24, width=36 (np.random.randint shape
-    convention). resize=(36, 24) is [width, height] (a no-op resize to
+    convention). resize=(24, 36) is [height, width] (a no-op resize to
     the same native size, just exercising the resize path too). div=3,
-    tile_overlap=(0, 0) -> tile_size is the *per-tile* [width, height]
-    (36 // 3, 24 // 3) = (12, 8) -- matches parse.py's own tile_size
+    tile_overlap=(0, 0) -> tile_size is the *per-tile* [height, width]
+    (24 // 3, 36 // 3) = (8, 12) -- matches parse.py's own tile_size
     computation (already divided by div, not divided again internally) --
     i.e. each tile is (8, 12) as a channel-first (C, H, W) array.
     """
     paths = _write_fake_images(tmp_path, ["dog.0.jpg"], size=(24, 36))  # (height, width)
     div = 3
     ds = CatsDogsDataset(
-        paths, variables=("r", "g", "b"), tile_size=(12, 8), num_channels=NUM_CHANNELS,
-        resize=(36, 24), div=div, tile_overlap=(0, 0),
+        paths, variables=("r", "g", "b"), tile_size=(8, 12), num_channels=NUM_CHANNELS,
+        resize=(24, 36), div=div, tile_overlap=(0, 0),
     )
     assert len(ds) == div * div
 

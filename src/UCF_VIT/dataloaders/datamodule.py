@@ -202,10 +202,11 @@ class NativePytorchDataModule(torch.nn.Module):
             dataset in `train_dataloader`; defaults to the default world group if None.
         num_classes (int, optional): Number of segmentation classes; required when `dataset` is
             "basic_ct" and `return_label` is True, to one-hot encode masks in `collate_fn`.
-        resize (Dict, optional): Dict mapping "imagenet" to the `[width, height]` size to resize
-            images to (matches cv2's own `dsize` convention -- see `dataset.py`'s
-            `FileReader.read_process_file`); only used when `dataset` is "imagenet". If absent
-            or has no "imagenet" entry, images are left at their native size.
+        resize (Dict, optional): Dict mapping "imagenet" to the `[height, width]` size to resize
+            images to (cv2's own `dsize` convention is `(width, height)`; `dataset.py`'s
+            `FileReader.read_process_file` swaps locally right before its `cv.resize` call);
+            only used when `dataset` is "imagenet". If absent or has no "imagenet" entry,
+            images are left at their native size.
     """
 
     def __init__(

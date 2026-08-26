@@ -288,13 +288,14 @@ def test_detect_img_size_basic_ct_reads_real_native_shape(tmp_path):
 
 
 def test_detect_img_size_imagenet_reads_real_file_native_pixel_size(tmp_path):
-    """Deliberately non-square (12x7, not e.g. 12x12) so this actually
-    verifies the [width, height] order rather than trivially passing on a
-    square fixture -- PIL's Image.size is (width, height), and that's the
-    order dataset.py's own cv.resize(..., dsize=[resize[0], resize[1]])
-    call already uses unswapped (cv2's dsize is itself (width, height)),
-    so detect_img_size must match it, not datamodule.py's own (incorrect)
-    docstring claim of [height, width].
+    """Deliberately non-square (width=12, height=7, not e.g. 12x12) so this
+    actually verifies the [height, width] order rather than trivially
+    passing on a square fixture -- PIL's Image.size is natively
+    (width, height); detect_img_size swaps it to (height, width) to match
+    the height-first convention used throughout the config and
+    data-loading layers (img_size/resize/tile_size), with the width-first
+    swap-back happening only locally at the actual cv2.resize call sites
+    (dataset.py, catsdogs.py).
     """
     images_dir = tmp_path / "imagesTr"
     images_dir.mkdir()
@@ -302,7 +303,7 @@ def test_detect_img_size_imagenet_reads_real_file_native_pixel_size(tmp_path):
 
     result = detect_img_size("imagenet", {"imagenet": str(tmp_path)})
 
-    assert result == [12, 7]
+    assert result == [7, 12]
 
 
 def test_detect_img_size_catsdogs_reads_real_file_native_pixel_size(tmp_path):
@@ -312,7 +313,7 @@ def test_detect_img_size_catsdogs_reads_real_file_native_pixel_size(tmp_path):
 
     result = detect_img_size("catsdogs", {"catsdogs": str(tmp_path)})
 
-    assert result == [12, 7]
+    assert result == [7, 12]
 
 
 def test_detect_img_size_uses_first_dict_root_dirs_key_only(tmp_path):
@@ -331,7 +332,7 @@ def test_detect_img_size_uses_first_dict_root_dirs_key_only(tmp_path):
 
     result = detect_img_size("catsdogs", {"first": str(first_dir), "second": str(second_dir)})
 
-    assert result == [12, 7]
+    assert result == [7, 12]
 
 
 def test_detect_img_size_raises_for_missing_imagesTr_dir(tmp_path):
