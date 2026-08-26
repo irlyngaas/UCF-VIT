@@ -743,7 +743,16 @@ def parse_pretrained_config(args, conf):
 
         #TODO: If tensor_parallel check if all checkpoint files exist
         #Check if all checkpoint file exists, for given parallelism setup
-        checkpointExists = os.path.isfile(os.path.join(pretrained_conf["trainer"]["checkpoint_path"],conf["trainer"]["pretrained_checkpoint_filename"]))
+        # Real filename save_checkpoint (training.py) actually writes is
+        # "<pretrained_checkpoint_filename>_rank_<N>.ckpt", not a bare
+        # "<pretrained_checkpoint_filename>" file -- the previous check here
+        # looked for a file that's never written by any real training run,
+        # so use_pretrained_model:True always failed with "Checkpoint file
+        # does not exist" for real (confirmed by a real Frontier run, job
+        # 5348717). Checking rank 0's file specifically (not per-tensor-
+        # parallel-rank, per the TODO above) mirrors run_training_smoke.py's
+        # own rank0_checkpoint_exists.
+        checkpointExists = os.path.isfile(os.path.join(pretrained_conf["trainer"]["checkpoint_path"],conf["trainer"]["pretrained_checkpoint_filename"]+"_rank_0.ckpt"))
         if not checkpointExists:
             sys.exit("Checkpoint file does not exist")
 

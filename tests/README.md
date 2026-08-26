@@ -542,13 +542,23 @@ only once cross-architecture coverage was widened beyond the one direction
    adding it to `trainer_conf`'s construction.
 3. `parse_pretrained_config`'s checkpoint-existence check
    (`os.path.isfile(os.path.join(pretrained_conf["trainer"]
-   ["checkpoint_path"], pretrained_checkpoint_filename))`) looks for a
+   ["checkpoint_path"], pretrained_checkpoint_filename))`) looked for a
    plain file named exactly `pretrained_checkpoint_filename` (e.g.
    `"epoch_0"`) — a *different* filename than what actually gets loaded
-   later (`..._rank_{world_rank}.ckpt`). Found while writing the Tier 2
-   test's checkpoint fixture; not fixed (doesn't block or crash anything,
-   just an imprecise existence pre-check that can pass/fail independently
-   of whether the real per-rank file exists) — flagged for a future pass.
+   later (`..._rank_{world_rank}.ckpt`) and than what any real training run
+   ever writes. Found while writing the Tier 2 test's checkpoint fixture;
+   **initially assessed as harmless** ("just an imprecise existence
+   pre-check, doesn't block anything") — that assessment was wrong. A real
+   Tier 3 run (job 5348717) hit it directly: phase 1 (fresh training)
+   passed and wrote a real `epoch_0_rank_0.ckpt`, but phase 2 (pretrained)
+   failed immediately with `"Checkpoint file does not exist"`, since no
+   file is ever named plain `"epoch_0"`. The Tier 1/Tier 2 tests never
+   caught this because they worked around it by creating that exact dummy
+   file as part of the test fixture, masking the real bug. Fixed by
+   checking for `"<pretrained_checkpoint_filename>_rank_0.ckpt"` instead
+   (mirroring `run_training_smoke.py`'s own `rank0_checkpoint_exists`); the
+   now-unnecessary dummy-file workarounds were removed from
+   `test_pretrained_loading_real.py`/`test_parse_pretrained_config.py`.
 4. `extract_encoder_state_dict`'s allowlist includes `cls_token` (genuinely
    a shared `VIT.__init__` attribute whenever it's present), but only `VIT`
    ever actually has one (`get_model`'s own `class_token=True if
@@ -561,6 +571,14 @@ only once cross-architecture coverage was widened beyond the one direction
    prefix-token direction, not the reverse 1→0. Fixed with a new
    `_prune_incompatible_cls_token`, called in `get_model` right after
    `_transplant_pos_embed`.
+
+Items 1-2 and 4 (everything except the checkpoint-existence-check filename)
+were verified together in one real run (job 5348693): all 62 tests passed
+across all 8 ranks, including both `test_pretrained_loading_real.py` cases
+(`test_pretrained_loading_wiring_real_get_model` and
+`test_pretrained_loading_cross_architecture_mae_into_unetr`). Item 3 was
+only caught afterward, by the Tier 3 run below — see that section for why
+Tier 2 didn't catch it.
 
 ## Running the distributed (Tier 2) tests
 
@@ -1927,6 +1945,17 @@ already uses, rather than reimplementing them):
 
 Prints a PASS/FAIL/TIMEOUT summary for both phases, same style as the other
 two Tier 3 scripts; exits nonzero if either phase fails.
+
+**Real runs on Frontier so far:**
+
+First run (job 5348717): phase 1 **PASS (66s)** — real training completed
+and wrote `epoch_0_rank_0.ckpt` normally. Phase 2 **FAIL (17s)**,
+`"Checkpoint file does not exist"` — this is exactly the checkpoint-
+existence-check bug described in the Tier 2 section's item 3 above; this
+run is what actually caught it (the Tier 1/Tier 2 tests had worked around
+it without realizing it was a real, blocking bug for genuine end-to-end
+usage). Fixed the same way described there. Needs a rerun to confirm phase
+2 now passes for real.
 
 ## Validating a config file by hand
 

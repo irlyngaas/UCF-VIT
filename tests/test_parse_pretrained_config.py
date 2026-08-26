@@ -89,12 +89,11 @@ def _parse_as_pretrained_source(pretrained_conf, downstream_conf):
 
     pretrained_conf["trainer"]["checkpoint_path"] = os.path.join(scratch, "pretrained_ckpt")
     os.makedirs(pretrained_conf["trainer"]["checkpoint_path"])
-    # parse_pretrained_config's checkpoint-existence pre-check needs a real
-    # file named exactly pretrained_checkpoint_filename to exist (see
-    # tests/README.md's "Real wiring bugs" section for why this is a
-    # different filename than what actually gets loaded -- harmless here,
-    # just needs to exist).
-    open(os.path.join(pretrained_conf["trainer"]["checkpoint_path"], "epoch_0"), "w").close()
+    # parse_pretrained_config's checkpoint-existence pre-check needs
+    # "<pretrained_checkpoint_filename>_rank_0.ckpt" to exist (the real
+    # filename save_checkpoint writes) -- content is never read here, this
+    # test only exercises get_kwargs, not an actual checkpoint load.
+    open(os.path.join(pretrained_conf["trainer"]["checkpoint_path"], "epoch_0_rank_0.ckpt"), "w").close()
 
     downstream_conf["trainer"]["checkpoint_path"] = os.path.join(scratch, "downstream_ckpt")
     downstream_conf["trainer"]["use_pretrained_model"] = True

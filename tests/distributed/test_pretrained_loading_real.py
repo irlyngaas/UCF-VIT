@@ -170,13 +170,13 @@ def test_pretrained_loading_wiring_real_get_model(dist_info):
             },
             os.path.join(pretrained_dir, "epoch_0_rank_0.ckpt"),
         )
-        # parse_pretrained_config's existence pre-check looks for a plain
-        # file named exactly pretrained_checkpoint_filename (no _rank_/.ckpt
-        # suffix) -- a real, separate, pre-existing inconsistency from what
-        # actually gets loaded (found while writing this test, not fixed
-        # here -- out of scope, doesn't block anything since it's just an
-        # existence check).
-        open(os.path.join(pretrained_dir, "epoch_0"), "w").close()
+        # No separate dummy file needed for parse_pretrained_config's
+        # checkpoint-existence pre-check -- it now correctly looks for
+        # "epoch_0_rank_0.ckpt" (the file actually written above), not a
+        # bare "epoch_0" (a real bug this test's own real-Frontier run,
+        # job 5348717, caught: the check looked for a filename no real
+        # training run ever writes, so use_pretrained_model:True
+        # unconditionally failed with "Checkpoint file does not exist").
 
     dist.barrier()
 
@@ -280,7 +280,6 @@ def test_pretrained_loading_cross_architecture_mae_into_unetr(dist_info):
             },
             os.path.join(pretrained_dir, "epoch_0_rank_0.ckpt"),
         )
-        open(os.path.join(pretrained_dir, "epoch_0"), "w").close()
 
     dist.barrier()
 
