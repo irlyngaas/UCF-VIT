@@ -152,6 +152,42 @@ def _prune_incompatible_cls_token(encoder_dict, model):
         del encoder_dict["cls_token"]
 
 
+def _patch_embed_img_size(tile_size, twoD, dataset):
+    """Converts a data-side tile_size into the (H, W[, D]) order PatchEmbed/VIT
+    actually expect (matching a real batch's own B, C, H, W[, D] shape).
+
+    `imagenet`/`catsdogs`'s tile_size is `[width, height]` -- this repo's own
+    established resize/dsize convention, matching cv2's own `dsize` parameter
+    (see e.g. dataset.py's read_process_file) -- always a 2-tuple, since
+    parse.py forces `twoD:True` whenever `img_size` has 2 entries (only
+    `basic_ct` ever has a 3-entry `img_size`). `basic_ct` has no resize step
+    at all, so its tile_size already mirrors the raw NIfTI array's own axis
+    order directly -- the same reasoning TileDataIter's own twoD/3D branch
+    distinction already relies on (dataset.py). Swapping unconditionally
+    would fix `imagenet`/`catsdogs` but break `basic_ct`.
+
+    Invisible for any square tile_size (a no-op either way) -- every shipped
+    config is square, so this was never caught until a real Frontier run
+    used a genuinely non-square `catsdogs` resize for the first time (job
+    5348773): PatchEmbed.forward's own shape assert caught it directly
+    ("Input height (192) doesn't match model (128)").
+
+    Args:
+        tile_size: This model's `conf["data"]["tile_size"]` (or `p_conf`'s
+            pretrained-model equivalent) -- 2-tuple for `imagenet`/
+            `catsdogs`, 2- or 3-tuple for `basic_ct` depending on `twoD`.
+        twoD: Whether this model treats its input as 2D.
+        dataset: `conf["data"]["dataset"]` (or `p_conf`'s pretrained-model
+            equivalent).
+
+    Returns:
+        A 2- or 3-tuple `img_size`, `(H, W)`/`(H, W, D)`-ordered.
+    """
+    if dataset in ("imagenet", "catsdogs"):
+        return (tile_size[1], tile_size[0])
+    return (tile_size[0], tile_size[1]) if twoD else (tile_size[0], tile_size[1], tile_size[2])
+
+
 def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, tensor_par_group):
     """Build the model architecture, load its initial weights, and wrap it with FSDP.
 
@@ -206,7 +242,7 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
         from UCF_VIT.model.arch import DiffusionVIT as model_arch
 
     model = model_arch(
-        img_size=(conf["data"]["tile_size"][0],conf["data"]["tile_size"][1]) if conf["data"]["twoD"] else (conf["data"]["tile_size"][0],conf["data"]["tile_size"][1], conf["data"]["tile_size"][2]),
+        img_size=_patch_embed_img_size(conf["data"]["tile_size"], conf["data"]["twoD"], conf["data"]["dataset"]),
         patch_size=conf["data"]["patch_size"],
         interp_size=conf["data"].get("interp_size"),
         in_chans=conf["data"]["in_chans"],
@@ -271,7 +307,7 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
             # (pos_embed only, via _transplant_pos_embed) to the new model's
             # shape afterward, not before loading the checkpoint.
             pretrained_model = pretrained_model_arch(
-                img_size=(p_conf["tile_size"][0],p_conf["tile_size"][1]) if p_conf["twoD"] else (p_conf["tile_size"][0],p_conf["tile_size"][1], p_conf["tile_size"][2]),
+                img_size=_patch_embed_img_size(p_conf["tile_size"], p_conf["twoD"], p_conf["dataset"]),
                 patch_size=p_conf["patch_size"],
                 interp_size=p_conf["interp_size"],
                 in_chans=conf["data"]["in_chans"],

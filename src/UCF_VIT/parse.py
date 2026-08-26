@@ -912,6 +912,7 @@ def parse_pretrained_config(args, conf):
             # The pretrained model's own original architecture-determining
             # values -- see the comment above pretrained_tile_size for why
             # these are deliberately not required to match conf's own.
+            "dataset": pretrained_conf["data"]["dataset"],
             "img_size": pretrained_img_size,
             "tile_size": pretrained_tile_size,
             "twoD": twoD,

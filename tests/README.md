@@ -85,7 +85,7 @@ pytest tests/test_config_validation.py -v
 | `tests/utils/test_metrics.py` | `masked_mse`, `DiceBLoss` |
 | `tests/test_config_validation.py` | Every YAML under `configs/` actually parses via `parse_config`, plus a negative-case regression test that `ap.do_ap:True` with no `ap.interp_size` set fails with a clear error, not a bare `KeyError` |
 | `tests/model/test_arch.py` | `VIT.effective_patch_size` (`interp_size` used when `adaptive_patching`, `patch_size` otherwise, `patch_size`/`interp_size` themselves never overwritten, missing-`interp_size`-under-`adaptive_patching` raises clearly) — needs the real `timm`/`monai`/`xformers` stack (`UCF_VIT.model.arch`'s own imports), skips cleanly via `importorskip` otherwise |
-| `tests/model/test_pretrained_loading.py` | `interpolate_pos_embed`/`interpolate_pos_embed_3d` (independent, non-1:1 height:width[:depth] ratio changes in both directions, class-token prefix preserved, same-size no-op), `extract_encoder_state_dict` against both a fake dict (allowlist keeps only the shared `VIT` encoder — including the `UNETR.encoder1`-vs-`"decoder" not in k` collision case that motivated an allowlist over a denylist) and every real model type's own real `state_dict()` as a pretrained source (`VIT`/`MAE`/`SAP`/`UNETR`/`DiffusionVIT` — not just the two types any shipped config actually uses, since nothing in `get_model` restricts which type the pretrained source is), and end-to-end pretrained-checkpoint transplant (same-architecture 2D and 3D non-cubic ratio changes, cross-architecture `MAE`→`VIT` *and* `VIT`→`MAE` — both class-token-count-mismatch directions, not just one — `sqrt_len_method:True` raising a clear error instead of silently transplanting a wrong-shaped `pos_embed`) — same `importorskip` gating as `test_arch.py`. The `VIT`→`MAE` direction caught a real bug: `extract_encoder_state_dict`'s allowlist includes `cls_token` (genuinely a shared `VIT.__init__` attribute when present), but a downstream model with no `cls_token` at all (any non-`VIT` type, or `class_token=False`) made `load_state_dict(strict=True)` raise `"Unexpected key(s): cls_token"` — unlike `pos_embed`, which always has *some* value to reconcile shapes against, `cls_token` can be entirely absent on one side. Fixed with a new `_prune_incompatible_cls_token`, called in `get_model` right after `_transplant_pos_embed`. |
+| `tests/model/test_pretrained_loading.py` | `interpolate_pos_embed`/`interpolate_pos_embed_3d` (independent, non-1:1 height:width[:depth] ratio changes in both directions, class-token prefix preserved, same-size no-op), `extract_encoder_state_dict` against both a fake dict (allowlist keeps only the shared `VIT` encoder — including the `UNETR.encoder1`-vs-`"decoder" not in k` collision case that motivated an allowlist over a denylist) and every real model type's own real `state_dict()` as a pretrained source (`VIT`/`MAE`/`SAP`/`UNETR`/`DiffusionVIT` — not just the two types any shipped config actually uses, since nothing in `get_model` restricts which type the pretrained source is), and end-to-end pretrained-checkpoint transplant (same-architecture 2D and 3D non-cubic ratio changes, cross-architecture `MAE`→`VIT` *and* `VIT`→`MAE` — both class-token-count-mismatch directions, not just one — `sqrt_len_method:True` raising a clear error instead of silently transplanting a wrong-shaped `pos_embed`) — same `importorskip` gating as `test_arch.py`. The `VIT`→`MAE` direction caught a real bug: `extract_encoder_state_dict`'s allowlist includes `cls_token` (genuinely a shared `VIT.__init__` attribute when present), but a downstream model with no `cls_token` at all (any non-`VIT` type, or `class_token=False`) made `load_state_dict(strict=True)` raise `"Unexpected key(s): cls_token"` — unlike `pos_embed`, which always has *some* value to reconcile shapes against, `cls_token` can be entirely absent on one side. Fixed with a new `_prune_incompatible_cls_token`, called in `get_model` right after `_transplant_pos_embed`. Also covers `_patch_embed_img_size` (not pretrained-loading specific — swaps `tile_size`'s `[width, height]` order to `PatchEmbed`'s expected `(H, W)` for `imagenet`/`catsdogs`, no swap for `basic_ct`; a real bug caught by a real Tier 3 run, see the Tier 3c section below). |
 | `tests/test_parse_pretrained_config.py` | `parse_pretrained_config` (+ `get_kwargs`'s per-model-type branch) for `SAP`/`UNETR`/`DiffusionVIT` as the pretrained source specifically — `tests/model/test_pretrained_loading.py`/`test_pretrained_loading_real.py` only ever use `VIT`/`MAE`. Pure `parse.py`-level (no `UCF_VIT.model.arch` import at all), so no `importorskip` needed — runs in any environment. |
 | `tests/integration/test_run_training_smoke_helpers.py` | `run_training_smoke.py`'s `compute_narrow_dict_idx` (real-data-found narrowing, empty-but-existing-dir and nonexistent-dir both raising `NoRealDataFoundError`, no-op for non-`iterative_dataloader` configs) and `deep_merge_config_overrides` (nested-key merge, wholesale-replace of non-dict values, new-key insertion, multiple independent sections) |
 | `tests/integration/test_feature_matrix_smoke_helpers.py` | `run_feature_matrix_smoke.py`'s `FEATURE_MATRIX` well-formedness (unique labels, real base-config paths, no accidental list-valued `tile_overlap` overrides) and — the most valuable check — every cell's tiny-model config surviving a real `parse_config` call |
@@ -571,14 +571,37 @@ only once cross-architecture coverage was widened beyond the one direction
    prefix-token direction, not the reverse 1→0. Fixed with a new
    `_prune_incompatible_cls_token`, called in `get_model` right after
    `_transplant_pos_embed`.
+5. **Not pretrained-loading specific — affects every model construction,
+   including training from scratch.** `get_model` built `PatchEmbed`'s
+   `img_size` straight from `conf["data"]["tile_size"]`
+   (`img_size=(tile_size[0], tile_size[1])`), but `tile_size` is `[width,
+   height]` for `imagenet`/`catsdogs` (this repo's own resize/dsize
+   convention, established earlier this session) while `PatchEmbed.forward`
+   (`building_blocks.py`) expects `(H, W)` (`B, C, H, W = x.shape`, then
+   asserts `H == self.img_size[0]`) — genuinely swapped. `basic_ct` goes
+   through the exact same line but needed *no* swap: it has no resize step
+   at all, so its `tile_size` already mirrors the raw NIfTI array's own axis
+   order directly (the same reasoning `TileDataIter`'s own twoD/3D branch
+   distinction, fixed earlier this session, already relies on). Invisible
+   for every shipped (square) config — a uniform swap would have fixed
+   `imagenet`/`catsdogs` but broken `basic_ct`. Caught by a real Tier 3 run
+   (job 5348773, after item 3 above was fixed and got far enough to reach
+   the actual forward pass for the first time): `AssertionError: Input
+   height (192) doesn't match model (128)`, from a `catsdogs` config
+   deliberately using a non-square `resize: [128, 192]`. Fixed with a new
+   `_patch_embed_img_size(tile_size, twoD, dataset)`, dataset-aware, used at
+   both `img_size=` construction sites in `get_model` (the main model and
+   the pretrained model). `p_conf` gained a `"dataset"` key for the second
+   call site.
 
-Items 1-2 and 4 (everything except the checkpoint-existence-check filename)
-were verified together in one real run (job 5348693): all 62 tests passed
-across all 8 ranks, including both `test_pretrained_loading_real.py` cases
+Items 1-2 and 4 were verified together in one real run (job 5348693): all
+62 tests passed across all 8 ranks, including both
+`test_pretrained_loading_real.py` cases
 (`test_pretrained_loading_wiring_real_get_model` and
-`test_pretrained_loading_cross_architecture_mae_into_unetr`). Item 3 was
-only caught afterward, by the Tier 3 run below — see that section for why
-Tier 2 didn't catch it.
+`test_pretrained_loading_cross_architecture_mae_into_unetr`) — both use
+square `img_size`s, so item 5 (not yet found at that point) wouldn't have
+been caught there regardless. Items 3 and 5 were only caught by the Tier 3
+runs below, in sequence — see that section.
 
 ## Running the distributed (Tier 2) tests
 
@@ -1954,8 +1977,17 @@ and wrote `epoch_0_rank_0.ckpt` normally. Phase 2 **FAIL (17s)**,
 existence-check bug described in the Tier 2 section's item 3 above; this
 run is what actually caught it (the Tier 1/Tier 2 tests had worked around
 it without realizing it was a real, blocking bug for genuine end-to-end
-usage). Fixed the same way described there. Needs a rerun to confirm phase
-2 now passes for real.
+usage). Fixed the same way described there.
+
+Second run (job 5348773), after that fix: phase 1 **PASS (66s)** again.
+Phase 2 got past the checkpoint-existence check this time and reached the
+real forward pass for the first time ever — where it hit item 5 above
+(`AssertionError: Input height (192) doesn't match model (128)`), **FAIL
+(21s)**. This run is what actually caught that bug — `[128, 192]`
+(non-square, chosen deliberately to prove ratio-independence) is the first
+resize this repo has ever used in a real training run that wasn't square.
+Fixed the same way described there. Needs another rerun to confirm phase 2
+now passes for real.
 
 ## Validating a config file by hand
 

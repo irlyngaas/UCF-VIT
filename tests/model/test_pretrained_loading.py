@@ -18,6 +18,16 @@ Covers three things introduced/fixed together:
    `sqrt_len_method:True` (`SAP`/`UNETR+do_ap`) explicitly rather than silently
    producing a wrong-shaped result (see this session's own investigation notes
    for why that regime's `grid_size` doesn't reflect its real token count).
+4. `UCF_VIT.model.utils._patch_embed_img_size` -- not pretrained-loading
+   specific (affects *every* model construction, including training from
+   scratch), but found via this same investigation: `get_model` built
+   `PatchEmbed`'s `img_size` straight from `tile_size`, which is `[width,
+   height]` for `imagenet`/`catsdogs` (this repo's own resize/dsize
+   convention) but `(H, W)` for `basic_ct` (no resize step, mirrors the raw
+   data array's own axis order directly) -- `PatchEmbed` itself always
+   expects `(H, W)`, so `imagenet`/`catsdogs` needed a swap `basic_ct`
+   didn't. Invisible for every shipped (square) config; caught by a real
+   non-square `catsdogs` resize on Frontier (job 5348773).
 
 Requires timm/monai/xformers (building_blocks.py's real, unconditional
 top-level imports, transitively pulled in by model/utils.py itself) -- see
@@ -45,6 +55,7 @@ interpolate_pos_embed_3d = pos_embed_mod.interpolate_pos_embed_3d
 extract_encoder_state_dict = model_utils_mod.extract_encoder_state_dict
 _transplant_pos_embed = model_utils_mod._transplant_pos_embed
 _prune_incompatible_cls_token = model_utils_mod._prune_incompatible_cls_token
+_patch_embed_img_size = model_utils_mod._patch_embed_img_size
 VIT = arch_mod.VIT
 MAE = arch_mod.MAE
 SAP = arch_mod.SAP
@@ -124,6 +135,39 @@ def test_interpolate_pos_embed_3d_same_size_is_a_true_noop():
     resized = interpolate_pos_embed_3d(pos_embed, grid, grid)
 
     assert resized is pos_embed
+
+
+# ---------------------------------------------------------------------------
+# _patch_embed_img_size
+# ---------------------------------------------------------------------------
+# Found via a real Frontier run (job 5348773): get_model built PatchEmbed's
+# img_size straight from tile_size, but tile_size is [width, height] for
+# imagenet/catsdogs (this repo's own resize/dsize convention) while
+# PatchEmbed expects (H, W) (matching a real batch's own B,C,H,W shape) --
+# swapped, invisible for every shipped (square) config, first caught by a
+# real non-square catsdogs resize: "Input height (192) doesn't match model
+# (128)". basic_ct has no resize step at all, so its tile_size already
+# mirrors the raw data array's own axis order directly -- no swap needed
+# there (a uniform swap would have fixed imagenet/catsdogs but broken
+# basic_ct).
+
+
+def test_patch_embed_img_size_swaps_for_catsdogs_and_imagenet():
+    assert _patch_embed_img_size((128, 192), True, "catsdogs") == (192, 128)
+    assert _patch_embed_img_size((128, 192), True, "imagenet") == (192, 128)
+
+
+def test_patch_embed_img_size_square_is_a_true_noop():
+    # Why this was invisible in every shipped config.
+    assert _patch_embed_img_size((256, 256), True, "catsdogs") == (256, 256)
+
+
+def test_patch_embed_img_size_no_swap_for_basic_ct():
+    # twoD:True, 3-tuple tile_size (basic_ct sliced into 2D z-planes) --
+    # first two elements kept as-is, undivided depth (index 2) dropped.
+    assert _patch_embed_img_size((64, 128, 256), True, "basic_ct") == (64, 128)
+    # twoD:False, full 3D volume -- kept as-is entirely.
+    assert _patch_embed_img_size((64, 128, 256), False, "basic_ct") == (64, 128, 256)
 
 
 # ---------------------------------------------------------------------------
