@@ -123,6 +123,35 @@ def _transplant_pos_embed(encoder_dict, pretrained_model, model):
         interpolate_pos_embed_adaptive(model, encoder_dict, new_size=model.fixed_length)
 
 
+def _prune_incompatible_cls_token(encoder_dict, model):
+    """Drops encoder_dict's "cls_token" entry (in place) if the new model has none.
+
+    A no-op if encoder_dict has no "cls_token" entry at all (the pretrained
+    source itself has class_token=False, so there's nothing to drop -- the new
+    model just keeps its own) or if the new model does have its own cls_token
+    (kept, transplanted normally -- a real, meaningful value in that case).
+
+    Only VIT ever has class_token=True in practice (get_model's own
+    class_token=True if conf["model"]["type"] == "VIT" else False) -- so this
+    only matters for a pretrained VIT source paired with a non-VIT (or
+    class_token=False VIT) downstream model, where cls_token is present in
+    encoder_dict (extract_encoder_state_dict's allowlist includes it, since
+    it's genuinely a shared VIT.__init__ attribute) but the new model has no
+    such attribute at all, not just a differently-shaped one -- unlike
+    pos_embed's prefix-count mismatch (_transplant_pos_embed above), which
+    always has *some* pos_embed to reconcile shapes against. Found via a real
+    VIT->MAE test: model.load_state_dict(..., strict=True) otherwise raises
+    "Unexpected key(s) in state_dict: cls_token".
+
+    Args:
+        encoder_dict: Dict as returned by extract_encoder_state_dict, from the
+            pretrained model; modified in place.
+        model: The constructed new model instance being fine-tuned.
+    """
+    if "cls_token" in encoder_dict and model.cls_token is None:
+        del encoder_dict["cls_token"]
+
+
 def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, tensor_par_group):
     """Build the model architecture, load its initial weights, and wrap it with FSDP.
 
@@ -285,6 +314,7 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
             # allowlist generalizes safely across all of them.
             encoder_dict = extract_encoder_state_dict(pretrained_model.state_dict())
             _transplant_pos_embed(encoder_dict, pretrained_model, model)
+            _prune_incompatible_cls_token(encoder_dict, model)
 
             #Load encoder states from pretrained model into the model we want to train
             model_dict = model.state_dict()

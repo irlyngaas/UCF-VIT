@@ -59,13 +59,26 @@ PRETRAINED_IMG_SIZE = [32, 64]
 NEW_IMG_SIZE = [64, 32]
 
 
-def _base_config(img_size, num_classes, checkpoint_path):
+def _base_config(img_size, checkpoint_path, model_type="VIT", extra_model=None, dataset="catsdogs"):
     """A minimal, real, self-contained config dict (no real data files
     needed -- img_size/num_channels given explicitly, so detect_img_size/
     detect_num_channels never fire) mirroring configs/catsdogs/classification/
-    base_config.yaml's structure.
+    base_config.yaml's structure. dataset="basic_ct" (segmentation, required
+    for SAP/UNETR -- parse_config's own dataset/model_type compatibility
+    assert) uses the iterative-dataloader dict_start_idx/end_idx/
+    buffer_sizes shape instead of catsdogs's plain "dataloader" type
+    (parse_config's own dataloader_type=="dataloader" branch is hardcoded to
+    catsdogs only).
     """
-    return {
+    if dataset == "catsdogs":
+        dataloader_conf = {"type": "dataloader", "batch_size": 2, "num_workers": 0, "pin_memory": False}
+    else:
+        dataloader_conf = {
+            "type": "iterative_dataloader", "batch_size": 2, "num_workers": 0, "pin_memory": False,
+            "dict_start_idx": {dataset: 0.0}, "dict_end_idx": {dataset: 1.0}, "dict_buffer_sizes": {dataset: 1},
+        }
+
+    conf = {
         "trainer": {
             "max_epochs": 1,
             "data_type": "float32",
@@ -82,24 +95,26 @@ def _base_config(img_size, num_classes, checkpoint_path):
         "scheduler": {"type": "linear-warmup-cosine-annealing", "warmup_epochs": 1, "warmup_start_lr": 1e-8, "eta_min": 1e-8},
         "grad_scaler": {"use_grad_scaler": False, "init_scale": 8192, "min_scale": 128, "growth_interval": 100},
         "model": {
-            "type": "VIT", "embed_dim": 8, "depth": 1, "num_heads": 1, "mlp_ratio": 1.0,
+            "type": model_type, "embed_dim": 8, "depth": 1, "num_heads": 1, "mlp_ratio": 1.0,
             "drop_path": 0.0, "drop_rate": 0.0, "use_channel_aggregation": False,
-            "num_classes": num_classes,
         },
         "tiling": {"do_tiling": False, "div": 1, "tile_overlap": 0, "use_all_data": False},
         "ap": {"do_ap": False, "fixed_length": 196, "separate_channels": False, "use_adaptive_pos_emb": False, "interp_size": 16},
         "data": {
-            "dataset": "catsdogs",
+            "dataset": dataset,
             "img_size": img_size,
             "twoD": True,
             "patch_size": 4,
-            "dict_root_dirs": {"catsdogs": "/nonexistent/never-read-since-get_model-never-loads-data"},
-            "num_channels": {"catsdogs": 1},
-            "dict_in_variables": {"catsdogs": ["v0"]},
+            "dict_root_dirs": {dataset: "/nonexistent/never-read-since-get_model-never-loads-data"},
+            "num_channels": {dataset: 1},
+            "dict_in_variables": {dataset: ["v0"]},
         },
-        "dataloader": {"type": "dataloader", "batch_size": 2, "num_workers": 0, "pin_memory": False},
+        "dataloader": dataloader_conf,
         "dataset_options": {},
     }
+    if extra_model:
+        conf["model"].update(extra_model)
+    return conf
 
 
 def _write_config(path, conf):
@@ -122,10 +137,10 @@ def test_pretrained_loading_wiring_real_get_model(dist_info):
         os.makedirs(pretrained_dir, exist_ok=True)
         os.makedirs(new_dir, exist_ok=True)
 
-        pretrained_conf = _base_config(PRETRAINED_IMG_SIZE, num_classes=2, checkpoint_path=pretrained_dir)
+        pretrained_conf = _base_config(PRETRAINED_IMG_SIZE, checkpoint_path=pretrained_dir, extra_model={"num_classes": 2})
         _write_config(pretrained_config_path, pretrained_conf)
 
-        new_conf = _base_config(NEW_IMG_SIZE, num_classes=3, checkpoint_path=new_dir)
+        new_conf = _base_config(NEW_IMG_SIZE, checkpoint_path=new_dir, extra_model={"num_classes": 3})
         new_conf["trainer"]["use_pretrained_model"] = True
         new_conf["trainer"]["pretrained_checkpoint_filename"] = "epoch_0"
         _write_config(new_config_path, new_conf)
@@ -203,4 +218,107 @@ def test_pretrained_loading_wiring_real_get_model(dist_info):
     output.sum().backward()
 
     assert output.shape == (2, 3)
+    assert torch.isfinite(output).all()
+
+
+@pytest.mark.skipif(WORLD_SIZE == 0, reason="requires SLURM_NTASKS (run via srun)")
+def test_pretrained_loading_cross_architecture_mae_into_unetr(dist_info):
+    """The real production workflow (pretrain via MAE, fine-tune into a
+    different downstream type) through the real get_model, not just the
+    hand-constructed unit test in tests/model/test_pretrained_loading.py's
+    MAE->VIT case. UNETR specifically, not VIT, since it needs its own real
+    kwargs (feature_size, linear_decoder) that a same-architecture VIT->VIT
+    test can never exercise -- linear_decoder=True/skip_connection=False
+    avoids needing UNETR's real monai conv skip-connection path, unrelated
+    to what's being verified here.
+    """
+    world_rank = dist_info["world_rank"]
+    local_rank = dist_info["local_rank"]
+    device = torch.device(f"cuda:{local_rank}")
+
+    pretrained_dir = os.path.join(SCRATCH_ROOT, "mae_pretrained")
+    new_dir = os.path.join(SCRATCH_ROOT, "unetr_new")
+    pretrained_config_path = os.path.join(SCRATCH_ROOT, "mae_pretrained.yaml")
+    new_config_path = os.path.join(SCRATCH_ROOT, "unetr_new.yaml")
+
+    if world_rank == 0:
+        os.makedirs(pretrained_dir, exist_ok=True)
+        os.makedirs(new_dir, exist_ok=True)
+
+        pretrained_conf = _base_config(
+            PRETRAINED_IMG_SIZE, checkpoint_path=pretrained_dir, model_type="MAE",
+            extra_model={"mask_ratio": 0.75, "linear_decoder": True},
+        )
+        _write_config(pretrained_config_path, pretrained_conf)
+
+        new_conf = _base_config(
+            NEW_IMG_SIZE, checkpoint_path=new_dir, model_type="UNETR", dataset="basic_ct",
+            extra_model={"num_classes": 3, "linear_decoder": True, "skip_connection": False, "feature_size": 4},
+        )
+        new_conf["trainer"]["use_pretrained_model"] = True
+        new_conf["trainer"]["pretrained_checkpoint_filename"] = "epoch_0"
+        _write_config(new_config_path, new_conf)
+
+        from UCF_VIT.model.arch import MAE
+
+        pretrained_model = MAE(
+            img_size=tuple(PRETRAINED_IMG_SIZE), patch_size=4, in_chans=1,
+            num_classes=None, embed_dim=8, depth=1, num_heads=1, mlp_ratio=1.0,
+            twoD=True, class_token=False, pos_embed="learn",
+            adaptive_patching=False, fixed_length=196,
+            mask_ratio=0.75, linear_decoder=True,
+            decoder_depth=None, decoder_embed_dim=None, decoder_num_heads=None, decoder_mlp_ratio=None,
+            weight_init="skip",
+        )
+        torch.save(
+            {
+                "epoch": 0,
+                "model_state_dict": pretrained_model.state_dict(),
+                "optimizer_state_dict": {},
+                "scheduler_state_dict": {},
+                "loss_list": [],
+            },
+            os.path.join(pretrained_dir, "epoch_0_rank_0.ckpt"),
+        )
+        open(os.path.join(pretrained_dir, "epoch_0"), "w").close()
+
+    dist.barrier()
+
+    args = argparse.Namespace(config=new_config_path, pretrained_config=pretrained_config_path)
+    conf = parse_config(args)
+    p_conf = parse_pretrained_config(args, conf)
+
+    ddp_group, tensor_par_group, data_seq_ort_group, fsdp_group, simple_ddp_group = init_par_groups(
+        world_rank=world_rank,
+        data_par_size=WORLD_SIZE,
+        tensor_par_size=1,
+        fsdp_size=1,
+        simple_ddp_size=WORLD_SIZE,
+    )
+
+    model, epoch_start, loss_list = get_model(
+        conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, tensor_par_group,
+    )
+
+    assert isinstance(model, FSDP)
+
+    with FSDP.summon_full_params(model, writeback=False):
+        # MAE's own class_token=False and UNETR's are both False (class_
+        # token=True only for model_type=="VIT" in get_model's own
+        # construction), so num_prefix_tokens=0 on both sides here -- no
+        # prefix-mismatch fallback exercised (that's covered separately by
+        # the MAE->VIT case in tests/model/test_pretrained_loading.py).
+        new_grid = tuple(s // 4 for s in NEW_IMG_SIZE)  # patch_size=4
+        assert model.pos_embed.shape == (1, new_grid[0] * new_grid[1], 8)
+        # UNETR's own decoder (mlp_head/upsample) must exist and be freshly
+        # initialized -- not present at all in MAE's own checkpoint, so
+        # nothing from it could have been (mis)transplanted here either.
+        assert model.mlp_head.out_features == 3
+
+    x = torch.randn(2, 1, NEW_IMG_SIZE[0], NEW_IMG_SIZE[1], device=device)
+    variables = ["v0"]
+    output = model(x, variables, None)
+    output.sum().backward()
+
+    assert output.shape == (2, 3, NEW_IMG_SIZE[0], NEW_IMG_SIZE[1])
     assert torch.isfinite(output).all()

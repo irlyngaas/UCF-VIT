@@ -44,8 +44,12 @@ interpolate_pos_embed = pos_embed_mod.interpolate_pos_embed
 interpolate_pos_embed_3d = pos_embed_mod.interpolate_pos_embed_3d
 extract_encoder_state_dict = model_utils_mod.extract_encoder_state_dict
 _transplant_pos_embed = model_utils_mod._transplant_pos_embed
+_prune_incompatible_cls_token = model_utils_mod._prune_incompatible_cls_token
 VIT = arch_mod.VIT
 MAE = arch_mod.MAE
+SAP = arch_mod.SAP
+UNETR = arch_mod.UNETR
+DiffusionVIT = arch_mod.DiffusionVIT
 
 import torch
 
@@ -162,6 +166,83 @@ def test_extract_encoder_state_dict_keeps_only_shared_vit_attrs():
 
 
 # ---------------------------------------------------------------------------
+# extract_encoder_state_dict against every real model type as a pretrained
+# source, not just MAE/VIT -- the real workflow is "pretrain via MAE, fine-
+# tune into any downstream type," but the encoder-extraction step is equally
+# reachable with SAP/UNETR/DiffusionVIT as the pretrained source (nothing in
+# get_model restricts which type that is), and each has its own real
+# decoder/task-specific keys the fake-dict test above only approximated.
+# ---------------------------------------------------------------------------
+
+_ENCODER_ONLY_PREFIXES = {"patch_embed", "token_embeds", "cls_token", "pos_embed", "var_embed", "adaptive_pos_dep_emb", "blocks", "norm"}
+
+
+def test_extract_encoder_state_dict_strips_real_sap_decoder():
+    # weight_init="skip": SAP.__init__ calls self.init_weights('') itself
+    # after building neck/mask_header (matches get_model's own
+    # weight_init='skip' for every non-VIT type).
+    model = SAP(
+        img_size=(16, 16), patch_size=4, interp_size=4, twoD=True,
+        num_classes=2, class_token=False, pos_embed="learn",
+        adaptive_patching=True, fixed_length=4, sqrt_len=2, sqrt_len_method=True,
+        weight_init="skip", embed_dim=8, depth=1, num_heads=1, mlp_ratio=1.0, in_chans=1,
+    )
+
+    result = extract_encoder_state_dict(model.state_dict())
+
+    assert result.keys() and all(k.split(".")[0] in _ENCODER_ONLY_PREFIXES for k in result)
+    # SAP's own neck/mask_header (its segmentation decoder) must be gone.
+    assert not any(k.startswith("neck") or k.startswith("mask_header") for k in result)
+
+
+def test_extract_encoder_state_dict_strips_real_unetr_decoder():
+    # linear_decoder=True, skip_connection=False: avoids building UNETR's
+    # real monai UnetrBasicBlock/UnetrPrUpBlock conv skip-connection path --
+    # unrelated to what's being verified here (which real keys
+    # extract_encoder_state_dict keeps/drops), and this way doesn't need a
+    # real feature_size-shaped 3D volume to construct.
+    model = UNETR(
+        img_size=(16, 16), patch_size=4, twoD=True, num_classes=2,
+        class_token=False, pos_embed="learn", adaptive_patching=False,
+        fixed_length=4, linear_decoder=True, feature_size=4, skip_connection=False,
+        weight_init="skip", embed_dim=8, depth=1, num_heads=1, mlp_ratio=1.0, in_chans=1,
+    )
+
+    result = extract_encoder_state_dict(model.state_dict())
+
+    assert result.keys() and all(k.split(".")[0] in _ENCODER_ONLY_PREFIXES for k in result)
+    # UNETR's own decoder-side modules (its literal "encoderN" conv blocks
+    # feed the decoder, not the transformer encoder -- see the fake-dict
+    # test above) and linear-decoder head must both be gone.
+    assert not any(
+        k.startswith(("encoder1", "encoder2", "encoder3", "encoder4", "decoder", "out", "upsample", "mlp_head"))
+        for k in result
+    )
+
+
+def test_extract_encoder_state_dict_strips_real_diffusionvit_decoder():
+    # linear_decoder=True: avoids building DiffusionVIT's real transformer
+    # decoder_blocks -- unrelated to what's being verified here.
+    model = DiffusionVIT(
+        img_size=(16, 16), patch_size=4, twoD=True, num_classes=None,
+        class_token=False, pos_embed="learn", adaptive_patching=False,
+        fixed_length=4, linear_decoder=True, time_steps=10,
+        decoder_depth=None, decoder_embed_dim=None, decoder_num_heads=None, decoder_mlp_ratio=None,
+        weight_init="skip", embed_dim=8, depth=1, num_heads=1, mlp_ratio=1.0, in_chans=1,
+    )
+
+    result = extract_encoder_state_dict(model.state_dict())
+
+    assert result.keys() and all(k.split(".")[0] in _ENCODER_ONLY_PREFIXES for k in result)
+    # DiffusionVIT's own timestep-conditioning/reconstruction-decoder
+    # modules must all be gone.
+    assert not any(
+        k.startswith(("temporalEmbeddings", "timeEmbeddingMap", "decoder"))
+        for k in result
+    )
+
+
+# ---------------------------------------------------------------------------
 # End-to-end: pretrain at one h:w ratio, load at a different h:w[:d] ratio
 # ---------------------------------------------------------------------------
 
@@ -175,6 +256,7 @@ def _load_pretrained_encoder(pretrained_model, model):
     """Mirrors get_model's pretrained branch: extract + transplant + merge."""
     encoder_dict = extract_encoder_state_dict(pretrained_model.state_dict())
     _transplant_pos_embed(encoder_dict, pretrained_model, model)
+    _prune_incompatible_cls_token(encoder_dict, model)
     model_dict = model.state_dict()
     model_dict.update(encoder_dict)
     model.load_state_dict(model_dict)
@@ -227,6 +309,38 @@ def test_pretrained_loading_cross_architecture_mae_encoder_into_vit():
     assert new_model.pos_embed.shape[1] == new_model.num_patches + new_model.num_prefix_tokens
     # MAE's decoder must not have leaked into the VIT model at all.
     assert not any(k.startswith("decoder") or k == "mask_token" for k in new_model.state_dict())
+
+
+def test_pretrained_loading_cross_architecture_vit_encoder_into_mae():
+    """The reverse prefix-token direction from the MAE->VIT case above: 1
+    class-token prefix row (VIT) down to 0 (MAE) -- _transplant_pos_embed's
+    mismatched-prefix-count branch slices `resized[:, pretrained_model.
+    num_prefix_tokens:]` (dropping the pretrained model's own leading cls
+    row) rather than prepending a fresh one, a genuinely different branch
+    than the 0->1 direction the MAE->VIT test above exercises.
+    """
+    pretrained = VIT(
+        img_size=(32, 64), patch_size=4, twoD=True, num_classes=2,
+        class_token=True, pos_embed="learn", **_COMMON_KWARGS,
+    )
+    new_model = MAE(
+        img_size=(64, 32), patch_size=4, twoD=True, class_token=False,
+        pos_embed="learn", mask_ratio=0.75, linear_decoder=True,
+        decoder_depth=None, decoder_embed_dim=None, decoder_num_heads=None,
+        decoder_mlp_ratio=None, num_classes=None,
+        weight_init="skip",
+        **_COMMON_KWARGS,
+    )
+    fresh_new_pos_embed = new_model.pos_embed.clone()
+
+    _load_pretrained_encoder(pretrained, new_model)
+
+    # No prefix row at all (class_token=False) -- not 1 + grid, just grid.
+    assert new_model.pos_embed.shape == fresh_new_pos_embed.shape
+    assert new_model.pos_embed.shape[1] == new_model.num_patches
+    assert not torch.equal(new_model.pos_embed, fresh_new_pos_embed)
+    # VIT's own classification head must not have leaked into MAE at all.
+    assert not any(k.startswith("head") for k in new_model.state_dict())
 
 
 def test_pretrained_loading_3d_non_cubic_ratio_change():
