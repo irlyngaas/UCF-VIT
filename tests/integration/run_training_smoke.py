@@ -427,14 +427,24 @@ def set_resume(config_path, resume):
         yaml.dump(conf, f)
 
 
-def run_training(config_path, ntasks, timeout):
+def run_training(config_path, ntasks, timeout, pretrained_config_path=None):
     """Runs training_scripts/train.py against `config_path` as an srun subprocess.
+
+    Args:
+        config_path: Path to the config to train.
+        ntasks: Number of srun tasks.
+        timeout: Timeout in seconds.
+        pretrained_config_path: If given, passed through as train.py's own
+            --pretrained_config argument (used by run_pretrained_smoke.py's
+            pretrained-loading phase; every other caller leaves this None).
 
     Returns:
         A dict with "returncode" (None on timeout) and "log" (combined
         stdout+stderr, tail-truncated).
     """
     cmd = ["srun", "-n", str(ntasks), "python", TRAIN_SCRIPT, config_path, "--launcher", "slurm"]
+    if pretrained_config_path is not None:
+        cmd += ["--pretrained_config", pretrained_config_path]
     try:
         result = subprocess.run(
             cmd, cwd=REPO_ROOT, capture_output=True, text=True, timeout=timeout

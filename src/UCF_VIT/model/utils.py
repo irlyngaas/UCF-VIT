@@ -277,7 +277,7 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
                 # load_optimizer_scheduler_from_checkpoint's map_location
                 # comment in training.py for why.
                 map_location = 'cpu'
-                pretrained_checkpoint = torch.load(conf["pretrained_model"]["checkpoint_path"]+"/"+conf["trainer"]["pretrained_checkpoint_filename"]+"_rank_"+str(world_rank)+".ckpt",map_location=map_location)
+                pretrained_checkpoint = torch.load(p_conf["checkpoint_path"]+"/"+conf["trainer"]["pretrained_checkpoint_filename"]+"_rank_"+str(world_rank)+".ckpt",map_location=map_location)
                 pretrained_model.load_state_dict(pretrained_checkpoint['model_state_dict'])
 
             # Works for any pretrained model type (not just MAE) -- see

@@ -501,11 +501,50 @@ interpolating via a `grid_size` that doesn't reflect the real token count;
 this. Fixing the underlying `SAP`/`UNETR` sizing issue itself is a separate
 task.
 
-Verified locally only (Tier 1) — per the user, sufficient for the h:w[:d]
-ratio logic itself; a distributed run would mainly add confidence this
-doesn't regress under `tensor_par_size`/`fsdp_size` > 1 (every shipped
-config uses `tensor_par_size:1` today), a separate, lower-priority concern
-that can be a future feature-matrix cell if ever needed.
+Verified locally at Tier 1 first — per the user, sufficient for the h:w[:d]
+ratio logic itself, since Tier 1 deliberately calls `extract_encoder_state_
+dict`/`_transplant_pos_embed` directly, bypassing `get_model`/
+`parse_pretrained_config` entirely. That left the actual integration/wiring
+layer with zero coverage, though, so real Tier 2/3 tests were added next
+(see below) — and turned up three more real, previously-undiscovered,
+unconditionally-crashing bugs in that layer, none related to h:w[:d] ratios
+at all: `use_pretrained_model:True` had apparently never actually run
+successfully, at any point in this repo's history, even before any of this
+session's changes.
+
+### Real wiring bugs found while testing the pretrained-loading path itself
+
+All three are unconditional — every one fires regardless of any resolution
+difference, so `use_pretrained_model:True` never got as far as the
+interpolation logic above before hitting one of them:
+
+1. `model/utils.py`'s pretrained branch read `conf["pretrained_model"]
+   ["checkpoint_path"]`, but `conf["pretrained_model"]` was never populated
+   anywhere — `parse_config` doesn't create that key, no shipped config has
+   a `pretrained_model:` section, and it's referenced nowhere else in the
+   codebase. Unconditional `KeyError`. Fixed by threading the pretrained
+   model's own real `checkpoint_path` (already correctly read from
+   `pretrained_conf["trainer"]["checkpoint_path"]` for the existence check)
+   through `p_conf`, the same pattern as the other pretrained-specific
+   fields added earlier.
+2. `parse_config`'s own `trainer_conf` reconstruction never copied
+   `pretrained_checkpoint_filename` through from the raw config at all —
+   found while locally verifying the Tier 2 test's config-building logic
+   (see `tests/distributed/test_pretrained_loading_real.py`'s own
+   docstring), *before* spending any real Frontier job time on it.
+   `parse_pretrained_config`'s later read of this (both its
+   checkpoint-existence check and the actual filename `get_model`'s
+   pretrained branch loads) always `KeyError`'d, unconditionally. Fixed by
+   adding it to `trainer_conf`'s construction.
+3. `parse_pretrained_config`'s checkpoint-existence check
+   (`os.path.isfile(os.path.join(pretrained_conf["trainer"]
+   ["checkpoint_path"], pretrained_checkpoint_filename))`) looks for a
+   plain file named exactly `pretrained_checkpoint_filename` (e.g.
+   `"epoch_0"`) — a *different* filename than what actually gets loaded
+   later (`..._rank_{world_rank}.ckpt`). Found while writing the Tier 2
+   test's checkpoint fixture; not fixed (doesn't block or crash anything,
+   just an imprecise existence pre-check that can pass/fail independently
+   of whether the real per-rank file exists) — flagged for a future pass.
 
 ## Running the distributed (Tier 2) tests
 
@@ -535,6 +574,7 @@ is needed. Output lands in `pytest-distributed-<jobid>.out` in that directory.
 | `tests/distributed/test_dataloader_real_data.py` | `FileReader`'s DDP-rank sharding and `ShuffleIterableDataset`'s no-loss/no-duplication guarantee, against real `basic_ct` and `imagenet` file lists on Frontier and `torch.distributed.get_rank()` for real (not simulated) across all `world_size` ranks, across `num_workers` (0/1/4) and `buffer_size` (1/20/100) — the real-scale counterpart to `tests/dataloaders/test_dataset.py`'s simulated-rank coverage of the same `num_workers=0` fix. File I/O itself is stubbed out (`FileReader.read_process_file` monkeypatched to a no-op) so this stays fast and focused on correctness, not decode speed. |
 | `tests/distributed/test_catsdogs_real_data.py` | The real production `DistributedSampler` + `DataLoader` + `CatsDogsDataset`/`CatsDogsCollate` wiring, against real CatsDogs JPEGs and real ranks — disjoint/complete file sharding across `num_workers` (0/1/4), and `adaptive_patching=True` against real photo content (not synthetic random-noise JPEGs, unlike `tests/datasets/test_catsdogs.py`), which actually exercises Canny edge detection on real image structure. Unlike the row above, file I/O is *not* stubbed — `CatsDogsDataset.__getitem__` has no meaningful decode-free path. |
 | `tests/distributed/test_dataloader_real_pipeline.py` | The full real pipeline — decode, tile, (for `basic_ct`) adaptive patch, collate — for `basic_ct`/`unetr`, `imagenet`/`classification`, and `catsdogs`/`classification`, each built via the exact real construction `train.py` itself uses for that dataloader type (`parse_config` + `calculate_load_balancing_on_the_fly` + `NativePytorchDataModule` for `basic_ct`/`imagenet`'s `iterative_dataloader`; a plain `CatsDogsDataset` + `DistributedSampler` + `DataLoader` for `catsdogs`'s `dataloader` type, which never touches the other two calls in production either). No stubbing anywhere; checks the actual decoded/collated batch (shapes, finite values, normalized ranges, valid label ranges, one-hot `seq_label` correctness for `basic_ct`'s real segmentation masks) rather than just sharding math. |
+| `tests/distributed/test_pretrained_loading_real.py` | The real, end-to-end pretrained-checkpoint-loading wiring — `parse_pretrained_config` building `p_conf`, `get_model` constructing `pretrained_model` at `p_conf`'s own (not the new model's) size, loading a real per-rank checkpoint file (`training.py`'s own `save_checkpoint` format), `extract_encoder_state_dict`/`_transplant_pos_embed`, and FSDP-wrapping the result — the integration layer `tests/model/test_pretrained_loading.py`'s Tier 1 tests deliberately bypass. Two small, fully-synthetic `VIT` configs (no real data files needed) at different, non-square `img_size`s (`[32,64]` → `[64,32]`); checks `get_model` returns an `FSDP`-wrapped model whose `pos_embed` shape matches the *new* config, whose classification head keeps the *new* `num_classes` (not transplanted), and that a real forward+backward pass runs. Writing this test surfaced two more real, previously-undiscovered, unconditionally-crashing bugs on top of the one found while planning it (`conf["pretrained_model"]["checkpoint_path"]` never populated) — see the narrative section below. |
 
 **Important constraint if you add more tests here**: `init_par_groups` and the
 `dist_functions.py` ops all make *collective* calls (`dist.new_group`,
@@ -1835,6 +1875,42 @@ Frontier data.
     grid calc, `training.py`'s SAP/UNETR sequence reshapes) and the
     catsdogs tiling addition both work correctly end to end, not just
     through `parse_config`.
+
+## Running the pretrained-checkpoint smoke test (Tier 3c)
+
+```bash
+cd launch/tests
+sbatch run_pretrained_smoke.sh
+```
+
+The real, maximally-realistic end-to-end proof of the pretrained-loading
+workflow: `tests/integration/run_pretrained_smoke.py` runs two real training
+phases against `configs/catsdogs/classification/base_config.yaml` (reusing
+`run_training_smoke.py`'s own `make_smoke_config`/`run_fresh_phase`/
+`run_training` directly, the same reuse pattern `run_feature_matrix_smoke.py`
+already uses, rather than reimplementing them):
+
+1. **Phase 1 (fresh)**: an unmodified real training run, producing a real
+   `epoch_0_rank_0.ckpt` via the real training loop — not a hand-built
+   checkpoint fixture.
+2. **Phase 2 (pretrained)**: a second run against the *same* base config,
+   with `dataset_options.resize.catsdogs` overridden to `[128, 192]` — a
+   different, non-square size than the shipped `[256, 256]`, not a uniform
+   rescale (same shape as `tests/model/test_pretrained_loading.py`'s Tier 1
+   cases). `resize`, not `data.img_size`, is what actually controls both the
+   real data pipeline's resize step and `tile_size`'s computation for
+   `catsdogs` (`parse.py`'s `effective_size = resize_conf.get(dataset,
+   img_size)`), so overriding it keeps the two consistent automatically —
+   verified locally before ever spending real Frontier time on it
+   (`tile_size` came back `(128, 192)`, `img_size` unchanged at `[256,
+   256]`). `trainer.use_pretrained_model:True` and
+   `pretrained_checkpoint_filename:"epoch_0"` point it at phase 1's
+   checkpoint via `train.py`'s own `--pretrained_config` argument (a new
+   optional parameter on `run_training`, additive — every existing caller
+   is unaffected).
+
+Prints a PASS/FAIL/TIMEOUT summary for both phases, same style as the other
+two Tier 3 scripts; exits nonzero if either phase fails.
 
 ## Validating a config file by hand
 

@@ -253,6 +253,11 @@ def parse_config(args, load_balance_offline=False):
         "checkpoint_filename": conf['trainer']['checkpoint_filename'],
         "resume_from_checkpoint": resume_from_checkpoint,
         "use_pretrained_model": conf['trainer']['use_pretrained_model'] if not resume_from_checkpoint else False,
+        # Never copied through before -- parse_pretrained_config's own read
+        # of this (both its checkpoint-existence check and the actual
+        # filename get_model's pretrained branch loads) always KeyError'd,
+        # unconditionally, whenever use_pretrained_model:True.
+        "pretrained_checkpoint_filename": conf['trainer'].get('pretrained_checkpoint_filename', ""),
         "save_frequency": save_frequency,
         "optimizer_type": optimizer_type,
         "scheduler_type": scheduler_type,
@@ -905,6 +910,12 @@ def parse_pretrained_config(args, conf):
             "interp_size": pretrained_interp_size,
             "fixed_length": pretrained_fixed_length,
             "use_adaptive_pos_emb": pretrained_use_adaptive_pos_emb,
+            # The pretrained model's own checkpoint directory (already read
+            # above for the existence check) -- get_model's pretrained
+            # branch needs this to actually find the checkpoint file; there
+            # is no "pretrained_model" section anywhere in a real config for
+            # it to otherwise come from.
+            "checkpoint_path": pretrained_conf["trainer"]["checkpoint_path"],
         }
     else:
         p_conf = {}
