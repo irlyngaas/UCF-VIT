@@ -1989,6 +1989,11 @@ resize this repo has ever used in a real training run that wasn't square.
 Fixed the same way described there. Needs another rerun to confirm phase 2
 now passes for real.
 
+Third run (job 5350108), after that fix: phase 1 **PASS (76s)**, phase 2
+**PASS (49s)** — full end-to-end pass, confirming both bugs above are
+actually fixed and the pretrained-loading workflow genuinely works for a
+non-square resolution change (`[256, 256]` → `[128, 192]`).
+
 ## Validating a config file by hand
 
 `utils/validate_config.py` is a standalone utility — the same one
