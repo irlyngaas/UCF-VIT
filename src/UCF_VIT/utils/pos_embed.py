@@ -240,18 +240,3 @@ def interpolate_pos_embed_3d(pos_embed, orig_grid_size, new_grid_size, num_prefi
     )
     new_pos_tokens = new_pos_tokens.permute(0, 2, 3, 4, 1).flatten(1, 3)
     return torch.cat([prefix_tokens, new_pos_tokens], dim=1)
-
-
-def interpolate_channel_embed(checkpoint_model, new_len):
-    """Truncates a checkpoint's channel embedding table to a new number of channels.
-
-    Args:
-        checkpoint_model: State dict loaded from a checkpoint; modified in place.
-        new_len: Target number of channel embeddings. Only applied when it is less
-            than or equal to the checkpoint's current channel count.
-    """
-    if "net.channel_embed" in checkpoint_model:
-        channel_embed_checkpoint = checkpoint_model["net.channel_embed"]
-        old_len = channel_embed_checkpoint.shape[1]
-        if new_len <= old_len:
-            checkpoint_model["net.channel_embed"] = channel_embed_checkpoint[:, :new_len]
