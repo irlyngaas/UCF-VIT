@@ -26,17 +26,27 @@ class Rect:
         assert y1<=y2, 'y1 > y2, wrong coordinate.'
     
     def contains(self, domain):
-        """Computes a normalized edge-density score for this rectangle's region of `domain`.
+        """Computes an edge-density score for this rectangle's region of `domain`.
+
+        Deliberately not normalized by any scale factor: this score is only
+        ever consumed by `FixedQuadTree._build_tree`'s own
+        `max(self.nodes, key=lambda x:x[1])` to pick which node to split next
+        -- a pure relative comparison, invariant to a uniform positive scale
+        applied to every candidate (`domain` is always consistently scaled
+        within one `_build_tree` call, whatever that scale happens to be), so
+        dividing by a constant here would never change which node wins. Every
+        other consumer of `self.nodes` (`serialize`, `nodes_value`,
+        `encode_nodes`, every `draw*` method) discards this score entirely.
 
         Args:
             domain: 2D edge-intensity image, shape (H, W).
 
         Returns:
             Integer edge-density score for this rectangle's region (summed
-            intensity divided by 255).
+            intensity).
         """
         patch = domain[self.y1:self.y2, self.x1:self.x2]
-        return int(np.sum(patch)/255)
+        return int(np.sum(patch))
 
     def get_area(self, img):
         """Extracts this rectangle's region from a 3D (H, W, Channel) image.

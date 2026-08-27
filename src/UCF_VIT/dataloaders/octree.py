@@ -30,18 +30,24 @@ class Cube:
         assert y1<=y2, 'y1 > y2, wrong coordinate.'
         assert z1<=z2, 'z1 > z2, wrong coordinate.'
     
-    def contains(self, domain, norm_factor):
-        """Computes a normalized edge-density score for this cube's region of `domain`.
+    def contains(self, domain):
+        """Computes an edge-density score for this cube's region of `domain`.
+
+        Deliberately not normalized by any scale factor -- see `Rect.contains`
+        (`quadtree.py`)'s own docstring: this score is only ever consumed by
+        `FixedOctTree._build_tree`'s own `max(self.nodes, key=lambda x:x[1])`
+        to pick which node to split next, a pure relative comparison
+        invariant to a uniform positive scale applied to every candidate.
 
         Args:
             domain: 3D edge-intensity volume, shape (Z, Y, X).
-            norm_factor: Divisor used to normalize the summed edge intensity.
 
         Returns:
-            Integer edge-density score for this cube's region.
+            Integer edge-density score for this cube's region (summed
+            intensity).
         """
         patch = domain[self.z1:self.z2, self.y1:self.y2, self.x1:self.x2]
-        return int(np.sum(patch)/norm_factor)
+        return int(np.sum(patch))
 
     def get_area(self, img):
         """Extracts this cube's region from a 4D (Z, Y, X, Channel) image volume.
@@ -130,17 +136,15 @@ class FixedOctTree:
     regions.
     """
 
-    def __init__(self, domain, fixed_length=128, norm_factor=255) -> None:
+    def __init__(self, domain, fixed_length=128) -> None:
         """Builds the octree over `domain`.
 
         Args:
             domain: 3D edge-intensity volume, shape (Z, Y, X), to subdivide.
             fixed_length: Target number of leaf nodes to subdivide into.
-            norm_factor: Divisor used to normalize each node's edge-density score.
         """
         self.domain = domain
         self.fixed_length = fixed_length
-        self.norm_factor = norm_factor
         self._build_tree()
 
     def _build_tree(self):
@@ -154,7 +158,7 @@ class FixedOctTree:
         h, w, d = self.domain.shape
         assert h>0 and w >0 and d>0, "Wrong img size."
         root = Cube(0,h,0,w,0,d)
-        self.nodes = [[root, root.contains(self.domain, self.norm_factor)]]
+        self.nodes = [[root, root.contains(self.domain)]]
         while len(self.nodes) < self.fixed_length:
             bbox, value = max(self.nodes, key=lambda x:x[1])
             idx = self.nodes.index([bbox, value])
@@ -163,21 +167,21 @@ class FixedOctTree:
 
             x1,x2,y1,y2,z1,z2 = bbox.get_coord()
             n1 = Cube(x1, int((x1+x2)/2), y1, int((y1+y2)/2), z1, int((z1+z2)/2))
-            v1 = n1.contains(self.domain, self.norm_factor)
+            v1 = n1.contains(self.domain)
             n2 = Cube(int((x1+x2)/2), x2, y1, int((y1+y2)/2), z1, int((z1+z2)/2))
-            v2 = n2.contains(self.domain, self.norm_factor)
+            v2 = n2.contains(self.domain)
             n3 = Cube(x1, int((x1+x2)/2), int((y1+y2)/2), y2, z1, int((z1+z2)/2))
-            v3 = n3.contains(self.domain, self.norm_factor)
+            v3 = n3.contains(self.domain)
             n4 = Cube(int((x1+x2)/2), x2, int((y1+y2)/2), y2, z1, int((z1+z2)/2))
-            v4 = n4.contains(self.domain, self.norm_factor)
+            v4 = n4.contains(self.domain)
             n5 = Cube(x1, int((x1+x2)/2), y1, int((y1+y2)/2), int((z1+z2)/2), z2)
-            v5 = n5.contains(self.domain, self.norm_factor)
+            v5 = n5.contains(self.domain)
             n6 = Cube(int((x1+x2)/2), x2, y1, int((y1+y2)/2), int((z1+z2)/2), z2)
-            v6 = n6.contains(self.domain, self.norm_factor)
+            v6 = n6.contains(self.domain)
             n7 = Cube(x1, int((x1+x2)/2), int((y1+y2)/2), y2, int((z1+z2)/2), z2)
-            v7 = n7.contains(self.domain, self.norm_factor)
+            v7 = n7.contains(self.domain)
             n8 = Cube(int((x1+x2)/2), x2, int((y1+y2)/2), y2, int((z1+z2)/2), z2)
-            v8 = n8.contains(self.domain, self.norm_factor)
+            v8 = n8.contains(self.domain)
 
             self.nodes = self.nodes[:idx] + [[n1,v1], [n2,v2], [n3,v3], [n4,v4],[n5,v5], [n6,v6], [n7,v7], [n8,v8]] +  self.nodes[idx+1:]
 

@@ -19,11 +19,14 @@ def test_rect_invalid_coords_raise():
 
 
 def test_rect_contains():
+    # contains() is deliberately unnormalized -- its score is only ever used
+    # for relative (max-based) comparison, see its own docstring -- so this
+    # is a raw sum, not divided by anything.
     domain = np.zeros((8, 8), dtype=np.float64)
     domain[0:4, 0:4] = 255  # domain is indexed [y, x]
 
     dense = Rect(x1=0, x2=4, y1=0, y2=4)
-    assert dense.contains(domain) == 16  # 4*4 px * 255 / 255
+    assert dense.contains(domain) == 4 * 4 * 255
 
     empty = Rect(x1=4, x2=8, y1=4, y2=8)
     assert empty.contains(domain) == 0

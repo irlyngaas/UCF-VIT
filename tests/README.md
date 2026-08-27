@@ -74,8 +74,9 @@ pytest tests/test_config_validation.py -v
 
 | File | Covers |
 | --- | --- |
-| `tests/dataloaders/test_quadtree.py` | `Rect` geometry, `FixedQuadTree` subdivision, node-value/encode-decode |
-| `tests/dataloaders/test_octree.py` | `Cube` geometry, `FixedOctTree` subdivision |
+| `tests/dataloaders/test_quadtree.py` | `Rect` geometry, `FixedQuadTree` subdivision, node-value/encode-decode. `Rect.contains` is unnormalized (`test_rect_contains` asserts a raw sum, not divided by 255) — see the `test_transform.py` row below for why. |
+| `tests/dataloaders/test_octree.py` | `Cube` geometry, `FixedOctTree` subdivision. `Cube.contains`/`FixedOctTree` no longer take a `norm_factor` at all (removed, not just defaulted) — same reasoning as `Rect.contains`. |
+| `tests/dataloaders/test_transform.py` | `Patchify`'s edge detection, split by `dataset`: `imagenet`/`catsdogs` still use `cv2.Canny` directly (untouched — real, already-uint8 photos, possibly multi-channel, which `skimage.feature.canny` can't accept), every other dataset (e.g. `basic_ct`) uses `skimage.feature.canny` instead of `cv2.Canny((img*255).astype(np.uint8), ...)`, which silently assumed the float image was already normalized to exactly `[0,1]` — wrong (wastes dynamic range, or clips) whenever that assumption doesn't hold. Regression test uses a float range far outside `[0,1]` to confirm the fix actually detects the edge. Also covers the non-photo path's real limitation — `skimage.feature.canny` only accepts single-channel 2D input, so multi-channel input raises a clear `NotImplementedError` rather than being silently mishandled. `canny_quantiles` (new constructor param, added alongside `Patchify`'s existing `cannys`) are quantile-based hysteresis thresholds (`use_quantiles=True`), dataset-scale-independent by construction unlike `cannys`' absolute values — starting values, not empirically tuned. New `scikit-image` dependency, added to `pyproject.toml`. `Patchify_3D`'s own coverage is separate — see the "Replaced `Patchify_3D`'s edge detection with a genuinely 3D `SimpleITK.CannyEdgeDetection`" section further down for the full rewrite and what these tests specifically verify. |
 | `tests/dataloaders/test_dataset.py` | `TileDataIter` (2D, 3D-full, and 3D-twoD-sliced tiling, with/without labels, overlap), `ShuffleIterableDataset` (no data loss/duplication across buffer sizes), `ProcessChannels` (batching, adaptive-patching wiring, `separate_channels`), `FileReader` (DDP-rank + dataloader-worker sharding disjointness/coverage up to `num_workers=7`, `keys_to_add` replication) |
 | `tests/dataloaders/test_datamodule.py` | `collate_fn` across `adaptive_patching`/`return_label`/`separate_channels`/`return_qdt`/dataset-type combinations, built from real `ProcessChannels` output rather than hand-fabricated tuples |
 | `tests/datasets/test_catsdogs.py` | `CatsDogsDataset` (label-from-filename, resize/channel-first conversion, adaptive-patching shapes, `div x div` tiling — `__len__` scaling, a deliberately non-square full-coverage regression test, and tiling composed with adaptive_patching) and `CatsDogsCollate`, against small real JPEG files written to a temp dir — `catsdogs` is the only shipped dataset using `dataloader.type: "dataloader"` (a plain `Dataset` + `DistributedSampler`, not the `iterative_dataloader` stack the two rows above cover), and previously had no tiling capability at all (`tiling.div` was silently ignored) |
@@ -690,6 +691,138 @@ real `imagenet`/`catsdogs`/`basic_ct` dataloader/tiling tests.
 pass**, phase 1 fresh training PASS (64s), phase 2 pretrained fine-tune at
 the non-square `[128, 192]` resize PASS (48s). The convention flip works
 correctly under real, real multi-rank training.
+
+### Switched `Patchify`/`Patchify_3D`'s non-photo Canny path to `skimage.feature.canny`, then removed the `255`/`norm_factor` scaling from both quadtree and octree entirely
+
+Investigating `Patchify`/`Patchify_3D`'s edge-detection pipeline (used by
+adaptive patching) surfaced a real bug: the non-`imagenet`/`catsdogs` path
+(e.g. `basic_ct`) computed `cv2.Canny((img*255).astype(np.uint8), ...)` —
+silently assuming the float input was already normalized to exactly
+`[0,1]` before scaling into `cv2.Canny`'s required 8-bit range. Wrong
+(wastes dynamic range, or clips) whenever that assumption doesn't hold,
+e.g. real un-normalized CT-style intensities. Switched that path to
+`skimage.feature.canny`, which operates on the real float values directly
+— no scaling/casting needed at all. `imagenet`/`catsdogs` deliberately
+kept `cv2.Canny` unchanged: `skimage.feature.canny` only accepts
+single-channel 2D input (verified directly — `cv2.Canny` silently combines
+multi-channel gradients internally, `skimage.feature.canny` does not), so
+switching those over too would have been a real regression for real,
+multi-channel photos. `Patchify`'s non-photo path now raises a clear
+`NotImplementedError` for multi-channel input rather than silently
+mishandling it; `Patchify_3D` needed no such guard, since it already loops
+per-channel itself. New `scikit-image` dependency, added to
+`pyproject.toml`.
+
+Making that switch required feeding `skimage.feature.canny`'s boolean
+output back into `FixedQuadTree`/`FixedOctTree` (both expect a
+`0`-vs-nonzero-scaled `domain`, not a boolean array) — which raised the
+question of what scale to rescale to. Tracing where that scale actually
+gets consumed turned up a bigger, orthogonal finding: `FixedQuadTree`
+(`quadtree.py`) and `FixedOctTree` (`octree.py`) were themselves
+inconsistent siblings — `Rect.contains` hardcoded a literal `/255`, while
+`Cube.contains`/`FixedOctTree` already took an explicit `norm_factor`
+parameter (`Patchify_3D` computed its own `norm_factor =
+int(255/self.num_channels)` to compensate for per-channel score
+accumulation). Checked every consumer of the per-node score
+(`self.nodes`'s `[Rect/Cube, value]` pairs) in both files — `serialize`,
+`nodes_value`, `encode_nodes`, every `draw*` method — and confirmed `value`
+is *only* ever read in one place in each file:
+`max(self.nodes, key=lambda x:x[1])` inside `_build_tree`, to pick which
+node to split next. That's a pure relative comparison, provably invariant
+to any uniform positive scale applied to every candidate (`255*3 > 255*2`
+iff `3 > 2`) — so the normalization was never functionally necessary in
+either tree, only ever affecting the human-readable magnitude of a score
+nothing else reads (the commented-out `# print([v for _,v in
+self.nodes])` debug line in `quadtree.py`'s own `_build_tree` is a good
+hint why it existed at all). Removed the scaling entirely from both:
+`Rect.contains`/`Cube.contains` now return a plain `int(np.sum(patch))`,
+`FixedOctTree`'s `norm_factor` parameter is gone (not just defaulted), and
+`Patchify`/`Patchify_3D` no longer rescale their edge maps at all before
+handing them to either tree — same tree structures, same patches, same
+everything observable, just simpler (and marginally more numerically
+robust: an exact integer sum on integer-dtype input, no floating-point
+division at all).
+
+`tests/dataloaders/test_quadtree.py`/`test_octree.py`'s existing
+`contains()`/`FixedOctTree` assertions were updated to match (raw sums,
+no `norm_factor` kwarg) — genuinely equivalent behavior, not a new
+correctness claim, so no new tree-structure tests were added for this
+part; `tests/dataloaders/test_transform.py` (new) covers the actual
+Canny-implementation switch itself. Not yet verified against real
+`basic_ct`+`do_ap:True` data on Frontier — no Tier 2/3 coverage exercises
+that combination yet.
+
+### Replaced `Patchify_3D`'s edge detection with a genuinely 3D `SimpleITK.CannyEdgeDetection`
+
+Reviewing `Patchify_3D`'s edge-detection pipeline in detail (walking
+through what each step actually computes) surfaced a real, structural
+limitation, independent of the `skimage.feature.canny` switch above: every
+gradient/edge computation in it (`cv2.Sobel`, `cv2.Canny`) only ever
+operated on one 2D `(H, W)` slice at a time — there was no derivative
+computed along the depth axis anywhere in the pipeline. Verified directly
+with a synthetic volume that's a step function purely along depth (uniform
+within every single slice, only a hard transition *across* slices, e.g.
+`vol[6:10,:,:] = 1.0`): the per-slice approach reported zero edges there
+entirely (no in-plane gradient exists at that kind of boundary), while a
+genuine 3D Canny correctly marks the transition planes. For volumes where
+depth-direction structure genuinely matters (not just anisotropic CT/MRI
+where in-plane detail dominates), this was a real blind spot, not merely a
+style difference.
+
+Replaced the whole per-slice Sobel/Canny pipeline with
+`SimpleITK.CannyEdgeDetection` — a true N-D Canny (smoothing + gradient +
+non-max-suppression + hysteresis, all genuinely volumetric), called once
+per channel over the *entire* volume rather than once per `(slice,
+channel)` pair. Confirmed directly it does **not** support multi-channel/
+vector images (`Pixel type: vector of 32-bit float is not supported in
+3D`), so the per-channel loop is still needed — this only collapses the
+inner slice loop, not the channel loop. New `SimpleITK` dependency, added
+to `pyproject.toml`.
+
+The old pipeline's separate `gradient_direction` computation
+(`np.arctan2(sobely, sobelx)`, a strictly 2D angle) and the
+direction-consistency gate built on it (`edge_data_normalized >
+threshold`) were dropped entirely rather than reimplemented in 3D — that
+angle has no natural 3D generalization (would need a full 3D gradient
+vector or a two-angle spherical representation, not a drop-in
+replacement), and its likely original purpose — suppressing noisy/
+spurious edges from the per-slice, single-"best-channel" accumulation —
+is largely redundant with what a real 3D Canny already provides for free
+(its own non-max-suppression + hysteresis thresholding already produces a
+clean, thinned edge mask). This connects directly to the `norm_factor`
+finding above: `FixedOctTree`'s consumed score is only ever used for
+relative (`max()`-based) comparison, never read for its precise value —
+so the simpler score doesn't need to also be a "clean" signal, just a
+meaningfully-ordered one.
+
+The actual design intent behind `edges_combined_counter` — give more
+weight to a voxel flagged as an edge on more channels — was preserved
+exactly, not just in spirit: verified directly (two channels, one shared
+edge region and one channel-1-only region) that the shared region scores
+`2` and the single-channel region scores `1`, the same relative weighting
+as before, just fed by genuinely 3D per-channel edge masks instead of
+stacked-per-slice 2D ones.
+
+Old implementation archived at
+`../UCF-VIT-claude-archive/src/UCF_VIT/dataloaders/transform.py`
+(`Patchify_3D` only — `Patchify`, the 2D sibling class, wasn't replaced).
+
+`tests/dataloaders/test_transform.py` gained 3 `Patchify_3D`-specific
+tests: `test_patchify_3d_detects_edge_purely_along_depth` (the direct
+regression test for the depth-blind-spot fix — asserts full-plane edges
+at the depth-only transition, zero everywhere else, which the old
+pipeline could never produce), `test_patchify_3d_weights_by_channel_
+agreement` (the channel-count-weighting verification described above),
+and `test_patchify_3d_shape_and_dtype` (basic sanity). One pre-existing,
+unrelated quirk found incidentally while writing these:
+`FixedOctTree._build_tree` can only exactly reach node counts in the
+sequence `1, 8, 15, 22, 29, ...` (`1 + 7k` — each split replaces 1 node
+with 8, net +7), so an arbitrary `fixed_length` can trip
+`FixedOctTree.serialize`'s own `assert len(seq_patch) == self.fixed_length`
+pre-existing check; not something this rewrite introduced or fixes, just
+something to keep in mind when picking `fixed_length` values. Not yet
+verified against real `basic_ct`+`do_ap:True` data on Frontier, same gap
+noted above.
 
 ## Running the distributed (Tier 2) tests
 

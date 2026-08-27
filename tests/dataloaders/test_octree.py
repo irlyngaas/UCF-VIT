@@ -21,14 +21,17 @@ def test_cube_invalid_coords_raise():
 
 
 def test_cube_contains():
+    # contains() is deliberately unnormalized -- its score is only ever used
+    # for relative (max-based) comparison, see its own docstring -- so this
+    # is a raw sum, not divided by anything.
     domain = np.zeros((16, 16, 16), dtype=np.float64)
     domain[0:8, 0:8, 0:8] = 255  # domain is indexed [z, y, x] by Cube.contains
 
     dense = Cube(x1=0, x2=8, y1=0, y2=8, z1=0, z2=8)
-    assert dense.contains(domain, norm_factor=255) == 8 * 8 * 8
+    assert dense.contains(domain) == 8 * 8 * 8 * 255
 
     empty = Cube(x1=8, x2=16, y1=8, y2=16, z1=8, z2=16)
-    assert empty.contains(domain, norm_factor=255) == 0
+    assert empty.contains(domain) == 0
 
 
 def test_cube_get_area():
@@ -48,7 +51,7 @@ def _total_volume(tree):
 
 def test_fixedocttree_splits_into_fixed_length_nodes():
     domain = np.zeros((16, 16, 16))
-    tree = FixedOctTree(domain=domain, fixed_length=8, norm_factor=255)
+    tree = FixedOctTree(domain=domain, fixed_length=8)
     assert len(tree.nodes) == 8
     assert _total_volume(tree) == 16 ** 3
 
@@ -56,7 +59,7 @@ def test_fixedocttree_splits_into_fixed_length_nodes():
 def test_fixedocttree_prioritizes_highest_density_region():
     domain = np.zeros((16, 16, 16))
     domain[0:8, 0:8, 0:8] = 255
-    tree = FixedOctTree(domain=domain, fixed_length=8, norm_factor=255)
+    tree = FixedOctTree(domain=domain, fixed_length=8)
     sizes = sorted(c.get_size() for c, _ in tree.nodes)
     assert sizes == [(8, 8, 8)] * 8
 
@@ -64,7 +67,7 @@ def test_fixedocttree_prioritizes_highest_density_region():
 def test_fixedocttree_further_subdivides_dense_region():
     domain = np.zeros((16, 16, 16))
     domain[0:8, 0:8, 0:8] = 255
-    tree = FixedOctTree(domain=domain, fixed_length=15, norm_factor=255)
+    tree = FixedOctTree(domain=domain, fixed_length=15)
     assert len(tree.nodes) == 15
     assert _total_volume(tree) == 16 ** 3
     sizes = sorted(c.get_size() for c, _ in tree.nodes)
