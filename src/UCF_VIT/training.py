@@ -10,7 +10,7 @@ from monai.utils.enums import MetricReduction
 from monai.metrics import DiceMetric
 from monai.transforms import AsDiscrete
 from monai.data import decollate_batch
-from UCF_VIT.utils.metrics import DiceBLoss
+from UCF_VIT.utils.metrics import DiceBLoss, masked_mse
 
 def load_optimizer_scheduler_from_checkpoint(conf, optimizer, scheduler, data_seq_ort_group, device):
     """Restores optimizer and scheduler state, loss history, and epoch from a checkpoint.
@@ -54,6 +54,11 @@ def train_step(conf, batch, model):
     Dispatches to architecture-specific forward/loss logic based on
     `conf["model"]["type"]` (VIT classification cross-entropy, SAP/UNETR
     segmentation Dice(+CE) loss, MAE/DiffusionVIT reconstruction MSE loss).
+    MAE additionally supports `conf["model"]["loss_fn"] == "maskMSE"`
+    (`masked_mse`, `UCF_VIT.utils.metrics`): reconstruction MSE computed only
+    over the masked (encoder-hidden) patches, the standard MAE-paper loss,
+    instead of `"MSE"`'s plain `nn.MSELoss()` over every patch (masked and
+    visible alike).
 
     Args:
         conf: Parsed training configuration dict (as returned by `parse_config`).
@@ -100,7 +105,11 @@ def train_step(conf, batch, model):
                 criterion = nn.MSELoss()
                 target = einops.rearrange(batch["seq"], 'b c s p -> b s (p c)')
                 loss = criterion(output, target)
-            #TODO: elif conf["model"]["kwargs"]["loss_fn"] == "maskMSE":
+            elif conf["model"]["loss_fn"] == "maskMSE":
+                output, mask = model.forward(batch["seq"], batch["variables"], batch["seq_ps"])
+                criterion = masked_mse
+                target = einops.rearrange(batch["seq"], 'b c s p -> b s (p c)')
+                loss = criterion(output, target, mask)
 
         else:
             if conf["model"]["loss_fn"] == "MSE":
@@ -108,11 +117,11 @@ def train_step(conf, batch, model):
                 criterion = nn.MSELoss()
                 target = patchify(batch["data"], conf["data"]["patch_size"], conf["data"]["twoD"])
                 loss = criterion(output,target)
-            #elif conf["model"]["kwargs"]["loss_fn"] == "maskMSE":
-            #    output, mask = net.forward(data, variables, None)
-            #    criterion = masked_mse
-            #    target = patchify(data, patch_size, twoD)
-            #    loss = criterion(output,target,mask)
+            elif conf["model"]["loss_fn"] == "maskMSE":
+                output, mask = model.forward(batch["data"], batch["variables"], batch["seq_ps"])
+                criterion = masked_mse
+                target = patchify(batch["data"], conf["data"]["patch_size"], conf["data"]["twoD"])
+                loss = criterion(output, target, mask)
 
         return loss
 
