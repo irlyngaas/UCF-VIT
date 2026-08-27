@@ -1,16 +1,22 @@
 """Tests for UCF_VIT.training.train_step's MAE loss dispatch.
 
-MAE supports two loss_fn values: "MSE" (plain nn.MSELoss over every patch,
-masked and visible alike -- model.forward's own mask return is discarded)
-and "maskMSE" (UCF_VIT.utils.metrics.masked_mse, averaged only over the
-masked/encoder-hidden patches -- the standard MAE-paper loss). "maskMSE"
-was previously dead code: the do_ap:True branch was a bare
-"#TODO: elif ...", and the do_ap:False branch was fully written but
-commented out. Both are now wired up; these tests exercise train_step's
-actual dispatch for both, using a fake model (no real MAE/timm/monai/
-xformers needed -- train_step only ever calls model.forward(...), so a
-stub with the right (output, mask) return is enough) rather than a real
-end-to-end training run.
+MAE supports four loss_fn values: "MSE" (plain nn.MSELoss over every patch,
+masked and visible alike -- model.forward's own mask return is discarded),
+"maskMSE" (UCF_VIT.utils.metrics.masked_mse, averaged only over the
+masked/encoder-hidden patches -- the standard MAE-paper loss), and, under
+ap.do_ap:True only, "nativeResMSE"/"nativeResMaskMSE"
+(UCF_VIT.utils.metrics.native_resolution_patch_mse/
+native_resolution_patch_masked_mse -- compares against the real
+native-resolution image region each adaptive patch covers, not the
+already-resized fixed-interp_size token "MSE"/"maskMSE" compare against
+under do_ap:True). "maskMSE" and the two "nativeRes*" options were
+previously dead code: "maskMSE"'s do_ap:True branch was a bare
+"#TODO: elif ...", its do_ap:False branch was fully written but commented
+out, and "nativeRes*" didn't exist at all. All four are now wired up;
+these tests exercise train_step's actual dispatch for each, using a fake
+model (no real MAE/timm/monai/xformers needed -- train_step only ever
+calls model.forward(...), so a stub with the right (output, mask) return
+is enough) rather than a real end-to-end training run.
 
 Deliberately constructs output so masked and unmasked patches have a
 different, known error (masked patches off by 2, unmasked patches exact)
@@ -32,6 +38,7 @@ import pytest
 import torch
 
 from UCF_VIT.training import train_step
+from UCF_VIT.utils.metrics import native_resolution_patch_masked_mse, native_resolution_patch_mse
 from UCF_VIT.utils.misc import patchify
 
 PATCH_SIZE = 2
@@ -119,4 +126,75 @@ def test_train_step_mae_mse_do_ap_averages_over_every_patch():
     loss = train_step(_conf("MSE", do_ap=True), batch, model)
 
     assert loss.item() == pytest.approx(EXPECTED_FULL_MSE)
+    assert model.calls[0] is SEQ_DO_AP
+
+
+# ---------------------------------------------------------------------------
+# "nativeResMSE" / "nativeResMaskMSE" -- compares against the real,
+# native-resolution image region each adaptive patch covers (batch["data"]),
+# not the already-resized fixed-interp_size token (batch["seq"]) "MSE"/
+# "maskMSE" compare against. batch["seq_ps"] is process_batch's own combined
+# [size, pos] tensor (built for the adaptive positional embedding) -- these
+# tests also verify train_step correctly slices it back into size/pos and
+# restores the adaptive_patching_channels==1 dim process_batch's own
+# torch.squeeze drops (see native_resolution_patch_mse's own docstring for
+# the size/pos shape contract).
+# ---------------------------------------------------------------------------
+
+NATIVE_RES_PATCH_SIZE = 6
+NATIVE_RES_DATA = torch.zeros(1, 1, 20, 40)
+NATIVE_RES_DATA[0, 0, 2:8, 20:26] = 100.0  # rows 2:8 (H), cols 20:26 (W)
+
+# One real patch, centered on the painted region above, plus one padding
+# slot (size==0) with a wildly wrong output that must not affect the loss.
+NATIVE_RES_SEQ_SIZE = torch.tensor([[6.0, 0.0]])  # (B, S)
+NATIVE_RES_SEQ_POS = torch.tensor([[[23.0, 5.0], [-1.0, -1.0]]])  # (B, S, 2)
+NATIVE_RES_SEQ_PS = torch.cat([NATIVE_RES_SEQ_SIZE.unsqueeze(-1), NATIVE_RES_SEQ_POS], dim=-1)  # (B, S, 3)
+
+NATIVE_RES_OUTPUT = torch.stack([
+    torch.full((NATIVE_RES_PATCH_SIZE * NATIVE_RES_PATCH_SIZE,), 100.0),
+    torch.full((NATIVE_RES_PATCH_SIZE * NATIVE_RES_PATCH_SIZE,), 9999.0),
+]).unsqueeze(0)  # (1, S=2, patch_dim)
+NATIVE_RES_MASK = torch.tensor([[1.0, 0.0]])  # only the real (non-padding) patch is masked-in
+
+
+def _native_res_conf(loss_fn):
+    return {
+        "model": {"type": "MAE", "loss_fn": loss_fn},
+        "ap": {"do_ap": True},
+        "data": {"interp_size": NATIVE_RES_PATCH_SIZE, "twoD": True},
+    }
+
+
+def test_train_step_mae_nativeresmse_do_ap_matches_native_resolution_patch_mse():
+    model = _FakeMAEModel(NATIVE_RES_OUTPUT, NATIVE_RES_MASK)
+    batch = {"seq": SEQ_DO_AP, "seq_ps": NATIVE_RES_SEQ_PS, "data": NATIVE_RES_DATA, "variables": ["v0"]}
+
+    loss = train_step(_native_res_conf("nativeResMSE"), batch, model)
+
+    expected = native_resolution_patch_mse(
+        NATIVE_RES_OUTPUT, NATIVE_RES_DATA,
+        NATIVE_RES_SEQ_SIZE.unsqueeze(1), NATIVE_RES_SEQ_POS.unsqueeze(1),
+        NATIVE_RES_PATCH_SIZE, twoD=True,
+    )
+    assert loss.item() == pytest.approx(expected.item())
+    assert loss.item() == pytest.approx(0.0, abs=1e-6)  # output exactly matches the real region
+    assert model.calls[0] is SEQ_DO_AP
+
+
+def test_train_step_mae_nativeresmaskmse_do_ap_matches_native_resolution_patch_masked_mse():
+    model = _FakeMAEModel(NATIVE_RES_OUTPUT, NATIVE_RES_MASK)
+    batch = {"seq": SEQ_DO_AP, "seq_ps": NATIVE_RES_SEQ_PS, "data": NATIVE_RES_DATA, "variables": ["v0"]}
+
+    loss = train_step(_native_res_conf("nativeResMaskMSE"), batch, model)
+
+    expected = native_resolution_patch_masked_mse(
+        NATIVE_RES_OUTPUT, NATIVE_RES_DATA,
+        NATIVE_RES_SEQ_SIZE.unsqueeze(1), NATIVE_RES_SEQ_POS.unsqueeze(1),
+        NATIVE_RES_PATCH_SIZE, twoD=True, mask=NATIVE_RES_MASK.unsqueeze(1),
+    )
+    assert loss.item() == pytest.approx(expected.item())
+    # the padding-slot's 9999 output is excluded (mask==0 there too) --
+    # would blow up the loss if it leaked in.
+    assert loss.item() == pytest.approx(0.0, abs=1e-6)
     assert model.calls[0] is SEQ_DO_AP

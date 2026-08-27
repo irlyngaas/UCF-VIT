@@ -49,7 +49,7 @@ model:
   drop_rate: 0.0
   use_channel_aggregation: False
 
-  loss_fn: "MSE" #"MSE" (every patch, masked and visible) or "maskMSE" (only the masked/encoder-hidden patches -- the standard MAE-paper loss)
+  loss_fn: "MSE" #"MSE" (every patch, masked and visible) or "maskMSE" (only the masked/encoder-hidden patches -- the standard MAE-paper loss). Under ap.do_ap:True, also "nativeResMSE"/"nativeResMaskMSE" (compares against the real, native-resolution image region each adaptive patch covers, not the already-resized fixed-interp_size token "MSE"/"maskMSE" compare against)
   mask_ratio: 0.75
   linear_decoder: False
   decoder_embed_dim: 512

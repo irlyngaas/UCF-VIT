@@ -10,7 +10,7 @@ from monai.utils.enums import MetricReduction
 from monai.metrics import DiceMetric
 from monai.transforms import AsDiscrete
 from monai.data import decollate_batch
-from UCF_VIT.utils.metrics import DiceBLoss, masked_mse
+from UCF_VIT.utils.metrics import DiceBLoss, masked_mse, native_resolution_patch_masked_mse, native_resolution_patch_mse
 
 def load_optimizer_scheduler_from_checkpoint(conf, optimizer, scheduler, data_seq_ort_group, device):
     """Restores optimizer and scheduler state, loss history, and epoch from a checkpoint.
@@ -58,7 +58,15 @@ def train_step(conf, batch, model):
     (`masked_mse`, `UCF_VIT.utils.metrics`): reconstruction MSE computed only
     over the masked (encoder-hidden) patches, the standard MAE-paper loss,
     instead of `"MSE"`'s plain `nn.MSELoss()` over every patch (masked and
-    visible alike).
+    visible alike). MAE with `ap.do_ap:True` additionally supports
+    `"nativeResMSE"`/`"nativeResMaskMSE"` (`native_resolution_patch_mse`/
+    `native_resolution_patch_masked_mse`): instead of comparing the
+    prediction against the already-resized, fixed-`interp_size` token
+    (what `"MSE"`/`"maskMSE"` compare against under `do_ap:True`), compares
+    it against the real, native-resolution image region each adaptive
+    patch actually covers -- a more faithful reconstruction objective for
+    small/detailed patches, whose fixed-size token is already a lossy,
+    downsampled version of the real pixels.
 
     Args:
         conf: Parsed training configuration dict (as returned by `parse_config`).
@@ -110,6 +118,22 @@ def train_step(conf, batch, model):
                 criterion = masked_mse
                 target = einops.rearrange(batch["seq"], 'b c s p -> b s (p c)')
                 loss = criterion(output, target, mask)
+            elif conf["model"]["loss_fn"] in ("nativeResMSE", "nativeResMaskMSE"):
+                # batch["seq_ps"] is process_batch's own combined
+                # [size, pos] tensor (built for the adaptive positional
+                # embedding), reused here as native_resolution_patch_mse's
+                # size/pos arguments -- unsqueeze(1) restores the
+                # adaptive_patching_channels==1 dim process_batch's own
+                # torch.squeeze already dropped (see process_batch's own
+                # comment; only the separate_channels:False case is
+                # supported here, same limitation seq_ps itself already has).
+                output, mask = model.forward(batch["seq"], batch["variables"], batch["seq_ps"])
+                seq_size = batch["seq_ps"][..., 0].unsqueeze(1)
+                seq_pos = batch["seq_ps"][..., 1:].unsqueeze(1)
+                if conf["model"]["loss_fn"] == "nativeResMSE":
+                    loss = native_resolution_patch_mse(output, batch["data"], seq_size, seq_pos, conf["data"]["interp_size"], conf["data"]["twoD"])
+                else:
+                    loss = native_resolution_patch_masked_mse(output, batch["data"], seq_size, seq_pos, conf["data"]["interp_size"], conf["data"]["twoD"], mask.unsqueeze(1))
 
         else:
             if conf["model"]["loss_fn"] == "MSE":
