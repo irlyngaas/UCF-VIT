@@ -17,7 +17,6 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 
 from torch.nn import Sequential
 from UCF_VIT.model.building_blocks import Block
-from UCF_VIT.utils.misc import interpolate_pos_embed_adaptive
 from UCF_VIT.utils.pos_embed import interpolate_pos_embed, interpolate_pos_embed_3d
 from timm.layers import use_fused_attn
 
@@ -117,10 +116,27 @@ def _transplant_pos_embed(encoder_dict, pretrained_model, model):
             )
         encoder_dict["pos_embed"] = resized
     else:
-        # adaptive_patching and not sqrt_len_method: pos_embed is a flat
-        # fixed_length sequence, not a spatial grid -- see
-        # interpolate_pos_embed_adaptive's own docstring.
-        interpolate_pos_embed_adaptive(model, encoder_dict, new_size=model.fixed_length)
+        # adaptive_patching and not sqrt_len_method: pos_embed is a flat,
+        # learned, per-sequence-slot-index embedding (used only when
+        # use_adaptive_pos_emb:False -- see VIT._pos_embed; when True,
+        # pos_embed is allocated but never actually read in forward, the
+        # geometry-derived adaptive_pos_dep_emb is used instead), not a
+        # spatial grid -- unlike grid_size's case above, slot index N has no
+        # reliable relationship to slot index N+1 at all (FixedQuadTree/
+        # FixedOctTree's own node order reflects greedy-split order, not
+        # spatial adjacency), so there's no principled way to resize it the
+        # way a real spatial grid can be. (An earlier version of this
+        # function tried a 1D linear interpolation along the slot-index axis
+        # regardless -- archived at
+        # ../UCF-VIT-claude-archive/src/UCF_VIT/utils/misc.py -- which both
+        # rested on that unfounded adjacency assumption and, independently,
+        # never sliced out num_prefix_tokens first, corrupting the
+        # class-token row into the interpolation whenever class_token:True.)
+        # Same reasoning as sqrt_len_method's rejection above, just handled
+        # by dropping rather than raising, since a size mismatch here is a
+        # real, unremarkable scenario (e.g. fine-tuning at a different
+        # fixed_length): the new model just keeps its own fresh init.
+        del encoder_dict["pos_embed"]
 
 
 def _prune_incompatible_cls_token(encoder_dict, model):

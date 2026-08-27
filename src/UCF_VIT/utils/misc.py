@@ -133,49 +133,6 @@ def configure_scheduler(optimizer, scheduler_type, scheduler_kwargs):
 
     return lr_scheduler
 
-def interpolate_pos_embed_adaptive(model, checkpoint_model, new_size=127):
-    """Interpolates adaptive-patching positional embeddings from a checkpoint to a new length.
-
-    Resizes the "pos_embed" and, if present, "decoder_pos_embed" entries of
-    `checkpoint_model` (in place) via 1D linear interpolation along the sequence
-    dimension, so they can be loaded into a model whose sequence length differs from
-    the checkpoint's.
-
-    Args:
-        model: Unused; kept for interface compatibility with `interpolate_pos_embed`.
-        checkpoint_model: State dict loaded from a checkpoint; modified in place.
-        new_size: Target sequence length for the interpolated embeddings.
-    """
-    if "pos_embed" in checkpoint_model:
-        pos_embed_checkpoint = checkpoint_model["pos_embed"]
-        embedding_size = pos_embed_checkpoint.shape[-1]
-        orig_num_patches = pos_embed_checkpoint.shape[-2]
-
-        if orig_num_patches != new_size:
-            pos_tokens = pos_embed_checkpoint.reshape(-1, orig_num_patches, embedding_size).permute(0, 2, 1)
-            new_pos_tokens = torch.nn.functional.interpolate(
-                pos_tokens, size=new_size, mode="linear", align_corners=False
-            )
-            new_pos_tokens = new_pos_tokens.permute(0,2,1)
-            checkpoint_model["pos_embed"] = new_pos_tokens
-
-            del new_pos_tokens
-
-    if "decoder_pos_embed" in checkpoint_model:
-        pos_embed_checkpoint = checkpoint_model["decoder_pos_embed"]
-        embedding_size = pos_embed_checkpoint.shape[-1]
-        orig_num_patches = pos_embed_checkpoint.shape[-2]
-
-        if orig_num_patches != new_size:
-            pos_tokens = pos_embed_checkpoint.reshape(-1, orig_num_patches, embedding_size).permute(0, 2, 1)
-            new_pos_tokens = torch.nn.functional.interpolate(
-                pos_tokens, size=new_size, mode="linear", align_corners=False
-            )
-            new_pos_tokens = new_pos_tokens.permute(0,2,1)
-            checkpoint_model["decoder_pos_embed"] = new_pos_tokens
-
-            del new_pos_tokens
-
 def init_par_groups(world_rank, data_par_size, tensor_par_size, fsdp_size, simple_ddp_size):
     """Creates the distributed process groups used for hybrid tensor/data/FSDP parallelism.
 

@@ -19,6 +19,21 @@ Covers three things introduced/fixed together:
    producing a wrong-shaped result (see this session's own investigation notes
    for why that regime's `grid_size` doesn't reflect its real token count).
 
+Note: the flat (adaptive, non-sqrt_len_method) case used to interpolate
+`pos_embed` via 1D linear interpolation along the sequence-slot-index axis
+(`UCF_VIT.utils.misc.interpolate_pos_embed_adaptive`) instead of the grid
+case's spatial resize. Reviewing that function found two real problems: no
+principled notion of "adjacent slots" exists for adaptive patching at all
+(`FixedQuadTree`/`FixedOctTree`'s node order reflects greedy-split order,
+not spatial position), so the interpolation rested on an assumption the
+data doesn't satisfy; and, independently, it never sliced out
+`num_prefix_tokens` first, so a class-token row got blended into the
+interpolation whenever `class_token:True`. Replaced with simply dropping
+the pretrained `pos_embed` on a `fixed_length` mismatch (the new model
+keeps its own fresh init) -- `interpolate_pos_embed_adaptive` was deleted,
+archived at
+`../UCF-VIT-claude-archive/src/UCF_VIT/utils/misc.py`.
+
 Note: `get_model` used to need a `_patch_embed_img_size` conversion step
 between `conf["data"]["tile_size"]` and `PatchEmbed`'s `img_size` argument,
 because `tile_size` was `[width, height]` for `imagenet`/`catsdogs` while
@@ -372,6 +387,38 @@ def test_pretrained_loading_3d_non_cubic_ratio_change():
 
     assert new_model.pos_embed.shape == fresh_new_pos_embed.shape
     assert not torch.equal(new_model.pos_embed, fresh_new_pos_embed)
+
+
+def test_pretrained_loading_adaptive_patching_fixed_length_mismatch_drops_pos_embed():
+    """adaptive_patching:True + not sqrt_len_method: pos_embed is a flat,
+    learned, per-sequence-slot-index embedding with no spatial/geometric
+    meaning attached to any given slot (FixedQuadTree/FixedOctTree's own
+    node order reflects greedy-split order, not spatial adjacency) --
+    unlike the grid case above, there's no principled way to resize it, so
+    a fixed_length mismatch drops it entirely (new model keeps its own
+    fresh init) rather than attempting an interpolation. An earlier
+    implementation instead did a 1D linear interpolation along the
+    slot-index axis, resting on an adjacency assumption the data doesn't
+    satisfy, and -- independently -- never sliced out num_prefix_tokens
+    first, corrupting the class-token row into the interpolation whenever
+    class_token:True (exercised directly here via class_token=True on both
+    sides).
+    """
+    kwargs = dict(
+        patch_size=4, interp_size=4, twoD=True, num_classes=2,
+        class_token=True, pos_embed="learn", adaptive_patching=True,
+        sqrt_len_method=False, embed_dim=8, depth=1, num_heads=1,
+        mlp_ratio=1.0, in_chans=1,
+    )
+    pretrained = VIT(img_size=(32, 32), fixed_length=16, **kwargs)
+    new_model = VIT(img_size=(32, 32), fixed_length=24, **kwargs)
+    fresh_new_pos_embed = new_model.pos_embed.clone()
+
+    _load_pretrained_encoder(pretrained, new_model)
+
+    # Dropped, not interpolated -- new model keeps its own fresh init exactly.
+    assert torch.equal(new_model.pos_embed, fresh_new_pos_embed)
+    assert new_model.pos_embed.shape[1] == new_model.fixed_length + new_model.num_prefix_tokens
 
 
 def test_pretrained_loading_sqrt_len_method_mismatch_raises_clearly():
