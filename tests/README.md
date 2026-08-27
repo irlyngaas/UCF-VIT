@@ -681,11 +681,14 @@ latent inconsistency never exercised by any non-square `imagenet` +
 change needed there, just a corroborating data point that the flip fixes
 a real inconsistency rather than introducing a new requirement.
 
-Needs a rerun of both `run_distributed_tests.sh` (Tier 2, re-covers
-`test_pretrained_loading_real.py` and the real dataloader tests) and
-`run_pretrained_smoke.sh` (Tier 3c, re-exercises the exact non-square
-`catsdogs` scenario end to end) to confirm the real training path still
-works after this convention flip.
+**Confirmed on real Frontier runs:** `run_distributed_tests.sh` (job
+5350427) — **62/62 passed on all 8 ranks**, including
+`test_pretrained_loading_real.py`'s real `get_model` wiring tests and the
+real `imagenet`/`catsdogs`/`basic_ct` dataloader/tiling tests.
+`run_pretrained_smoke.sh` (job 5350429, Tier 3c) — **full end-to-end
+pass**, phase 1 fresh training PASS (64s), phase 2 pretrained fine-tune at
+the non-square `[128, 192]` resize PASS (48s). The convention flip works
+correctly under real, real multi-rank training.
 
 ## Running the distributed (Tier 2) tests
 
@@ -2084,8 +2087,12 @@ That convention was later flipped to `[height, width]` (see "Flipped
 `img_size`/`resize`/`tile_size` to `[height, width]`" earlier in this
 file) — `NEW_RESIZE`'s literal value is unchanged in
 `run_pretrained_smoke.py`, but it now means height=128, width=192, still
-a genuinely non-square case. Needs another real rerun to reconfirm phase 2
-still passes under the new convention.
+a genuinely non-square case.
+
+Fourth run (job 5350429), under the new `[height, width]` convention:
+phase 1 **PASS (64s)**, phase 2 **PASS (48s)** — reconfirms the
+end-to-end pretrained-loading workflow still works correctly after the
+convention flip.
 
 ## Validating a config file by hand
 
