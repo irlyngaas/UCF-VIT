@@ -235,7 +235,7 @@ def main():
         iterations_per_epoch = iterations_per_epoch_tensor.item()
 
     if conf["model"]["type"] == "DiffusionVIT":
-        ddpm_scheduler = DDPM_Scheduler(num_time_steps=conf["model"]["kwargs"]["time_steps"]).to(device)
+        ddpm_scheduler = DDPM_Scheduler(num_time_steps=conf["model"]["kwargs"]["num_time_steps"]).to(device)
     else:
         ddpm_scheduler = None
 

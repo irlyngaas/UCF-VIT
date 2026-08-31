@@ -81,11 +81,13 @@ pytest tests/test_config_validation.py -v
 | `tests/dataloaders/test_datamodule.py` | `collate_fn` across `adaptive_patching`/`return_label`/`separate_channels`/`return_qdt`/dataset-type combinations, built from real `ProcessChannels` output rather than hand-fabricated tuples |
 | `tests/datasets/test_catsdogs.py` | `CatsDogsDataset` (label-from-filename, resize/channel-first conversion, adaptive-patching shapes, `div x div` tiling — `__len__` scaling, a deliberately non-square full-coverage regression test, and tiling composed with adaptive_patching) and `CatsDogsCollate`, against small real JPEG files written to a temp dir — `catsdogs` is the only shipped dataset using `dataloader.type: "dataloader"` (a plain `Dataset` + `DistributedSampler`, not the `iterative_dataloader` stack the two rows above cover), and previously had no tiling capability at all (`tiling.div` was silently ignored) |
 | `tests/utils/test_misc.py` | `is_power_of_two`, `calculate_tile_overlap`, `calculate_tile_bounds` (`div==1` passthrough, no-overlap tiling, overlap at first/middle/last tile boundaries — extracted from `TileDataIter` so `CatsDogsDataset`'s tiling can reuse the exact same math), `patchify`/`unpatchify` roundtrips, `process_root_dirs` (`imagenet` per-class bucketing — evenly/non-evenly-divisible `> data_par_size`, `<= data_par_size`, bucket-content correctness — and the non-`imagenet` branch), `detect_num_channels` (`imagenet` hardcoding with no filesystem touched, `catsdogs`/PIL real-file band-count detection across RGB/`L`/RGBA, `basic_ct`/nibabel real-file 3D-shape detection, the 4D-shape-raises case, missing-`imagesTr`-raises, and independent per-key detection), `detect_img_size` (`basic_ct`/nibabel real-file native-shape detection, `imagenet`/`catsdogs`/PIL real-file native-pixel-size detection using a deliberately non-square fixture to verify PIL's native `(width, height)` `.size` is correctly swapped to the `[height, width]` convention, first-`dict_root_dirs`-key-only sampling, missing-`imagesTr`-raises, empty-`dict_root_dirs`-raises), `shard_mlp_state_dict`/`shard_attention_state_dict` (weight-slice reconstruction, `fc2.bias`/`proj.bias` summing back to the original exactly, `qk_norm` rejection) |
-| `tests/utils/test_pos_embed.py` | 1D/2D/3D sin-cos position embeddings, `SinusoidalEmbeddings` |
+| `tests/utils/test_pos_embed.py` | 1D/2D/3D sin-cos position embeddings |
+| `tests/utils/test_time_embed.py` | `SinusoidalEmbeddings` — moved here from `pos_embed.py` alongside `UCF_VIT.utils.time_embed` itself, when `Block_diffusion` (see `test_diffusion_vit.py` below) needed it as a per-block submodule rather than a `DiffusionVIT`-level one |
 | `tests/utils/test_lr_scheduler.py` | `LinearWarmupCosineAnnealingLR` warmup/annealing shape |
 | `tests/utils/test_metrics.py` | `masked_mse`, `DiceBLoss`, `native_resolution_patch_mse`/`native_resolution_patch_masked_mse` (renamed from `adaptive_patching_mse`/`adaptive_patching_masked_mse` — the original name didn't distinguish it from `MSE`/`maskMSE`'s own per-patch averaging under `ap.do_ap:True`; the real distinguishing property is comparing against the *native-resolution* image region each patch covers, not the already-resized fixed-`interp_size` token) — 2D and 3D crop-vs-prediction correctness via real `y` slices (not hand-derived pixel formulas, which turned out to be error-prone to get right by hand even for a case that was actually correct, see below), padding-patch exclusion, shared-vs-independent-per-channel adaptive-patching grids, masked-variant mask+padding exclusion. Rewritten to be fully vectorized (`torch.nn.functional.grid_sample`, one batched call across every batch/channel/sequence position, no Python-level loop) — the original was an unvectorized, never-hooked-up, never-run triple-nested-loop implementation with a real axis-order bug: it indexed the target `y[..., x_start:x_end, y_start:y_end]`, but `x`/`y` (from `UCF_VIT.dataloaders.quadtree.Rect`'s own convention) are the *width*/*height*-derived bounds respectively, while `y`'s real axis order is `(..., H, W)` — swapped, invisible on square images, the same class of bug found and fixed elsewhere this session (`TileDataIter`, `catsdogs.py`, the whole `img_size`/`resize`/`tile_size` convention flip). Fixed as part of the rewrite by using `grid_sample`'s own native `x`/`y`[`/z`]-to-last/second-to-last[/third-to-last]-axis convention directly, which — confirmed by tracing `dataloaders/dataset.py`'s `np.moveaxis(np_image, 0, -1)` (only ever relocates the channel axis, never the 3 spatial ones) all the way through `Patchify`/`Patchify_3D` — already matches how this codebase's real axes are laid out end to end, no permutation needed. |
 | `tests/test_config_validation.py` | Every YAML under `configs/` actually parses via `parse_config`, plus a negative-case regression test that `ap.do_ap:True` with no `ap.interp_size` set fails with a clear error, not a bare `KeyError` |
 | `tests/model/test_arch.py` | `VIT.effective_patch_size` (`interp_size` used when `adaptive_patching`, `patch_size` otherwise, `patch_size`/`interp_size` themselves never overwritten, missing-`interp_size`-under-`adaptive_patching` raises clearly) — needs the real `timm`/`monai`/`xformers` stack (`UCF_VIT.model.arch`'s own imports), skips cleanly via `importorskip` otherwise |
+| `tests/model/test_diffusion_vit.py` | `Block_diffusion` (`building_blocks.py`) — `DiffusionVIT`'s new per-block timestep conditioning (a `SinusoidalEmbeddings` + learned `EmbeddingDenseLayer` projection re-injected into the token sequence before every block's attention, replacing the earlier design that added a timestep embedding once, before the first block). Confirms `get_model`'s `block_fn=Block_diffusion` (`DiffusionVIT`-only) actually produces `Block_diffusion` instances for both `self.blocks` and, when `linear_decoder:False`, `self.decoder_blocks`; a real forward+backward pass runs and stays finite in both decoder modes; and, the actual point of the feature, that different timesteps produce genuinely different output, not just get plumbed through and ignored. See the narrative section below for the real bugs found wiring this in. |
 | `tests/model/test_pretrained_loading.py` | `interpolate_pos_embed`/`interpolate_pos_embed_3d` (independent, non-1:1 height:width[:depth] ratio changes in both directions, class-token prefix preserved, same-size no-op), `extract_encoder_state_dict` against both a fake dict (allowlist keeps only the shared `VIT` encoder — including the `UNETR.encoder1`-vs-`"decoder" not in k` collision case that motivated an allowlist over a denylist) and every real model type's own real `state_dict()` as a pretrained source (`VIT`/`MAE`/`SAP`/`UNETR`/`DiffusionVIT` — not just the two types any shipped config actually uses, since nothing in `get_model` restricts which type the pretrained source is), and end-to-end pretrained-checkpoint transplant (same-architecture 2D and 3D non-cubic ratio changes, cross-architecture `MAE`→`VIT` *and* `VIT`→`MAE` — both class-token-count-mismatch directions, not just one — `sqrt_len_method:True` raising a clear error instead of silently transplanting a wrong-shaped `pos_embed`) — same `importorskip` gating as `test_arch.py`. The `VIT`→`MAE` direction caught a real bug: `extract_encoder_state_dict`'s allowlist includes `cls_token` (genuinely a shared `VIT.__init__` attribute when present), but a downstream model with no `cls_token` at all (any non-`VIT` type, or `class_token=False`) made `load_state_dict(strict=True)` raise `"Unexpected key(s): cls_token"` — unlike `pos_embed`, which always has *some* value to reconcile shapes against, `cls_token` can be entirely absent on one side. Fixed with a new `_prune_incompatible_cls_token`, called in `get_model` right after `_transplant_pos_embed`. Used to also cover `_patch_embed_img_size` (a `tile_size`-to-`PatchEmbed`-`img_size` conversion, needed because `tile_size` was `[width, height]` for `imagenet`/`catsdogs`; a real bug caught by a real Tier 3 run, see the Tier 3c section below) — that function was later deleted once the config/data-loading layer itself was changed to store `img_size`/`resize`/`tile_size` as `[height, width]` (see "Flipped `img_size`/`resize`/`tile_size` to `[height, width]`" further down), which made it a true no-op for every dataset. Also covers the flat (adaptive, non-`sqrt_len_method`) `pos_embed` case on a `fixed_length` mismatch: reviewing `interpolate_pos_embed_adaptive` (formerly used there, 1D linear interpolation along the sequence-slot-index axis) found it rested on an adjacency assumption adaptive-patching sequences don't actually satisfy (`FixedQuadTree`/`FixedOctTree`'s node order reflects greedy-split order, not spatial position) and, independently, never sliced out `num_prefix_tokens` first — a real, reachable bug corrupting the class-token row into the interpolation whenever `class_token:True`. Replaced with simply dropping the pretrained `pos_embed` on a mismatch (new model keeps its own fresh init); `interpolate_pos_embed_adaptive` deleted, archived at `../UCF-VIT-claude-archive/src/UCF_VIT/utils/misc.py`. `test_pretrained_loading_adaptive_patching_fixed_length_mismatch_drops_pos_embed` exercises this directly with `class_token=True` on both sides — the exact scenario that used to be corrupted. |
 | `tests/test_parse_pretrained_config.py` | `parse_pretrained_config` (+ `get_kwargs`'s per-model-type branch) for `SAP`/`UNETR`/`DiffusionVIT` as the pretrained source specifically — `tests/model/test_pretrained_loading.py`/`test_pretrained_loading_real.py` only ever use `VIT`/`MAE`. Pure `parse.py`-level (no `UCF_VIT.model.arch` import at all), so no `importorskip` needed — runs in any environment. |
 | `tests/test_train_step.py` | `training.py`'s `train_step` MAE loss dispatch: `loss_fn:"MSE"` (plain `nn.MSELoss` over every patch) and `loss_fn:"maskMSE"` (`masked_mse`, averaged only over the masked/encoder-hidden patches — the standard MAE-paper loss), for both `ap.do_ap:True` and `False`; and, `ap.do_ap:True`-only, `loss_fn:"nativeResMSE"`/`"nativeResMaskMSE"` (`native_resolution_patch_mse`/`native_resolution_patch_masked_mse` — compares against the real, native-resolution image region each adaptive patch covers, not the already-resized fixed-`interp_size` token `"MSE"`/`"maskMSE"` compare against under `do_ap:True`). `"maskMSE"` was previously dead code (the `do_ap:True` branch was a bare `#TODO`, the `do_ap:False` branch was fully written but commented out), and `"nativeRes*"` didn't exist at all — now all wired up. Uses a fake model (`train_step` only ever calls `model.forward(...)`, so a stub returning a fixed `(output, mask)` is enough, no real MAE/`timm`/`monai`/`xformers` needed). The `"MSE"`/`"maskMSE"` tests construct output so masked and unmasked patches have a different, known error, so the two losses produce different, independently-verifiable numbers from the same fixture rather than coincidentally agreeing; the `"nativeRes*"` tests verify `train_step`'s dispatch against directly calling `native_resolution_patch_mse`/`_masked_mse` itself, including that `batch["seq_ps"]` (`process_batch`'s own combined, squeezed `[size, pos]` tensor, built for the adaptive positional embedding) gets correctly sliced back apart and its `adaptive_patching_channels` dim restored. Every test also asserts the fake model was called with the expected input tensor (`batch["seq"]` vs `batch["data"]`) — `train_step`'s previously-found real bugs (see below) were all about picking the wrong branch/input, not just computing the wrong number. |
@@ -823,6 +825,85 @@ pre-existing check; not something this rewrite introduced or fixes, just
 something to keep in mind when picking `fixed_length` values. Not yet
 verified against real `basic_ct`+`do_ap:True` data on Frontier, same gap
 noted above.
+
+### Added `Block_diffusion`: per-block timestep conditioning for `DiffusionVIT`
+
+The user made local changes adding `Block_diffusion` (`building_blocks.py`,
+a `Block` subclass) so `DiffusionVIT` re-injects a per-block timestep
+embedding before every block's attention, instead of adding one timestep
+embedding once before the first block and letting it propagate implicitly
+through the residual stream. Checking the changes before committing found
+three real, blocking bugs, all fixed:
+
+1. `parse.py`'s `get_kwargs` referenced `Block_diffusion` in
+   `kwargs.update({"block_fn": Block_diffusion})` without ever importing
+   it — confirmed directly (`hasattr(parse_module, "Block_diffusion")` was
+   `False`) that this would raise `NameError` on every `DiffusionVIT`
+   config, immediately, before ever reaching model construction. Fixing
+   it by adding the import to `parse.py` worked, but introduced a real
+   side effect: `parse.py` is deliberately kept free of
+   `building_blocks.py`'s own real, unconditional `timm`/`monai`/`xformers`
+   top-level imports (see `tests/test_parse_pretrained_config.py`'s own
+   docstring), specifically so config parsing/validation works without the
+   full model stack installed — confirmed this broke for `DiffusionVIT`
+   configs specifically by actually running `test_config_validation.py`
+   (3 real `ModuleNotFoundError: xformers.components` failures, not a
+   stub gap). Asked the user, who chose to move `block_fn` selection to
+   `model/utils.py`'s `get_model` instead — which already does
+   conditional, per-model-type imports of the real model classes, so
+   adding `Block_diffusion` there costs nothing new (that file already
+   unconditionally imports `building_blocks.py` at its own top level).
+   `block_fn=Block_diffusion if <type> == "DiffusionVIT" else Block` was
+   added at both of `get_model`'s real construction sites (the main model
+   and the pretrained-loading branch), and removed from `get_kwargs`
+   entirely — restoring `parse.py`'s standalone usability for every model
+   type, `DiffusionVIT` included.
+2. `src/UCF_VIT/training.py` (not `training_scripts/train.py`, a
+   different file — the user correctly updated the latter) had two
+   remaining reads of `conf["model"]["kwargs"]["time_steps"]`, the
+   config-kwargs key name before the user's own rename to
+   `num_time_steps` (needed since `VIT.__init__` gained a real
+   `num_time_steps` parameter that `DiffusionVIT` no longer pops out of
+   `kwargs` early). Found via a repo-wide grep for the old key name after
+   fixing (1) — both would have raised `KeyError` the moment a real
+   `DiffusionVIT` training step actually ran (building the noised input
+   `t`), in two different code paths (`process_batch`'s
+   `tensor_par_size == 1` and `> 1` branches). Fixed by updating both to
+   the new key name.
+3. Three existing tests referenced the pre-rename `time_steps` name and
+   would have failed as stale assertions/`TypeError`s regardless of the
+   above:
+   `tests/test_parse_pretrained_config.py::test_parse_pretrained_config_diffusionvit_source`
+   (asserted `p_conf["kwargs"]["time_steps"]`),
+   `tests/model/test_pretrained_loading.py::test_extract_encoder_state_dict_strips_real_diffusionvit_decoder`
+   (constructed a real `DiffusionVIT` with `time_steps=10` — `VIT.__init__`
+   has no such parameter, only `num_time_steps`), and
+   `tests/utils/test_pos_embed.py` (imported `SinusoidalEmbeddings` from
+   its old location — the user moved it, correctly, out of `pos_embed.py`
+   into a new dedicated `UCF_VIT.utils.time_embed`, since `Block_diffusion`
+   needed it as a per-block submodule rather than a `DiffusionVIT`-level
+   one; the class itself is unchanged, just relocated). All three updated;
+   the `SinusoidalEmbeddings` test moved into a new
+   `tests/utils/test_time_embed.py` alongside the class's new home, rather
+   than just import-patched in place, matching this repo's one-test-file-
+   per-source-module convention.
+
+Also added missing docstrings (`Block.__init__`'s new `num_time_steps`
+parameter, `Block_diffusion` itself) and simplified two
+`for i, blk in enumerate(self.blocks/decoder_blocks): x = blk(x,t)` loops
+to `for blk in ...` (`i` was unused) — matching the file's otherwise
+thorough docstring convention and its own pre-existing, *used*-`i`
+`enumerate` pattern elsewhere (`forward_intermediates`), which was left
+untouched.
+
+Verified directly (not just via the test suite): constructed a real
+`DiffusionVIT` with `block_fn=Block_diffusion`, confirmed `model.blocks`
+are genuinely `Block_diffusion` instances, ran a real forward+backward
+pass in both `linear_decoder` modes, and confirmed two different `t`
+tensors produce genuinely different output (not just plumbed through and
+ignored) — the actual point of the feature.
+
+Not yet verified on real Frontier hardware/data.
 
 ## Running the distributed (Tier 2) tests
 

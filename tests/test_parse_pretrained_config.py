@@ -154,5 +154,5 @@ def test_parse_pretrained_config_diffusionvit_source():
     p_conf = _parse_as_pretrained_source(pretrained_conf, downstream_conf)
 
     assert p_conf["model_type"] == "DiffusionVIT"
-    assert p_conf["kwargs"]["time_steps"] == 100
+    assert p_conf["kwargs"]["num_time_steps"] == 100
     assert p_conf["kwargs"]["linear_decoder"] is True

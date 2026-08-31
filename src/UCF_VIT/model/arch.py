@@ -13,8 +13,7 @@ import torch.nn as nn
 from UCF_VIT.model.building_blocks import Block, PatchEmbed, Mlp, DropPath, AttentionPoolLatent, PatchDropout, \
     trunc_normal_, resample_patch_embed, resample_abs_pos_embed, \
     get_act_layer, get_norm_layer, LayerType, \
-    MyUnetBlock, EmbeddingDenseLayer, \
-    VariableMapping_Attention
+    MyUnetBlock, VariableMapping_Attention
 
 from timm.models._manipulate import named_apply, checkpoint_seq
 
@@ -22,7 +21,6 @@ from UCF_VIT.utils.pos_embed import (
     get_1d_sincos_pos_embed_from_grid,
     get_2d_sincos_pos_embed,
     get_3d_sincos_pos_embed,
-    SinusoidalEmbeddings,
 )
 import torch.distributed as dist
 
@@ -176,6 +174,7 @@ class VIT(nn.Module):
             FusedAttn_option = FusedAttn.NONE,
             use_adaptive_pos_emb: bool = False,
             sqrt_len_method: bool = False,
+            num_time_steps: int = None,
     ) -> None:
         """Builds the patch/token embedding, positional embedding, transformer blocks, and optional classification head.
 
@@ -271,6 +270,7 @@ class VIT(nn.Module):
         self.FusedAttn_option = FusedAttn_option
         self.use_adaptive_pos_emb = use_adaptive_pos_emb
         self.sqrt_len_method = sqrt_len_method
+        self.num_time_steps = num_time_steps
 
         if self.adaptive_patching:
             assert self.interp_size is not None, "interp_size is required when adaptive_patching is turned on"
@@ -336,6 +336,7 @@ class VIT(nn.Module):
                 mlp_layer=mlp_layer,
                 tensor_par_size=tensor_par_size,
                 tensor_par_group=tensor_par_group,
+                num_time_steps=num_time_steps
             )
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
@@ -1599,13 +1600,9 @@ class DiffusionVIT(VIT):
         self.decoder_embed_dim = kwargs.pop('decoder_embed_dim', '')
         self.decoder_num_heads = kwargs.pop('decoder_num_heads', '')
         self.decoder_mlp_ratio = kwargs.pop('decoder_mlp_ratio', '')
-        self.time_steps = kwargs.pop('time_steps', '')
         super().__init__(*args, **kwargs)
         #Remove decoder from VIT
         self.head = None 
-
-        self.temporalEmbeddings = SinusoidalEmbeddings(time_steps=self.time_steps, embed_dim=self.embed_dim)
-        self.timeEmbeddingMap = EmbeddingDenseLayer(self.embed_dim, self.embed_dim, 0.5) # dropout_prob = 0.5
 
         if self.linear_decoder:
             self.decoder_pred = nn.Linear(self.embed_dim, self.patch_dim)
@@ -1636,6 +1633,7 @@ class DiffusionVIT(VIT):
                     norm_layer=self.norm_layer,
                     act_layer=self.act_layer,
                     mlp_layer=self.mlp_layer,
+                    num_time_steps=self.num_time_steps,
                 )
                 for i in range(self.decoder_depth)])
         else:
@@ -1748,9 +1746,6 @@ class DiffusionVIT(VIT):
                
         x = self._pos_embed(x, None)
         x = self.patch_drop(x)
-        time_emb = self.temporalEmbeddings(x,t)
-        time_emb = self.timeEmbeddingMap(time_emb.to(x.dtype))[:,None,:]
-        x = x + time_emb
 
         if self.tensor_par_size > 1:
             src_rank = dist.get_rank() - dist.get_rank(group=self.tensor_par_group)
@@ -1764,7 +1759,8 @@ class DiffusionVIT(VIT):
             x = x.contiguous()
             dist.broadcast(x, src_rank, group=self.tensor_par_group)
 
-        x = self.blocks(x)
+        for blk in self.blocks:
+            x = blk(x, t)
         x = self.norm(x)
 
         if self.tensor_par_size > 1:
@@ -1772,7 +1768,7 @@ class DiffusionVIT(VIT):
 
         return x
 
-    def forward_head(self, x: torch.Tensor):
+    def forward_head(self, x: torch.Tensor, t):
         """Pools the encoder output and decodes it into a per-patch pixel-space prediction.
 
         Args:
@@ -1790,7 +1786,8 @@ class DiffusionVIT(VIT):
 
             x = self.decoder_embed(x)
             x = x + self.decoder_pos_embed
-            x = self.decoder_blocks(x)
+            for blk in self.decoder_blocks:
+                x = blk(x, t)
             x = self.decoder_norm(x)
 
             if self.tensor_par_size > 1:
@@ -1812,5 +1809,5 @@ class DiffusionVIT(VIT):
         """
         t = t.to('cpu')
         x = self.forward_features(x, t, variables)
-        x = self.forward_head(x)
+        x = self.forward_head(x,t)
         return x

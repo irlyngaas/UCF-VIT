@@ -27,6 +27,7 @@ from monai.networks.blocks.dynunet_block import get_conv_layer
 
 from UCF_VIT.utils.dist_functions import F_AllReduce_B_Identity, F_Identity_B_AllReduce, F_Identity_B_AllReduce_VariableMapping
 from UCF_VIT.utils.fused_attn import FusedAttn
+from UCF_VIT.utils.time_embed import SinusoidalEmbeddings
 
 import xformers
 from xformers.components.attention.core import scaled_dot_product_attention as xformers_sdpa
@@ -341,6 +342,7 @@ class Block(nn.Module):
             mlp_layer: nn.Module = Mlp,
             tensor_par_size: int = 1,
             tensor_par_group: Optional[dist.ProcessGroup] = None,
+            num_time_steps: int = None,
     ) -> None:
         """Initializes the block's attention, MLP, normalization, layer-scale, and drop-path sublayers.
 
@@ -363,9 +365,14 @@ class Block(nn.Module):
             tensor_par_size: Number of tensor-parallel ranks to shard attention/MLP
                 across.
             tensor_par_group: Process group for tensor-parallel communication.
+            num_time_steps: Number of diffusion timesteps to embed; unused by
+                `Block` itself, only stored for `Block_diffusion` (a subclass)
+                to read in its own `__init__`.
         """
         super().__init__()
         self.norm1 = norm_layer(dim)
+        self.dim = dim
+        self.num_time_steps = num_time_steps
         self.attn = Attention(
             dim,
             fused_attn=fused_attn,
@@ -405,6 +412,48 @@ class Block(nn.Module):
         x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
         x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
         return x
+
+class Block_diffusion(Block):
+    """`Block` with per-block diffusion-timestep conditioning.
+
+    Adds its own `SinusoidalEmbeddings` + `EmbeddingDenseLayer` (a learned
+    projection of the fixed sinusoidal timestep encoding) and re-injects the
+    result into `x` before attention, at every block -- rather than adding a
+    timestep embedding once, before the first block, and letting it
+    propagate implicitly through the residual stream.
+    """
+
+    def __init__(self, *args, **kwargs):
+        """Builds a `Block`, then adds its own timestep-embedding sublayers.
+
+        Args:
+            *args: Positional arguments forwarded to `Block.__init__`.
+            **kwargs: Keyword arguments forwarded to `Block.__init__`; must
+                include `num_time_steps` (number of diffusion timesteps to
+                embed) and `dim` (used as both the timestep embedding's
+                dimension and `EmbeddingDenseLayer`'s hidden/output
+                dimension).
+        """
+        super().__init__(*args, **kwargs)
+        self.temporalEmbeddings = SinusoidalEmbeddings(time_steps=self.num_time_steps, embed_dim=self.dim)
+        self.timeEmbeddingMap = EmbeddingDenseLayer(self.dim, self.dim, 0.1) # dropout_prob
+
+    def forward(self, x: torch.Tensor, t) -> torch.Tensor:
+        """Adds a per-block timestep embedding to `x`, then runs the attention and MLP sublayers.
+
+        Args:
+            x: Input tensor, shape (B, N, dim).
+            t: Diffusion timestep indices, shape (B,).
+
+        Returns:
+            Output tensor, shape (B, N, dim).
+        """
+        time_emb = self.temporalEmbeddings(x,t)
+        time_emb = self.timeEmbeddingMap(time_emb.to(x.dtype))[:,None,:]
+        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x + time_emb))))
+        x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
+        return x
+
 
 class MyUnetBlock(nn.Module):
     """     

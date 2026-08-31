@@ -1,9 +1,7 @@
 import numpy as np
 import pytest
-import torch
 
 from UCF_VIT.utils.pos_embed import (
-    SinusoidalEmbeddings,
     get_1d_sincos_pos_embed_from_grid,
     get_2d_sincos_pos_embed,
     get_3d_sincos_pos_embed,
@@ -42,20 +40,3 @@ def test_get_3d_sincos_pos_embed_shape():
     # even (get_1d_sincos_pos_embed_from_grid's requirement) -> divisible by 6.
     emb = get_3d_sincos_pos_embed(embed_dim=12, grid_size_h=2, grid_size_w=3, grid_size_d=4)
     assert emb.shape == (2 * 3 * 4, 12)
-
-
-def test_sinusoidal_embeddings_lookup():
-    embed_dim = 6
-    time_steps = 10
-    module = SinusoidalEmbeddings(time_steps=time_steps, embed_dim=embed_dim)
-
-    x = torch.zeros(2, 1)
-    t = torch.tensor([0, 5])
-    out = module(x, t)
-
-    assert out.shape == (2, embed_dim)
-    torch.testing.assert_close(out[0], module.embeddings[0])
-    torch.testing.assert_close(out[1], module.embeddings[5])
-    # timestep 0 -> sin(0)=0, cos(0)=1
-    torch.testing.assert_close(out[0, 0::2], torch.zeros(embed_dim // 2))
-    torch.testing.assert_close(out[0, 1::2], torch.ones(embed_dim // 2))

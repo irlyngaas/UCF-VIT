@@ -280,7 +280,7 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
             if conf["dataloader"]["return_label"]:
                 label = batch["label"].to(device)
             if conf["model"]["type"] == "DiffusionVIT":
-                t = torch.randint(0,conf["model"]["kwargs"]["time_steps"],(conf["dataloader"]["batch_size"],))
+                t = torch.randint(0,conf["model"]["kwargs"]["num_time_steps"],(conf["dataloader"]["batch_size"],))
                 e = torch.randn_like(data, requires_grad=False)
                 if conf["data"]["twoD"]:
                     a = ddpm_scheduler.alpha[t].view(conf["dataloader"]["batch_size"],1,1,1).to(precision_dt).to(device)
@@ -471,7 +471,7 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
                 if conf["dataloader"]["return_label"]:
                     label = batch["label"].to(device)
                 if conf["model"]["type"] == "DiffusionVIT":
-                    t = torch.randint(0,conf["model"]["kwargs"]["time_steps"],(batch_size,))
+                    t = torch.randint(0,conf["model"]["kwargs"]["num_time_steps"],(batch_size,))
                     e = torch.randn_like(data, requires_grad=False)
                     if twoD:
                         a = ddpm_scheduler.alpha[t].view(batch_size,1,1,1).to(precision_dt).to(device)

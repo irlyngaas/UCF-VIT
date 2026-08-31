@@ -252,7 +252,7 @@ def test_extract_encoder_state_dict_strips_real_diffusionvit_decoder():
     model = DiffusionVIT(
         img_size=(16, 16), patch_size=4, twoD=True, num_classes=None,
         class_token=False, pos_embed="learn", adaptive_patching=False,
-        fixed_length=4, linear_decoder=True, time_steps=10,
+        fixed_length=4, linear_decoder=True, num_time_steps=10,
         decoder_depth=None, decoder_embed_dim=None, decoder_num_heads=None, decoder_mlp_ratio=None,
         weight_init="skip", embed_dim=8, depth=1, num_heads=1, mlp_ratio=1.0, in_chans=1,
     )

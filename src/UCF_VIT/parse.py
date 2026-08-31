@@ -146,9 +146,8 @@ def get_kwargs(model_type, conf):
         try:
             num_time_steps = conf['model']['num_time_steps']
         except KeyError:
-            #TODO: If not specified, get num_classes based on dataset used
             sys.exit("num_time_steps is required")
-        kwargs.update({"time_steps": num_time_steps})
+        kwargs.update({"num_time_steps": num_time_steps})
 
         try:
             linear_decoder = conf["model"]["linear_decoder"]

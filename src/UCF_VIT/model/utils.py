@@ -16,7 +16,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 
 from torch.nn import Sequential
-from UCF_VIT.model.building_blocks import Block
+from UCF_VIT.model.building_blocks import Block, Block_diffusion
 from UCF_VIT.utils.pos_embed import interpolate_pos_embed, interpolate_pos_embed_3d
 from timm.layers import use_fused_attn
 
@@ -241,6 +241,12 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
         use_adaptive_pos_emb=conf["ap"]["use_adaptive_pos_emb"],
         weight_init='' if conf["model"]["type"] == "VIT" else 'skip', #Choose ['' or 'skip'] If using VIT use '' otherwise use 'skip'. Option whether to use VITs weight initialization or use the one corresponding to the architecture you choose
         class_token=True if conf["model"]["type"] == "VIT" else False,
+        # Block_diffusion adds a per-block timestep-conditioning sublayer
+        # (SinusoidalEmbeddings + EmbeddingDenseLayer) on top of the plain
+        # Block -- only DiffusionVIT's forward_features/forward_head
+        # actually call each block with the extra `t` argument Block_diffusion
+        # requires, so this must stay DiffusionVIT-only.
+        block_fn=Block_diffusion if conf["model"]["type"] == "DiffusionVIT" else Block,
         # Without these, VIT/SAP/MAE/UNETR/DiffusionVIT all fall back to
         # their constructor defaults (tensor_par_size=1, tensor_par_group=
         # None) regardless of conf["parallelism"]["tensor_par_size"] --
@@ -306,6 +312,7 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
                 use_adaptive_pos_emb=p_conf["use_adaptive_pos_emb"],
                 weight_init='' if p_conf["model_type"] == "VIT" else 'skip', #Choose ['' or 'skip'] If using VIT use '' otherwise use 'skip'. Option whether to use VITs weight initialization or use the one corresponding to the architecture you choose
                 class_token=True if p_conf["model_type"] == "VIT" else False,
+                block_fn=Block_diffusion if p_conf["model_type"] == "DiffusionVIT" else Block,
                 # Same reasoning as the main model_arch(...) call above --
                 # parse_pretrained_config already asserts the pretrained
                 # model's own tensor_par_size matches conf's, and this
