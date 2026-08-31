@@ -34,16 +34,25 @@ keeps its own fresh init) -- `interpolate_pos_embed_adaptive` was deleted,
 archived at
 `../UCF-VIT-claude-archive/src/UCF_VIT/utils/misc.py`.
 
-Note: `get_model` used to need a `_patch_embed_img_size` conversion step
-between `conf["data"]["tile_size"]` and `PatchEmbed`'s `img_size` argument,
-because `tile_size` was `[width, height]` for `imagenet`/`catsdogs` while
-`PatchEmbed` expects `(H, W)` -- caught by a real non-square `catsdogs`
-resize on Frontier (job 5348773). The config/data-loading layer was later
+Note: `get_model` needs a conversion step between `conf["data"]["tile_size"]`
+and `PatchEmbed`'s `img_size` argument -- originally `_patch_embed_img_size`,
+which handled `tile_size` being `[width, height]` for `imagenet`/`catsdogs`
+while `PatchEmbed` expects `(H, W)` (caught by a real non-square `catsdogs`
+resize on Frontier, job 5348773). The config/data-loading layer was later
 changed to store `img_size`/`resize`/`tile_size` as `[height, width]`
-throughout (matching `PatchEmbed`'s own convention directly), which made
-`_patch_embed_img_size` a true no-op for every dataset, so it was deleted
-and both `get_model` call sites now just pass `tuple(tile_size)` straight
-through.
+throughout, which made the width/height-swap half of `_patch_embed_img_size`
+a no-op -- but its other job, truncating `basic_ct`'s 3-tuple `tile_size`
+(`(H_tile, W_tile, Z_native)`, kept 3-wide even when `twoD` is True so
+`TileDataIter`'s dispatch logic still works) down to a genuine 2-tuple
+whenever `twoD` is True, was *not* a no-op, and got dropped along with the
+whole function. That regressed every `basic_ct`+`twoD` UNETR run (its
+decoder's `nn.Upsample(size=self.img_size, ...)` needs an exact-rank size
+match) -- caught by a real Frontier smoke run (job 5388433):
+`ValueError: Input and output must have the same number of spatial
+dimensions, but got input with spatial dimensions of [128, 128] and output
+size of (256, 256, 256)`. Fixed by reinstating the truncation as
+`_model_img_size(tile_size, twoD)` (dataset-name argument dropped -- the
+2-vs-3 truncation only depends on `twoD` now, not which dataset it is).
 
 Requires timm/monai/xformers (building_blocks.py's real, unconditional
 top-level imports, transitively pulled in by model/utils.py itself) -- see
@@ -71,6 +80,7 @@ interpolate_pos_embed_3d = pos_embed_mod.interpolate_pos_embed_3d
 extract_encoder_state_dict = model_utils_mod.extract_encoder_state_dict
 _transplant_pos_embed = model_utils_mod._transplant_pos_embed
 _prune_incompatible_cls_token = model_utils_mod._prune_incompatible_cls_token
+_model_img_size = model_utils_mod._model_img_size
 VIT = arch_mod.VIT
 MAE = arch_mod.MAE
 SAP = arch_mod.SAP
@@ -78,6 +88,29 @@ UNETR = arch_mod.UNETR
 DiffusionVIT = arch_mod.DiffusionVIT
 
 import torch
+
+
+# ---------------------------------------------------------------------------
+# _model_img_size
+# ---------------------------------------------------------------------------
+
+
+def test_model_img_size_2d_tuple_passes_through_unchanged():
+    # imagenet/catsdogs: tile_size is always already a genuine 2-tuple.
+    assert _model_img_size((128, 64), twoD=True) == (128, 64)
+
+
+def test_model_img_size_basic_ct_twod_truncates_stale_z_depth():
+    # basic_ct+twoD: tile_size keeps a raw, undivided z-depth as its 3rd
+    # entry (parse.py's own dataloader-dispatch requirement) -- the model's
+    # img_size must not include it, or decoder heads that use it as an exact
+    # target size (UNETR's nn.Upsample) crash on a spatial-dimension-count
+    # mismatch. Regression test for job 5388433.
+    assert _model_img_size((128, 128, 256), twoD=True) == (128, 128)
+
+
+def test_model_img_size_basic_ct_3d_keeps_all_three_dims():
+    assert _model_img_size((64, 64, 64), twoD=False) == (64, 64, 64)
 
 
 # ---------------------------------------------------------------------------

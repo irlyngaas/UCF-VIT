@@ -664,18 +664,21 @@ sites:
   `src/UCF_VIT/`): same `cv.resize` swap, for consistency — it consumes
   `dataset_options.resize` directly too.
 
-`_patch_embed_img_size` became a true identity function for every dataset
-once the config layer matched `PatchEmbed`'s own convention (its
-`imagenet`/`catsdogs` branch reduced to `return tuple(tile_size)`, already
-what the `basic_ct` branch did) — deleted entirely; both `get_model` call
-sites now just pass `tuple(conf["data"]["tile_size"])`/
-`tuple(p_conf["tile_size"])` straight through. `p_conf["dataset"]`
+`_patch_embed_img_size`'s width/height-swap half became a no-op once the
+config layer matched `PatchEmbed`'s own convention, so at the time it was
+deleted entirely and both `get_model` call sites were changed to just pass
+`tuple(conf["data"]["tile_size"])`/`tuple(p_conf["tile_size"])` straight
+through. **This assumption turned out to be wrong for `basic_ct`** — see
+"Regression: deleting `_patch_embed_img_size` also dropped its
+`basic_ct`+`twoD` truncation" below, found on a later Frontier run and
+fixed by reinstating a narrower `_model_img_size` helper. `p_conf["dataset"]`
 (`parse.py`), which existed only to feed `_patch_embed_img_size`'s
-now-deleted `dataset` argument, was removed too — confirmed via grep no
-other code or test read it. `parse.py`'s own `tile_size` computation
-needed no functional change at all — it was always pure elementwise
-arithmetic (`effective_size[i] // div + tile_overlap[i]`) with no
-width/height-specific logic, only comments describing the old order.
+`dataset` argument, was removed too — confirmed via grep no other code or
+test read it (still true after the fix below, since `_model_img_size`
+doesn't take a `dataset` argument either). `parse.py`'s own `tile_size`
+computation needed no functional change at all — it was always pure
+elementwise arithmetic (`effective_size[i] // div + tile_overlap[i]`) with
+no width/height-specific logic, only comments describing the old order.
 
 As a side effect, this also makes `training.py`'s tensor-parallel
 broadcast-placeholder construction (`torch.zeros(..., tile_size[0],
@@ -693,6 +696,55 @@ real `imagenet`/`catsdogs`/`basic_ct` dataloader/tiling tests.
 pass**, phase 1 fresh training PASS (64s), phase 2 pretrained fine-tune at
 the non-square `[128, 192]` resize PASS (48s). The convention flip works
 correctly under real, real multi-rank training.
+
+### Regression: deleting `_patch_embed_img_size` also dropped its `basic_ct`+`twoD` truncation
+
+A later feature-matrix smoke run (job 5388433, run independently of the
+height-first-flip work above) turned up a real crash the local test suite
+had no way to catch: `basic_ct-unetr+twoD` and
+`basic_ct-unetr+twoD+tensor_par` both failed with
+
+```
+ValueError: Input and output must have the same number of spatial
+dimensions, but got input with spatial dimensions of [128, 128] and output
+size of (256, 256, 256).
+```
+
+Root cause: `_patch_embed_img_size` did two independent jobs, not one.
+Its width/height-swap job (for `imagenet`/`catsdogs`) did become a no-op
+once the config layer flipped to `[height, width]` — but its other job was
+`return (tile_size[0], tile_size[1]) if twoD else (tile_size[0],
+tile_size[1], tile_size[2])`, i.e. truncating `basic_ct`'s `tile_size` to a
+genuine 2-tuple whenever `twoD` is True. `parse.py` deliberately keeps
+`basic_ct`'s `tile_size` a 3-tuple `(H_tile, W_tile, Z_native)` even when
+`twoD` is True (the raw, undivided z-depth is needed for
+`TileDataIter`'s 3-vs-2-tuple dispatch and its per-z-slice walk — see
+`parse.py`'s own comment above its `elif twoD:` `tile_size` branch). That
+truncation was *not* a no-op, and was lost when the whole function was
+deleted on the assumption it now always was one. `PatchEmbed` itself never
+surfaced this (it only ever indexes `img_size[0]`/`[1]`, silently ignoring
+a stray 3rd entry), but `UNETR`'s decoder does not: `unetr_head` calls
+`nn.Upsample(size=self.img_size, ...)`, which requires the target `size`
+to have exactly as many entries as the input tensor has spatial dims —
+`self.img_size` staying a 3-tuple crashes there.
+
+Fixed by reinstating the truncation as `UCF_VIT.model.utils._model_img_size(tile_size, twoD)`
+— a small, directly unit-testable function (`tests/model/test_pretrained_loading.py`'s
+`test_model_img_size_*` tests) rather than an inline expression at each
+`get_model` call site, specifically so this behavior has direct Tier 1
+coverage this time instead of only being reachable through a real,
+FSDP/dist-requiring `get_model` call. Also dropped the `dataset` argument
+`_patch_embed_img_size` used to take (`_model_img_size` only needs
+`twoD` — the imagenet/catsdogs-vs-basic_ct distinction was always really
+"does `tile_size` have a trailing entry the model shouldn't see", which
+`twoD` already answers directly).
+
+**Not yet re-confirmed on Frontier** — the local Tier 1 fix (`_model_img_size`
+tests, 197/197 passed locally) restores direct unit coverage of the
+truncation logic itself, but `get_model`'s FSDP/dist wiring around it can
+only be exercised for real via `run_pretrained_smoke.sh` (Tier 3c) or a
+feature-matrix smoke rerun (Tier 3b) — recommended before trusting
+`basic_ct`+`twoD` UNETR runs again.
 
 ### Switched `Patchify`/`Patchify_3D`'s non-photo Canny path to `skimage.feature.canny`, then removed the `255`/`norm_factor` scaling from both quadtree and octree entirely
 

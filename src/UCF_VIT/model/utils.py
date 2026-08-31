@@ -168,6 +168,42 @@ def _prune_incompatible_cls_token(encoder_dict, model):
         del encoder_dict["cls_token"]
 
 
+def _model_img_size(tile_size, twoD):
+    """Converts a data-side tile_size into the img_size PatchEmbed/VIT expect.
+
+    imagenet/catsdogs's tile_size is always a genuine 2-tuple (H, W). basic_ct's
+    tile_size, however, stays a 3-tuple (H_tile, W_tile, Z_native) even when
+    twoD is True -- parse.py deliberately keeps the raw, undivided z-depth
+    there so TileDataIter's 3-vs-2-tuple dispatch and per-z-slice walk still
+    work (see parse.py's own comment above its `elif twoD:` tile_size branch).
+    The model itself only ever wants a true 2-tuple in that case: PatchEmbed
+    indexes just img_size[0]/[1] and would silently ignore a stray 3rd entry,
+    but decoder heads that use self.img_size directly as an exact target size
+    (e.g. UNETR's `nn.Upsample(size=self.img_size, ...)`) do not, and crash
+    with mismatched spatial-dimension counts.
+
+    Caught by a real basic_ct+twoD UNETR run on Frontier (job 5388433):
+    `ValueError: Input and output must have the same number of spatial
+    dimensions, but got input with spatial dimensions of [128, 128] and
+    output size of (256, 256, 256)`. This function used to exist as
+    `_patch_embed_img_size` with an extra dataset-name argument (removed
+    during the img_size/resize/tile_size height-first convention flip, on the
+    mistaken assumption that its basic_ct branch was already an identity --
+    it wasn't; it truncated to 2 entries whenever twoD was True, exactly the
+    behavior restored here).
+
+    Args:
+        tile_size: This model's `conf["data"]["tile_size"]` (or `p_conf`'s
+            pretrained-model equivalent) -- 2-tuple for imagenet/catsdogs,
+            2- or 3-tuple for basic_ct depending on twoD.
+        twoD: Whether this model treats its input as 2D.
+
+    Returns:
+        A 2-tuple if twoD else a 3-tuple, `(H, W)`/`(H, W, D)`-ordered.
+    """
+    return tuple(tile_size[:2]) if twoD else tuple(tile_size)
+
+
 def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, tensor_par_group):
     """Build the model architecture, load its initial weights, and wrap it with FSDP.
 
@@ -222,7 +258,7 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
         from UCF_VIT.model.arch import DiffusionVIT as model_arch
 
     model = model_arch(
-        img_size=tuple(conf["data"]["tile_size"]),
+        img_size=_model_img_size(conf["data"]["tile_size"], conf["data"]["twoD"]),
         patch_size=conf["data"]["patch_size"],
         interp_size=conf["data"].get("interp_size"),
         in_chans=conf["data"]["in_chans"],
@@ -293,7 +329,7 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
             # (pos_embed only, via _transplant_pos_embed) to the new model's
             # shape afterward, not before loading the checkpoint.
             pretrained_model = pretrained_model_arch(
-                img_size=tuple(p_conf["tile_size"]),
+                img_size=_model_img_size(p_conf["tile_size"], p_conf["twoD"]),
                 patch_size=p_conf["patch_size"],
                 interp_size=p_conf["interp_size"],
                 in_chans=conf["data"]["in_chans"],
