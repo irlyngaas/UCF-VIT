@@ -36,6 +36,8 @@ Training large ViT models at scale remains a major technical challenge in both A
 # Install
 Installation instruction are provide for running on systems with both AMD and NVIDIA GPU hardware. Instructions are included for systems ranging from a local DGX cluster to the Frontier Supercomputer.
 
+Every platform-independent package we depend on (`monai`, `nibabel`, `torchdata`, `einops`, `opencv-python-headless`, `matplotlib`, `scipy`, `scikit-image`, `SimpleITK`, `timm`) is declared in `pyproject.toml` and gets installed automatically by `pip install -e .`. `torch` and `xformers` are deliberately left out of `pyproject.toml` since the correct build depends on your GPU vendor (ROCm for AMD, CUDA for NVIDIA) -- install those manually first with the platform-specific commands below, then run `pip install -e .` to pull in everything else.
+
 ## Systems with AMD GPUs
 There are two options available for creating software environments for systems with AMD GPUs 1) creating Conda environment from scratch or 2) using an apptainer container (the installation instructions for this are currently limited to use on the Frontier supercomputer). Creating a Conda environment from scratch is recommended as the Apptainer containers currently only work in limited scenarios due to missing ROCM packages in the base apptainer image.
 
@@ -53,14 +55,6 @@ TORCHAUDIO_VERSION=2.7.0
 
 pip install torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} torchaudio==${TORCHAUDIO_VERSION} --index-url ${TORCH_URL}
 pip install xformers==0.0.30 --extra-index-url=https://download.pytorch.org/whl/rocm${ROCM_VERSION}
-pip install timm \
- monai==1.4.0 \
- nibabel \
- torchdata==0.9.0 \
- einops \
- opencv-python-headless \
- matplotlib \
- scipy
 
 #If your system has an existing MPI installed use the proper mpi4py installation for your sytsem
 #Default install mpi4py 
@@ -95,15 +89,7 @@ conda create -n vit python=3.11 -y
 conda activate vit
 CUDA_DRIVER=cu128
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/${CUDA_DRIVER}
-pip install xformers \
-timm \
-monai==1.4.0 \
-nibabel \
-torchdata==0.9.0 \
-einops \
-opencv-python-headless==4.11.0.86 \
-matplotlib \
-scipy 
+pip install xformers
 
 #If your system has an existing MPI installed use the proper mpi4py installation for your sytsem
 #Default install mpi4py 
