@@ -28,6 +28,23 @@ def test_shipped_config_parses(config_path):
     validate_config(config_path)
 
 
+def test_multiprocessing_context_defaults_to_none_when_omitted():
+    """Every shipped config except basic_ct/sap leaves dataloader.multiprocessing_context
+    unset -- DataLoader's own default (fork on Linux) must stay in effect for those,
+    unchanged from before this option existed."""
+    unetr_config = os.path.join(REPO_ROOT, "configs", "basic_ct", "unetr", "base_config.yaml")
+    conf = validate_config(unetr_config)
+    assert conf["dataloader"]["multiprocessing_context"] is None
+
+
+def test_multiprocessing_context_read_from_config_when_set():
+    """basic_ct/sap opts into spawn -- see its own multiprocessing_context comment and
+    NativePytorchDataModule's docstring for why (a real, intermittent Frontier segfault,
+    job 5390076, from forking a DataLoader worker after CUDA/NCCL init)."""
+    conf = validate_config(SAP_CONFIG)
+    assert conf["dataloader"]["multiprocessing_context"] == "spawn"
+
+
 def test_missing_interp_size_under_do_ap_raises_clearly():
     """Regression test for interp_size's requiredness: do_ap:True with no
     ap.interp_size set must fail with a clear, actionable error (not a bare

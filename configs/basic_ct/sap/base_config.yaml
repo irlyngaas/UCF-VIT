@@ -99,3 +99,12 @@ dataloader:
   batch_size: 32
   num_workers: 1
   pin_memory: False
+  # SAP always does adaptive patching (do_ap:True, see the `ap:` section below) on 3D
+  # basic_ct volumes -- the heaviest per-sample CPU workload of any shipped config's
+  # DataLoader worker. Combined with tensor_par_size>1 (more NCCL process groups in the
+  # parent process), forking that worker after CUDA/NCCL is already initialized (as
+  # every training script does -- get_model runs before train_dataloader) hit a real,
+  # intermittent segfault on Frontier (job 5390076). Every other shipped config keeps
+  # DataLoader's default (fork) -- see NativePytorchDataModule's multiprocessing_context
+  # docstring for the full explanation.
+  multiprocessing_context: "spawn"

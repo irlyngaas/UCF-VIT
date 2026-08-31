@@ -644,6 +644,11 @@ def parse_config(args, load_balance_offline=False):
         "dataset_module": dataset_module if dataloader_type == "dataloader" else None,
         "collate_fn": collate_fn if dataloader_type == "dataloader" else None,
         "return_label": return_label,
+        # Optional -- None (the default, if omitted from the config) leaves DataLoader's
+        # own default multiprocessing_context in place (fork on Linux). See
+        # NativePytorchDataModule's multiprocessing_context docstring entry for why a
+        # config would ever set this to "spawn".
+        "multiprocessing_context": conf['dataloader'].get('multiprocessing_context'),
 
     }
 

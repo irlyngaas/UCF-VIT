@@ -746,6 +746,75 @@ only be exercised for real via `run_pretrained_smoke.sh` (Tier 3c) or a
 feature-matrix smoke rerun (Tier 3b) — recommended before trusting
 `basic_ct`+`twoD` UNETR runs again.
 
+### Fixed a real, intermittent `basic_ct-sap+tensor_par` segfault: fork-after-CUDA-init
+
+A second real Frontier smoke run (job 5390076, after the `_model_img_size` fix above
+was confirmed working) still showed one failure: `basic_ct-sap+tensor_par`, killed by
+`RuntimeError: DataLoader worker (pid ...) is killed by signal: Segmentation fault`,
+with no Python traceback at all inside the worker. Tracked down by comparing job
+timestamps against `git log`: the same crash (same signature) had already happened on
+earlier smoke runs going back to job 5338382 (2026-08-24), *before* the
+`SimpleITK`-based `Patchify_3D` rewrite even existed (`ef125a5`, 2026-08-27) — with two
+runs passing in between (jobs 5341294, 5347454). So this was never a regression from
+any single commit; it's a pre-existing, timing-dependent race that just happened to
+pass twice by luck.
+
+Root cause: `training_scripts/train.py` calls `get_model` (builds the model, moves it
+to the GPU, initializes NCCL process groups, wraps in FSDP) *before*
+`data_module.setup()`/`train_dataloader()`. Every shipped config sets
+`dataloader.num_workers: 1`, and PyTorch's `DataLoader` defaults to `fork()` on Linux
+whenever `num_workers > 0` (`datamodule.py`'s `train_dataloader()` never set
+`multiprocessing_context`). Forking a process that already has an active CUDA/NCCL
+context is a documented PyTorch hazard: CUDA/NCCL keep internal background threads
+that can be mid-critical-section (holding a malloc-arena lock, a driver lock, etc.) at
+the instant of the fork; `fork()` only clones the calling thread, so the child
+inherits that lock held forever by a thread that no longer exists. Any ordinary CPU
+work in the child that touches libc's allocator (which nearly all Python code does)
+can then hang or segfault, with no relation to what code the child is actually
+running — exactly matching the traceback-free crash observed.
+
+This explains why `basic_ct-sap+tensor_par` is the *only* failure across all 19
+feature-matrix configs, every one of which forks a worker after CUDA init the same
+way: it uniquely combines `tensor_par_size: 2` (more NCCL process groups active in the
+parent -> more background threads -> a wider race window at the moment of fork) with
+`do_ap: True` on 3D `basic_ct` data (SAP always requires adaptive patching -- building
+an octree over a full 3D volume is the heaviest per-sample CPU workload of any
+worker in the matrix -> the child spends longer than any other config's worker doing
+allocator-heavy work while a stuck lock could be waiting). Every other config is
+missing one side of that combination (2D adaptive patching's octree is far lighter;
+3D adaptive patching without `tensor_par_size > 1` has a much narrower parent-side
+race window).
+
+Fixed by adding an opt-in `multiprocessing_context` option (`None` by default --
+`DataLoader`'s own default, i.e. unchanged `fork` behavior for every other config --
+only `configs/basic_ct/sap/base_config.yaml` sets it to `"spawn"`), threaded through
+`parse.py`'s `dataloader_conf` -> `NativePytorchDataModule.__init__` ->
+`train_dataloader()`'s `DataLoader(...)` call, and separately through `train.py`'s own
+manual `DataLoader` construction (the `dataloader.type: "dataloader"` map-style path,
+not exercised by any shipped config but fixed for consistency). `spawn` requires the
+`DataLoader`'s `collate_fn` to be picklable, which the previous closure `lambda batch:
+collate_fn(batch, return_label=self.return_label, ...)` was not -- replaced with
+`functools.partial(collate_fn, return_label=self.return_label, ...)` in both
+`datamodule.py` and `train.py` (`collate_fn`/`CatsDogsCollate` were already
+module-level functions, so `functools.partial` over them pickles cleanly). Verified
+`train.py`'s actual training logic is already guarded behind `if __name__ ==
+"__main__":` with no risky module-level side effects above it, so `spawn` re-importing
+the module in each worker doesn't re-run `dist.init_process_group`/etc.
+
+Deliberately *not* made the new global default -- `spawn` starts a fresh Python
+interpreter per worker and re-imports the whole `torch`/`timm`/`monai`/`xformers`
+chain, real per-worker startup latency that every other (non-crashing) config would
+pay for no benefit.
+
+**Tier 1 coverage:** `tests/test_config_validation.py`'s
+`test_multiprocessing_context_defaults_to_none_when_omitted` (any other shipped
+config) and `test_multiprocessing_context_read_from_config_when_set`
+(`basic_ct/sap`) cover the config-parsing plumbing directly. The fork-vs-spawn crash
+itself can only be exercised for real via a real multi-rank Frontier run (no local
+CUDA/NCCL context to race against) -- **not yet re-confirmed** on Frontier; recommend
+rerunning `run_feature_matrix_smoke.sh` (Tier 3b) specifically for
+`basic_ct-sap+tensor_par` before trusting this fixed.
+
 ### Switched `Patchify`/`Patchify_3D`'s non-photo Canny path to `skimage.feature.canny`, then removed the `255`/`norm_factor` scaling from both quadtree and octree entirely
 
 Investigating `Patchify`/`Patchify_3D`'s edge-detection pipeline (used by

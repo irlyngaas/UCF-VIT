@@ -1,3 +1,4 @@
+import functools
 import os
 from typing import Dict, Optional
 
@@ -207,6 +208,23 @@ class NativePytorchDataModule(torch.nn.Module):
             `FileReader.read_process_file` swaps locally right before its `cv.resize` call);
             only used when `dataset` is "imagenet". If absent or has no "imagenet" entry,
             images are left at their native size.
+        multiprocessing_context (str, optional): `DataLoader`'s own `multiprocessing_context`
+            argument -- `None` (the default) leaves PyTorch's own default in place (`fork` on
+            Linux). Only worth setting to `"spawn"` for a config combining `num_workers > 0`
+            with heavy per-sample CPU work (e.g. adaptive-patching a 3D volume) run alongside
+            `tensor_par_size > 1`: forking a worker process after CUDA/NCCL is already
+            initialized in the parent (as happens here -- `get_model` runs before
+            `train_dataloader` in every training script) is a known hazard (PyTorch's own
+            docs warn about it) -- CUDA/NCCL keep background threads that can hold a lock at
+            the instant of the fork, which the child then inherits stuck forever, causing a
+            segfault the next time it touches libc's allocator (i.e. almost immediately, in
+            unrelated-looking code). Root-caused this way after a real, intermittent
+            `basic_ct`+`SAP`+`tensor_par_size:2` Frontier segfault (job 5390076) that predated
+            this option -- see `configs/basic_ct/sap/base_config.yaml`'s own
+            `multiprocessing_context: "spawn"` for the one shipped config that actually needs
+            it. `"spawn"` costs real per-worker startup latency (a fresh Python interpreter
+            re-imports the whole `torch`/`timm`/`monai`/`xformers` chain), so it's opt-in per
+            config rather than a new global default.
     """
 
     def __init__(
@@ -237,6 +255,7 @@ class NativePytorchDataModule(torch.nn.Module):
         ddp_group: Optional[dist.ProcessGroup] = None,
         num_classes: Optional[int] = None,
         resize: Optional[Dict] = None,
+        multiprocessing_context: Optional[str] = None,
     ):
         """Initializes the data module and builds the per-dataset file listings.
 
@@ -263,6 +282,7 @@ class NativePytorchDataModule(torch.nn.Module):
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.pin_memory = pin_memory
+        self.multiprocessing_context = multiprocessing_context
         self.interp_size = interp_size
         self.tile_size = tile_size
         self.twoD = twoD
@@ -559,6 +579,10 @@ class NativePytorchDataModule(torch.nn.Module):
             drop_last=True,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            collate_fn=lambda batch: collate_fn(batch, return_label=self.return_label, adaptive_patching = self.adaptive_patching, separate_channels=self.separate_channels, dataset=self.dataset, num_classes=self.num_classes, num_labels=num_labels, return_qdt=self.return_qdt, dict_key=k),
+            # A plain function + functools.partial (rather than a closure lambda) so this
+            # is picklable, which multiprocessing_context="spawn" requires -- see the
+            # multiprocessing_context docstring entry above for why that matters.
+            collate_fn=functools.partial(collate_fn, return_label=self.return_label, adaptive_patching=self.adaptive_patching, separate_channels=self.separate_channels, dataset=self.dataset, num_classes=self.num_classes, num_labels=num_labels, return_qdt=self.return_qdt, dict_key=k),
+            multiprocessing_context=self.multiprocessing_context,
         )
 

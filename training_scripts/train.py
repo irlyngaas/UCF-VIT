@@ -1,3 +1,4 @@
+import functools
 import os
 import sys
 from datetime import timedelta
@@ -172,6 +173,7 @@ def main():
                 resize = conf["dataset_options"]["resize"],
                 num_classes = conf["model"]["kwargs"]["num_classes"] if conf["model"]["type"] in ["UNETR", "SAP"] else None,
                 ddp_group = ddp_group,
+                multiprocessing_context = conf["dataloader"]["multiprocessing_context"],
             ).to(device)
 
             data_module.setup()
@@ -206,7 +208,10 @@ def main():
             # whole world.
             train_sampler = torch.utils.data.distributed.DistributedSampler(train_data, shuffle=True, num_replicas=conf["parallelism"]["data_par_size"],rank=dist.get_rank(ddp_group))
 
-            train_dataloader = DataLoader(dataset = train_data, sampler=train_sampler, num_workers=conf["dataloader"]["num_workers"], pin_memory=conf["dataloader"]["pin_memory"], batch_size=conf["dataloader"]["batch_size"], drop_last=True, collate_fn=lambda batch: conf["dataloader"]["collate_fn"](batch, adaptive_patching=conf["ap"]["do_ap"], return_label=conf["dataloader"]["return_label"]))
+            # functools.partial (not a closure lambda) so this is picklable, which
+            # multiprocessing_context="spawn" requires -- see NativePytorchDataModule's
+            # multiprocessing_context docstring entry for why that matters.
+            train_dataloader = DataLoader(dataset = train_data, sampler=train_sampler, num_workers=conf["dataloader"]["num_workers"], pin_memory=conf["dataloader"]["pin_memory"], batch_size=conf["dataloader"]["batch_size"], drop_last=True, collate_fn=functools.partial(conf["dataloader"]["collate_fn"], adaptive_patching=conf["ap"]["do_ap"], return_label=conf["dataloader"]["return_label"]), multiprocessing_context=conf["dataloader"]["multiprocessing_context"])
         else:
             # Same reasoning as the iterative_dataloader branch above.
             train_dataloader = None
