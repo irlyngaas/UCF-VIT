@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -A stf006
+#SBATCH -A gen006
 #SBATCH -J diffusion_fsdp
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=4
@@ -20,7 +20,7 @@ module load rocm
 module load rccl-net-plugin
 
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
-conda activate /lustre/orion/stf006/world-shared/nafi/envs/ucf-vit
+conda activate vit
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TRAINING_SCRIPT="${REPO_ROOT}/dev_scripts/train_diffusion_fsdp_wFixedFID_2D_singMod.py"
