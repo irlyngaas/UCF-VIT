@@ -228,6 +228,19 @@ def parse_config(args, load_balance_offline=False):
 
     resume_from_checkpoint = conf['trainer']['resume_from_checkpoint']
 
+    # resume_from_checkpoint continues an existing run from its own checkpoint
+    # (optimizer/scheduler state, loss history, epoch included); use_pretrained_model
+    # starts a new run whose encoder is initialized from a *different* model's
+    # weights. Previously, setting both True silently dropped use_pretrained_model
+    # with no warning at all (see the "use_pretrained_model" entry in trainer_conf
+    # below, and parse_pretrained_config's own identical silent override) -- now
+    # rejected explicitly instead. .get (not a bare index) because
+    # use_pretrained_model is allowed to be omitted entirely when
+    # resume_from_checkpoint:True (trainer_conf's own ternary below never evaluates
+    # it in that case either).
+    if resume_from_checkpoint and conf['trainer'].get('use_pretrained_model', False):
+        sys.exit("trainer.resume_from_checkpoint and trainer.use_pretrained_model cannot both be True -- resume_from_checkpoint continues an existing training run from its own checkpoint, use_pretrained_model starts a new run initialized from a different model's weights. Set only one of them to True.")
+
     try:
         optimizer_type = conf["optimizer"]["type"]
         assert optimizer_type.lower() in ['sgd', 'adam', 'adamw'], "Optimizer type not supported. Choose optimizer type from the following choices: sgd, adam, adamw"

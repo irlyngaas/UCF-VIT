@@ -60,6 +60,30 @@ def test_multiprocessing_context_read_from_config_when_set():
         os.remove(path)
 
 
+def test_resume_and_pretrained_both_true_raises_clearly():
+    """Regression test: resume_from_checkpoint:True and use_pretrained_model:True
+    together used to silently drop use_pretrained_model with no warning at all
+    (trainer_conf's own "use_pretrained_model" ternary, and parse_pretrained_config's
+    identical silent override) -- now rejected explicitly instead, since the two are
+    mutually exclusive (resume continues an existing run's own checkpoint;
+    use_pretrained_model starts a new run from a different model's weights)."""
+    with open(SAP_CONFIG) as f:
+        conf = yaml.load(f, Loader=yaml.FullLoader)
+    conf["trainer"]["resume_from_checkpoint"] = True
+    conf["trainer"]["use_pretrained_model"] = True
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    os.close(fd)
+    try:
+        with open(path, "w") as f:
+            yaml.dump(conf, f)
+        args = argparse.Namespace(config=path, pretrained_config="")
+        with pytest.raises(SystemExit, match="resume_from_checkpoint and trainer.use_pretrained_model cannot both be True"):
+            parse_config(args, load_balance_offline=True)
+    finally:
+        os.remove(path)
+
+
 def test_missing_interp_size_under_do_ap_raises_clearly():
     """Regression test for interp_size's requiredness: do_ap:True with no
     ap.interp_size set must fail with a clear, actionable error (not a bare
