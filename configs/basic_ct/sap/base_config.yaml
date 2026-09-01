@@ -97,14 +97,22 @@ dataloader:
     'ct1': 100,
   }
   batch_size: 32
-  num_workers: 1
-  pin_memory: False
   # SAP always does adaptive patching (do_ap:True, see the `ap:` section below) on 3D
   # basic_ct volumes -- the heaviest per-sample CPU workload of any shipped config's
   # DataLoader worker. Combined with tensor_par_size>1 (more NCCL process groups in the
-  # parent process), forking that worker after CUDA/NCCL is already initialized (as
-  # every training script does -- get_model runs before train_dataloader) hit a real,
-  # intermittent segfault on Frontier (job 5390076). Every other shipped config keeps
-  # DataLoader's default (fork) -- see NativePytorchDataModule's multiprocessing_context
-  # docstring for the full explanation.
-  multiprocessing_context: "spawn"
+  # parent process), num_workers>0 forking that worker after CUDA/NCCL is already
+  # initialized (as every training script does -- get_model runs before
+  # train_dataloader) hit a real, intermittent segfault on Frontier (job 5390076).
+  # Tried multiprocessing_context:"spawn" as a fix (avoids inheriting the parent's
+  # CUDA/NCCL state at all) -- that did eliminate the original segfault signature, but
+  # traded it for a different, faster, whole-job-killing crash (job 5394881: one or
+  # more ranks died silently within 42s, no Python-level output at all, others killed
+  # by the NCCL watchdog) -- plausibly spawn conflicting with Frontier's Cray/Slurm
+  # launch environment itself. num_workers:0 sidesteps both hazards by never forking or
+  # spawning a worker process at all for this config -- data loading runs in the main
+  # process, at the cost of losing dataloader/compute overlap here. Every other shipped
+  # config keeps num_workers:1 with DataLoader's default (fork) multiprocessing_context
+  # -- see NativePytorchDataModule's multiprocessing_context docstring for the full
+  # explanation of both issues.
+  num_workers: 0
+  pin_memory: False

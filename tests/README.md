@@ -785,35 +785,63 @@ missing one side of that combination (2D adaptive patching's octree is far light
 3D adaptive patching without `tensor_par_size > 1` has a much narrower parent-side
 race window).
 
-Fixed by adding an opt-in `multiprocessing_context` option (`None` by default --
-`DataLoader`'s own default, i.e. unchanged `fork` behavior for every other config --
-only `configs/basic_ct/sap/base_config.yaml` sets it to `"spawn"`), threaded through
-`parse.py`'s `dataloader_conf` -> `NativePytorchDataModule.__init__` ->
-`train_dataloader()`'s `DataLoader(...)` call, and separately through `train.py`'s own
-manual `DataLoader` construction (the `dataloader.type: "dataloader"` map-style path,
-not exercised by any shipped config but fixed for consistency). `spawn` requires the
-`DataLoader`'s `collate_fn` to be picklable, which the previous closure `lambda batch:
-collate_fn(batch, return_label=self.return_label, ...)` was not -- replaced with
-`functools.partial(collate_fn, return_label=self.return_label, ...)` in both
+First attempt: added an opt-in `multiprocessing_context` option (`None` by default --
+`DataLoader`'s own default, i.e. unchanged `fork` behavior for every other config),
+threaded through `parse.py`'s `dataloader_conf` -> `NativePytorchDataModule.__init__`
+-> `train_dataloader()`'s `DataLoader(...)` call, and separately through `train.py`'s
+own manual `DataLoader` construction (the `dataloader.type: "dataloader"` map-style
+path, not exercised by any shipped config but fixed for consistency). `spawn` requires
+the `DataLoader`'s `collate_fn` to be picklable, which the previous closure `lambda
+batch: collate_fn(batch, return_label=self.return_label, ...)` was not -- replaced
+with `functools.partial(collate_fn, return_label=self.return_label, ...)` in both
 `datamodule.py` and `train.py` (`collate_fn`/`CatsDogsCollate` were already
 module-level functions, so `functools.partial` over them pickles cleanly). Verified
 `train.py`'s actual training logic is already guarded behind `if __name__ ==
 "__main__":` with no risky module-level side effects above it, so `spawn` re-importing
 the module in each worker doesn't re-run `dist.init_process_group`/etc.
 
-Deliberately *not* made the new global default -- `spawn` starts a fresh Python
-interpreter per worker and re-imports the whole `torch`/`timm`/`monai`/`xformers`
-chain, real per-worker startup latency that every other (non-crashing) config would
-pay for no benefit.
+`configs/basic_ct/sap/base_config.yaml` set `multiprocessing_context: "spawn"` to try
+it. **This traded the crash for a worse one.** A real Frontier rerun (job 5394881, this
+time confirmed running the actual `spawn` code -- an earlier rerun, job 5391242, had
+been submitted before the Frontier checkout was pulled, so it was silently still
+testing the old `fork` code and is not evidence either way) showed a *different*
+failure: no more `DataLoader worker ... killed by signal: Segmentation fault` (so
+`spawn` did eliminate that original fork-after-CUDA-init race), but one or more ranks
+died silently within 42s (vs. 171-252s before -- a startup-time crash, not a
+mid-iteration one), no Python-level output at all from the crashing ranks, with the
+survivors killed by NCCL's watchdog ("possible application crash on rank 0 or a
+network set up issue") and the whole `srun` step terminated. Plausibly `spawn`
+conflicting with Frontier's Cray/Slurm launch environment itself (network interconnect
+binding, PMI/process tracking, or similar assumptions a fresh `spawn`ed process
+disturbs that a `fork`ed one doesn't) -- not confirmed further, since the crashing
+ranks left no trace of what actually happened.
+
+**Final fix:** `configs/basic_ct/sap/base_config.yaml` now sets `num_workers: 0`
+instead (and leaves `multiprocessing_context` unset, back to `None`/`fork`, same as
+every other config) -- avoids forking *or* spawning a worker process at all for this
+config, sidestepping both hazards entirely. The tradeoff is losing dataloader/compute
+overlap for this one config (data loading now runs in the main process); acceptable
+given adaptive-patching a 3D volume is comparatively light next to this config's own
+GPU compute. The `multiprocessing_context` option itself was kept (not reverted) --
+it's real, generically useful infrastructure for a future config that needs it, just
+not the right fix for this specific crash.
+
+Deliberately did *not* make `spawn` the new global default even before finding its own
+problem -- it starts a fresh Python interpreter per worker and re-imports the whole
+`torch`/`timm`/`monai`/`xformers` chain, real per-worker startup latency every other
+(non-crashing) config would pay for no benefit.
 
 **Tier 1 coverage:** `tests/test_config_validation.py`'s
-`test_multiprocessing_context_defaults_to_none_when_omitted` (any other shipped
-config) and `test_multiprocessing_context_read_from_config_when_set`
-(`basic_ct/sap`) cover the config-parsing plumbing directly. The fork-vs-spawn crash
-itself can only be exercised for real via a real multi-rank Frontier run (no local
-CUDA/NCCL context to race against) -- **not yet re-confirmed** on Frontier; recommend
+`test_multiprocessing_context_defaults_to_none_when_omitted` (now covers
+`basic_ct/sap` directly, since no shipped config sets it any more) and
+`test_multiprocessing_context_read_from_config_when_set` (a synthetic override on a
+temp config file, so the `parse.py` plumbing itself stays covered even with no shipped
+config exercising it) cover the config-parsing plumbing. The actual runtime behavior
+(crash or no crash) can only be exercised for real via a real multi-rank Frontier run
+(no local CUDA/NCCL/Slurm environment to reproduce either hazard against) -- the
+`num_workers:0` fix is **not yet confirmed** on Frontier as of this writing; recommend
 rerunning `run_feature_matrix_smoke.sh` (Tier 3b) specifically for
-`basic_ct-sap+tensor_par` before trusting this fixed.
+`basic_ct-sap+tensor_par` before trusting it.
 
 ### Switched `Patchify`/`Patchify_3D`'s non-photo Canny path to `skimage.feature.canny`, then removed the `255`/`norm_factor` scaling from both quadtree and octree entirely
 

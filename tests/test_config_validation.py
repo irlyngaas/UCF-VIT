@@ -29,20 +29,35 @@ def test_shipped_config_parses(config_path):
 
 
 def test_multiprocessing_context_defaults_to_none_when_omitted():
-    """Every shipped config except basic_ct/sap leaves dataloader.multiprocessing_context
-    unset -- DataLoader's own default (fork on Linux) must stay in effect for those,
-    unchanged from before this option existed."""
-    unetr_config = os.path.join(REPO_ROOT, "configs", "basic_ct", "unetr", "base_config.yaml")
-    conf = validate_config(unetr_config)
+    """Every shipped config leaves dataloader.multiprocessing_context unset --
+    DataLoader's own default (fork on Linux) stays in effect for all of them. (Tried
+    "spawn" for basic_ct/sap specifically, to work around a real fork-after-CUDA-init
+    segfault -- job 5390076 -- but that traded it for a different, faster,
+    whole-job-killing crash, job 5394881; basic_ct/sap uses num_workers:0 instead now.
+    See NativePytorchDataModule's multiprocessing_context docstring and
+    basic_ct/sap/base_config.yaml's own num_workers comment for the full story.)"""
+    conf = validate_config(SAP_CONFIG)
     assert conf["dataloader"]["multiprocessing_context"] is None
 
 
 def test_multiprocessing_context_read_from_config_when_set():
-    """basic_ct/sap opts into spawn -- see its own multiprocessing_context comment and
-    NativePytorchDataModule's docstring for why (a real, intermittent Frontier segfault,
-    job 5390076, from forking a DataLoader worker after CUDA/NCCL init)."""
-    conf = validate_config(SAP_CONFIG)
-    assert conf["dataloader"]["multiprocessing_context"] == "spawn"
+    """No shipped config currently sets this (see test_multiprocessing_context_defaults_
+    to_none_when_omitted for why) -- covers the parse.py plumbing itself via a synthetic
+    override, so it doesn't silently bit-rot if a future config does need it."""
+    with open(SAP_CONFIG) as f:
+        conf = yaml.load(f, Loader=yaml.FullLoader)
+    conf["dataloader"]["multiprocessing_context"] = "spawn"
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    os.close(fd)
+    try:
+        with open(path, "w") as f:
+            yaml.dump(conf, f)
+        args = argparse.Namespace(config=path, pretrained_config="")
+        parsed = parse_config(args, load_balance_offline=True)
+        assert parsed["dataloader"]["multiprocessing_context"] == "spawn"
+    finally:
+        os.remove(path)
 
 
 def test_missing_interp_size_under_do_ap_raises_clearly():
