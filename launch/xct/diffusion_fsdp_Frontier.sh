@@ -19,7 +19,7 @@ module load PrgEnv-gnu
 module load rocm
 module load rccl-net-plugin
 
-source "$HOME/miniconda3/etc/profile.d/conda.sh"
+source "$HOME/miniforge3/etc/profile.d/conda.sh"
 conda activate vit
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
