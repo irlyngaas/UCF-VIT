@@ -217,18 +217,22 @@ numbers:
 pytest -m dataloader_speed -s
 ```
 
-Runs anywhere (no GPU/SLURM needed) — that's just the local invocation. To
-run it on a real Frontier compute node instead of a login node (mainly so
-the `num_workers` cases have real, uncontended cores behind them):
+`test_dataset_speed.py` runs anywhere (no GPU/SLURM needed) — that's just
+the local invocation. `test_pin_memory_speed.py` (below) needs a real GPU
+and skips module-level without one. To run everything on a real Frontier
+compute node instead of a login node (mainly so the `num_workers` cases
+have real, uncontended cores behind them, and so `test_pin_memory_speed.py`
+has a real GPU to measure against):
 
 ```bash
 cd launch/tests
 sbatch run_dataloader_speed.sh
 ```
 
-A single plain process (no `srun`, unlike `run_distributed_tests.sh`) — the
-tests themselves are CPU-only and don't touch `torch.distributed` or the
-GPUs. Output lands in `pytest-dataloader-speed-<jobid>.out`.
+A single plain process (no `srun`, unlike `run_distributed_tests.sh`) — none
+of these tests touch `torch.distributed` or launch multiple ranks; only
+`test_pin_memory_speed.py` touches a GPU at all (the other two are
+CPU-only). Output lands in `pytest-dataloader-speed-<jobid>.out`.
 
 `tests/dataloaders/test_dataset_speed_real_data.py` replaces
 `test_dataset_speed.py`'s made-up `time.sleep()` delay with genuine
@@ -254,6 +258,24 @@ for a caveat on `num_workers > 0`: worker-subprocess startup cost is
 included in the timed region, so it can dominate the measurement at small
 batch counts, especially at higher worker
 counts.
+
+`tests/dataloaders/test_pin_memory_speed.py` measures whether
+`dataloader.pin_memory:True` (every shipped config currently has this
+`False`) is actually worth turning on — raised while looking at whether
+adding `non_blocking=True` to `training.py`'s dataloader-sourced
+`.to(device)` calls would help (it only produces a real async copy when the
+source is pinned, so as shipped today it would be a no-op). Two levels: a
+synthetic microbenchmark isolating pure host->device transfer cost (pinned
+vs. pageable source memory, crossed with `non_blocking` True/False, at two
+batch sizes, no real decode involved), and a real basic_ct/unetr
+`NativePytorchDataModule` run (same construction as
+`test_dataset_speed_real_data.py`'s own basic_ct case) with `pin_memory`
+swept True/False, timing real decode *and* the `.to(device)` transfer
+together — the actual per-iteration cost a training run would feel. Needs a
+real GPU (skips module-level without one, unlike the other two files here)
+since pinning's whole effect is on the host->device copy — that's also why
+`run_dataloader_speed.sh` requests `--gres=gpu:8` even though the other two
+files in this directory don't use it.
 
 Writing this surfaced a real gap in `compute_narrow_dict_idx` (shared with
 `test_dataloader_real_pipeline.py` and Tier 3's smoke test): it already
@@ -1486,6 +1508,50 @@ O(`data_par_size`) -> O(1) reduction per rank, not a micro-optimization, so
 the expected win should be visible in wall-clock epoch-boundary time at
 scale, but that hasn't been measured against a real large-`data_par_size`
 run yet.
+
+#### Fixed a `.to(precision_dt).to(device)` ordering bug that silently defeated `pin_memory`
+
+Raised while discussing whether `non_blocking=True` would speed up
+`training.py`'s dataloader-sourced `.to(device)` calls: `non_blocking=True`
+only produces a real asynchronous copy when the source CPU tensor is
+pinned. Every one of `process_batch`'s dataloader-sourced tensors
+(`data`/`seq`/`seq_size`/`seq_pos`/`seq_label`) was being cast to
+`precision_dt` *before* moving to device -- `.to(precision_dt).to(device)`.
+When `precision_dt` actually differs from the tensor's own dtype
+(`trainer.data_type: bfloat16`), `.to(precision_dt)` allocates a fresh,
+*unpinned* CPU tensor, so even with `dataloader.pin_memory:True` the
+subsequent `.to(device)` would silently lose pinning and fall back to a
+blocking copy regardless of `non_blocking`. (`float32` configs were
+unaffected -- casting to a tensor's own dtype is a no-op, so the original
+pinned tensor passed through unchanged either way.)
+
+Fixed by reordering every one of those calls to `.to(device).to(precision_dt)`
+-- move first (from pinned memory, if `pin_memory:True`), cast dtype
+afterward as a cheap on-device op. Same final dtype/device either way (the
+`tensor_par_size > 1` branch's own comment about matching the broadcast
+receivers' placeholder still holds), so this is a pure reordering, not a
+behavior change. `ddpm_scheduler.alpha[t]`-derived tensors (not sourced from
+the dataloader, so pinning was never relevant to them) were deliberately
+left as `.to(precision_dt).to(device)`, unchanged.
+
+Also added `non_blocking=True` to every one of these same dataloader-sourced
+`.to(device)` calls (`data`/`seq`/`seq_size`/`seq_pos`/`seq_label`/`label`).
+This is safe to do unconditionally, regardless of `dataloader.pin_memory`:
+when the source tensor isn't pinned, PyTorch silently falls back to an
+ordinary blocking copy (identical to `non_blocking=False`) rather than
+erroring or warning -- so **`non_blocking=True` only actually changes
+anything when `pin_memory:True`**; with every shipped config still at
+`pin_memory:False` today, this is a no-op in production until that's
+flipped. No need to thread `pin_memory`'s value into `process_batch` just to
+gate the flag. `ddpm_scheduler.alpha[t]`-derived tensors, the `torch.zeros`
+broadcast-receiver placeholders on non-tensor-parallel-rank-0 processes, and
+`t = t.to(device)` (`DiffusionVIT`'s freshly-`torch.randint`-ed timestep)
+were all deliberately left unchanged -- none of them originate from the
+dataloader, so none of them can ever be pinned in the first place, and
+adding the flag there would misleadingly suggest otherwise. Whether to
+actually flip `pin_memory:True` in a shipped config is exactly what
+`tests/dataloaders/test_pin_memory_speed.py` (see "Running the dataloader
+speed tests" above) exists to measure with real numbers first.
 
 ## Running the distributed (Tier 2) tests
 

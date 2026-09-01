@@ -33,12 +33,16 @@ mkdir -p $MIOPEN_USER_DB_PATH
 
 export PYTHONPATH=$PWD:$PYTHONPATH
 
-# tests/dataloaders/*speed*.py are CPU-only (no GPU/torch.distributed needed)
-# and just a single plain process -- no srun here, unlike
-# run_distributed_tests.sh. Requesting a full node (matching every other
-# launch/*/*.sh script) mainly so num_workers up to 7 has real cores behind
-# it, not login-node contention with everyone else's shell sessions; the
-# GPUs go unused.
+# tests/dataloaders/*speed*.py are single plain processes -- no
+# torch.distributed, no srun here, unlike run_distributed_tests.sh.
+# Requesting a full node (matching every other launch/*/*.sh script) mainly
+# so num_workers up to 7 has real cores behind it, not login-node contention
+# with everyone else's shell sessions. test_dataset_speed.py and
+# test_dataset_speed_real_data.py are CPU-only (the GPUs go unused for
+# those); test_pin_memory_speed.py is the one file here that actually uses
+# a GPU (host->device transfer is the whole thing being measured), which is
+# why --gres=gpu:8 was already being requested even before that file
+# existed.
 #
 # -m dataloader_speed is required -- these tests are excluded from the
 # default `pytest` run (see addopts in pyproject.toml), since they're
@@ -48,8 +52,8 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 #
 # Points at the whole tests/dataloaders/ directory (marker-filtered, so only
 # dataloader_speed-marked tests actually run) rather than a single file, so
-# both test_dataset_speed.py (synthetic delay) and
-# test_dataset_speed_real_data.py (real NIfTI/JPEG decode -- needs real
-# Frontier data, which is why this has to run here and not just anywhere)
-# run together; any future speed-test file gets picked up the same way.
+# every speed-test file (synthetic delay, real NIfTI/JPEG decode, pin_memory
+# transfer timing -- needs real Frontier data/a real GPU, which is why this
+# has to run here and not just anywhere) runs together; any future
+# speed-test file gets picked up the same way.
 time python -m pytest -m dataloader_speed -s ../../tests/dataloaders/ -v

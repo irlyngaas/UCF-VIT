@@ -295,8 +295,20 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
 
         if conf["ap"]["do_ap"]:
             batch = get_batch(conf, it_loader)
-            data = batch["data"].to(precision_dt).to(device)
-            seq = batch["seq"].to(precision_dt).to(device)
+            # .to(device) before .to(precision_dt), not after: casting dtype
+            # first would allocate a fresh, unpinned CPU tensor whenever
+            # precision_dt actually differs from the loaded tensor's own
+            # dtype (bfloat16 configs), silently defeating
+            # dataloader.pin_memory -- moving first (still pinned, if
+            # pin_memory:True) then casting on-device keeps the transfer
+            # itself eligible for a real non_blocking=True async copy.
+            # non_blocking=True is always safe to pass here regardless of
+            # dataloader.pin_memory -- when the source isn't pinned, PyTorch
+            # silently falls back to an ordinary blocking copy (identical to
+            # non_blocking=False), so this only actually does anything when
+            # pin_memory:True. No need to gate it on the config value.
+            data = batch["data"].to(device, non_blocking=True).to(precision_dt)
+            seq = batch["seq"].to(device, non_blocking=True).to(precision_dt)
             # Assigned as locals (not just left inside `batch`) so the
             # seq_ps conversion below can read them the same way regardless
             # of tensor_par_size -- see that block's comment.
@@ -305,16 +317,18 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
             dict_key = batch["dict_key"]
             variables = batch["variables"]
             if conf["dataloader"]["return_label"]:
-                label = batch["label"].to(device)
+                label = batch["label"].to(device, non_blocking=True)
                 if conf["model"]["type"] in ["UNETR", "SAP"]: #Classification
-                    seq_label = batch["seq_label"].to(device)
+                    seq_label = batch["seq_label"].to(device, non_blocking=True)
         else:
             batch = get_batch(conf, it_loader)
-            data = batch["data"].to(precision_dt).to(device)
+            # See the do_ap:True branch above for why .to(device) comes
+            # first and non_blocking=True is unconditional.
+            data = batch["data"].to(device, non_blocking=True).to(precision_dt)
             variables = batch["variables"]
             dict_key = batch["dict_key"]
             if conf["dataloader"]["return_label"]:
-                label = batch["label"].to(device)
+                label = batch["label"].to(device, non_blocking=True)
             if conf["model"]["type"] == "DiffusionVIT":
                 t = torch.randint(0,conf["model"]["kwargs"]["num_time_steps"],(conf["dataloader"]["batch_size"],))
                 e = torch.randn_like(data, requires_grad=False)
@@ -345,19 +359,25 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
         if conf["ap"]["do_ap"]:
             if dist.get_rank(tensor_par_group) == 0:
                 batch = get_batch(conf, it_loader)
-                data = batch["data"].to(precision_dt).to(device)
-                seq = batch["seq"].to(precision_dt).to(device)
-                # Must match the receivers' placeholder (dtype=precision_dt,
-                # .to(device)) exactly, or the broadcast below either fails
-                # outright (NCCL has no CPU backend -- "No backend type
-                # associated with device type cpu") or silently mismatches
-                # dtype across ranks.
-                seq_size = batch["seq_size"].to(precision_dt).to(device)
-                seq_pos = batch["seq_pos"].to(precision_dt).to(device)
+                # .to(device) before .to(precision_dt), non_blocking=True
+                # unconditional (see the tensor_par_size==1 branch above for
+                # why) -- the *final* dtype/device still matches the
+                # receivers' placeholder (dtype=precision_dt, .to(device))
+                # exactly either way, or the broadcast below would either
+                # fail outright (NCCL has no CPU backend -- "No backend type
+                # associated with device type cpu") or silently mismatch
+                # dtype across ranks. The broadcasts a few lines down are
+                # stream-ordered after these copies (same default stream, no
+                # explicit sync needed), so a still-in-flight async copy is
+                # safe to broadcast from.
+                data = batch["data"].to(device, non_blocking=True).to(precision_dt)
+                seq = batch["seq"].to(device, non_blocking=True).to(precision_dt)
+                seq_size = batch["seq_size"].to(device, non_blocking=True).to(precision_dt)
+                seq_pos = batch["seq_pos"].to(device, non_blocking=True).to(precision_dt)
                 variables = batch["variables"]
                 dict_key = batch["dict_key"]
                 if conf["dataloader"]["return_label"]:
-                    label = batch["label"].to(device)
+                    label = batch["label"].to(device, non_blocking=True)
                     if conf["model"]["type"] in ["UNETR", "SAP"]:
                         # Must match the receiver's dtype=precision_dt
                         # placeholder below -- real seq_label is float32
@@ -366,8 +386,9 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
                         # when data_type:float32 is configured; explicit here
                         # so bfloat16 configs don't hit the same
                         # sender/receiver dtype mismatch just fixed for
-                        # label above.
-                        seq_label = batch["seq_label"].to(precision_dt).to(device)
+                        # label above. Order flipped for the same pin_memory
+                        # reason as data/seq/seq_size/seq_pos above.
+                        seq_label = batch["seq_label"].to(device, non_blocking=True).to(precision_dt)
 
                 if dataset == "imagenet":
                     dict_key = "imagenet"
@@ -501,11 +522,13 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
         else:
             if dist.get_rank(tensor_par_group) == 0:
                 batch = get_batch(conf, it_loader)
-                data = batch["data"].to(precision_dt).to(device)
+                # See the tensor_par_size==1 branch above for why .to(device)
+                # comes first and non_blocking=True is unconditional.
+                data = batch["data"].to(device, non_blocking=True).to(precision_dt)
                 dict_key = batch["dict_key"]
                 variables = batch["variables"]
                 if conf["dataloader"]["return_label"]:
-                    label = batch["label"].to(device)
+                    label = batch["label"].to(device, non_blocking=True)
                 if conf["model"]["type"] == "DiffusionVIT":
                     t = torch.randint(0,conf["model"]["kwargs"]["num_time_steps"],(batch_size,))
                     e = torch.randn_like(data, requires_grad=False)
