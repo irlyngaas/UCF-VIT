@@ -1032,6 +1032,12 @@ We store the arguments for each individual run in a yaml file. This config file 
 - [MODE] is the training mode you want to use. There are two options (simple and fsdp). See [Parallelism Modes](#Parallelism-Modes) for a more detailed description
 - [OPTIONAL] is an optional keyword for launch scripts using the apptainer method for installing containers on Frontier or the docker method for installing containers for running on DGX machines
 
+9. Evaluate a checkpoint with `training_scripts/val.py`/`test.py`
+- Unlike the training launch scripts above, `launch/val.sh` and `launch/test.sh` are generic across every dataset/model -- pass the config path as an argument instead of hardcoding it per-launch-script:
+  - `cd launch && sbatch val.sh ../configs/basic_ct/unetr/base_config.yaml`
+  - `cd launch && sbatch test.sh ../configs/basic_ct/unetr/base_config.yaml`
+- Use the same config as the training run being evaluated (same `checkpoint_path`/`checkpoint_filename`) -- `val.py`/`test.py` force `trainer.resume_from_checkpoint: True` in code regardless of what the config says.
+
 
 ## Datasets
 We use two example datasets to test functionality of our code, their descriptions and instructions for downloading are below.
