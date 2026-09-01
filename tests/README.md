@@ -1407,6 +1407,86 @@ bucket across more than that, determinism across separate constructions
 matters most -- confirming the `data_par_size`-independence fix from the
 section above still holds with shuffling layered on top of it.
 
+#### Immediate follow-up: `reset()`/`setup()` doing O(`data_par_size`) redundant work per rank
+
+**Flagged by the user as a candidate for possible future reversion** -- it
+may make `NativePytorchDataModule` more complicated than the win is worth.
+If `_my_dataset_key`/`_shuffle_and_replicate` ever get in the way, it's safe
+to revert `setup()`/`reset()`/`train_dataloader()` to rebuilding every key in
+`dict_lister_trains` each call (the simpler, if O(`data_par_size`)-wasteful,
+version this replaced -- see this commit's parent for that version).
+
+Raised as a direct question about a real-world symptom the user had already
+observed: `reset()` being "costly and problematic to perform." Tracing it
+through found a genuine, pre-existing (not introduced this session)
+architectural issue, one this session's imagenet work made more visible
+(more buckets now exist, `data_par_size`-many) rather than caused:
+
+```python
+def reset(self):
+    dict_data_train = {}
+    for i, k in enumerate(self.dict_lister_trains.keys()):
+        ...
+        dict_data_train = self.set_iterative_dataloader(dict_data_train, k, lister_train, keys_to_add)
+```
+
+`reset()`/`setup()` looped over **every** key in `self.dict_lister_trains`
+-- rebuilding a full `ProcessChannels(ShuffleIterableDataset(TileDataIter(
+FileReader(...))))` pipeline and doing an independent `np.random.choice`
+reshuffle for each one -- even though `train_dataloader()` only ever
+consumes a single one (selected via `gx`/`group_id` matching). For
+`basic_ct` with one root dir this loop already only had one key (no-op
+inefficiency), but for imagenet (now up to `data_par_size` bucket keys) or
+any multi-root-dir joint training, every rank redundantly did this for
+every other rank's bucket too -- O(`data_par_size`) wasted work per rank,
+every epoch, and since every rank does it simultaneously, O(`data_par_size`^2)
+wasted work cluster-wide. At the node counts this framework targets, that's
+a real, scale-dependent cost, not a fixed one -- directly explains
+"costly, and gets worse with more nodes."
+
+Before implementing, the user asked whether this meant only doing the
+partial work actually needed, rather than everything -- confirmed yes:
+`train_dataloader()` already computes exactly which single bucket a rank
+needs (via `group_id`), just *after* `setup()`/`reset()` had already
+wastefully built every bucket. Moving that same selection earlier lets
+`reset()`/`setup()` skip the other `data_par_size - 1` buckets entirely.
+
+Fixed by extracting the `gx`/`group_id` matching logic (previously computed
+fresh inside `train_dataloader()`, using `self.dict_data_train`'s full
+enumeration) into a new `_my_dataset_key()` method, called from `setup()`/
+`reset()` *before* the shuffle-and-replicate step -- restricting to
+`self.dict_lister_trains[k]` for just that one key. `train_dataloader()`
+itself simplifies accordingly: since `self.dict_data_train` now only ever
+holds one entry, it just takes it directly (`next(iter(...))`) instead of
+re-deriving `group_id` and searching for the matching enumeration index.
+Two dead-code local variables (`group_size`/`group_rank`, computed but never
+used anywhere) were dropped along the way. `self.dict_lister_trains` itself
+(built once in `__init__`, holding every bucket) is untouched -- only the
+per-epoch `dict_data_train` rebuild is restricted, keeping the one-time
+construction cost and existing tests' ability to inspect the full bucketed
+structure via `dict_lister_trains` unchanged.
+
+**Tier 1 coverage:** `tests/dataloaders/test_datamodule_membership.py` adds
+two tests -- `test_setup_and_reset_only_build_this_ranks_own_key_not_every_
+bucket` confirms `dict_lister_trains` still holds every bucket (8) while
+`dict_data_train` holds exactly 1 after `setup()`/`reset()`; and, the
+highest-risk part of this change, `test_train_dataloader_gives_different_
+ranks_different_buckets` simulates 4 separate ranks (monkeypatching
+`torch.distributed.get_rank`, matching `test_dataset.py`'s own established
+pattern for this) with `dataset_group_list="1:1:1:1"` (matching what
+`calculate_load_balancing_on_the_fly` really produces for imagenet -- not
+the single-group default `NativePytorchDataModule` falls back to when
+`dataset_group_list` is omitted, which this test had to catch and account
+for explicitly) and confirms each rank's real `train_dataloader()` output
+wraps a genuinely different bucket, covering every bucket between them
+exactly once.
+
+**Not yet measured on real Frontier hardware** -- the fix is a structural
+O(`data_par_size`) -> O(1) reduction per rank, not a micro-optimization, so
+the expected win should be visible in wall-clock epoch-boundary time at
+scale, but that hasn't been measured against a real large-`data_par_size`
+run yet.
+
 ## Running the distributed (Tier 2) tests
 
 ```bash

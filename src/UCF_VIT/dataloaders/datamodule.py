@@ -515,14 +515,88 @@ class NativePytorchDataModule(torch.nn.Module):
         return dict_data_train
         
 
+    # NOTE(reset/setup optimization): flagged by the user as a candidate for
+    # possible future reversion -- it may make this module more complicated
+    # than it's worth. If _my_dataset_key/_shuffle_and_replicate ever get in
+    # the way, it's safe to revert setup()/reset()/train_dataloader() to
+    # rebuilding every key in dict_lister_trains each call (the simpler, if
+    # O(data_par_size)-wasteful, version this replaced).
+    def _my_dataset_key(self):
+        """Determines which single `dict_lister_trains`/`dict_data_train` key this rank owns.
+
+        Uses the same `gx`-based `group_id` matching `train_dataloader` used to
+        rely on computing itself -- factored out so `setup()`/`reset()` can
+        shuffle and build only *this* rank's own key's pipeline, instead of
+        every key's. Before this, every rank redundantly shuffled and rebuilt
+        *every* key's pipeline every epoch, even though `train_dataloader`
+        only ever consumed one -- O(number of keys) wasted work per rank,
+        every epoch. For imagenet specifically (up to `data_par_size` keys/
+        buckets), that meant O(`data_par_size`) wasted work per rank and
+        O(`data_par_size`^2) wasted work cluster-wide -- a real,
+        scale-dependent `reset()` cost, not a fixed one.
+
+        Returns:
+            The single `self.dict_lister_trains` key this rank's DDP-rank
+            group is assigned to.
+
+        Raises:
+            NotImplementedError: If `torch.distributed` is not initialized.
+        """
+        if not torch.distributed.is_initialized():
+            raise NotImplementedError("Only support distributed training")
+
+        if self.ddp_group == None:
+            ddp_rank = torch.distributed.get_rank()
+        else:
+            ddp_rank = torch.distributed.get_rank(group=self.ddp_group)
+
+        group_list = list(map(lambda x: int(x), self.gx.split(":")))
+        assert self.data_par_size == sum(group_list), "data_par_size, group_list: %d %d"%(self.data_par_size, sum(group_list))
+        group_id = np.where(np.cumsum(group_list) > ddp_rank)[0][0]
+
+        for idx, k in enumerate(self.dict_lister_trains.keys()):
+            if idx == group_id:
+                return k
+
+    def _shuffle_and_replicate(self, k):
+        """Shuffles this rank's own key's file listing and replicates it `keys_to_add` times.
+
+        Shared by `setup()`/`reset()` -- see their own docstrings for when/why
+        each calls this.
+
+        Args:
+            k: The dataset key to shuffle/replicate -- always `self._my_dataset_key()`'s
+                result in practice, but takes it as an argument rather than
+                recomputing it, since `setup()` also needs `k` for `self.batches_per_rank_epoch[k]`.
+
+        Returns:
+            A tuple `(lister_train, keys_to_add)`: the shuffled (and, if
+            `keys_to_add > 1`, replicated -- each repetition independently
+            shuffled) file list, and how many times it was replicated.
+        """
+        lister_train = self.dict_lister_trains[k]
+        if self.dataset == "imagenet":
+            keys_to_add = 1
+        else:
+            keys_to_add = int(np.ceil(self.max_balance/self.batches_per_rank_epoch[k]))
+        _lister_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
+        if keys_to_add > 1:
+            for i in range(keys_to_add-1):
+                _balance_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
+                _lister_train.extend(_balance_train)
+        return _lister_train, keys_to_add
+
     def setup(self):
-        """Builds the iterable training datasets for every dataset key, if not already built.
+        """Builds the iterable training dataset for this rank's own dataset key, if not already built.
 
         Computes `self.max_balance`, the largest `batches_per_rank_epoch` across
-        datasets, then replicates each dataset's file listing enough times
-        (`keys_to_add`) so that dataloading can continue reusing files until the
-        largest dataset is exhausted, and builds each dataset's pipeline via
-        `set_iterative_dataloader`. No-op if `self.dict_data_train` is already set.
+        every joint dataset (not just this rank's own -- a smaller joint
+        dataset's `keys_to_add` replication needs to know the largest one's
+        epoch length to match it), then replicates and shuffles *only this
+        rank's own dataset key's* file listing (`keys_to_add` times) and
+        builds its pipeline via `set_iterative_dataloader`. No-op if
+        `self.dict_data_train` is already set. See `_my_dataset_key`'s own
+        docstring for why every other key is skipped entirely.
         """
         # load datasets only if they're not loaded already
         if not self.dict_data_train:
@@ -538,88 +612,45 @@ class NativePytorchDataModule(torch.nn.Module):
                     if self.batches_per_rank_epoch[k] > self.max_balance:
                           self.max_balance = self.batches_per_rank_epoch[k]
 
-            dict_data_train = {}
-            for i, k in enumerate(self.dict_lister_trains.keys()):
-                lister_train = self.dict_lister_trains[k]
-                if self.dataset == "imagenet":
-                    keys_to_add = 1
-                else:
-                    keys_to_add = int(np.ceil(self.max_balance/self.batches_per_rank_epoch[k]))
-                _lister_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
-                if keys_to_add > 1:
-                    for i in range(keys_to_add-1):
-                        _balance_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
-                        _lister_train.extend(_balance_train)
-
-                lister_train = _lister_train
-
-                dict_data_train = self.set_iterative_dataloader(dict_data_train, k, lister_train, keys_to_add)
-
-            self.dict_data_train = dict_data_train
+            k = self._my_dataset_key()
+            lister_train, keys_to_add = self._shuffle_and_replicate(k)
+            self.dict_data_train = self.set_iterative_dataloader({}, k, lister_train, keys_to_add)
 
     def reset(self):
-        """Rebuilds each dataset's iterable pipeline with a freshly shuffled file order.
+        """Rebuilds this rank's own dataset-key pipeline with a freshly shuffled file order.
 
         Called between epochs to randomize file order and reintroduce data that may
         have been missed in prior epochs (files get dropped when a dataset's file
-        count isn't evenly divisible by the number of GPUs splitting it up).
+        count isn't evenly divisible by the number of GPUs splitting it up). See
+        `_my_dataset_key`'s own docstring for why every other key is skipped
+        entirely.
         """
-        #Reset data file list to randomize order of files. Needed in order to introduce data that was potentially missed in prior epochs. Some data files are missed when the number of files for each dataset is not divisible by the number of GPUs that's splitting up those files
-        dict_data_train = {}
-        for i, k in enumerate(self.dict_lister_trains.keys()):
-            lister_train = self.dict_lister_trains[k]
-            if self.dataset == "imagenet":
-                keys_to_add = 1
-            else:
-                keys_to_add = int(np.ceil(self.max_balance/self.batches_per_rank_epoch[k]))
-            _lister_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
-            if keys_to_add > 1:
-                for i in range(keys_to_add-1):
-                    _balance_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
-                    _lister_train.extend(_balance_train)
-
-            lister_train = _lister_train
-
-            dict_data_train = self.set_iterative_dataloader(dict_data_train, k, lister_train, keys_to_add)
-
-        self.dict_data_train = dict_data_train
+        k = self._my_dataset_key()
+        lister_train, keys_to_add = self._shuffle_and_replicate(k)
+        self.dict_data_train = self.set_iterative_dataloader({}, k, lister_train, keys_to_add)
 
     def train_dataloader(self):
         """Builds the `DataLoader` for the dataset assigned to this rank's data-parallel group.
 
-        Requires `torch.distributed` to be initialized. Determines which dataset
-        this rank belongs to from `self.gx` (the colon-separated GPU-per-dataset
-        split) and this rank's position within `self.ddp_group`, then wraps that
-        dataset's iterable pipeline in a `DataLoader` using `collate_fn`.
+        `setup()`/`reset()` already built `self.dict_data_train` for only this
+        rank's own dataset key (see `_my_dataset_key`), so this just wraps
+        that single pipeline in a `DataLoader` using `collate_fn`.
 
         Returns:
             A `torch.utils.data.DataLoader` over this rank's assigned dataset.
 
         Raises:
-            NotImplementedError: If `torch.distributed` is not initialized.
+            NotImplementedError: If `torch.distributed` is not initialized, or
+                if `setup()`/`reset()` haven't been called yet.
         """
         if not torch.distributed.is_initialized():
             raise NotImplementedError("Only support distributed training")
+        if not self.dict_data_train:
+            raise NotImplementedError("dict_data_train is empty -- call setup() (or reset()) first")
 
-        assert torch.distributed.is_initialized()
-
-        if self.ddp_group == None:
-            ddp_rank = torch.distributed.get_rank()
-        else:
-            ddp_rank = torch.distributed.get_rank(group=self.ddp_group)
-
-        group_list = list(map(lambda x: int(x), self.gx.split(":")))
-
-        assert self.data_par_size == sum(group_list), "data_par_size, group_list: %d %d"%(self.data_par_size, sum(group_list))
-        group_id = np.where(np.cumsum(group_list) > ddp_rank)[0][0]
-        group_size = group_list[group_id]
-        group_rank = ddp_rank - ([0] + np.cumsum(group_list).tolist())[group_id]
-
-        for idx, k in enumerate(self.dict_data_train.keys()):
-            if idx == group_id:
-                data_train = self.dict_data_train[k]
-                num_labels = 1
-                break
+        k = next(iter(self.dict_data_train))
+        data_train = self.dict_data_train[k]
+        num_labels = 1
 
         return DataLoader(
             data_train,

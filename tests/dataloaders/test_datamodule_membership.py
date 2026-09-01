@@ -111,6 +111,27 @@ def test_membership_unaffected_by_setup_and_reset(tmp_path):
     assert before == after_setup == after_reset
 
 
+def test_setup_and_reset_only_build_this_ranks_own_key_not_every_bucket(tmp_path):
+    """The actual cost fix: setup()/reset() used to rebuild every key in
+    dict_lister_trains (all data_par_size imagenet buckets) on every rank,
+    even though train_dataloader only ever consumes one -- O(data_par_size)
+    wasted shuffling/pipeline-construction per rank, every epoch. Now they
+    only ever build this rank's own key. dict_lister_trains itself (built
+    once, in __init__) still legitimately holds every bucket -- only
+    dict_data_train (rebuilt every setup()/reset() call) is restricted.
+    """
+    root = _make_imagenet_dir(tmp_path, num_classes=20, images_per_class=5)  # 100 images
+    module = _make_imagenet_module(root, 0.0, 1.0, data_par_size=8)
+    assert len(module.dict_lister_trains) == 8  # every bucket, as before
+
+    module.batches_per_rank_epoch = {"imagenet": 5}
+    module.setup()
+    assert len(module.dict_data_train) == 1  # only this rank's own key
+
+    module.reset()
+    assert len(module.dict_data_train) == 1
+
+
 def _make_imagenet_dir(tmp_path, num_classes, images_per_class):
     root = tmp_path / "imagenet_root"
     for c in range(num_classes):
@@ -227,3 +248,37 @@ def test_imagenet_membership_stable_across_data_par_size_even_with_shuffle_seed(
     few_ranks = _make_imagenet_module(root, 0.0, 0.8, data_par_size=4, bucket_shuffle_seed=42)
 
     assert _all_imagenet_files(many_ranks) == _all_imagenet_files(few_ranks)
+
+
+def test_train_dataloader_gives_different_ranks_different_buckets(tmp_path, monkeypatch):
+    """The highest-risk part of the reset()/setup() cost fix: train_dataloader
+    used to independently recompute group_id (via gx) and search
+    dict_data_train for the matching enumeration index, since dict_data_train
+    held every bucket. Now dict_data_train only ever holds *this* rank's own
+    bucket (built by setup()/reset(), via the same group_id logic, now
+    factored into _my_dataset_key), so train_dataloader just takes its one
+    entry directly. Simulates 4 separate ranks (monkeypatching
+    torch.distributed.get_rank, matching test_dataset.py's own established
+    pattern for this) with dataset_group_list="1:1:1:1" (matching what
+    calculate_load_balancing_on_the_fly really produces for imagenet -- one
+    rank per bucket, not the single-group default this module falls back to
+    when dataset_group_list is omitted) and confirms each rank's DataLoader
+    wraps a genuinely different bucket, covering every bucket between them.
+    """
+    root = _make_imagenet_dir(tmp_path, num_classes=20, images_per_class=5)  # 100 images
+    data_par_size = 4
+
+    seen_dict_keys = []
+    for ddp_rank in range(data_par_size):
+        monkeypatch.setattr("torch.distributed.get_rank", lambda ddp_rank=ddp_rank: ddp_rank)
+        module = _make_imagenet_module(
+            root, 0.0, 1.0, data_par_size=data_par_size, dataset_group_list="1:1:1:1",
+        )
+        module.batches_per_rank_epoch = {"imagenet": 5}
+        module.setup()
+        dataloader = module.train_dataloader()
+        # collate_fn's dict_key= kwarg (functools.partial) records which
+        # bucket this rank's DataLoader actually wraps.
+        seen_dict_keys.append(dataloader.collate_fn.keywords["dict_key"])
+
+    assert sorted(seen_dict_keys) == list(range(data_par_size))  # every bucket, each exactly once
