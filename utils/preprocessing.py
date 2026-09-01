@@ -183,8 +183,8 @@ def global_mean_std(inp_dir, files, num_chunks=20, max_workers=None):
     std = sqrt(var) if var > 0 else 0.0
     return mean, std
 
-Base_fldr ="/lustre/fs0/scratch/ziabariak/"
-inp_dirs  = ["ALL_256x256x256_data_Original"] #13988.486 6382.325281588208
+Base_fldr ="/mnt/DGX01/AmirZ/LDRD_Projects/2024_2025/Diffusion_Training_data_ornlRecons/"
+inp_dirs  = ["XCT_Concrete_256x256"]#NeutronCT_Concrete_256x256x256"] #13988.486 6382.325281588208
 # inp_dirs  = ["ALL_256x256x256_data"] #6.7299716e-08 1.0000006556508776
 all_means = []  
 all_stds = []
@@ -199,7 +199,9 @@ for inpf in inp_dirs:
     files = [ f for f in sorted(os.listdir(inp_dir)) if f.endswith('npy')]
     out_dir = inp_dir +"_Standardized"
     os.makedirs(out_dir,exist_ok=True)
-    mean_val, std_val = global_mean_std(inp_dir, files, num_chunks=2800, max_workers=8)
+    # mean_val, std_val = global_mean_std(inp_dir, files, num_chunks=2800, max_workers=8)
+    # mean_val = 8787.113; std_val=2271.0200351383955;
+    mean_val = 5714.432; std_val=838.6252142643935;
     print(mean_val, std_val) 
     all_means.append(mean_val)#
     all_stds.append(std_val)

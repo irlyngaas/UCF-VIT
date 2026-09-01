@@ -380,30 +380,78 @@ def main(device):
         del optimizer_states
         del scheduler_states
 
+# if __name__ == "__main__":
+
+#     os.environ['MASTER_ADDR'] = str(os.environ['HOSTNAME'])
+#     os.environ['MASTER_PORT'] = "29500"
+#     os.environ['WORLD_SIZE'] = os.environ['SLURM_NTASKS']
+#     os.environ['RANK'] = os.environ['SLURM_PROCID']
+
+#     world_size = int(os.environ['SLURM_NTASKS'])
+#     world_rank = int(os.environ['SLURM_PROCID'])
+#     local_rank = int(os.environ['SLURM_LOCALID'])
+
+#     torch.cuda.set_device(local_rank)
+#     device = torch.cuda.current_device()
+
+
+
+#     #torch.backends.cudnn.benchmark = True
+
+#     dist.init_process_group('nccl', timeout=timedelta(seconds=7200000), rank=world_rank, world_size=world_size)
+
+# #    initialize_process()
+
+#     print("Using dist.init_process_group. world_size ",world_size,flush=True)
+    
+#     main(device)
+
+#     dist.destroy_process_group()
+
 if __name__ == "__main__":
 
-    os.environ['MASTER_ADDR'] = str(os.environ['HOSTNAME'])
-    os.environ['MASTER_PORT'] = "29500"
-    os.environ['WORLD_SIZE'] = os.environ['SLURM_NTASKS']
-    os.environ['RANK'] = os.environ['SLURM_PROCID']
+    # This script should be launched with torchrun, e.g.:
+    # torchrun --nnodes=1 --nproc_per_node=8 your_script.py
 
-    world_size = int(os.environ['SLURM_NTASKS'])
-    world_rank = int(os.environ['SLURM_PROCID'])
-    local_rank = int(os.environ['SLURM_LOCALID'])
+    # torchrun sets these:
+    #   RANK, WORLD_SIZE, LOCAL_RANK, MASTER_ADDR, MASTER_PORT
+    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
+        raise RuntimeError(
+            "RANK and WORLD_SIZE must be set. "
+            "Did you launch with `torchrun`?"
+        )
 
-    torch.cuda.set_device(local_rank)
-    device = torch.cuda.current_device()
+    world_rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
+    # Optional: sanity print
+    print(
+        f"[rank {world_rank}] world_size={world_size}, "
+        f"local_rank={local_rank}",
+        flush=True,
+    )
 
+    # Set CUDA device
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        device = torch.cuda.current_device()
+    else:
+        device = torch.device("cpu")
 
-    #torch.backends.cudnn.benchmark = True
+    # Init process group; env:// will pick up MASTER_ADDR/PORT set by torchrun
+    dist.init_process_group(
+        backend="nccl",
+        init_method="env://",
+        timeout=timedelta(seconds=7200000),
+        # rank/world_size are optional when using env://, but you can keep them:
+        rank=world_rank,
+        world_size=world_size,
+    )
 
-    dist.init_process_group('nccl', timeout=timedelta(seconds=7200000), rank=world_rank, world_size=world_size)
+    print("Using dist.init_process_group. world_size", world_size, flush=True)
 
-#    initialize_process()
-
-    print("Using dist.init_process_group. world_size ",world_size,flush=True)
-    
+    # Your main training function
     main(device)
 
     dist.destroy_process_group()
