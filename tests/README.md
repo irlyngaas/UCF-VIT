@@ -838,10 +838,34 @@ problem -- it starts a fresh Python interpreter per worker and re-imports the wh
 temp config file, so the `parse.py` plumbing itself stays covered even with no shipped
 config exercising it) cover the config-parsing plumbing. The actual runtime behavior
 (crash or no crash) can only be exercised for real via a real multi-rank Frontier run
-(no local CUDA/NCCL/Slurm environment to reproduce either hazard against) -- the
-`num_workers:0` fix is **not yet confirmed** on Frontier as of this writing; recommend
-rerunning `run_feature_matrix_smoke.sh` (Tier 3b) specifically for
-`basic_ct-sap+tensor_par` before trusting it.
+(no local CUDA/NCCL/Slurm environment to reproduce either hazard against) --
+**confirmed fixed** on Frontier: job 5394938 (`basic_ct-sap+tensor_par` alone, real
+data, `num_workers:0`) **PASS (281s)**.
+
+Checked whether `num_workers:0` needed any special-casing elsewhere: it doesn't --
+`calculate_load_balancing_on_the_fly` (`UCF_VIT.utils.misc`, used both by
+`train.py`'s always-on load-balancing call and by the standalone
+`utils/load_balance.py` script) already explicitly treats `num_workers == 0` as `1`
+for its own per-worker-batch arithmetic (with a comment predating this incident
+explaining why: `num_workers:0` means the main process acts as the sole worker, not
+"zero workers"), so `basic_ct-sap+tensor_par`'s real Frontier pass exercised that path
+correctly with no changes needed.
+
+Also added a friendlier error message for this exact crash: `UCF_VIT.training.get_batch`
+(every `next(it_loader)` call site funnels through here) now catches PyTorch's own
+`RuntimeError: DataLoader worker (pid(s) ...) exited unexpectedly` (confirmed, by
+reading the installed `torch`'s own `dataloader.py` source, as the exact, stable outer
+wording every worker-crash case raises -- the more specific "is killed by signal: ..."
+text is one level deeper, chained as `__cause__`) and re-raises it with a pointer to
+try `dataloader.num_workers: 0`, only when `dataloader.num_workers > 0` (so it can't
+misfire when there's no worker process to have crashed) -- `tests/test_get_batch.py`
+covers the augmented case, the `num_workers:0` non-augmented passthrough case, and an
+unrelated-`RuntimeError` non-augmented passthrough case, via a fake iterator (no real
+crash, real DataLoader, or heavy model deps needed). This only helps the
+segfault-in-worker crash mode, not the `spawn`-vs-Cray-launch-environment crash mode
+from job 5394881 above -- that one killed the process with no catchable Python
+exception at all, so no error message can be attached to it; `num_workers:0` avoiding
+the worker process entirely is still the only real fix for that one.
 
 ### Switched `Patchify`/`Patchify_3D`'s non-photo Canny path to `skimage.feature.canny`, then removed the `255`/`norm_factor` scaling from both quadtree and octree entirely
 

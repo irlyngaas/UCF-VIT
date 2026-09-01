@@ -190,24 +190,56 @@ def get_batch(conf, it_loader):
         "seq_pos", "label", and "seq_label"; entries not applicable to the current
         model type/adaptive-patching setting are set to None.
     """
-    if conf["model"]["type"] == "VIT":
-        if conf["ap"]["do_ap"]:
-            data, seq, seq_size, seq_pos, label, variables, dict_key = next(it_loader)
-        else:
-            data, label, variables, dict_key = next(it_loader)
+    try:
+        if conf["model"]["type"] == "VIT":
+            if conf["ap"]["do_ap"]:
+                data, seq, seq_size, seq_pos, label, variables, dict_key = next(it_loader)
+            else:
+                data, label, variables, dict_key = next(it_loader)
 
-    elif conf["model"]["type"] in ["UNETR", "SAP"]:
-        if conf["ap"]["do_ap"]:
-            data, seq, seq_size, seq_pos, label, seq_label, variables, dict_key = next(it_loader)
-        else:
-            data, label, variables, dict_key = next(it_loader)
+        elif conf["model"]["type"] in ["UNETR", "SAP"]:
+            if conf["ap"]["do_ap"]:
+                data, seq, seq_size, seq_pos, label, seq_label, variables, dict_key = next(it_loader)
+            else:
+                data, label, variables, dict_key = next(it_loader)
 
-    elif conf["model"]["type"] in ["MAE", "DiffusionVIT"]:
-        if conf["ap"]["do_ap"]:
-            data, seq, seq_size, seq_pos, variables, dict_key = next(it_loader)
-        else:
-            data, variables, dict_key = next(it_loader)
-    #TODO: Add other Model types
+        elif conf["model"]["type"] in ["MAE", "DiffusionVIT"]:
+            if conf["ap"]["do_ap"]:
+                data, seq, seq_size, seq_pos, variables, dict_key = next(it_loader)
+            else:
+                data, variables, dict_key = next(it_loader)
+        #TODO: Add other Model types
+    except RuntimeError as e:
+        # PyTorch's own DataLoader raises exactly this wording (dataloader.py's
+        # _try_get_data) when a worker process dies without a normal Python
+        # exception -- most commonly a segfault (str(e.__cause__), if set,
+        # usually names the signal directly, e.g. "is killed by signal:
+        # Segmentation fault"). Only fires when num_workers > 0 -- with
+        # num_workers:0 there's no worker process to die, so this can't be a
+        # false positive. Root-caused for this codebase's own training.py
+        # (get_model always initializes CUDA/NCCL before train_dataloader is
+        # ever constructed) as a fork-after-CUDA-init hazard, especially when
+        # combining dataloader.num_workers > 0, parallelism.tensor_par_size > 1,
+        # and ap.do_ap:True on 3D data (heavy per-sample CPU work in the
+        # worker) -- see configs/basic_ct/sap/base_config.yaml's own
+        # num_workers comment and tests/README.md for the real Frontier
+        # incident (job 5390076) this was diagnosed from, including why
+        # multiprocessing_context:"spawn" is not a safe blanket fix either
+        # (job 5394881 crashed differently under spawn, on this same cluster).
+        if "exited unexpectedly" in str(e) and conf["dataloader"]["num_workers"] > 0:
+            raise RuntimeError(
+                f"{e}\n\nThis usually means a DataLoader worker process crashed "
+                "(often a segfault) -- commonly caused by forking a worker "
+                "(dataloader.num_workers > 0) after CUDA/NCCL is already "
+                "initialized in the parent process, especially when combining "
+                "tensor_par_size > 1 with adaptive patching (ap.do_ap:True) on "
+                "3D data. Try setting dataloader.num_workers to 0 in your "
+                "config -- this avoids forking a worker process entirely (data "
+                "loading runs in the main process instead), at the cost of "
+                "losing dataloader/compute overlap. See "
+                "configs/basic_ct/sap/base_config.yaml for a worked example."
+            ) from e
+        raise
 
     return { "data": data,
              "variables": variables,
