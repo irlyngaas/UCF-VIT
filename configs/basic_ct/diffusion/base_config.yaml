@@ -104,3 +104,9 @@ dataloader:
   batch_size: 32
   num_workers: 1
   pin_memory: False
+  # Optional -- default 0.1/0.1 when omitted (see UCF_VIT.parse._resolve_dataset_splits).
+  # Only used for dataset keys with no separate data.dict_val_root_dirs/dict_test_root_dirs
+  # entry: reserves this fraction of that key's own [dict_start_idx, dict_end_idx) window for
+  # val.py/test.py, narrowing what train.py itself uses down from dict_end_idx accordingly.
+  val_split_ratio: 0.1
+  test_split_ratio: 0.1

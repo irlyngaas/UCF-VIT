@@ -1,13 +1,9 @@
 import functools
-import os
 from typing import Dict, Optional
 
 import numpy as np
 import torch
-import torchdata.datapipes as dp
 from torch.utils.data import DataLoader
-from pathlib import Path
-import glob
 import torch.nn.functional as F
 import torch.distributed as dist
 
@@ -17,6 +13,8 @@ from .dataset import (
     ShuffleIterableDataset,
     ProcessChannels,
 )
+from UCF_VIT.utils.misc import bucket_file_list, slice_file_list
+from UCF_VIT.utils.misc import process_root_dirs as process_root_dirs_shared
 
 def collate_fn(batch, return_label, adaptive_patching, separate_channels, dataset, num_classes, num_labels, return_qdt, dict_key):
     """Collate function for `NativePytorchDataModule`'s iterative dataloaders.
@@ -225,6 +223,28 @@ class NativePytorchDataModule(torch.nn.Module):
             it. `"spawn"` costs real per-worker startup latency (a fresh Python interpreter
             re-imports the whole `torch`/`timm`/`monai`/`xformers` chain), so it's opt-in per
             config rather than a new global default.
+        allow_file_reuse (bool, optional): If False (default), a dataset key with fewer
+            files than the DDP ranks/workers assigned to it fails loudly
+            (`calculate_load_balancing_on_the_fly`'s and `FileReader.__iter__`'s own
+            asserts) rather than silently letting some ranks/workers train on no data
+            at all. If True, every rank/worker gets at least one file instead, reusing
+            (duplicating) files round-robin as needed, with a printed warning
+            quantifying how much reuse is happening. Not just a small/debug-dataset
+            concern -- at the node counts this repo targets, `data_par_size` can
+            exceed a real dataset's file count too. See `FileReader.__iter__`'s own
+            comment for the reuse mechanism.
+        bucket_shuffle_seed (int, optional): Imagenet only -- seeds the shuffle
+            `bucket_file_list` applies (to the already train/val/test-sliced image
+            list) before dividing it into per-DDP-rank-group buckets. Without this,
+            bucketing is a contiguous split of a class-sorted list, so each bucket
+            (and therefore each rank) only ever sees a narrow range of classes every
+            epoch -- a real concern for data-parallel SGD (class-homogeneous local
+            batches skew BatchNorm statistics and correlate gradients within a
+            rank's own step sequence). A fixed seed keeps this fully deterministic
+            (same seed always gives the same shuffle, independent of
+            `data_par_size`/process restarts, same as everything else about the
+            split) while giving each bucket a representative cross-section of
+            classes instead. `None` preserves the original contiguous ordering.
     """
 
     def __init__(
@@ -256,6 +276,8 @@ class NativePytorchDataModule(torch.nn.Module):
         num_classes: Optional[int] = None,
         resize: Optional[Dict] = None,
         multiprocessing_context: Optional[str] = None,
+        allow_file_reuse: bool = False,
+        bucket_shuffle_seed: Optional[int] = None,
     ):
         """Initializes the data module and builds the per-dataset file listings.
 
@@ -283,6 +305,8 @@ class NativePytorchDataModule(torch.nn.Module):
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.multiprocessing_context = multiprocessing_context
+        self.allow_file_reuse = allow_file_reuse
+        self.bucket_shuffle_seed = bucket_shuffle_seed
         self.interp_size = interp_size
         self.tile_size = tile_size
         self.twoD = twoD
@@ -317,50 +341,68 @@ class NativePytorchDataModule(torch.nn.Module):
         self.dict_in_variables = in_variables
 
         self.dict_lister_trains = self.process_root_dirs()
-           
+
+        # Fixes train/val/test membership once, from a deterministic (sorted) file
+        # order, before setup()/reset() ever run their own epoch-to-epoch reshuffle
+        # (np.random.choice, unseeded -- needed for genuine per-epoch training
+        # variety and per-rank sharding fairness, so deliberately not removed).
+        # Without this, dict_start_idx/dict_end_idx's ratio slice (applied inside
+        # FileReader, called from set_iterative_dataloader below) would be applied
+        # to a freshly-randomized order on every single setup()/reset() call --
+        # harmless when dict_start_idx/dict_end_idx was always the full [0,1) range
+        # (every shipped config, before auto train/val/test splitting existed), but
+        # real data leakage once it can be a genuine partial range: which files
+        # counted as "train" vs held-out "val"/"test" would silently change on every
+        # checkpoint restart, and even between epochs of the *same* run. Sorting
+        # here also makes this independent of process_root_dirs's own listing order
+        # (os.listdir/glob.glob/FileLister aren't guaranteed stable across calls).
+        # set_iterative_dataloader passes a no-op start_idx=0.0/end_idx=1.0 to
+        # FileReader now that slicing happens here instead.
+        for k in self.dict_lister_trains:
+            if self.dataset == "imagenet":
+                start_idx, end_idx = self.dict_start_idx["imagenet"], self.dict_end_idx["imagenet"]
+            else:
+                start_idx, end_idx = self.dict_start_idx[k], self.dict_end_idx[k]
+            self.dict_lister_trains[k] = slice_file_list(sorted(self.dict_lister_trains[k]), start_idx, end_idx)
+
+        if self.dataset == "imagenet":
+            # Buckets are purely a rank/GPU-group assignment mechanism
+            # (FileReader.read_process_file derives each image's label from its
+            # own parent directory at read time, not from which bucket it's
+            # in) -- bucketing here, after the slice above (process_root_dirs
+            # used to bucket internally, *before* any slicing, which is
+            # exactly what made membership depend on data_par_size), keeps
+            # train/val/test membership independent of data_par_size entirely:
+            # only how the already-resolved membership gets divided across
+            # ranks depends on it now, not which images are in it. Must call
+            # bucket_file_list identically (same already-sorted-and-sliced
+            # input, same data_par_size) to calculate_load_balancing_on_the_fly's
+            # own call, or train_dataloader's gx-based bucket selection breaks
+            # -- see bucket_file_list's own docstring for why.
+            k = next(iter(self.dict_lister_trains))
+            self.dict_lister_trains = bucket_file_list(self.dict_lister_trains[k], self.data_par_size, shuffle_seed=self.bucket_shuffle_seed)
 
         self.dict_data_train: Optional[Dict] = None
 
     def process_root_dirs(self):
-        """Builds per-data-parallel-group lists of image file paths for `self.dataset`.
+        """Builds per-dataset-key lists of image file paths for `self.dataset`.
 
-        For "imagenet", groups classes under each root directory into
-        `self.data_par_size` (or fewer) buckets of combined class image lists. For
-        other datasets, lists all files under each root directory's "imagesTr"
-        subfolder, one entry per key in `self.dict_root_dirs`.
+        Thin wrapper over the shared `UCF_VIT.utils.misc.process_root_dirs` --
+        used to also be a separate, near-duplicate implementation of the same
+        imagenet-bucketing logic, which had to be manually kept in sync with
+        `calculate_load_balancing_on_the_fly`'s own bucketing (both ultimately
+        feed `train_dataloader`'s `gx`-based rank-to-bucket selection, which
+        requires the two to agree on bucket count/order exactly). Delegating to
+        one shared function eliminates that synchronization risk by
+        construction. Bucketing itself (imagenet only) now happens later, in
+        `__init__`, *after* `dict_start_idx`/`dict_end_idx` slicing -- see that
+        code's own comment for why.
 
         Returns:
-            Dict mapping a group/dataset key to a list of file paths.
+            Dict mapping each `self.dict_root_dirs` key to its (sorted) list of
+            file paths.
         """
-        if self.dataset == "imagenet":
-            dict_lister_trains = {}
-            for k, root_dir in self.dict_root_dirs.items():
-                #TODO: Add shuffling for data_par_size if it doesn't divide 1000 equally
-                classes = sorted(os.listdir(root_dir))
-                if len(classes) > self.data_par_size:
-                    classes_to_combine = int(len(classes) // self.data_par_size)
-                img_list = []
-                classes_counter = 0
-                num_data_roots = 0
-                for cls_name in classes: 
-                    if classes_counter == classes_to_combine:
-                        classes_counter = 0
-                        img_list = []
-                    cls_dir = os.path.join(root_dir, cls_name)
-                    for img_path in glob.glob(os.path.join(cls_dir,"*.JPEG")):
-                        img_list.append(img_path)
-                    classes_counter += 1
-                
-                    if classes_counter == classes_to_combine:
-                        img_dict = {num_data_roots: img_list}
-                        dict_lister_trains.update(img_dict)
-                        num_data_roots +=1
-
-                    if num_data_roots > self.data_par_size-1:
-                        break
-        else:
-            dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in self.dict_root_dirs.items() }
-        return dict_lister_trains
+        return process_root_dirs_shared(self.dataset, self.dict_root_dirs)
 
     def set_iterative_dataloader(self, dict_data_train, k, lister_train, keys_to_add):
         """Builds the iterable dataset pipeline (file read -> tile -> shuffle -> channel processing) for one dataset key.
@@ -378,16 +420,20 @@ class NativePytorchDataModule(torch.nn.Module):
             `dict_data_train`, with `dict_data_train[k]` set to the new
             `ProcessChannels`-wrapped iterable dataset.
         """
+        # start_idx/end_idx are a no-op [0.0, 1.0) here -- dict_start_idx/dict_end_idx
+        # were already applied once, deterministically, in __init__ (before
+        # setup()/reset()'s own epoch-to-epoch reshuffle of lister_train could
+        # re-randomize which files count as this key's train/val/test membership --
+        # see __init__'s own comment for the full rationale). FileReader still takes
+        # start_idx/end_idx as real parameters for its other, direct callers/tests.
+        start_idx = 0.0
+        end_idx = 1.0
         if self.dataset == "imagenet":
-            start_idx = self.dict_start_idx["imagenet"]
-            end_idx = self.dict_end_idx["imagenet"]
             buffer_size = self.dict_buffer_sizes["imagenet"]
             variables = self.dict_in_variables["imagenet"]
             num_channels_used = self.num_channels_used["imagenet"]
             resize = self.resize.get("imagenet") if self.resize else None
         else:
-            start_idx = self.dict_start_idx[k]
-            end_idx = self.dict_end_idx[k]
             buffer_size = self.dict_buffer_sizes[k]
             variables = self.dict_in_variables[k]
             num_channels_used = self.num_channels_used[k]
@@ -408,6 +454,7 @@ class NativePytorchDataModule(torch.nn.Module):
                                 ddp_group=self.ddp_group,
                                 dataset=self.dataset,
                                 resize=resize,
+                                allow_file_reuse=self.allow_file_reuse,
                             ),
                         self.tile_size,
                         self.twoD,
@@ -443,7 +490,8 @@ class NativePytorchDataModule(torch.nn.Module):
                                 return_label = return_label,
                                 keys_to_add = keys_to_add,
                                 ddp_group = self.ddp_group,
-                                dataset=self.dataset
+                                dataset=self.dataset,
+                                allow_file_reuse=self.allow_file_reuse,
                             ),
                         self.tile_size,
                         self.twoD,
@@ -481,7 +529,7 @@ class NativePytorchDataModule(torch.nn.Module):
 
             #Choice to made at this point. Imagenet uses 1) The default option is to use 2)
             #1) Use the dataset with the smallest amount of data tiles. In this case dataloading stops once all tiles are yielded from the smallest dataset
-            #2) Add more files to each dataset. Allowing dataloading to continue reusing files from the dataset until all tiles are yielded from the largest dataset 
+            #2) Add more files to each dataset. Allowing dataloading to continue reusing files from the dataset until all tiles are yielded from the largest dataset
             self.max_balance = 0
             if self.dataset == "imagenet":
                 self.max_balance = self.batches_per_rank_epoch["imagenet"]
@@ -504,7 +552,7 @@ class NativePytorchDataModule(torch.nn.Module):
                         _lister_train.extend(_balance_train)
 
                 lister_train = _lister_train
-                
+
                 dict_data_train = self.set_iterative_dataloader(dict_data_train, k, lister_train, keys_to_add)
 
             self.dict_data_train = dict_data_train
@@ -531,7 +579,7 @@ class NativePytorchDataModule(torch.nn.Module):
                     _lister_train.extend(_balance_train)
 
             lister_train = _lister_train
-            
+
             dict_data_train = self.set_iterative_dataloader(dict_data_train, k, lister_train, keys_to_add)
 
         self.dict_data_train = dict_data_train
@@ -552,7 +600,7 @@ class NativePytorchDataModule(torch.nn.Module):
         """
         if not torch.distributed.is_initialized():
             raise NotImplementedError("Only support distributed training")
-            
+
         assert torch.distributed.is_initialized()
 
         if self.ddp_group == None:
@@ -572,7 +620,7 @@ class NativePytorchDataModule(torch.nn.Module):
                 data_train = self.dict_data_train[k]
                 num_labels = 1
                 break
-            
+
         return DataLoader(
             data_train,
             batch_size=self.batch_size,

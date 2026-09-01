@@ -527,3 +527,53 @@ def test_filereader_shards_combine_ddp_rank_and_dataloader_workers(monkeypatch, 
     covered = set().union(*shards)
     assert covered == set(file_list)
     assert all(len(shard) == files_per_shard for shard in shards)
+
+
+def test_filereader_raises_when_not_enough_files_and_reuse_disabled(monkeypatch):
+    monkeypatch.setattr(FileReader, "read_process_file", lambda self, path: path)
+    monkeypatch.setattr("torch.utils.data.get_worker_info", lambda: _FakeWorkerInfo(num_workers=1, id=0))
+
+    file_list = [f"/fake/{i}.jpg" for i in range(3)]  # 3 files, 5 DDP ranks -> some shard empty
+    reader = FileReader(
+        file_list, start_idx=0.0, end_idx=1.0, variables=("v0",), gx="5",
+        ddp_group=None, data_par_size=5, dataset="imagenet",
+    )
+    with pytest.raises(AssertionError, match="doesn't have at least one unique file"):
+        list(reader)
+
+
+def test_filereader_reuses_files_round_robin_when_allowed(monkeypatch):
+    monkeypatch.setattr(FileReader, "read_process_file", lambda self, path: path)
+
+    file_list = [f"/fake/{i}.jpg" for i in range(3)]  # 3 files, 5 DDP ranks
+    data_par_size = 5
+
+    shards = []
+    for ddp_rank in range(data_par_size):
+        monkeypatch.setattr("torch.distributed.get_rank", lambda ddp_rank=ddp_rank: ddp_rank)
+        monkeypatch.setattr("torch.utils.data.get_worker_info", lambda: _FakeWorkerInfo(num_workers=1, id=0))
+        reader = FileReader(
+            file_list, start_idx=0.0, end_idx=1.0, variables=("v0",), gx=str(data_par_size),
+            ddp_group=None, data_par_size=data_par_size, dataset="imagenet", allow_file_reuse=True,
+        )
+        shard = [path for path, variables in reader]
+        assert len(shard) == 1  # every shard still gets exactly one file, not zero
+        shards.append(shard[0])
+
+    # Round-robin reuse: rank i gets file_list[i % len(file_list)] -- every
+    # file covered, some files claimed by more than one rank since there are
+    # more ranks (5) than files (3).
+    assert shards == [file_list[i % len(file_list)] for i in range(data_par_size)]
+    assert set(shards) == set(file_list)
+
+
+def test_filereader_raises_on_zero_files_even_with_reuse_allowed(monkeypatch):
+    monkeypatch.setattr(FileReader, "read_process_file", lambda self, path: path)
+    monkeypatch.setattr("torch.utils.data.get_worker_info", lambda: _FakeWorkerInfo(num_workers=1, id=0))
+
+    reader = FileReader(
+        [], start_idx=0.0, end_idx=1.0, variables=("v0",), gx="1",
+        ddp_group=None, data_par_size=1, dataset="imagenet", allow_file_reuse=True,
+    )
+    with pytest.raises(AssertionError, match="zero files at all"):
+        list(reader)

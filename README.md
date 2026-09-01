@@ -864,6 +864,15 @@ Starting indices ratio (between 0.0 and 1.0) to determine amount of files in dir
 - `dict_end_idx`: Dictionary of floats (0,1).
 Ending indices ratio (between 0.0 and 1.0) to determine amount of files in directory to use
 
+- `dict_val_root_dirs` / `dict_test_root_dirs`: Dictionary of paths, optional.
+Paths to directories with dedicated validation/test data files, for datasets that have their own real split. Only needs an entry for dataset keys that actually have a separate directory -- any key present in `dict_root_dirs` but absent here gets an automatic split instead (see below). None of the datasets shipped with this repo currently have a dedicated split, but the option exists for one that does.
+
+- `dict_val_start_idx` / `dict_val_end_idx` / `dict_test_start_idx` / `dict_test_end_idx`: Dictionary of floats (0,1), optional.
+Same idea as `dict_start_idx`/`dict_end_idx`, but for trimming a *separate* `dict_val_root_dirs`/`dict_test_root_dirs` directory. Only meaningful for keys that have one; defaults to the full `[0.0, 1.0)` range (the whole directory) when omitted.
+
+- `val_split_ratio` / `test_split_ratio`: Float (0,1), default `0.1` each.
+For any dataset key with **no** separate `dict_val_root_dirs`/`dict_test_root_dirs` entry, this fraction of that key's own `[dict_start_idx, dict_end_idx)` window is automatically carved out and reserved for validation/testing instead -- `train.py` itself only trains on the remaining share (`1 - val_split_ratio - test_split_ratio`). Set both to `0` to disable auto-splitting and use 100% of `[dict_start_idx, dict_end_idx)` for training, matching the behavior before this option existed. See [Training Scripts](#training-scripts) for `val.py`/`test.py`, which consume whichever split (dedicated or auto-split) ends up resolved.
+
 - `dict_buffer_sizes`: Dictionary of ints.
 Buffer Size to use when filling iterative dataloader with prospective tiles for creation of batches
 
@@ -923,6 +932,12 @@ Whether or not to separate channels and adaptively patch with different quadtree
 - `data_par_size`: Int.
 The amount of data parallel training ranks being used
 
+- `allow_file_reuse`: Bool, default `False`.
+A dataset key with fewer files than the DDP ranks/dataloader workers assigned to it normally fails loudly at startup, rather than silently letting some ranks/workers train on no data at all. Setting this `True` instead lets every rank/worker get at least one file, reusing (duplicating) files round-robin across ranks/workers as needed -- a printed warning quantifies how much reuse is actually happening. This isn't only a small/debug-dataset concern: at the scale this framework targets (potentially thousands of nodes), `data_par_size` can exceed a real dataset's file count too, not just a toy one. Only applies to `train.py` -- `val.py`/`test.py` always evaluate with it off, regardless of what the config says, since their whole point is a fixed, exact computation over the same files every time so results stay directly comparable across different amounts of training; reuse would make the aggregate loss/accuracy a distorted, weighted (not uniform) average instead.
+
+- `bucket_shuffle_seed`: Int or `null`, default `42`. Imagenet only.
+Imagenet's images are divided into `data_par_size`-many buckets (one per DDP-rank group), and arrive sorted class-by-class before that division happens -- without shuffling first, each bucket (and therefore each rank) ends up with a narrow, contiguous range of classes rather than a representative cross-section, which can skew BatchNorm statistics and correlate gradients within a rank's own step sequence. This seeds a deterministic shuffle applied before bucketing (same seed always gives the same shuffle, independent of `data_par_size`/checkpoint restarts, same as everything else about the train/val/test split) so each bucket gets a representative mix of classes instead. Set to `null` in the config to opt out and keep the original contiguous ordering.
+
 - `dataset`: String. 
 -Variable for telling dataloader how to handle data and how to break up root directories into files within source code (Each dataset potentially needs it's own code to do this depending on the data type and layout of files). See [Datset Integration](#dataset-integration)
 
@@ -952,7 +967,9 @@ All of the currently existing architectures exist in 2 independent sub-folders, 
 The main building blocks for the VIT based archictectures are in the **Attention** and **Feed-forward** functions, provided in the Attention class and MLP class in `src/UCF_VIT/simple/building_blocks.py` and `src/UCF_VIT/fsdp/building_blocks.py`. We ask that you use these functions as is and do not modify them, as these common building blocks will be used across the different network architectures.
 
 ## Training Scripts
-We provide several example training scripts. These include all of the necessary things for running the main training loop, including utilities such as checkpoint loading and saving and mechanisms for launching across hardware for different systems. We leave it to the user to implement their own validation and testing routines in order to more closely fit their needs. Training scripts are provided for each of the training architectures for the simple mode. We also have several scripts to train architectures in the fdsp mode. To convert the simple scripts to use fsdp mode, implement the code changes that were done for, e.g. `training_scripts/train_masked_simple.py` to `training_scripts/train_masked_fsdp.py`. 
+We provide several example training scripts. These include all of the necessary things for running the main training loop, including utilities such as checkpoint loading and saving and mechanisms for launching across hardware for different systems. Training scripts are provided for each of the training architectures for the simple mode. We also have several scripts to train architectures in the fdsp mode. To convert the simple scripts to use fsdp mode, implement the code changes that were done for, e.g. `training_scripts/train_masked_simple.py` to `training_scripts/train_masked_fsdp.py`. 
+
+Alongside `training_scripts/train.py`, we also provide `training_scripts/val.py` and `training_scripts/test.py` -- forward-only counterparts that evaluate an already-trained checkpoint against a validation/test split (no backward pass, no optimizer/scheduler, `model.eval()` + `torch.no_grad()` throughout). Both take the *same* config file as the training run being evaluated (same `checkpoint_path`/`checkpoint_filename`) -- just invoked as `python val.py [CONFIG_FILE]`/`python test.py [CONFIG_FILE]` instead of `train.py`. Which data they evaluate against is controlled by `dict_val_root_dirs`/`dict_test_root_dirs` (and the `val_split_ratio`/`test_split_ratio` auto-split fallback) in the [Dataloader](#dataloader) config section -- see that section's own parameter descriptions for the full train/val/test split behavior.
 
 The training scripts have the capability to launch in different modes for compatibility with different systems. Each training script takes two arguments the first is the config file containing all the different parameters for the particular run and an argument for specifying the specific launching mechanism used to work across the hardware on the system. Currently we provide two launch modes: MPI and SLURM. 
 

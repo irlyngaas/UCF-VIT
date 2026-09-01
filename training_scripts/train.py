@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 from UCF_VIT.parse import parse_config, parse_pretrained_config
 from UCF_VIT.model.utils import get_model
 from UCF_VIT.training import load_optimizer_scheduler_from_checkpoint, train_epoch
-from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, init_par_groups, calculate_load_balancing_on_the_fly
+from UCF_VIT.utils.misc import configure_optimizer, configure_scheduler, init_par_groups, calculate_load_balancing_on_the_fly, slice_file_list
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.utils.fused_attn import FusedAttn
 from UCF_VIT.ddpm.ddpm import DDPM_Scheduler
@@ -174,6 +174,8 @@ def main():
                 num_classes = conf["model"]["kwargs"]["num_classes"] if conf["model"]["type"] in ["UNETR", "SAP"] else None,
                 ddp_group = ddp_group,
                 multiprocessing_context = conf["dataloader"]["multiprocessing_context"],
+                allow_file_reuse = conf["dataloader"]["allow_file_reuse"],
+                bucket_shuffle_seed = conf["dataloader"]["bucket_shuffle_seed"],
             ).to(device)
 
             data_module.setup()
@@ -194,7 +196,19 @@ def main():
         if dist.get_rank(tensor_par_group) == 0:
             #TODO: Loop over dict keys
             dkey_train = list(conf["data"]["dict_root_dirs"])[0]
-            train_list = glob.glob(os.path.join(conf["data"]["dict_root_dirs"][dkey_train],'*.jpg'))
+            # sorted(): glob.glob's order isn't guaranteed stable across separate
+            # process launches -- for iterative_dataloader, NativePytorchDataModule
+            # sorts before slicing for exactly this reason (see its own __init__
+            # comment); this path needs the same determinism so train/val/test
+            # membership (below) doesn't silently shift across runs.
+            train_list = sorted(glob.glob(os.path.join(conf["data"]["dict_root_dirs"][dkey_train],'*.jpg')))
+            # The map-style "dataloader" path has no FileReader of its own to apply
+            # dict_start_idx/dict_end_idx the way iterative_dataloader does -- slice
+            # the globbed list directly instead, so this path respects the same
+            # train/val/test split parse_config's _resolve_dataset_splits resolved
+            # (a no-op slice, [0.0,1.0), for any config not using val.py/test.py's
+            # auto-split at all).
+            train_list = slice_file_list(train_list, conf["dataloader"]["dict_start_idx"][dkey_train], conf["dataloader"]["dict_end_idx"][dkey_train])
 
             train_data = conf["dataloader"]["dataset_module"](train_list, conf["data"]["dict_in_variables"][dkey_train], conf["data"]["tile_size"], adaptive_patching=conf["ap"]["do_ap"], fixed_length=conf["ap"]["fixed_length"], interp_size=conf["data"]["interp_size"], num_channels=conf["data"]["num_channels"][dkey_train], dataset=conf["data"]["dataset"], resize=conf["dataset_options"]["resize"].get(conf["data"]["dataset"]), div=conf["tiling"]["div"], tile_overlap=conf["tiling"]["tile_overlap"])
 

@@ -7,6 +7,8 @@ import torch
 from PIL import Image
 
 from UCF_VIT.utils.misc import (
+    bucket_file_list,
+    calculate_load_balancing_on_the_fly,
     calculate_tile_bounds,
     calculate_tile_overlap,
     detect_img_size,
@@ -16,6 +18,7 @@ from UCF_VIT.utils.misc import (
     process_root_dirs,
     shard_attention_state_dict,
     shard_mlp_state_dict,
+    slice_file_list,
     unpatchify,
 )
 
@@ -26,6 +29,77 @@ from UCF_VIT.utils.misc import (
 )
 def test_is_power_of_two(n, expected):
     assert is_power_of_two(n) is expected
+
+
+def test_slice_file_list_matches_fixed_length_reader_formula():
+    # Mirrors FileReader.__init__'s own slice exactly -- see its docstring/
+    # implementation (UCF_VIT.dataloaders.dataset.FileReader).
+    files = [f"f{i}" for i in range(10)]
+    assert slice_file_list(files, 0.0, 1.0) == files
+    assert slice_file_list(files, 0.0, 0.5) == files[:5]
+    assert slice_file_list(files, 0.5, 1.0) == files[5:]
+    assert slice_file_list(files, 0.8, 0.9) == files[8:9]
+
+
+def test_slice_file_list_empty_range_returns_empty_list():
+    files = [f"f{i}" for i in range(10)]
+    assert slice_file_list(files, 0.9, 0.9) == []
+
+
+def _make_basic_ct_dir(tmp_path, num_files):
+    root = tmp_path / "ct_root"
+    images_tr = root / "imagesTr"
+    images_tr.mkdir(parents=True)
+    for i in range(num_files):
+        (images_tr / f"img{i:03d}.nii.gz").write_text("")
+    return str(root)
+
+
+def _basic_ct_conf(root, data_par_size, allow_file_reuse):
+    return {
+        "data": {
+            "dict_root_dirs": {"ct1": root},
+            "img_size": [64, 64, 64],
+            "tile_size": (64, 64, 64),
+            "twoD": False,
+            "dataset": "basic_ct",
+            "patch_size": 16,
+            "interp_size": None,
+        },
+        "dataloader": {
+            "dict_start_idx": {"ct1": 0.0},
+            "dict_end_idx": {"ct1": 1.0},
+            "batch_size": 1,
+            "num_workers": 1,
+            "allow_file_reuse": allow_file_reuse,
+        },
+        "tiling": {"div": 1},
+        "ap": {"do_ap": False},
+        "parallelism": {"data_par_size": data_par_size},
+    }
+
+
+def test_calculate_load_balancing_raises_when_not_enough_files_and_reuse_disabled(tmp_path):
+    root = _make_basic_ct_dir(tmp_path, num_files=3)
+    conf = _basic_ct_conf(root, data_par_size=5, allow_file_reuse=False)
+    with pytest.raises(AssertionError, match="not all GPUs have at least one image"):
+        calculate_load_balancing_on_the_fly(conf)
+
+
+def test_calculate_load_balancing_floors_to_one_when_reuse_allowed(tmp_path):
+    root = _make_basic_ct_dir(tmp_path, num_files=3)
+    conf = _basic_ct_conf(root, data_par_size=5, allow_file_reuse=True)
+    batches_per_rank_epoch, dataset_group_list = calculate_load_balancing_on_the_fly(conf)
+    # Every rank gets at least 1 image (reused) -> at least 1 batch/rank/epoch,
+    # not the 0 that would otherwise make the whole dataset key unusable.
+    assert batches_per_rank_epoch["ct1"] >= 1
+
+
+def test_calculate_load_balancing_raises_on_zero_files_even_with_reuse_allowed(tmp_path):
+    root = _make_basic_ct_dir(tmp_path, num_files=0)
+    conf = _basic_ct_conf(root, data_par_size=1, allow_file_reuse=True)
+    with pytest.raises(AssertionError, match="zero files"):
+        calculate_load_balancing_on_the_fly(conf)
 
 
 def test_calculate_tile_overlap_even():
@@ -122,71 +196,138 @@ def _make_imagenet_dir(tmp_path, num_classes, images_per_class):
     return str(root)
 
 
-def test_process_root_dirs_imagenet_more_classes_than_data_par_size_evenly_divisible(tmp_path):
+def test_process_root_dirs_imagenet_lists_every_image_unbucketed(tmp_path):
+    """process_root_dirs no longer buckets imagenet by data_par_size (that used
+    to make which images count as train/val/test depend on data_par_size --
+    see NativePytorchDataModule.__init__'s own comment) -- one entry per
+    dict_root_dirs key, same shape as the non-imagenet branch, with every
+    image present exactly once, regardless of data_par_size.
+    """
     root = _make_imagenet_dir(tmp_path, num_classes=16, images_per_class=2)
-    result = process_root_dirs("imagenet", {"imagenet": root}, data_par_size=4)
+    result = process_root_dirs("imagenet", {"imagenet": root})
 
-    assert set(result.keys()) == {0, 1, 2, 3}  # exactly data_par_size buckets
-    for bucket in result.values():
-        assert len(bucket) == 8  # 4 classes/bucket (16/4) * 2 images/class
-    # every image appears in exactly one bucket, none dropped (evenly divisible)
-    all_images = [img for bucket in result.values() for img in bucket]
-    assert len(all_images) == len(set(all_images)) == 32
+    assert set(result.keys()) == {"imagenet"}
+    assert len(result["imagenet"]) == len(set(result["imagenet"])) == 32
 
 
-def test_process_root_dirs_imagenet_more_classes_than_data_par_size_not_evenly_divisible(tmp_path):
-    """Documents current (not fixed here -- see the TODO in process_root_dirs
-    itself) behavior: leftover classes past data_par_size * classes_to_combine
-    are silently dropped, not distributed among the buckets.
-    """
-    root = _make_imagenet_dir(tmp_path, num_classes=10, images_per_class=1)
-    result = process_root_dirs("imagenet", {"imagenet": root}, data_par_size=4)
-
-    assert set(result.keys()) == {0, 1, 2, 3}  # still exactly data_par_size buckets
-    classes_to_combine = 10 // 4  # == 2, per process_root_dirs' own formula
-    for bucket in result.values():
-        assert len(bucket) == classes_to_combine
-    all_images = [img for bucket in result.values() for img in bucket]
-    assert len(all_images) == classes_to_combine * 4 == 8  # last 2 of 10 classes dropped
-
-
-@pytest.mark.parametrize("num_classes", [1, 4, 7, 8])
-def test_process_root_dirs_imagenet_classes_at_or_below_data_par_size(tmp_path, num_classes):
-    """Regression test: process_root_dirs used to raise UnboundLocalError
-    for len(classes) <= data_par_size (classes_to_combine was only assigned
-    in the len(classes) > data_par_size branch). Fixed to combine 1 class
-    per bucket in that case, giving len(classes) buckets instead of
-    data_par_size -- matches this function's own docstring ("data_par_size
-    (or fewer) buckets"). num_classes == data_par_size (8) is included since
-    it's the boundary the buggy `>` comparison got wrong.
-    """
-    root = _make_imagenet_dir(tmp_path, num_classes=num_classes, images_per_class=3)
-    result = process_root_dirs("imagenet", {"imagenet": root}, data_par_size=8)
-
-    assert set(result.keys()) == set(range(num_classes))  # one bucket per class
-    for bucket in result.values():
-        assert len(bucket) == 3  # exactly that one class's images, uncombined
-    all_images = [img for bucket in result.values() for img in bucket]
-    assert len(all_images) == len(set(all_images)) == num_classes * 3  # nothing dropped
-
-
-def test_process_root_dirs_imagenet_bucket_contents_are_correct_classes(tmp_path):
-    """Beyond counts: each bucket must contain the *right* classes' images,
-    combined in sorted-class order, not just the right totals.
+def test_process_root_dirs_imagenet_order_is_sorted_class_then_image(tmp_path):
+    """Beyond counts: images must come out in deterministic sorted-class,
+    sorted-image-within-class order (not glob's own unspecified order) -- the
+    determinism the whole train/val/test split now depends on.
     """
     root = tmp_path / "imagenet_root"
-    # class00 and class01 -> bucket 0; class02 and class03 -> bucket 1
     for c in range(4):
         cdir = root / f"class{c:02d}"
         cdir.mkdir(parents=True)
         (cdir / "img0.JPEG").write_text("")
 
-    result = process_root_dirs("imagenet", {"imagenet": str(root)}, data_par_size=2)
+    result = process_root_dirs("imagenet", {"imagenet": str(root)})
 
-    assert os.path.basename(os.path.dirname(result[0][0])) == "class00"
-    assert os.path.basename(os.path.dirname(result[0][1])) == "class01"
-    assert os.path.basename(os.path.dirname(result[1][0])) == "class02"
-    assert os.path.basename(os.path.dirname(result[1][1])) == "class03"
+    classes_in_order = [os.path.basename(os.path.dirname(p)) for p in result["imagenet"]]
+    assert classes_in_order == ["class00", "class01", "class02", "class03"]
+
+
+@pytest.mark.parametrize("num_classes", [1, 4, 7, 8])
+def test_process_root_dirs_imagenet_data_par_size_argument_is_ignored(tmp_path, num_classes):
+    """Regardless of data_par_size passed (even omitted), the full image list
+    is always returned unbucketed -- data_par_size only affects bucket_file_list
+    now, called later, after train/val/test membership is already resolved.
+    """
+    root = _make_imagenet_dir(tmp_path, num_classes=num_classes, images_per_class=3)
+    result_no_arg = process_root_dirs("imagenet", {"imagenet": root})
+    result_with_arg = process_root_dirs("imagenet", {"imagenet": root}, data_par_size=8)
+
+    assert result_no_arg == result_with_arg
+    assert len(result_no_arg["imagenet"]) == num_classes * 3
+
+
+# ---------------------------------------------------------------------------
+# bucket_file_list
+# ---------------------------------------------------------------------------
+
+
+def test_bucket_file_list_evenly_divisible():
+    files = [f"f{i}" for i in range(12)]
+    result = bucket_file_list(files, num_buckets=4)
+
+    assert set(result.keys()) == {0, 1, 2, 3}
+    assert all(len(bucket) == 3 for bucket in result.values())
+    all_files = [f for bucket in result.values() for f in bucket]
+    assert sorted(all_files) == sorted(files)  # every file present exactly once, none dropped
+
+
+def test_bucket_file_list_uneven_division_keeps_every_file():
+    # Unlike the old per-class bucketing this replaced, no file is ever
+    # silently dropped for not dividing evenly -- np.array_split gives the
+    # first `remainder` buckets one extra item instead.
+    files = [f"f{i}" for i in range(10)]
+    result = bucket_file_list(files, num_buckets=4)
+
+    assert set(result.keys()) == {0, 1, 2, 3}
+    sizes = sorted(len(bucket) for bucket in result.values())
+    assert sizes == [2, 2, 3, 3]
+    all_files = [f for bucket in result.values() for f in bucket]
+    assert sorted(all_files) == files
+
+
+def test_bucket_file_list_preserves_order_within_and_across_buckets():
+    files = [f"f{i}" for i in range(6)]
+    result = bucket_file_list(files, num_buckets=3)
+
+    assert result[0] == ["f0", "f1"]
+    assert result[1] == ["f2", "f3"]
+    assert result[2] == ["f4", "f5"]
+
+
+def test_bucket_file_list_caps_buckets_to_file_count_not_empty_buckets():
+    """Regression guard: more buckets requested than files available must
+    never produce an empty bucket purely from over-bucketing (that would trip
+    FileReader's zero-files guard even under allow_file_reuse, which is meant
+    for "not enough files for this many ranks", not "zero files for this key
+    at all") -- capped to len(file_list) buckets instead.
+    """
+    files = ["f0", "f1", "f2"]
+    result = bucket_file_list(files, num_buckets=10)
+
+    assert set(result.keys()) == {0, 1, 2}
+    assert all(len(bucket) == 1 for bucket in result.values())
+
+
+def test_bucket_file_list_empty_input_returns_single_empty_bucket():
+    # A single {0: []} (not {}) so downstream zero-files asserts still fire
+    # clearly instead of silently iterating zero buckets.
+    assert bucket_file_list([], num_buckets=5) == {0: []}
+
+
+def test_bucket_file_list_shuffle_seed_is_deterministic():
+    files = [f"f{i}" for i in range(20)]
+    first = bucket_file_list(files, num_buckets=4, shuffle_seed=42)
+    second = bucket_file_list(files, num_buckets=4, shuffle_seed=42)
+    assert first == second
+
+
+def test_bucket_file_list_shuffle_seed_still_covers_every_file_once():
+    files = [f"f{i}" for i in range(20)]
+    result = bucket_file_list(files, num_buckets=4, shuffle_seed=42)
+    all_files = [f for bucket in result.values() for f in bucket]
+    assert sorted(all_files) == sorted(files)
+
+
+def test_bucket_file_list_shuffle_seed_breaks_up_contiguous_order():
+    # Without a seed, bucketing is a contiguous split -- bucket 0 gets the
+    # first N/num_buckets elements verbatim. With a seed, it shouldn't.
+    files = [f"f{i}" for i in range(20)]
+    unshuffled = bucket_file_list(files, num_buckets=4)
+    shuffled = bucket_file_list(files, num_buckets=4, shuffle_seed=42)
+    assert unshuffled[0] == files[:5]
+    assert shuffled[0] != files[:5]
+
+
+def test_bucket_file_list_no_seed_preserves_contiguous_order():
+    files = [f"f{i}" for i in range(20)]
+    result = bucket_file_list(files, num_buckets=4)
+    assert result[0] == files[:5]
+    assert result[1] == files[5:10]
 
 
 def test_process_root_dirs_non_imagenet_lists_imagesTr(tmp_path):

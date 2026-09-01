@@ -37,6 +37,7 @@ class FileReader(IterableDataset):
         keys_to_add: int = 1,
         dataset: str = "imagenet",
         resize: Optional[list] = None,
+        allow_file_reuse: bool = False,
     ) -> None:
         """Initializes the reader over the `[start_idx, end_idx)` fraction of `file_list`.
 
@@ -61,6 +62,12 @@ class FileReader(IterableDataset):
                 native size (every file under this dataset key must then
                 already share the same size, since samples in a batch
                 must have matching shapes).
+            allow_file_reuse: If False (default), `__iter__` raises when this
+                dataset key has fewer files than DDP ranks x dataloader workers
+                to shard across (each shard would otherwise be empty). If True,
+                every shard gets at least one file instead, reused (duplicated,
+                round-robin) across shards as needed -- with a printed warning.
+                See `__iter__`'s own comment for the mechanism.
         """
         super().__init__()
         self.num_channels_available = len(variables)
@@ -75,6 +82,7 @@ class FileReader(IterableDataset):
         self.keys_to_add = keys_to_add
         self.ddp_group = ddp_group
         self.dataset = dataset
+        self.allow_file_reuse = allow_file_reuse
 
         #Optional Inputs
         if self.dataset == "imagenet":
@@ -188,7 +196,20 @@ class FileReader(IterableDataset):
         rank = group_rank
 
         per_worker = int(math.floor(len(self.file_list)/ float(self.keys_to_add) / float(num_shards)))
-        assert per_worker > 0, "Each worker doesn't have at least one file, run utils/load_balance.py to diagnose the issue"
+        if per_worker == 0:
+            # Not enough files for this many DDP ranks x dataloader workers to each
+            # get a disjoint, non-empty shard. allow_file_reuse:True (default False)
+            # trades that guarantee for one file per worker, reused (duplicated)
+            # round-robin across shards instead of failing -- see parse.py's own
+            # allow_file_reuse comment for why this is a real concern at the node
+            # counts this repo targets, not just a small/debug-dataset one.
+            assert len(self.file_list) > 0, "This dataset key has zero files at all -- check dict_root_dirs/dict_start_idx/dict_end_idx (allow_file_reuse can't reuse files that don't exist)."
+            assert self.allow_file_reuse, "Each worker doesn't have at least one unique file, run utils/load_balance.py to diagnose the issue. Set dataloader.allow_file_reuse: True to let workers reuse (duplicate) files instead."
+            per_worker = 1
+            if ddp_rank == 0 and worker_info.id == 0:
+                print(f"WARNING: only {len(self.file_list)} files available for {num_shards} worker shards "
+                      f"({num_shards / len(self.file_list):.3g}x oversubscribed) -- allow_file_reuse:True means "
+                      f"files will be reused (duplicated) round-robin across workers/ranks this epoch.", flush=True)
         worker_id = rank * num_workers_per_ddp + worker_info.id
         iter_start = worker_id * per_worker
         iter_end = iter_start + per_worker
@@ -197,6 +218,11 @@ class FileReader(IterableDataset):
             start_it = iter_start + m*int(len(self.file_list)/self.keys_to_add)
             end_it = iter_end + m*int(len(self.file_list)/self.keys_to_add)
             for idx in range(start_it, end_it):
+                # % len(self.file_list): a no-op in the normal (enough files)
+                # case, since idx never reaches len(self.file_list) there --
+                # only wraps when allow_file_reuse's per_worker=1 fallback above
+                # pushed idx past the real list length.
+                idx = idx % len(self.file_list)
                 if self.return_label:
                     data, label = self.read_process_file(self.file_list[idx])
                     yield data, label, self.variables

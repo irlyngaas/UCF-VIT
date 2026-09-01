@@ -90,7 +90,7 @@ pytest tests/test_config_validation.py -v
 | `tests/model/test_diffusion_vit.py` | `Block_diffusion` (`building_blocks.py`) — `DiffusionVIT`'s new per-block timestep conditioning (a `SinusoidalEmbeddings` + learned `EmbeddingDenseLayer` projection re-injected into the token sequence before every block's attention, replacing the earlier design that added a timestep embedding once, before the first block). Confirms `get_model`'s `block_fn=Block_diffusion` (`DiffusionVIT`-only) actually produces `Block_diffusion` instances for both `self.blocks` and, when `linear_decoder:False`, `self.decoder_blocks`; a real forward+backward pass runs and stays finite in both decoder modes; and, the actual point of the feature, that different timesteps produce genuinely different output, not just get plumbed through and ignored. See the narrative section below for the real bugs found wiring this in. |
 | `tests/model/test_pretrained_loading.py` | `interpolate_pos_embed`/`interpolate_pos_embed_3d` (independent, non-1:1 height:width[:depth] ratio changes in both directions, class-token prefix preserved, same-size no-op), `extract_encoder_state_dict` against both a fake dict (allowlist keeps only the shared `VIT` encoder — including the `UNETR.encoder1`-vs-`"decoder" not in k` collision case that motivated an allowlist over a denylist) and every real model type's own real `state_dict()` as a pretrained source (`VIT`/`MAE`/`SAP`/`UNETR`/`DiffusionVIT` — not just the two types any shipped config actually uses, since nothing in `get_model` restricts which type the pretrained source is), and end-to-end pretrained-checkpoint transplant (same-architecture 2D and 3D non-cubic ratio changes, cross-architecture `MAE`→`VIT` *and* `VIT`→`MAE` — both class-token-count-mismatch directions, not just one — `sqrt_len_method:True` raising a clear error instead of silently transplanting a wrong-shaped `pos_embed`) — same `importorskip` gating as `test_arch.py`. The `VIT`→`MAE` direction caught a real bug: `extract_encoder_state_dict`'s allowlist includes `cls_token` (genuinely a shared `VIT.__init__` attribute when present), but a downstream model with no `cls_token` at all (any non-`VIT` type, or `class_token=False`) made `load_state_dict(strict=True)` raise `"Unexpected key(s): cls_token"` — unlike `pos_embed`, which always has *some* value to reconcile shapes against, `cls_token` can be entirely absent on one side. Fixed with a new `_prune_incompatible_cls_token`, called in `get_model` right after `_transplant_pos_embed`. Used to also cover `_patch_embed_img_size` (a `tile_size`-to-`PatchEmbed`-`img_size` conversion, needed because `tile_size` was `[width, height]` for `imagenet`/`catsdogs`; a real bug caught by a real Tier 3 run, see the Tier 3c section below) — that function was later deleted once the config/data-loading layer itself was changed to store `img_size`/`resize`/`tile_size` as `[height, width]` (see "Flipped `img_size`/`resize`/`tile_size` to `[height, width]`" further down), which made it a true no-op for every dataset. Also covers the flat (adaptive, non-`sqrt_len_method`) `pos_embed` case on a `fixed_length` mismatch: reviewing `interpolate_pos_embed_adaptive` (formerly used there, 1D linear interpolation along the sequence-slot-index axis) found it rested on an adjacency assumption adaptive-patching sequences don't actually satisfy (`FixedQuadTree`/`FixedOctTree`'s node order reflects greedy-split order, not spatial position) and, independently, never sliced out `num_prefix_tokens` first — a real, reachable bug corrupting the class-token row into the interpolation whenever `class_token:True`. Replaced with simply dropping the pretrained `pos_embed` on a mismatch (new model keeps its own fresh init); `interpolate_pos_embed_adaptive` deleted, archived at `../UCF-VIT-claude-archive/src/UCF_VIT/utils/misc.py`. `test_pretrained_loading_adaptive_patching_fixed_length_mismatch_drops_pos_embed` exercises this directly with `class_token=True` on both sides — the exact scenario that used to be corrupted. |
 | `tests/test_parse_pretrained_config.py` | `parse_pretrained_config` (+ `get_kwargs`'s per-model-type branch) for `SAP`/`UNETR`/`DiffusionVIT` as the pretrained source specifically — `tests/model/test_pretrained_loading.py`/`test_pretrained_loading_real.py` only ever use `VIT`/`MAE`. Pure `parse.py`-level (no `UCF_VIT.model.arch` import at all), so no `importorskip` needed — runs in any environment. |
-| `tests/test_train_step.py` | `training.py`'s `train_step` MAE loss dispatch: `loss_fn:"MSE"` (plain `nn.MSELoss` over every patch) and `loss_fn:"maskMSE"` (`masked_mse`, averaged only over the masked/encoder-hidden patches — the standard MAE-paper loss), for both `ap.do_ap:True` and `False`; and, `ap.do_ap:True`-only, `loss_fn:"nativeResMSE"`/`"nativeResMaskMSE"` (`native_resolution_patch_mse`/`native_resolution_patch_masked_mse` — compares against the real, native-resolution image region each adaptive patch covers, not the already-resized fixed-`interp_size` token `"MSE"`/`"maskMSE"` compare against under `do_ap:True`). `"maskMSE"` was previously dead code (the `do_ap:True` branch was a bare `#TODO`, the `do_ap:False` branch was fully written but commented out), and `"nativeRes*"` didn't exist at all — now all wired up. Uses a fake model (`train_step` only ever calls `model.forward(...)`, so a stub returning a fixed `(output, mask)` is enough, no real MAE/`timm`/`monai`/`xformers` needed). The `"MSE"`/`"maskMSE"` tests construct output so masked and unmasked patches have a different, known error, so the two losses produce different, independently-verifiable numbers from the same fixture rather than coincidentally agreeing; the `"nativeRes*"` tests verify `train_step`'s dispatch against directly calling `native_resolution_patch_mse`/`_masked_mse` itself, including that `batch["seq_ps"]` (`process_batch`'s own combined, squeezed `[size, pos]` tensor, built for the adaptive positional embedding) gets correctly sliced back apart and its `adaptive_patching_channels` dim restored. Every test also asserts the fake model was called with the expected input tensor (`batch["seq"]` vs `batch["data"]`) — `train_step`'s previously-found real bugs (see below) were all about picking the wrong branch/input, not just computing the wrong number. |
+| `tests/test_forward_step.py` | `training.py`'s `forward_step` (renamed from `train_step` — see the `eval_epoch` narrative section below) MAE loss dispatch: `loss_fn:"MSE"` (plain `nn.MSELoss` over every patch) and `loss_fn:"maskMSE"` (`masked_mse`, averaged only over the masked/encoder-hidden patches — the standard MAE-paper loss), for both `ap.do_ap:True` and `False`; and, `ap.do_ap:True`-only, `loss_fn:"nativeResMSE"`/`"nativeResMaskMSE"` (`native_resolution_patch_mse`/`native_resolution_patch_masked_mse` — compares against the real, native-resolution image region each adaptive patch covers, not the already-resized fixed-`interp_size` token `"MSE"`/`"maskMSE"` compare against under `do_ap:True`). `"maskMSE"` was previously dead code (the `do_ap:True` branch was a bare `#TODO`, the `do_ap:False` branch was fully written but commented out), and `"nativeRes*"` didn't exist at all — now all wired up. Uses a fake model (`forward_step` only ever calls `model.forward(...)`, so a stub returning a fixed `(output, mask)` is enough, no real MAE/`timm`/`monai`/`xformers` needed). The `"MSE"`/`"maskMSE"` tests construct output so masked and unmasked patches have a different, known error, so the two losses produce different, independently-verifiable numbers from the same fixture rather than coincidentally agreeing; the `"nativeRes*"` tests verify `forward_step`'s dispatch against directly calling `native_resolution_patch_mse`/`_masked_mse` itself, including that `batch["seq_ps"]` (`process_batch`'s own combined, squeezed `[size, pos]` tensor, built for the adaptive positional embedding) gets correctly sliced back apart and its `adaptive_patching_channels` dim restored. Every test also asserts the fake model was called with the expected input tensor (`batch["seq"]` vs `batch["data"]`) — `forward_step`'s previously-found real bugs (see below) were all about picking the wrong branch/input, not just computing the wrong number. |
 | `tests/integration/test_run_training_smoke_helpers.py` | `run_training_smoke.py`'s `compute_narrow_dict_idx` (real-data-found narrowing, empty-but-existing-dir and nonexistent-dir both raising `NoRealDataFoundError`, no-op for non-`iterative_dataloader` configs) and `deep_merge_config_overrides` (nested-key merge, wholesale-replace of non-dict values, new-key insertion, multiple independent sections) |
 | `tests/integration/test_feature_matrix_smoke_helpers.py` | `run_feature_matrix_smoke.py`'s `FEATURE_MATRIX` well-formedness (unique labels, real base-config paths, no accidental list-valued `tile_overlap` overrides) and — the most valuable check — every cell's tiny-model config surviving a real `parse_config` call |
 
@@ -1077,6 +1077,335 @@ tensors produce genuinely different output (not just plumbed through and
 ignored) — the actual point of the feature.
 
 Not yet verified on real Frontier hardware/data.
+
+### Added `val.py`/`test.py` and automatic train/val/test dataset splitting
+
+Previously `training_scripts/train.py` was the only training script -- the
+README said explicitly "we leave it to the user to implement their own
+validation and testing routines." Added `training_scripts/val.py` and
+`training_scripts/test.py`, structured like `train.py` but forward-only
+(`model.eval()` + `torch.no_grad()`, no optimizer/scheduler/checkpoint-save),
+plus the config-level plumbing to give them something to evaluate against
+even when a dataset has no dedicated validation/test directory (none of the
+datasets shipped with this repo do).
+
+Confirmed by direct code-reading before writing anything: `train_step`
+(`training.py`) was *already* forward-pass-only -- it's `train_epoch` that
+adds the backward/optimizer/scheduler/checkpoint-save on top -- and
+`get_model`'s `resume_from_checkpoint` branch already loads just
+`model_state_dict` with no optimizer state touched. So `eval_epoch` (new,
+mirrors `train_epoch`'s per-iteration `process_batch`->`train_step`->
+metric->print logic exactly, reusing both functions unchanged, just wrapped
+in `torch.no_grad()` with no backward/optimizer/scheduler/checkpoint) and
+`val.py`/`test.py` (which force `trainer.resume_from_checkpoint = True` in
+code and never build an optimizer/scheduler at all) needed no changes to
+either of those existing functions. Once `train_step` was genuinely shared by
+both `train_epoch` and `eval_epoch`, its name stopped being accurate (it
+never touches training-specific state at all) -- renamed to `forward_step`
+throughout (`training.py`, `tests/test_train_step.py` ->
+`tests/test_forward_step.py`, this file), a pure rename with no behavior
+change.
+
+New optional config keys (`data.dict_val_root_dirs`/`dict_test_root_dirs`,
+`dataloader.dict_val_start_idx`/`dict_val_end_idx`/`dict_test_start_idx`/
+`dict_test_end_idx`, `dataloader.val_split_ratio`/`test_split_ratio`, default
+`0.1`/`0.1`) let a dataset key either point val/test at a real, separate
+directory, or -- the common case today -- get an automatic 80/10/10 split
+carved out of that key's own already-configured `[dict_start_idx,
+dict_end_idx)` window (`UCF_VIT.parse._resolve_dataset_splits`), narrowing
+what `train.py` itself uses down from `dict_end_idx` accordingly. This *is* a
+deliberate behavior change for every shipped config (confirmed with the user
+before implementing): they all used the full `[0,1)` range for training
+before this existed, so training now uses 80% by default unless a config
+explicitly sets both ratios to `0`. Every shipped
+`configs/*/*/base_config.yaml` got explicit `val_split_ratio: 0.1`/
+`test_split_ratio: 0.1` lines added for discoverability, even though those
+match the code-level default.
+
+`_resolve_dataset_splits` resolves per dataset key independently (an
+explicit separate root for one key and auto-split for another, in the same
+config, both work correctly) and respects an *already*-narrowed
+`dict_start_idx`/`dict_end_idx` window rather than assuming `[0,1)` (e.g. a
+config already trimmed to `[0.0, 0.5)` for some other reason gets its 80/10/10
+split carved out of that 0.5-wide window, not the full directory).
+`get_split_conf(conf, "val"/"test")` returns a shallow-copied `conf` with
+just `data["dict_root_dirs"]`/`dataloader["dict_start_idx"]`/`["dict_end_idx"]`
+swapped to the resolved split -- `val.py`/`test.py` feed this straight into
+the *same* `calculate_load_balancing_on_the_fly`/`NativePytorchDataModule`
+construction `train.py` already uses, completely unchanged; no new logic was
+needed in either of those.
+
+The map-style `"dataloader"` path (catsdogs only) had no slicing mechanism
+at all before this (it just globbed every file unconditionally) -- new
+`UCF_VIT.utils.misc.slice_file_list` (mirrors `FileReader.__init__`'s own
+slice formula exactly) is applied to the globbed list in `train.py` (using
+its own, possibly-now-narrowed range -- a no-op slice for any config not
+using the new auto-split) and in `val.py`/`test.py` (using the resolved
+val/test range).
+
+**Tier 1 coverage:** `tests/test_split_resolution.py` covers
+`_resolve_dataset_splits`/`get_split_conf` directly -- default 80/10/10,
+respecting an already-narrowed window, zero-ratio reproduces the pre-existing
+100%-train behavior exactly, an explicit separate root leaves train's own
+range untouched, mixed per-key behavior across two dataset keys in one
+config, and the ratio-sum-too-large/empty-split-resolved error cases.
+`tests/test_eval_epoch.py` mirrors `test_forward_step.py`'s fake-model
+technique (a fake MAE model recording `torch.is_grad_enabled()` at each
+forward call, a fake always-iterable dataloader) to verify `eval_epoch` runs
+every iteration under `torch.no_grad()` and sums (not averages) loss across
+iterations, matching `train_epoch`'s own accumulation semantics.
+`tests/utils/test_misc.py` covers `slice_file_list` directly against
+`FileReader`'s own formula. `tests/test_config_validation.py`'s existing
+`test_shipped_config_parses` (parametrized over every real
+`configs/*/*/base_config.yaml`) now exercises the new split-resolution logic
+for real on every shipped config, confirming none of them break.
+
+**Not yet verified end-to-end on Frontier** -- recommend a real run of
+`val.py`/`test.py` against a config with an already-trained checkpoint (both
+the auto-split `iterative_dataloader` case, e.g. `basic_ct`, and the
+catsdogs map-style case), plus a rerun of the existing
+`run_feature_matrix_smoke.sh`/`run_training_smoke.sh` Tier 3 scripts to
+confirm real training runs are unaffected beyond the intentional 80%
+narrowing.
+
+#### Follow-up: fixed a real data-leakage bug the above surfaced
+
+Raised by the user immediately after the above landed: "will auto-split use
+the same files if we do a checkpoint restart?" Tracing it through found the
+answer was no -- and worse than just restarts.
+
+`NativePytorchDataModule.setup()`/`.reset()` (`datamodule.py`, pre-existing,
+called once per script invocation and once per epoch respectively) reshuffle
+each dataset key's file listing via unseeded `np.random.choice(...,
+replace=False)` for legitimate reasons (per-epoch training variety, per-rank
+sharding fairness) -- but that reshuffle happened *before*
+`dict_start_idx`/`dict_end_idx`'s ratio slice (applied inside `FileReader`,
+via `set_iterative_dataloader`). Confirmed via `grep`: no `np.random.seed`/
+`torch.manual_seed` anywhere in `src/`, so this shuffle is genuinely
+different every call. Before auto-split, `dict_start_idx`/`dict_end_idx` was
+always the full `[0,1)` range for every shipped config, so shuffling before
+taking 100% of a list was a no-op -- harmless. Once it can be a genuine
+partial range (auto-split's whole point), it stopped being harmless: which
+files count as "train" vs held-out "val"/"test" silently changed on every
+checkpoint restart, every separate `val.py`/`test.py` invocation, **and even
+between epochs of the same continuous training run** (`train.py` calls
+`reset()` after every epoch) -- real data leakage, not just a
+reproducibility nuisance.
+
+Fixed by slicing once, deterministically, in `NativePytorchDataModule.__init__`
+-- `sorted()` first (since `os.listdir`/`glob.glob`/`FileLister`'s own order
+isn't guaranteed stable across calls either), then `slice_file_list` (the
+same helper added for the catsdogs map-style path) -- replacing
+`self.dict_lister_trains[k]` with the fixed, correct membership *before*
+`setup()`/`reset()` ever see it. `set_iterative_dataloader` now passes a
+no-op `start_idx=0.0`/`end_idx=1.0` to `FileReader`, since the real slicing
+already happened. `setup()`/`reset()`'s own reshuffle is otherwise completely
+untouched -- it still reorders (and `keys_to_add`-replicates) *within* the
+now-fixed membership, exactly as intended, just never changes *which* files
+are in it. The map-style `"dataloader"` (catsdogs) path didn't have this
+exact bug (no `np.random.choice` shuffle exists there), but got the same
+`sorted()` treatment on its `glob.glob(...)` calls in `train.py`/`val.py`/
+`test.py` for the same determinism reason, since `glob.glob`'s order isn't
+guaranteed stable across separate process launches either.
+
+**Tier 1 coverage:** new `tests/dataloaders/test_datamodule_membership.py`
+constructs `NativePytorchDataModule` directly against a small real fake
+directory (`tmp_path`, no mocking) and checks `dict_lister_trains` --
+membership is identical across two separate constructions with the same
+inputs (simulating a restart), train/val/test ranges resolve to disjoint
+sets that together cover every file, and `setup()`/`reset()` never mutate
+`dict_lister_trains` itself (they build their own local shuffled copy).
+
+#### Follow-up: `allow_file_reuse` for fewer files than DDP ranks
+
+Raised by the user next, as a design question rather than a bug report:
+today, if a dataset key has fewer files than the DDP ranks x dataloader
+workers assigned to it, training fails loudly (two separate asserts --
+`calculate_load_balancing_on_the_fly`'s `min(num_images_per_rank) >= 1.0`,
+and `FileReader.__iter__`'s `per_worker > 0`, since its own worker-sharding
+divides the file list into `num_shards` *contiguous* chunks and some chunk
+comes up empty). The user proposed an opt-in way to proceed anyway, reusing
+(duplicating) files across ranks instead of failing, with a warning. Also
+flagged, correctly, when initially framed as a small/debug-dataset-only
+concern: this repo targets potentially thousands of nodes, so `data_par_size`
+can exceed a real (not toy) dataset's file count too.
+
+Implemented as a new `dataloader.allow_file_reuse` config option (default
+`False` -- the hard-fail stays the default). When `True`:
+- `calculate_load_balancing_on_the_fly` floors `num_images_per_rank`/
+  `num_images_per_rank_worker` to `1` instead of asserting, printing a
+  specific warning (files available vs. ranks x workers requested) when it
+  actually kicks in for a given key.
+- `FileReader.__iter__`'s contiguous-chunk `per_worker` computation falls
+  back to `per_worker = 1` instead of asserting when a shard would be
+  empty, and every file index is wrapped with `% len(self.file_list)`
+  (a no-op in the normal case, since `idx` never reaches the list length
+  there) -- giving round-robin reuse: shard `i` gets
+  `file_list[i % len(file_list)]`. Prints its own quantified warning
+  (oversubscription ratio) from exactly one rank/worker.
+- Both paths keep a **separate, unconditional** guard for a dataset key
+  resolving to zero files at all (`allow_file_reuse` can't reuse files that
+  don't exist) -- writing this surfaced a real, pre-existing, unrelated bug:
+  `calculate_load_balancing_on_the_fly` previously fell through a zero-files
+  key straight into a bare `ZeroDivisionError` (`total_tiles_all_data`) with
+  no clear message at all; now asserts clearly, right where `num_total_images`
+  is built, regardless of `allow_file_reuse`.
+
+**Tier 1 coverage:** `tests/dataloaders/test_dataset.py` adds three
+`FileReader`-level tests (mirroring its existing worker-sharding test
+style/fixtures) -- raises with `allow_file_reuse` off, reuses round-robin
+(verified against the exact expected `file_list[i % len(file_list)]`
+assignment) with it on, and still raises on genuinely zero files even with
+it on. `tests/utils/test_misc.py` adds the equivalent three tests for
+`calculate_load_balancing_on_the_fly` directly, against a small real fake
+`basic_ct`-shaped directory (`tmp_path`).
+
+**Immediate follow-up correction from the user:** `allow_file_reuse` should
+never apply to `val.py`/`test.py`, regardless of what the config says. Their
+whole purpose is a fixed, exact computation over the same files every time,
+so results are directly comparable across different amounts of training
+(different checkpoints/epochs) -- reuse would make the aggregate loss/
+accuracy a distorted, weighted (not uniform) average instead (files landing
+on more than one rank/worker counted more than once), and *which* files get
+duplicated can shift with `data_par_size` too, so even the bias itself
+wouldn't stay comparable across runs. If there genuinely aren't enough val/
+test files for the requested parallelism, that should still fail loudly, not
+silently evaluate on a distorted set.
+
+Fixed by overriding `allow_file_reuse:False` on `val_conf`/`test_conf`
+(`get_split_conf`'s output) right after it's built in `val.py`/`test.py`,
+before it reaches either `calculate_load_balancing_on_the_fly` or
+`NativePytorchDataModule` -- both need the override, not just one, or the
+two would disagree about whether reuse happened (`calculate_load_balancing_
+on_the_fly`'s counts assuming reuse while `FileReader` doesn't actually do
+it, or vice versa). If the config being evaluated actually set
+`allow_file_reuse:True` (for training's own sake), `val.py`/`test.py` print
+a one-line note that they're ignoring it, rather than silently diverging
+from what the config appears to say.
+
+#### Follow-up: imagenet's train/val/test split still depended on `data_par_size`
+
+Raised as a direct follow-up question after the membership-stability fix
+above: does a checkpoint restart with a different node count change which
+files land in train/val/test? For `basic_ct` (and any non-imagenet dataset),
+no -- confirmed the fix above already makes it fully independent. For
+`imagenet`, tracing it through found the answer was still yes:
+`NativePytorchDataModule.process_root_dirs`'s imagenet branch bucketed
+classes into `self.data_par_size` groups (`classes_to_combine = len(classes)
+// self.data_par_size`) *before* the train/val/test slice ever ran -- change
+`data_par_size` and the buckets regroup from different classes entirely, so
+bucket `0`'s images after a restart aren't the same images as bucket `0`
+before it, even though the slice ratio itself didn't change.
+
+This connects to something bigger than a single-file fix, though:
+`train_dataloader` picks which bucket a rank consumes by matching `gx`
+(built from `calculate_load_balancing_on_the_fly`'s own, *separate*,
+independently-implemented bucketing in `utils/misc.py`) against
+`dict_data_train`'s bucket enumeration order --
+
+```python
+group_id = np.where(np.cumsum(group_list) > ddp_rank)[0][0]
+for idx, k in enumerate(self.dict_data_train.keys()):
+    if idx == group_id:
+        data_train = self.dict_data_train[k]
+```
+
+-- so the two bucketing implementations had to agree on bucket count/order
+exactly, manually kept in sync, for rank-to-data assignment to be correct at
+all. A drift between them would silently misassign which rank trains on
+which data, in a way nothing local can catch (only a real multi-rank run
+would show it). Given that stake, this was flagged explicitly to the user
+before implementing, rather than assumed safe to fix quietly.
+
+Fixed by eliminating the duplicate-implementation risk at its root instead
+of patching around it:
+- `UCF_VIT.utils.misc.process_root_dirs` (the shared, module-level function)
+  no longer buckets by `data_par_size` for imagenet at all -- it just lists
+  every image, grouped by class, in deterministic sorted order (classes via
+  `sorted(os.listdir(...))`, images within a class now also via
+  `sorted(glob.glob(...))`, fixing a second, smaller pre-existing
+  non-determinism along the way). Same shape as the non-imagenet branch now:
+  one entry per `dict_root_dirs` key.
+- New `bucket_file_list(file_list, num_buckets)` (also `utils/misc.py`) does
+  simple, deterministic, order-preserving index-based chunking (`np.array_split`,
+  so no file is ever silently dropped for not dividing evenly -- unlike the
+  old per-class bucketing, which did drop leftover classes; see the now-removed
+  `test_process_root_dirs_imagenet_more_classes_than_data_par_size_not_evenly_
+  divisible`). Buckets are purely a rank/GPU-group assignment mechanism --
+  `FileReader.read_process_file` derives each image's label from its own
+  parent directory at read time, not from which bucket it's in -- so
+  abandoning the old "whole classes per bucket" property has no correctness
+  cost.
+- Both `calculate_load_balancing_on_the_fly` and `NativePytorchDataModule.
+  __init__` now call the exact same sequence -- `process_root_dirs` (list) ->
+  `slice_file_list` on a sorted copy (resolve train/val/test membership,
+  `data_par_size`-independent) -> `bucket_file_list` (divide the *already-
+  resolved* membership into `data_par_size` buckets) -- so bucket count/order
+  agreement between the two is now guaranteed by construction (same shared
+  functions, same inputs), not by manually keeping two implementations in
+  sync. `NativePytorchDataModule.process_root_dirs` (the class method) is now
+  a thin wrapper delegating to the shared function, removing the
+  near-duplicate implementation entirely.
+
+**Tier 1 coverage:** `tests/utils/test_misc.py`'s old bucketing-contract
+tests for `process_root_dirs` were rewritten for the new unbucketed contract
+(every image present, deterministic sorted-class order, `data_par_size`
+argument now ignored) and five new `bucket_file_list` tests added (even/
+uneven division with nothing dropped, order preservation, capping to
+`len(file_list)` buckets instead of ever producing an empty one, empty-input
+handling). `tests/dataloaders/test_datamodule_membership.py` adds three
+imagenet-specific tests, including the direct regression test for the actual
+question asked --
+`test_imagenet_membership_deterministic_across_different_data_par_size`
+constructs two `NativePytorchDataModule`s against the same directory with
+`data_par_size=100` and `data_par_size=4` and asserts the *set* of images in
+the (train-ratio) split is identical, even though bucket structure legitimately
+differs between them.
+
+**Not yet verified on real Frontier hardware** -- per the explicit risk
+discussed with the user before implementing, this needs a real multi-rank
+imagenet run to confirm rank-to-data assignment (via `gx`/`group_id`) is
+still correct end to end, not just that the two bucketing implementations
+now agree by construction.
+
+#### Immediate follow-up: `bucket_shuffle_seed`, since bucketing is now visibly contiguous
+
+Once imagenet's split no longer depended on `data_par_size`, the user spotted
+a related consequence of *how* it's independent: `process_root_dirs` lists
+images sorted class-by-class, and `bucket_file_list`'s `np.array_split` is a
+contiguous, order-preserving split -- so each bucket (and therefore each DDP
+rank) only ever gets a narrow range of adjacent classes, every epoch. Not a
+correctness bug (`FileReader.read_process_file` derives each image's label
+from its own parent directory at read time, independent of bucket identity),
+but a real data-parallel-SGD quality concern: class-homogeneous local
+batches skew BatchNorm statistics and correlate gradients within a rank's
+own step sequence.
+
+Fixed by adding an optional `shuffle_seed` parameter to `bucket_file_list`
+itself (not a separate step some caller could apply inconsistently) --
+shuffles a copy of the file list with a seeded, deterministic RNG
+(`np.random.RandomState(seed).shuffle(...)`) before chunking. Exposed as
+`dataloader.bucket_shuffle_seed` (imagenet only; default `42`, not `None` --
+shuffling is a strict improvement with no reproducibility cost, so it's on
+by default rather than opt-in; set to `null` to keep the original contiguous
+ordering). Threaded through the same `parse.py` -> `NativePytorchDataModule`/
+`calculate_load_balancing_on_the_fly` path as `allow_file_reuse`, and
+inherited unchanged by `val.py`/`test.py` via `get_split_conf` (no
+train/eval conflict here, unlike `allow_file_reuse` -- shuffling only
+affects which bucket an image lands in, never train/val/test membership, so
+there's no reason for val/test to disable it).
+
+**Tier 1 coverage:** `tests/utils/test_misc.py` adds four `bucket_file_list`
+tests (deterministic given the same seed, still covers every file exactly
+once, actually breaks up the contiguous order relative to no seed, and
+confirms no seed still preserves it). `tests/dataloaders/test_datamodule_
+membership.py` adds five imagenet-specific tests: one documenting the
+narrow-class-range problem directly (no seed -> `<=2` classes per bucket for
+a 20-classes/10-buckets fixture), one confirming a seed spreads at least one
+bucket across more than that, determinism across separate constructions
+(same as the restart-stability tests above), and -- the one that actually
+matters most -- confirming the `data_par_size`-independence fix from the
+section above still holds with shuffling layered on top of it.
 
 ## Running the distributed (Tier 2) tests
 

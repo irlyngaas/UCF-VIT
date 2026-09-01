@@ -1,4 +1,10 @@
-"""Tests for UCF_VIT.training.train_step's MAE loss dispatch.
+"""Tests for UCF_VIT.training.forward_step's MAE loss dispatch.
+
+Named forward_step (renamed from train_step) because it's purely a forward
+pass + loss computation, with no backward/optimizer step of its own -- shared
+unchanged by both train_epoch (which backpropagates the returned loss
+afterward) and eval_epoch (which doesn't), once val.py/test.py needed a
+forward-only counterpart to train.py.
 
 MAE supports four loss_fn values: "MSE" (plain nn.MSELoss over every patch,
 masked and visible alike -- model.forward's own mask return is discarded),
@@ -13,8 +19,8 @@ under do_ap:True). "maskMSE" and the two "nativeRes*" options were
 previously dead code: "maskMSE"'s do_ap:True branch was a bare
 "#TODO: elif ...", its do_ap:False branch was fully written but commented
 out, and "nativeRes*" didn't exist at all. All four are now wired up;
-these tests exercise train_step's actual dispatch for each, using a fake
-model (no real MAE/timm/monai/xformers needed -- train_step only ever
+these tests exercise forward_step's actual dispatch for each, using a fake
+model (no real MAE/timm/monai/xformers needed -- forward_step only ever
 calls model.forward(...), so a stub with the right (output, mask) return
 is enough) rather than a real end-to-end training run.
 
@@ -25,7 +31,7 @@ different, known error (masked patches off by 2, unmasked patches exact)
 numbers from the same fixture, rather than relying on both losses
 happening to agree on a trivial all-matching or all-mismatching case.
 
-train_step's real, previously-found bugs (see tests/README.md) were all
+forward_step's real, previously-found bugs (see tests/README.md) were all
 about picking the wrong branch/input tensor (do_ap not checked at all, or
 checked but reading the wrong batch key) -- so each test also asserts the
 fake model was actually called with the expected input tensor (batch["seq"]
@@ -37,7 +43,7 @@ import einops
 import pytest
 import torch
 
-from UCF_VIT.training import train_step
+from UCF_VIT.training import forward_step
 from UCF_VIT.utils.metrics import native_resolution_patch_masked_mse, native_resolution_patch_mse
 from UCF_VIT.utils.misc import patchify
 
@@ -47,7 +53,7 @@ DATA = torch.arange(1 * 1 * 4 * 4, dtype=torch.float32).reshape(1, 1, 4, 4)
 TARGET_NON_DO_AP = patchify(DATA, PATCH_SIZE, True)  # (1, 4, 4)
 
 # Equivalent do_ap input: same 4 patches x patch_dim=4, channel-first
-# (Batch, Channel, Seq_Length, Patch_Size*Patch_Size), matching train_step's
+# (Batch, Channel, Seq_Length, Patch_Size*Patch_Size), matching forward_step's
 # own einops.rearrange(batch["seq"], 'b c s p -> b s (p c)') target
 # construction.
 SEQ_DO_AP = TARGET_NON_DO_AP.unsqueeze(1)  # (1, 1, 4, 4) : (B, C, S, P)
@@ -62,7 +68,7 @@ EXPECTED_FULL_MSE = 2.0  # mean((2)**2 or 0**2) over all 16 elements = 32/16
 
 
 class _FakeMAEModel:
-    """Stub standing in for a real MAE model -- train_step only ever calls
+    """Stub standing in for a real MAE model -- forward_step only ever calls
     `.forward(x, variables, seq_ps)`, so this records what it was called
     with and returns a fixed (output, mask), no real model needed.
     """
@@ -85,45 +91,45 @@ def _conf(loss_fn, do_ap):
     }
 
 
-def test_train_step_mae_maskmse_non_do_ap_averages_only_masked_patches():
+def test_forward_step_mae_maskmse_non_do_ap_averages_only_masked_patches():
     output = TARGET_NON_DO_AP + ERROR_PER_ELEMENT
     model = _FakeMAEModel(output, MASK)
     batch = {"data": DATA, "variables": ["v0"], "seq_ps": None}
 
-    loss = train_step(_conf("maskMSE", do_ap=False), batch, model)
+    loss = forward_step(_conf("maskMSE", do_ap=False), batch, model)
 
     assert loss.item() == pytest.approx(EXPECTED_MASKED_MSE)
     assert model.calls[0] is DATA
 
 
-def test_train_step_mae_mse_non_do_ap_averages_over_every_patch():
+def test_forward_step_mae_mse_non_do_ap_averages_over_every_patch():
     output = TARGET_NON_DO_AP + ERROR_PER_ELEMENT
     model = _FakeMAEModel(output, MASK)
     batch = {"data": DATA, "variables": ["v0"], "seq_ps": None}
 
-    loss = train_step(_conf("MSE", do_ap=False), batch, model)
+    loss = forward_step(_conf("MSE", do_ap=False), batch, model)
 
     assert loss.item() == pytest.approx(EXPECTED_FULL_MSE)
     assert model.calls[0] is DATA
 
 
-def test_train_step_mae_maskmse_do_ap_averages_only_masked_patches():
+def test_forward_step_mae_maskmse_do_ap_averages_only_masked_patches():
     output = TARGET_DO_AP + ERROR_PER_ELEMENT
     model = _FakeMAEModel(output, MASK)
     batch = {"seq": SEQ_DO_AP, "variables": ["v0"], "seq_ps": None}
 
-    loss = train_step(_conf("maskMSE", do_ap=True), batch, model)
+    loss = forward_step(_conf("maskMSE", do_ap=True), batch, model)
 
     assert loss.item() == pytest.approx(EXPECTED_MASKED_MSE)
     assert model.calls[0] is SEQ_DO_AP
 
 
-def test_train_step_mae_mse_do_ap_averages_over_every_patch():
+def test_forward_step_mae_mse_do_ap_averages_over_every_patch():
     output = TARGET_DO_AP + ERROR_PER_ELEMENT
     model = _FakeMAEModel(output, MASK)
     batch = {"seq": SEQ_DO_AP, "variables": ["v0"], "seq_ps": None}
 
-    loss = train_step(_conf("MSE", do_ap=True), batch, model)
+    loss = forward_step(_conf("MSE", do_ap=True), batch, model)
 
     assert loss.item() == pytest.approx(EXPECTED_FULL_MSE)
     assert model.calls[0] is SEQ_DO_AP
@@ -135,7 +141,7 @@ def test_train_step_mae_mse_do_ap_averages_over_every_patch():
 # not the already-resized fixed-interp_size token (batch["seq"]) "MSE"/
 # "maskMSE" compare against. batch["seq_ps"] is process_batch's own combined
 # [size, pos] tensor (built for the adaptive positional embedding) -- these
-# tests also verify train_step correctly slices it back into size/pos and
+# tests also verify forward_step correctly slices it back into size/pos and
 # restores the adaptive_patching_channels==1 dim process_batch's own
 # torch.squeeze drops (see native_resolution_patch_mse's own docstring for
 # the size/pos shape contract).
@@ -166,11 +172,11 @@ def _native_res_conf(loss_fn):
     }
 
 
-def test_train_step_mae_nativeresmse_do_ap_matches_native_resolution_patch_mse():
+def test_forward_step_mae_nativeresmse_do_ap_matches_native_resolution_patch_mse():
     model = _FakeMAEModel(NATIVE_RES_OUTPUT, NATIVE_RES_MASK)
     batch = {"seq": SEQ_DO_AP, "seq_ps": NATIVE_RES_SEQ_PS, "data": NATIVE_RES_DATA, "variables": ["v0"]}
 
-    loss = train_step(_native_res_conf("nativeResMSE"), batch, model)
+    loss = forward_step(_native_res_conf("nativeResMSE"), batch, model)
 
     expected = native_resolution_patch_mse(
         NATIVE_RES_OUTPUT, NATIVE_RES_DATA,
@@ -182,11 +188,11 @@ def test_train_step_mae_nativeresmse_do_ap_matches_native_resolution_patch_mse()
     assert model.calls[0] is SEQ_DO_AP
 
 
-def test_train_step_mae_nativeresmaskmse_do_ap_matches_native_resolution_patch_masked_mse():
+def test_forward_step_mae_nativeresmaskmse_do_ap_matches_native_resolution_patch_masked_mse():
     model = _FakeMAEModel(NATIVE_RES_OUTPUT, NATIVE_RES_MASK)
     batch = {"seq": SEQ_DO_AP, "seq_ps": NATIVE_RES_SEQ_PS, "data": NATIVE_RES_DATA, "variables": ["v0"]}
 
-    loss = train_step(_native_res_conf("nativeResMaskMSE"), batch, model)
+    loss = forward_step(_native_res_conf("nativeResMaskMSE"), batch, model)
 
     expected = native_resolution_patch_masked_mse(
         NATIVE_RES_OUTPUT, NATIVE_RES_DATA,

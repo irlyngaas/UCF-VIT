@@ -48,8 +48,12 @@ def load_optimizer_scheduler_from_checkpoint(conf, optimizer, scheduler, data_se
 
     return optimizer, scheduler, loss_list, epoch_start
 
-def train_step(conf, batch, model):
-    """Runs a single forward pass and loss computation for one training batch.
+def forward_step(conf, batch, model):
+    """Runs a single forward pass and loss computation for one batch.
+
+    Purely forward-pass -- no backward, no optimizer step -- so this is shared
+    unchanged by both `train_epoch` (which backpropagates the returned loss
+    afterward) and `eval_epoch` (which doesn't).
 
     Dispatches to architecture-specific forward/loss logic based on
     `conf["model"]["type"]` (VIT classification cross-entropy, SAP/UNETR
@@ -445,7 +449,7 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
                                 # 1]) and datamodule.py's
                                 # seq_mask.permute(2, 0, 1) stacking, which
                                 # together put patch_size**2 ahead of
-                                # fixed_length). train_step's einops.rearrange
+                                # fixed_length). forward_step's einops.rearrange
                                 # ('b c (ps1 ps2) (s1 s2) -> ...') relies on
                                 # this exact order -- the previous
                                 # (fixed_length, patch_size*patch_size)
@@ -677,9 +681,9 @@ def train_epoch(conf, model, train_dataloader, epoch, iterations_per_epoch, opti
         batch = process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_scheduler)
 
         if conf["model"]["type"] in ["VIT", "UNETR"]:
-            loss, output = train_step(conf, batch, model)
+            loss, output = forward_step(conf, batch, model)
         elif conf["model"]["type"] in ["MAE", "SAP", "DiffusionVIT"]:
-            loss = train_step(conf, batch, model)
+            loss = forward_step(conf, batch, model)
 
         epoch_loss += loss.detach()
 
@@ -726,4 +730,78 @@ def train_epoch(conf, model, train_dataloader, epoch, iterations_per_epoch, opti
 
     if epoch % conf["trainer"]["save_frequency"] == 0:
         save_checkpoint(conf, model, optimizer, scheduler, epoch, loss_list)
+
+
+def eval_epoch(conf, model, eval_dataloader, epoch, iterations_per_epoch, device, tensor_par_group, ddpm_scheduler):
+    """Runs one forward-only pass over a val/test dataloader: batch loop, loss/metric, no backward.
+
+    Mirrors `train_epoch`'s per-iteration `process_batch` -> `forward_step` ->
+    accuracy/Dice metric -> print logic exactly, reusing both `process_batch`
+    and `forward_step` unchanged. Unlike `train_epoch`, the whole loop runs under
+    `torch.no_grad()` and there is no backward pass, optimizer/scheduler step,
+    or checkpoint save -- the caller is responsible for putting `model` in eval
+    mode (`model.eval()`) before calling this, same as `train_epoch`'s caller
+    is responsible for `model.train()`.
+
+    Args:
+        conf: Parsed training configuration dict (as returned by `parse_config`).
+        model: Model being evaluated.
+        eval_dataloader: Validation or test dataloader.
+        epoch: Epoch/step number, used only for logging.
+        iterations_per_epoch: Number of batches to process this pass.
+        device: Device to run the loss/accuracy accumulators on.
+        tensor_par_group: Process group for tensor-parallel batch distribution.
+        ddpm_scheduler: `DDPM_Scheduler` used when evaluating a "DiffusionVIT" model.
+
+    Returns:
+        A tuple `(epoch_loss, epoch_accuracy)` -- both `torch.Tensor` scalars,
+        summed (not averaged) over `iterations_per_epoch` batches, matching
+        `train_epoch`'s own `epoch_loss`/`epoch_accuracy` semantics.
+        `epoch_accuracy` stays 0.0 for model types that don't compute a
+        per-batch accuracy/Dice metric (MAE, SAP, DiffusionVIT).
+    """
+    epoch_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
+    epoch_accuracy = torch.tensor(0.0, dtype=torch.float32, device=device)
+    counter = 0
+    with torch.no_grad():
+        while counter < iterations_per_epoch:
+            counter = counter + 1
+
+            batch = process_batch(conf, eval_dataloader, device, tensor_par_group, ddpm_scheduler)
+
+            if conf["model"]["type"] in ["VIT", "UNETR"]:
+                loss, output = forward_step(conf, batch, model)
+            elif conf["model"]["type"] in ["MAE", "SAP", "DiffusionVIT"]:
+                loss = forward_step(conf, batch, model)
+
+            epoch_loss += loss.detach()
+
+            if conf["model"]["type"] == "VIT":
+                acc = (output.argmax(dim=1) == batch["label"]).float().mean()
+                epoch_accuracy += acc.detach()
+
+            elif conf["model"]["type"] == "UNETR":
+                post_label = AsDiscrete(to_onehot=conf["model"]["kwargs"]["num_classes"])
+                post_pred = AsDiscrete(argmax=True, to_onehot=conf["model"]["kwargs"]["num_classes"])
+                dice_acc = DiceMetric(include_background=False, reduction=MetricReduction.MEAN, get_not_nans=True)
+
+                eval_labels_list = decollate_batch(batch["label"])
+                eval_labels_convert = [post_label(eval_label_tensor) for eval_label_tensor in eval_labels_list]
+                eval_outputs_list = decollate_batch(output)
+                eval_output_convert = [post_pred(eval_pred_tensor) for eval_pred_tensor in eval_outputs_list]
+                acc = dice_acc(y_pred=eval_output_convert, y=eval_labels_convert)
+
+            if dist.get_rank() == 0:
+                if conf["model"]["type"] in ["VIT", "UNETR"]:
+                    print("epoch: ", epoch, "batch_idx", counter, "it_loss ", loss, "it_acc", acc, flush=True)
+                elif conf["model"]["type"] in ["MAE", "SAP", "DiffusionVIT"]:
+                    print("epoch: ", epoch, "batch_idx", counter, "it_loss ", loss, flush=True)
+
+    if dist.get_rank() == 0:
+        if conf["model"]["type"] == "VIT":
+            print("epoch: ", epoch, "epoch_loss ", epoch_loss, "epoch_accuracy ", epoch_accuracy, flush=True)
+        elif conf["model"]["type"] in ["MAE", "UNETR", "SAP", "DiffusionVIT"]:
+            print("epoch: ", epoch, "epoch_loss ", epoch_loss, flush=True)
+
+    return epoch_loss, epoch_accuracy
 

@@ -193,6 +193,151 @@ def get_kwargs(model_type, conf):
 
     return kwargs
 
+
+def _resolve_dataset_splits(dict_root_dirs, dict_start_idx, dict_end_idx,
+                             dict_val_root_dirs, dict_val_start_idx, dict_val_end_idx,
+                             dict_test_root_dirs, dict_test_start_idx, dict_test_end_idx,
+                             val_split_ratio, test_split_ratio):
+    """Resolves per-dataset-key train/val/test root dirs and start/end idx ratios.
+
+    For each dataset key in `dict_root_dirs`: if a separate `dict_val_root_dirs`/
+    `dict_test_root_dirs` entry exists for that key, val/test use that directory
+    with their own start/end idx (defaulting to the full [0.0, 1.0) range) and
+    train's own [dict_start_idx, dict_end_idx) window for that key is left
+    untouched. Otherwise, val/test reuse `dict_root_dirs`'s *same* directory for
+    that key, auto-splitting three contiguous, non-overlapping sub-ranges out of
+    train's own already-configured [dict_start_idx, dict_end_idx) window (not
+    assumed to be [0, 1) -- respects any existing narrowing): train keeps the
+    first `1 - val_split_ratio - test_split_ratio` portion, val the next
+    `val_split_ratio` portion, test the last `test_split_ratio` portion -- and
+    train's own start/end idx for that key is narrowed in place to reflect its
+    reduced share.
+
+    A ratio of 0.0 (with no separate root given) means that split has no data
+    for that key at all -- it's simply omitted from the returned val/test dicts,
+    rather than given a degenerate zero-width range.
+
+    Args:
+        dict_root_dirs: Training dataset-key -> root directory dict.
+        dict_start_idx: Training dataset-key -> start ratio dict (0.0-1.0).
+        dict_end_idx: Training dataset-key -> end ratio dict (0.0-1.0).
+        dict_val_root_dirs: Optional dataset-key -> val root directory dict --
+            keys present here get a real, separate val split, not auto-split.
+        dict_val_start_idx: Optional dataset-key -> val start ratio dict, only
+            meaningful for keys in `dict_val_root_dirs` (defaults to 0.0).
+        dict_val_end_idx: Optional dataset-key -> val end ratio dict, only
+            meaningful for keys in `dict_val_root_dirs` (defaults to 1.0).
+        dict_test_root_dirs: Same as `dict_val_root_dirs`, for test.
+        dict_test_start_idx: Same as `dict_val_start_idx`, for test.
+        dict_test_end_idx: Same as `dict_val_end_idx`, for test.
+        val_split_ratio: Fraction of each auto-split key's train window to
+            reserve for val (e.g. 0.1). Ignored for keys with a separate
+            `dict_val_root_dirs` entry.
+        test_split_ratio: Same as `val_split_ratio`, for test.
+
+    Returns:
+        An 8-tuple `(train_start_idx, train_end_idx, val_root_dirs,
+        val_start_idx, val_end_idx, test_root_dirs, test_start_idx,
+        test_end_idx)` of dataset-key -> value dicts.
+    """
+    train_start_idx = {}
+    train_end_idx = {}
+    val_root_dirs = {}
+    val_start_idx = {}
+    val_end_idx = {}
+    test_root_dirs = {}
+    test_start_idx = {}
+    test_end_idx = {}
+
+    for k in dict_root_dirs:
+        this_train_start = dict_start_idx.get(k, 0.0)
+        this_train_end = dict_end_idx.get(k, 1.0)
+        window = this_train_end - this_train_start
+
+        has_val_root = k in dict_val_root_dirs
+        has_test_root = k in dict_test_root_dirs
+
+        if has_val_root:
+            val_root_dirs[k] = dict_val_root_dirs[k]
+            val_start_idx[k] = dict_val_start_idx.get(k, 0.0)
+            val_end_idx[k] = dict_val_end_idx.get(k, 1.0)
+        if has_test_root:
+            test_root_dirs[k] = dict_test_root_dirs[k]
+            test_start_idx[k] = dict_test_start_idx.get(k, 0.0)
+            test_end_idx[k] = dict_test_end_idx.get(k, 1.0)
+
+        reserve_val = 0.0 if has_val_root else val_split_ratio
+        reserve_test = 0.0 if has_test_root else test_split_ratio
+        assert reserve_val >= 0.0 and reserve_test >= 0.0 and (reserve_val + reserve_test) < 1.0, (
+            f"val_split_ratio + test_split_ratio must be < 1.0 for dataset '{k}' "
+            f"(got {reserve_val} + {reserve_test})"
+        )
+
+        new_train_end = this_train_start + window * (1.0 - reserve_val - reserve_test)
+
+        if not has_val_root and reserve_val > 0.0:
+            val_root_dirs[k] = dict_root_dirs[k]
+            val_start_idx[k] = new_train_end
+            val_end_idx[k] = new_train_end + window * reserve_val
+        if not has_test_root and reserve_test > 0.0:
+            test_root_dirs[k] = dict_root_dirs[k]
+            test_start_idx[k] = new_train_end + window * reserve_val
+            test_end_idx[k] = this_train_end
+
+        train_start_idx[k] = this_train_start
+        train_end_idx[k] = new_train_end
+
+    return (train_start_idx, train_end_idx, val_root_dirs, val_start_idx, val_end_idx,
+            test_root_dirs, test_start_idx, test_end_idx)
+
+
+def get_split_conf(conf, split):
+    """Returns a shallow-copied `conf` pointed at the resolved val or test split.
+
+    Swaps `data["dict_root_dirs"]` and `dataloader["dict_start_idx"]`/
+    `["dict_end_idx"]` for the resolved `dict_val_root_dirs`/`dict_test_root_dirs`
+    (etc., see `parse_config`'s own DATA section, which calls
+    `_resolve_dataset_splits`) -- everything else in `conf` (num_channels,
+    dict_in_variables, img_size, tile_size, model kwargs, trainer settings,
+    etc.) passes through unchanged, since those describe the dataset/model, not
+    which split of it this is. The result feeds into
+    `calculate_load_balancing_on_the_fly`/`NativePytorchDataModule` exactly like
+    `conf` itself, completely unchanged -- val/test scripts just call those with
+    this instead of `conf`.
+
+    Args:
+        conf: Parsed training configuration dict, as returned by `parse_config`.
+        split: "val" or "test".
+
+    Returns:
+        A new conf dict (shallow copy of `conf`, `conf["data"]`, and
+        `conf["dataloader"]`) with `dict_root_dirs`/`dict_start_idx`/
+        `dict_end_idx` pointed at the requested split.
+
+    Raises:
+        AssertionError: If `split` isn't "val"/"test", or if that split
+            resolved to no data at all for every dataset key (no separate
+            root given and its split ratio is 0.0 for every key).
+    """
+    assert split in ("val", "test"), "split must be 'val' or 'test'"
+    root_dirs = conf["data"][f"dict_{split}_root_dirs"]
+    start_idx = conf["dataloader"][f"dict_{split}_start_idx"]
+    end_idx = conf["dataloader"][f"dict_{split}_end_idx"]
+    assert root_dirs, (
+        f"No {split} data available -- dict_{split}_root_dirs resolved empty. "
+        f"Either set data.dict_{split}_root_dirs in the config, or make sure "
+        f"dataloader.{split}_split_ratio is > 0 for at least one dataset key."
+    )
+
+    split_conf = dict(conf)
+    split_conf["data"] = dict(conf["data"])
+    split_conf["data"]["dict_root_dirs"] = root_dirs
+    split_conf["dataloader"] = dict(conf["dataloader"])
+    split_conf["dataloader"]["dict_start_idx"] = start_idx
+    split_conf["dataloader"]["dict_end_idx"] = end_idx
+    return split_conf
+
+
 def parse_config(args, load_balance_offline=False):
     """Load and validate a training configuration YAML file into a structured dict.
 
@@ -610,7 +755,30 @@ def parse_config(args, load_balance_offline=False):
         sqrt_len = None
             
         
-    data_conf = {    
+    # Resolves per-dataset-key train/val/test root dirs and start/end idx ratios --
+    # used for both dataloader.type values (iterative_dataloader and the map-style
+    # dataloader/catsdogs path both slice by dataset key and start/end ratio, just
+    # via different mechanisms downstream -- FileReader for the former, a plain
+    # list slice for the latter). See _resolve_dataset_splits's own docstring for
+    # the full train/val/test semantics; get_split_conf is what val.py/test.py use
+    # to consume the val_root_dirs/test_root_dirs results below.
+    (resolved_train_start_idx, resolved_train_end_idx,
+     resolved_val_root_dirs, resolved_val_start_idx, resolved_val_end_idx,
+     resolved_test_root_dirs, resolved_test_start_idx, resolved_test_end_idx) = _resolve_dataset_splits(
+        dict_root_dirs=conf['data']['dict_root_dirs'],
+        dict_start_idx=conf['dataloader'].get('dict_start_idx', {}) or {},
+        dict_end_idx=conf['dataloader'].get('dict_end_idx', {}) or {},
+        dict_val_root_dirs=conf['data'].get('dict_val_root_dirs', {}) or {},
+        dict_val_start_idx=conf['dataloader'].get('dict_val_start_idx', {}) or {},
+        dict_val_end_idx=conf['dataloader'].get('dict_val_end_idx', {}) or {},
+        dict_test_root_dirs=conf['data'].get('dict_test_root_dirs', {}) or {},
+        dict_test_start_idx=conf['dataloader'].get('dict_test_start_idx', {}) or {},
+        dict_test_end_idx=conf['dataloader'].get('dict_test_end_idx', {}) or {},
+        val_split_ratio=conf['dataloader'].get('val_split_ratio', 0.1),
+        test_split_ratio=conf['dataloader'].get('test_split_ratio', 0.1),
+    )
+
+    data_conf = {
         "dataset": dataset,
         "img_size": img_size,
         "tile_size": tile_size,
@@ -619,6 +787,8 @@ def parse_config(args, load_balance_offline=False):
         "default_vars": default_vars,
         "twoD": twoD,
         "dict_root_dirs": conf['data']['dict_root_dirs'],
+        "dict_val_root_dirs": resolved_val_root_dirs,
+        "dict_test_root_dirs": resolved_test_root_dirs,
         "num_channels": num_channels,
         "dict_in_variables": dict_in_variables,
         "in_chans": in_chans,
@@ -648,8 +818,18 @@ def parse_config(args, load_balance_offline=False):
 
     dataloader_conf = {
         "type": dataloader_type,
-        "dict_start_idx": conf['dataloader']['dict_start_idx'] if dataloader_type == "iterative_dataloader" else None,
-        "dict_end_idx": conf['dataloader']['dict_end_idx'] if dataloader_type == "iterative_dataloader" else None,
+        # dict_start_idx/dict_end_idx are train's own (possibly narrowed by
+        # _resolve_dataset_splits's auto-split above) start/end idx -- populated
+        # for both dataloader.type values now (previously None for "dataloader",
+        # since no slicing existed on that path at all; train.py's own catsdogs
+        # branch now applies these via slice_file_list, same as
+        # iterative_dataloader's FileReader does).
+        "dict_start_idx": resolved_train_start_idx,
+        "dict_end_idx": resolved_train_end_idx,
+        "dict_val_start_idx": resolved_val_start_idx,
+        "dict_val_end_idx": resolved_val_end_idx,
+        "dict_test_start_idx": resolved_test_start_idx,
+        "dict_test_end_idx": resolved_test_end_idx,
         "dict_buffer_sizes": conf['dataloader']['dict_buffer_sizes'] if dataloader_type == "iterative_dataloader" else None,
         "batch_size": conf['dataloader']['batch_size'],
         "num_workers": conf['dataloader']['num_workers'],
@@ -662,6 +842,33 @@ def parse_config(args, load_balance_offline=False):
         # NativePytorchDataModule's multiprocessing_context docstring entry for why a
         # config would ever set this to "spawn".
         "multiprocessing_context": conf['dataloader'].get('multiprocessing_context'),
+        # Optional, default False. When a dataset key has fewer files than the
+        # number of DDP ranks/workers assigned to it, training normally fails
+        # loudly (calculate_load_balancing_on_the_fly's and FileReader's own
+        # asserts) rather than silently letting some ranks train on no data at
+        # all. Setting this True instead lets every rank/worker get at least
+        # one file, reusing (duplicating) files across ranks/workers as needed
+        # -- with a printed warning quantifying how much reuse is happening.
+        # Not just a small/debug-dataset concern: at the node counts this repo
+        # targets, data_par_size can exceed a real (not toy) dataset's file
+        # count too. See calculate_load_balancing_on_the_fly's and
+        # FileReader.__iter__'s own comments for the mechanism.
+        "allow_file_reuse": conf['dataloader'].get('allow_file_reuse', False),
+        # Imagenet only -- seeds the shuffle bucket_file_list applies (to the
+        # already train/val/test-sliced image list) before dividing it into
+        # per-DDP-rank-group buckets. Without this, bucketing is a contiguous
+        # split of a class-sorted list, so each bucket (and therefore each
+        # rank) only ever sees a narrow range of classes every epoch -- a real
+        # concern for data-parallel SGD (class-homogeneous local batches skew
+        # BatchNorm statistics and correlate gradients within a rank's own
+        # step sequence). Defaults to a fixed seed (not None/disabled) since
+        # shuffling is a strict improvement with no reproducibility cost --
+        # same seed always gives the same shuffle, independent of
+        # data_par_size/process restarts, same as everything else about the
+        # split. Set to `null` in the config to opt out and keep the original
+        # contiguous ordering. See NativePytorchDataModule's/bucket_file_list's
+        # own comments for the full rationale.
+        "bucket_shuffle_seed": conf['dataloader'].get('bucket_shuffle_seed', 42),
 
     }
 

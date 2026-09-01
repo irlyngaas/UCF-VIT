@@ -366,61 +366,129 @@ def shard_attention_state_dict(full_state_dict, num_heads, tensor_par_size, tp_r
     return sharded
 
 
-def process_root_dirs(dataset, dict_root_dirs, data_par_size):
-    """Builds per-data-parallel-group lists of image file paths for a dataset.
+def process_root_dirs(dataset, dict_root_dirs, data_par_size=None):
+    """Builds per-dataset-key lists of image file paths.
 
-    For "imagenet", groups classes under each root directory into `data_par_size`
-    (or fewer) buckets of combined class image lists. For other datasets, lists all
-    files under each root directory's "imagesTr" subfolder, one entry per key in
-    `dict_root_dirs`.
+    For "imagenet", lists every image under each root directory (grouped by
+    class, in deterministic sorted-class/sorted-image order), one entry per key
+    in `dict_root_dirs`. For other datasets, lists all files under each root
+    directory's "imagesTr" subfolder, same shape.
+
+    Deliberately *not* bucketed by rank count here anymore -- imagenet used to
+    be split into `data_par_size` buckets internally, which made *which files
+    count as train/val/test* depend on `data_par_size` (a real problem on a
+    checkpoint restart with a different node count, or even just running
+    `val.py`/`test.py` at a different parallelism than the training run they're
+    evaluating). Bucketing now happens via `bucket_file_list`, called by
+    `calculate_load_balancing_on_the_fly`/`NativePytorchDataModule.__init__`
+    *after* they've each applied `dict_start_idx`/`dict_end_idx` slicing to this
+    function's (sorted, deterministic) output -- so which images are in a given
+    split no longer depends on rank count at all, only how that already-fixed
+    membership gets divided across ranks does.
 
     Args:
         dataset: Dataset name, e.g. "imagenet" or another supported dataset key.
-        dict_root_dirs: Dict mapping a dataset key to its root directory path.
-        data_par_size: Number of data-parallel groups to split the imagenet classes
-            across; unused for non-imagenet datasets.
+        data_par_size: Unused -- kept only so existing callers passing it
+            positionally don't need updating.
 
     Returns:
-        Dict mapping a group/dataset key to a list of file paths.
+        Dict mapping each `dict_root_dirs` key to its (sorted) list of file
+        paths.
     """
     if dataset == "imagenet":
         dict_lister_trains = {}
         for k, root_dir in dict_root_dirs.items():
-            #TODO: Add shuffling for data_par_size if it doesn't divide 1000 equally
             classes = sorted(os.listdir(root_dir))
-            if len(classes) > data_par_size:
-                classes_to_combine = int(len(classes) // data_par_size)
-            else:
-                # Fewer classes than requested buckets: one class per
-                # bucket (don't combine), giving len(classes) buckets
-                # instead of data_par_size -- matches this function's own
-                # docstring ("data_par_size (or fewer) buckets"). Previously
-                # unset in this branch, raising UnboundLocalError as soon as
-                # the loop below made its first classes_counter ==
-                # classes_to_combine check.
-                classes_to_combine = 1
             img_list = []
-            classes_counter = 0
-            num_data_roots = 0
-            for cls_name in classes: 
-                if classes_counter == classes_to_combine:
-                    classes_counter = 0
-                    img_list = []
+            for cls_name in classes:
                 cls_dir = os.path.join(root_dir, cls_name)
-                for img_path in glob.glob(os.path.join(cls_dir,"*.JPEG")):
-                    img_list.append(img_path)
-                classes_counter += 1
-            
-                if classes_counter == classes_to_combine:
-                    img_dict = {num_data_roots: img_list}
-                    dict_lister_trains.update(img_dict)
-                    num_data_roots +=1
-
-                if num_data_roots > data_par_size-1:
-                    break
+                img_list.extend(sorted(glob.glob(os.path.join(cls_dir, "*.JPEG"))))
+            dict_lister_trains[k] = img_list
     else:
         dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in dict_root_dirs.items() }
     return dict_lister_trains
+
+
+def bucket_file_list(file_list, num_buckets, shuffle_seed=None):
+    """Splits `file_list` into up to `num_buckets` roughly-equal, deterministic chunks.
+
+    Used to divide a dataset key's *already train/val/test-sliced* file list
+    into per-DDP-rank-group buckets for imagenet -- kept a separate step from
+    slicing itself (`slice_file_list`) specifically so it can run identically,
+    on the same already-resolved membership, from both
+    `calculate_load_balancing_on_the_fly` (to compute per-bucket rank ratios)
+    and `NativePytorchDataModule.__init__` (to build the real per-bucket
+    dataloader pipelines). Those two must agree exactly on bucket count/order --
+    `NativePytorchDataModule.train_dataloader` picks which bucket a rank
+    consumes by matching `calculate_load_balancing_on_the_fly`'s own per-bucket
+    rank-count string (`gx`) against `dict_data_train`'s bucket enumeration
+    order -- calling this one shared function from both guarantees that by
+    construction instead of by manually keeping two separate implementations
+    in sync.
+
+    Args:
+        file_list: List of file paths, already sliced to the desired train/
+            val/test membership (order doesn't matter for bucket *sizes*, but
+            both callers pass an already-sorted list so bucket *contents* also
+            end up identical between the two, not just bucket counts).
+        num_buckets: Requested number of buckets.
+        shuffle_seed: Optional int. If given, `file_list` is shuffled (a
+            seeded, deterministic permutation -- the same seed always produces
+            the same shuffle, independent of `data_par_size`/process restarts,
+            same as everything else about this split) before chunking, so each
+            bucket gets a representative random cross-section of `file_list`
+            instead of a contiguous range. Matters specifically for imagenet:
+            `file_list` arrives sorted class-by-class (`process_root_dirs`),
+            so without shuffling, contiguous chunking means each bucket (and
+            therefore each DDP rank) only ever sees a narrow range of classes
+            every epoch -- a real concern for data-parallel SGD (class-
+            homogeneous local batches skew BatchNorm statistics and correlate
+            gradients within a rank's own step sequence). `None` (not the
+            default at the config level -- see `parse.py`'s own
+            `bucket_shuffle_seed` comment) preserves the original ordering.
+
+    Returns:
+        Dict mapping bucket index (`0` to `min(num_buckets, len(file_list)) - 1`,
+        or just `{0: []}` if `file_list` is empty) to that bucket's file list --
+        every file appears in exactly one bucket, bucket sizes differing by at
+        most one file. Never fewer than 1 file per bucket purely from
+        over-bucketing (capped to `len(file_list)` buckets instead) -- an empty
+        bucket for that reason would otherwise trip `FileReader`'s zero-files
+        guard even under `allow_file_reuse`, which is meant for "not enough
+        files for this many ranks", not "zero files for this key at all".
+    """
+    if not file_list:
+        return {0: []}
+    if shuffle_seed is not None:
+        file_list = list(file_list)
+        np.random.RandomState(shuffle_seed).shuffle(file_list)
+    actual_buckets = min(num_buckets, len(file_list))
+    chunks = np.array_split(np.array(file_list, dtype=object), actual_buckets)
+    return {i: list(chunks[i]) for i in range(actual_buckets)}
+
+def slice_file_list(file_list, start_idx, end_idx):
+    """Slices `file_list` to the `[start_idx, end_idx)` fraction requested.
+
+    Mirrors `FileReader.__init__`'s own slicing formula exactly (see
+    `UCF_VIT.dataloaders.dataset.FileReader`) -- the map-style `"dataloader"`
+    path (catsdogs) has no `FileReader` of its own, so `train.py`/`val.py`/
+    `test.py` call this directly on the globbed file list instead, to apply the
+    same train/val/test split ratios `parse_config`'s `_resolve_dataset_splits`
+    already resolved for the `iterative_dataloader` path.
+
+    Args:
+        file_list: List of file paths, in listing order (no shuffle applied
+            here or by the caller -- the slice is deterministic).
+        start_idx: Fraction (0.0-1.0) of `file_list` to start reading from.
+        end_idx: Fraction (0.0-1.0) of `file_list` to stop reading at.
+
+    Returns:
+        The `[int(start_idx*len(file_list)), int(end_idx*len(file_list)))`
+        slice of `file_list`.
+    """
+    start = int(start_idx * len(file_list))
+    end = int(end_idx * len(file_list))
+    return file_list[start:end]
 
 def _find_representative_file(root_dir, key, what):
     """Finds one real file to sample for auto-detecting a per-dataset-key
@@ -635,7 +703,25 @@ def calculate_load_balancing_on_the_fly(conf, VERBOSE=False):
     else:
         resize = None
 
-    dict_lister_trains = process_root_dirs(dataset, dict_root_dirs, num_total_ddp_ranks)
+    dict_lister_trains = process_root_dirs(dataset, dict_root_dirs)
+
+    # For imagenet, dict_start_idx/dict_end_idx's ratio slice (on a sorted,
+    # deterministic order) must happen *before* any rank-count-dependent
+    # bucketing, or which images count as train/val/test would depend on
+    # data_par_size -- see process_root_dirs's/bucket_file_list's own comments
+    # for the full rationale. dict_root_dirs always has exactly one key for
+    # imagenet (matching dict_start_idx["imagenet"]'s own hardcoded-key read
+    # elsewhere), so slicing it here and re-keying dict_lister_trains by
+    # bucket index replaces the single "imagenet" entry entirely -- the loop
+    # below's imagenet branch then just consumes each bucket's already-correct
+    # membership as-is. Non-imagenet keys are unaffected (dict_root_dirs's own
+    # keys map 1:1 to dict_lister_trains's, no bucketing at all); their slicing
+    # happens in the loop below, unchanged except for the added sorted().
+    if dataset == "imagenet":
+        k = next(iter(dict_lister_trains))
+        sliced = slice_file_list(sorted(dict_lister_trains[k]), dict_start_idx["imagenet"], dict_end_idx["imagenet"])
+        assert len(sliced) > 0, f"Dataset '{k}' has zero files -- check dict_root_dirs/dict_start_idx/dict_end_idx."
+        dict_lister_trains = bucket_file_list(sliced, num_total_ddp_ranks, shuffle_seed=conf['dataloader'].get('bucket_shuffle_seed', 42))
 
     num_total_tiles = []
     num_total_images = []
@@ -643,12 +729,19 @@ def calculate_load_balancing_on_the_fly(conf, VERBOSE=False):
     for i, k in enumerate(dict_lister_trains.keys()):
         lister_train = dict_lister_trains[k]
         if dataset == "imagenet":
-            start_idx = int(dict_start_idx["imagenet"] * len(lister_train))
-            end_idx = int(dict_end_idx["imagenet"] * len(lister_train))
+            # Already sliced to the correct train/val/test membership and
+            # bucketed above.
+            keys = lister_train
         else:
             start_idx = int(dict_start_idx[k] * len(lister_train))
             end_idx = int(dict_end_idx[k] * len(lister_train))
-        keys = lister_train[start_idx:end_idx]
+            keys = sorted(lister_train)[start_idx:end_idx]
+            # Fails clearly here rather than falling through to a bare
+            # ZeroDivisionError further down (total_tiles_all_data would be 0) --
+            # a dataset key resolving to zero files is always a config problem,
+            # regardless of allow_file_reuse (which can't reuse files that don't
+            # exist -- see its own comment further down).
+            assert len(keys) > 0, f"Dataset '{k}' has zero files -- check dict_root_dirs/dict_start_idx/dict_end_idx."
         num_total_images.append(len(keys))
 
         if len(tile_size) == 3: #3D images
@@ -741,19 +834,38 @@ def calculate_load_balancing_on_the_fly(conf, VERBOSE=False):
     for i in range(len(ddp_rank_ratio)):
         assert ddp_rank_ratio[i] > 0, "All Datasets need at least one GPU. Add more GPUs to the training to resolve this issue, or consider removing datasets with small amounts of data"
 
+    # Optional -- default False (see parse.py's own "allow_file_reuse" comment for
+    # the full rationale). A dataset key with fewer files than DDP ranks/workers
+    # assigned to it isn't just a small/debug-dataset concern -- at the node counts
+    # this repo targets, data_par_size can exceed a real dataset's file count too.
+    allow_file_reuse = conf['dataloader'].get('allow_file_reuse', False)
+
     num_images_per_rank = []
     num_images_per_rank_worker = []
     actual_num_images_per_rank = []
+    dict_keys = list(dict_lister_trains.keys())
     for i in range(len(num_total_tiles)):
-        num_images_per_rank.append(int(math.floor(num_total_images[i] / float(ddp_rank_ratio[i]))))
-        num_images_per_rank_worker.append(int(math.floor(num_images_per_rank[i] / float(num_workers))))
-        actual_num_images_per_rank.append(num_images_per_rank_worker[i]*num_workers)
+        # num_total_images[i] > 0 already asserted above, right where it's built.
+        this_num_images_per_rank = int(math.floor(num_total_images[i] / float(ddp_rank_ratio[i])))
+        this_num_images_per_rank_worker = int(math.floor(this_num_images_per_rank / float(num_workers)))
+        if allow_file_reuse:
+            if this_num_images_per_rank_worker < 1 and dist.get_rank() == 0:
+                print(f"WARNING: dataset '{dict_keys[i]}' has only {num_total_images[i]} files for "
+                      f"{ddp_rank_ratio[i]} assigned DDP ranks x {num_workers} workers "
+                      f"({num_total_images[i] / (ddp_rank_ratio[i] * num_workers):.3g} files per rank/worker) -- "
+                      f"allow_file_reuse:True means files will be reused (duplicated) across ranks/workers this "
+                      f"epoch, each rank/worker getting exactly 1 file.", flush=True)
+            this_num_images_per_rank = max(1, this_num_images_per_rank)
+            this_num_images_per_rank_worker = max(1, this_num_images_per_rank_worker)
+        num_images_per_rank.append(this_num_images_per_rank)
+        num_images_per_rank_worker.append(this_num_images_per_rank_worker)
+        actual_num_images_per_rank.append(this_num_images_per_rank_worker*num_workers)
     if VERBOSE:
         print("Num Images Per Rank", num_images_per_rank)
         print("Num Images Per Worker", num_images_per_rank_worker)
         print("Actual Num Images Per Rank", actual_num_images_per_rank)
-    assert min(num_images_per_rank) >= 1.0, "Decrease number of GPUs, not all GPUs have at least one image"
-    assert min(num_images_per_rank_worker) >= 1.0, "Decrease number of GPUs or num_workers, not all dataloader workers have at least one image"
+    assert min(num_images_per_rank) >= 1.0, "Decrease number of GPUs, not all GPUs have at least one image. Or set dataloader.allow_file_reuse: True to let ranks reuse (duplicate) files instead."
+    assert min(num_images_per_rank_worker) >= 1.0, "Decrease number of GPUs or num_workers, not all dataloader workers have at least one image. Or set dataloader.allow_file_reuse: True to let workers reuse (duplicate) files instead."
 
     batches_per_rank = []
     batches_per_worker = []
