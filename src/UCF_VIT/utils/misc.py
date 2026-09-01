@@ -887,6 +887,33 @@ def calculate_load_balancing_on_the_fly(conf, VERBOSE=False):
             new_data = [(k, int(batches_per_worker[i]*num_workers))]
             batches_per_rank_epoch.update(new_data)
 
+    # The num_images_per_rank/num_images_per_rank_worker asserts above only
+    # guarantee at least 1 *image* per rank/worker -- not at least 1 full
+    # *batch* per rank, which needs batch_size images (drop_last=True in the
+    # DataLoader means a rank with fewer than batch_size images this epoch
+    # yields zero batches, not a smaller one). Without this check that
+    # silently propagates into a bare ZeroDivisionError deep in
+    # NativePytorchDataModule._shuffle_and_replicate
+    # (self.max_balance/self.batches_per_rank_epoch[k]) instead of a clear,
+    # actionable message here. A real way to hit this: dataloader.
+    # val_split_ratio/test_split_ratio's automatic train/val/test split
+    # narrows how many of a dataset key's images go to training, which can
+    # push an already-tight allocation (e.g. a dataset key sized close to
+    # batch_size * data_par_size) below one batch/rank even though it had
+    # enough images before the split.
+    zero_batch_keys = [k for k, v in batches_per_rank_epoch.items() if v < 1]
+    assert not zero_batch_keys, (
+        f"Dataset key(s) {zero_batch_keys} yield 0 batches per rank with "
+        f"dataloader.batch_size={batch_size} -- too few images per rank/worker after "
+        f"DDP-rank/worker sharding, and (if dataloader.val_split_ratio/test_split_ratio are "
+        f"set) after the automatic train/val/test split narrowed how many images go to "
+        f"training. Increase the available data, decrease dataloader.batch_size, decrease "
+        f"parallelism.data_par_size/dataloader.num_workers, set "
+        f"dataloader.allow_file_reuse: True to let ranks/workers reuse (duplicate) images "
+        f"instead, or lower dataloader.val_split_ratio/test_split_ratio so more data stays "
+        f"in training."
+    )
+
     if VERBOSE:
         if dataset == "imagenet":
             print("'%s': %i," % ("imagenet", int(min(batches_per_rank))))

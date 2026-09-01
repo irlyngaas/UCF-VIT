@@ -60,6 +60,7 @@ from run_training_smoke import (  # noqa: E402
     NoRealDataFoundError,
     compute_narrow_dict_idx,
     create_narrow_catsdogs_dir,
+    inflate_min_files_for_train_split,
 )
 
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule  # noqa: E402
@@ -79,12 +80,17 @@ NUM_BATCHES_TO_PULL = 4
 # basic_ct's baseline config now has do_tiling=False/twoD=False/do_ap=False,
 # so each real file is exactly one sample, no tiling/z-slice multiplication
 # -- min_files is a *total* count that the config's declared data_par_size=8
-# then divides (same as catsdogs below), unlike imagenet where
-# process_root_dirs already buckets real files one bucket per rank before
-# min_files narrows *within* each bucket, so imagenet's min_files only needs
-# to cover batch_size * NUM_BATCHES_TO_PULL per rank, not per dataset.
+# then divides (same as catsdogs below). imagenet's min_files targets
+# samples per *bucket* -- process_root_dirs no longer buckets internally
+# (see its own docstring), so _narrowed_config_path multiplies by
+# data_par_size before narrowing. All three also get scaled up via
+# inflate_min_files_for_train_split so this many files survive the automatic
+# train/val/test split, not just the initial narrowing -- without that,
+# these tight, no-margin-by-design targets can end up with 0 real batches to
+# time (see that function's own docstring for the real Frontier
+# ZeroDivisionError this fixes).
 BASIC_CT_MIN_FILES = 4 * NUM_BATCHES_TO_PULL * 8  # basic_ct/unetr's real batch_size=4 (UNETR's own decoder-memory exception -- see its config comment)
-IMAGENET_MIN_FILES = 32 * NUM_BATCHES_TO_PULL + 32  # >= 32 (real batch_size) * NUM_BATCHES_TO_PULL, with margin
+IMAGENET_MIN_FILES = 32 * NUM_BATCHES_TO_PULL + 32  # >= 32 (real batch_size) * NUM_BATCHES_TO_PULL, with margin -- per bucket
 CATSDOGS_MIN_FILES = 32 * NUM_BATCHES_TO_PULL * 8
 
 
@@ -92,8 +98,13 @@ def _narrowed_config_path(base_config_path, min_files, num_workers, tag):
     with open(base_config_path) as f:
         conf = yaml.load(f, Loader=yaml.FullLoader)
 
+    narrow_min_files = min_files
+    if conf["data"]["dataset"] == "imagenet":
+        narrow_min_files *= conf["parallelism"]["data_par_size"]
+    narrow_min_files = inflate_min_files_for_train_split(conf, narrow_min_files)
+
     try:
-        narrow_end_idx = compute_narrow_dict_idx(conf, min_files)
+        narrow_end_idx = compute_narrow_dict_idx(conf, narrow_min_files)
     except NoRealDataFoundError as e:
         pytest.skip(str(e))
 
@@ -161,7 +172,9 @@ def _narrowed_catsdogs_config_path(num_workers, tag):
     job_id = os.environ.get("SLURM_JOB_ID", str(os.getpid()))
     scratch_dir = f"/tmp/{job_id}/dataloader_speed_real/{tag}"
     try:
-        dkey, narrowed_dir = create_narrow_catsdogs_dir(conf, scratch_dir, CATSDOGS_MIN_FILES)
+        dkey, narrowed_dir = create_narrow_catsdogs_dir(
+            conf, scratch_dir, inflate_min_files_for_train_split(conf, CATSDOGS_MIN_FILES),
+        )
     except NoRealDataFoundError as e:
         pytest.skip(str(e))
     conf["data"]["dict_root_dirs"][dkey] = narrowed_dir

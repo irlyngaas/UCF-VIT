@@ -1553,6 +1553,82 @@ actually flip `pin_memory:True` in a shipped config is exactly what
 `tests/dataloaders/test_pin_memory_speed.py` (see "Running the dataloader
 speed tests" above) exists to measure with real numbers first.
 
+#### Real Frontier run (jobs 5397294/5397298) found a real `ZeroDivisionError`: the automatic train/val/test split can starve an already-tight allocation
+
+The first real Tier 2 (`pytest-distributed-5397294.out`) and Tier 3
+(`training-smoke-5397298.out`) runs against everything from this session's
+auto train/val/test splitting work onward. Tier 2: 61 passed (including,
+for the first time on real hardware, `test_eval_real_pipeline.py`'s
+checkpoint-resume/`eval_epoch` test and both `test_pretrained_loading_real.py`
+cases), 2 failed --
+`test_dataloader_real_pipeline.py::test_real_pipeline_basic_ct_unetr` (got 1
+batch, wanted 2) and `::test_real_pipeline_imagenet_classification` (got 0
+batches, wanted 2). Tier 3: all 4 `basic_ct-*` configs (diffusion/mae/sap/
+unetr) crashed identically on every rank with a bare `ZeroDivisionError` in
+`NativePytorchDataModule._shuffle_and_replicate`
+(`self.max_balance/self.batches_per_rank_epoch[k]`); `catsdogs-*`/
+`imagenet-*` all passed (fresh + resume).
+
+Root cause, same for both: `run_training_smoke.py`'s `make_smoke_config`
+narrows `basic_ct` real data to *exactly* `batch_size * data_par_size` files
+-- a pre-existing, deliberately zero-margin cap (added earlier, to keep
+`basic_ct-unetr`'s expensive full-resolution conv decoder from timing out
+the smoke test), safe as long as 100% of narrowed files went to training.
+Once `dataloader.val_split_ratio`/`test_split_ratio` (default 0.1/0.1) exist
+and apply automatically, train's own share of that narrowing shrinks to
+80% -- 80% of "exactly enough for 1 batch/rank" is *less* than 1 batch/rank,
+so `batches_per_rank_epoch["ct1"]` floors to 0. `test_dataloader_real_
+pipeline.py`'s own `BASIC_CT_MIN_FILES`/`IMAGENET_MIN_FILES` had the same
+staleness (sized for 100% going to train, before auto-split existed); the
+imagenet case is compounded by this session's own bucket-after-slice fix
+(`bucket_file_list` now divides the *narrowed* total across `data_par_size`
+buckets, not the full pre-narrowing dataset, so `min_files` no longer means
+"per bucket" the way `process_root_dirs`'s old internal bucketing made it
+mean). `catsdogs`/`imagenet` configs survived Tier 3 only because their own
+narrowing helper (`create_narrow_catsdogs_dir`) uses a *floor*
+(`max(min_files, batch_size*data_par_size)`) with real margin above it, not
+a tight cap -- basic_ct was the one config type with zero margin to begin
+with.
+
+This isn't just a test-narrowing artifact -- it means any real dataset sized
+close to `batch_size * data_par_size` hits the same bare `ZeroDivisionError`
+in production now that auto-split is on by default. Fixed two ways:
+
+1. **Production** (`UCF_VIT/utils/misc.py`,
+   `calculate_load_balancing_on_the_fly`): replaced the silent path to that
+   `ZeroDivisionError` with an explicit assert, right where
+   `batches_per_rank_epoch` is fully built -- `assert not zero_batch_keys`,
+   naming which dataset key(s) yield 0 batches/rank and listing every
+   remedy (more data, smaller `batch_size`, fewer GPUs/workers,
+   `allow_file_reuse:True`, or lower `val_split_ratio`/`test_split_ratio`).
+   **Tier 1 coverage**: `tests/utils/test_misc.py`'s new
+   `test_calculate_load_balancing_raises_when_zero_batches_per_rank` --
+   8 files / `data_par_size=8` (1 image/rank, clears the pre-existing "at
+   least one image" assert) with `batch_size=2` (needs 2), reproducing the
+   exact real failure mode as a fast, no-Frontier-needed regression test.
+2. **Test narrowing**: added `inflate_min_files_for_train_split(conf,
+   min_files)` (`tests/integration/run_training_smoke.py`, alongside
+   `compute_narrow_dict_idx`/`create_narrow_catsdogs_dir`) -- scales
+   `min_files` up by `1 / (1 - val_split_ratio - test_split_ratio)` so that
+   many files still land in *training* after the split, not just somewhere
+   in the pre-split narrowed total. `make_smoke_config` (Tier 3, shared with
+   Tier 3b) and every real-data narrowing call site
+   (`test_dataloader_real_pipeline.py`, `test_dataset_speed_real_data.py`,
+   `test_pin_memory_speed.py`) now call it before narrowing; imagenet call
+   sites additionally multiply by `data_par_size` first, to restore the
+   "per bucket" `min_files` semantics `process_root_dirs`'s old internal
+   bucketing used to provide for free. `compute_narrow_dict_idx`'s own
+   docstring updated to stop claiming imagenet narrowing is "per bucket" --
+   it isn't, since `process_root_dirs` stopped bucketing internally
+   earlier this session. **Tier 1 coverage**: 3 new tests in
+   `tests/integration/test_run_training_smoke_helpers.py` for
+   `inflate_min_files_for_train_split` itself (default ratios, explicit
+   ratios, zero-ratio no-op).
+
+**Not yet re-verified against a real Frontier run** -- this fix hasn't been
+rerun on Frontier yet; the next `run_distributed_tests.sh`/
+`run_training_smoke.sh` pair should confirm both failures are resolved.
+
 ## Running the distributed (Tier 2) tests
 
 ```bash

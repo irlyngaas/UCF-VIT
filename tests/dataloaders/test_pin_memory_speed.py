@@ -61,7 +61,7 @@ DEVICE = torch.device("cuda:0")
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(REPO_ROOT, "tests", "integration"))
 
-from run_training_smoke import NoRealDataFoundError, compute_narrow_dict_idx  # noqa: E402
+from run_training_smoke import NoRealDataFoundError, compute_narrow_dict_idx, inflate_min_files_for_train_split  # noqa: E402
 
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule  # noqa: E402
 from UCF_VIT.parse import parse_config  # noqa: E402
@@ -115,7 +115,10 @@ def _narrowed_config_path(pin_memory):
         conf = yaml.load(f, Loader=yaml.FullLoader)
 
     try:
-        narrow_end_idx = compute_narrow_dict_idx(conf, BASIC_CT_MIN_FILES)
+        # inflate_min_files_for_train_split: see its own docstring -- without
+        # it, this tight, no-margin-by-design target can lose its only batch
+        # to the automatic train/val/test split.
+        narrow_end_idx = compute_narrow_dict_idx(conf, inflate_min_files_for_train_split(conf, BASIC_CT_MIN_FILES))
     except NoRealDataFoundError as e:
         pytest.skip(str(e))
 

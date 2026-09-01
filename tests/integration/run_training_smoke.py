@@ -72,6 +72,7 @@ reusing this file's real-data-narrowing and fresh/resume-run machinery
 
 import argparse
 import glob
+import math
 import os
 import shutil
 import subprocess
@@ -142,6 +143,40 @@ class NoRealDataFoundError(Exception):
     """
 
 
+def inflate_min_files_for_train_split(conf, min_files):
+    """Scales up a `min_files` narrowing target to survive the automatic train/val/test split.
+
+    `compute_narrow_dict_idx`/`create_narrow_catsdogs_dir` narrow a dataset
+    down to (approximately) `min_files` real files -- but `parse_config`'s
+    own `dataloader.val_split_ratio`/`test_split_ratio` (default 0.1/0.1
+    each) then automatically carves *train's own* share down further, within
+    whatever `dict_start_idx`/`dict_end_idx` window narrowing already
+    produced (see `UCF_VIT.parse._resolve_dataset_splits`). Narrowing
+    straight to `min_files` and then losing 20% of it to that split can push
+    an already-tight target (e.g. exactly `batch_size * data_par_size`, "just
+    enough for one batch/rank") below one batch/rank in *training* -- a real
+    `ZeroDivisionError` this caught on Frontier (`calculate_load_balancing_
+    on_the_fly` asserts against it now, but callers narrowing real data for
+    a training run should still request enough to not hit that assert in the
+    first place). Callers that want `min_files` to land in *training specifically*
+    (not just somewhere in the narrowed pre-split total) should pass their
+    target through this before calling `compute_narrow_dict_idx`/
+    `create_narrow_catsdogs_dir`.
+
+    Args:
+        conf: A parsed (real, un-tinied) config dict, as loaded from YAML --
+            reads `conf["dataloader"].get("val_split_ratio"/"test_split_ratio", 0.1)`,
+            matching parse.py's own defaults.
+        min_files: The number of files wanted in training specifically.
+
+    Returns:
+        `min_files` scaled up by `1 / (1 - val_split_ratio - test_split_ratio)`,
+        rounded up.
+    """
+    train_share = 1.0 - conf["dataloader"].get("val_split_ratio", 0.1) - conf["dataloader"].get("test_split_ratio", 0.1)
+    return math.ceil(min_files / train_share)
+
+
 def compute_narrow_dict_idx(conf, min_files):
     """Computes tight dict_start_idx/dict_end_idx overrides from real file counts.
 
@@ -161,12 +196,15 @@ def compute_narrow_dict_idx(conf, min_files):
             Needs conf["data"]["dataset"]/["dict_root_dirs"] and
             conf["parallelism"]["fsdp_size"]/["simple_ddp_size"] (to derive
             data_par_size the same way process_root_dirs' caller does).
-        min_files: Target number of real files to keep per dataset key (or,
-            for imagenet, per data-parallel bucket -- process_root_dirs
-            partitions imagenet into one bucket per data-parallel rank, and
-            dict_start_idx/dict_end_idx["imagenet"] applies identically to
-            every bucket, so this sizes against the *smallest* bucket to
-            guarantee every bucket keeps at least min_files).
+        min_files: Target number of real files to keep per dataset key. For
+            imagenet specifically, this narrows the *whole* dataset (every
+            class combined) to approximately min_files total -- process_root_dirs
+            no longer buckets imagenet by data-parallel rank before slicing
+            (see its own docstring), so unlike before, this is NOT "min_files
+            per bucket"; NativePytorchDataModule/calculate_load_balancing_on_
+            the_fly divide whatever this narrows to across data_par_size
+            buckets afterward. Callers wanting a specific per-bucket count
+            should multiply min_files by data_par_size before calling this.
 
     Returns:
         A dict {key: fraction in (0, 1]} to use as both dict_end_idx and (with
@@ -373,7 +411,13 @@ def make_smoke_config(base_config_path, scratch_dir, min_files=DEFAULT_MIN_FILES
     # ~1 batch/rank regardless of how small its batch_size is, without
     # needing a per-config override.
     data_par_size = conf["parallelism"]["fsdp_size"] * conf["parallelism"]["simple_ddp_size"]
-    min_files = min(min_files, conf["dataloader"]["batch_size"] * data_par_size)
+    # The cap targets ~1 batch/rank in *training* -- inflate_min_files_for_
+    # train_split accounts for parse_config's own automatic train/val/test
+    # split (dataloader.val_split_ratio/test_split_ratio) narrowing train's
+    # own share further, so this many files still land in training itself,
+    # not 0 (see that function's own docstring for the real Frontier
+    # ZeroDivisionError this fixes).
+    min_files = min(min_files, inflate_min_files_for_train_split(conf, conf["dataloader"]["batch_size"] * data_par_size))
 
     conf["model"].update(TINY_MODEL_OVERRIDES)
 

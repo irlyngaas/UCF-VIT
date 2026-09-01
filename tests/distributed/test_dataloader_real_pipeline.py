@@ -71,6 +71,7 @@ from run_training_smoke import (  # noqa: E402
     NoRealDataFoundError,
     compute_narrow_dict_idx,
     create_narrow_catsdogs_dir,
+    inflate_min_files_for_train_split,
 )
 
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule  # noqa: E402
@@ -89,13 +90,18 @@ NUM_BATCHES_TO_CHECK = 2
 # so (unlike before this file's basic_ct config was baseline-ified) each real
 # file is exactly one sample, no tiling/z-slice multiplication -- min_files
 # must directly cover batch_size * NUM_BATCHES_TO_CHECK * data_par_size real
-# files, same as imagenet/catsdogs below. For imagenet, process_root_dirs
-# already buckets real files one bucket per rank before min_files narrows
-# *within* each bucket, and there's no tiling multiplication (div=1 for
-# classification) -- so min_files here must directly cover
-# batch_size * NUM_BATCHES_TO_CHECK samples per rank, not just per dataset.
+# files, same as imagenet/catsdogs below. For imagenet, process_root_dirs no
+# longer buckets by rank at all (see its own docstring) -- min_files here
+# targets samples per *bucket*; _narrowed_config_path multiplies it by
+# data_par_size before narrowing, since compute_narrow_dict_idx now narrows
+# the whole (unbucketed) dataset. Both also get scaled up via
+# inflate_min_files_for_train_split (see its own docstring) so this many
+# files survive parse_config's automatic train/val/test split, not just the
+# initial narrowing -- without that, these tight, no-margin-by-design targets
+# reproducibly hit calculate_load_balancing_on_the_fly's 0-batches-per-rank
+# assert on real Frontier data (job 5397294).
 BASIC_CT_MIN_FILES = 4 * NUM_BATCHES_TO_CHECK * 8  # basic_ct/unetr's real batch_size=4 (UNETR's own decoder-memory exception -- see its config comment), data_par_size=8
-IMAGENET_MIN_FILES = 100  # >= 32 (real batch_size) * 2 (NUM_BATCHES_TO_CHECK), with margin
+IMAGENET_MIN_FILES = 100  # >= 32 (real batch_size) * 2 (NUM_BATCHES_TO_CHECK), with margin -- per bucket
 
 # create_narrow_catsdogs_dir's min_files is a floor under max(min_files,
 # batch_size * data_par_size) -- real catsdogs/classification's batch_size=32
@@ -117,8 +123,16 @@ def _narrowed_config_path(base_config_path, min_files, tag):
     with open(base_config_path) as f:
         conf = yaml.load(f, Loader=yaml.FullLoader)
 
+    narrow_min_files = min_files
+    if conf["data"]["dataset"] == "imagenet":
+        # See compute_narrow_dict_idx's own docstring: it no longer narrows
+        # "per bucket" for imagenet, so scale up here to get min_files worth
+        # of images in each of data_par_size buckets after the fact.
+        narrow_min_files *= conf["parallelism"]["data_par_size"]
+    narrow_min_files = inflate_min_files_for_train_split(conf, narrow_min_files)
+
     try:
-        narrow_end_idx = compute_narrow_dict_idx(conf, min_files)
+        narrow_end_idx = compute_narrow_dict_idx(conf, narrow_min_files)
     except NoRealDataFoundError as e:
         pytest.skip(str(e))
 
@@ -146,7 +160,9 @@ def _narrowed_catsdogs_config_path(world_rank):
     job_id = os.environ.get("SLURM_JOB_ID", str(os.getpid()))
     scratch_dir = f"/tmp/{job_id}/dataloader_real_pipeline/catsdogs-{world_rank}"
     try:
-        dkey, narrowed_dir = create_narrow_catsdogs_dir(conf, scratch_dir, CATSDOGS_MIN_FILES)
+        dkey, narrowed_dir = create_narrow_catsdogs_dir(
+            conf, scratch_dir, inflate_min_files_for_train_split(conf, CATSDOGS_MIN_FILES),
+        )
     except NoRealDataFoundError as e:
         pytest.skip(str(e))
     conf["data"]["dict_root_dirs"][dkey] = narrowed_dir

@@ -55,7 +55,7 @@ def _make_basic_ct_dir(tmp_path, num_files):
     return str(root)
 
 
-def _basic_ct_conf(root, data_par_size, allow_file_reuse):
+def _basic_ct_conf(root, data_par_size, allow_file_reuse, batch_size=1):
     return {
         "data": {
             "dict_root_dirs": {"ct1": root},
@@ -69,7 +69,7 @@ def _basic_ct_conf(root, data_par_size, allow_file_reuse):
         "dataloader": {
             "dict_start_idx": {"ct1": 0.0},
             "dict_end_idx": {"ct1": 1.0},
-            "batch_size": 1,
+            "batch_size": batch_size,
             "num_workers": 1,
             "allow_file_reuse": allow_file_reuse,
         },
@@ -93,6 +93,22 @@ def test_calculate_load_balancing_floors_to_one_when_reuse_allowed(tmp_path):
     # Every rank gets at least 1 image (reused) -> at least 1 batch/rank/epoch,
     # not the 0 that would otherwise make the whole dataset key unusable.
     assert batches_per_rank_epoch["ct1"] >= 1
+
+
+def test_calculate_load_balancing_raises_when_zero_batches_per_rank(tmp_path):
+    # 8 files / data_par_size=8 -> exactly 1 image/rank, enough to clear the
+    # "at least one image per rank" check above -- but batch_size=2 needs 2
+    # images/rank for even one full batch (drop_last=True), so
+    # batches_per_rank_epoch["ct1"] floors to 0. Without this assert, that
+    # propagates into a bare ZeroDivisionError deep in
+    # NativePytorchDataModule._shuffle_and_replicate instead of a clear
+    # message here -- the real failure mode that surfaced on Frontier when
+    # dataloader.val_split_ratio/test_split_ratio's automatic split narrowed
+    # an already-tight basic_ct allocation below one batch/rank.
+    root = _make_basic_ct_dir(tmp_path, num_files=8)
+    conf = _basic_ct_conf(root, data_par_size=8, allow_file_reuse=False, batch_size=2)
+    with pytest.raises(AssertionError, match="0 batches per rank"):
+        calculate_load_balancing_on_the_fly(conf)
 
 
 def test_calculate_load_balancing_raises_on_zero_files_even_with_reuse_allowed(tmp_path):

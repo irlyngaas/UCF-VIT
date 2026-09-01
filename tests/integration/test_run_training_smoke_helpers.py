@@ -11,12 +11,18 @@ deep_merge_config_overrides is reused by
 tests/integration/run_feature_matrix_smoke.py (Tier 3b).
 """
 
+import math
 import os
 import tempfile
 
 import pytest
 
-from run_training_smoke import NoRealDataFoundError, compute_narrow_dict_idx, deep_merge_config_overrides
+from run_training_smoke import (
+    NoRealDataFoundError,
+    compute_narrow_dict_idx,
+    deep_merge_config_overrides,
+    inflate_min_files_for_train_split,
+)
 
 
 def _base_conf(dict_root_dirs, dataset="basic_ct"):
@@ -67,6 +73,28 @@ def test_compute_narrow_dict_idx_nonexistent_dir_raises():
 def test_compute_narrow_dict_idx_non_iterative_dataloader_is_noop():
     conf = {"dataloader": {"type": "dataloader"}}
     assert compute_narrow_dict_idx(conf, min_files=5) is None
+
+
+# ---------------------------------------------------------------------------
+# inflate_min_files_for_train_split
+# ---------------------------------------------------------------------------
+
+
+def test_inflate_min_files_for_train_split_default_ratios():
+    # No val_split_ratio/test_split_ratio given -> parse.py's own defaults
+    # (0.1/0.1 each) -> 80% train share -> scale by 1/0.8.
+    conf = {"dataloader": {}}
+    assert inflate_min_files_for_train_split(conf, 32) == math.ceil(32 / 0.8)
+
+
+def test_inflate_min_files_for_train_split_explicit_ratios():
+    conf = {"dataloader": {"val_split_ratio": 0.2, "test_split_ratio": 0.3}}
+    assert inflate_min_files_for_train_split(conf, 10) == math.ceil(10 / 0.5)
+
+
+def test_inflate_min_files_for_train_split_zero_ratios_is_noop():
+    conf = {"dataloader": {"val_split_ratio": 0.0, "test_split_ratio": 0.0}}
+    assert inflate_min_files_for_train_split(conf, 32) == 32
 
 
 # ---------------------------------------------------------------------------
