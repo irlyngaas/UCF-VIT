@@ -1625,9 +1625,45 @@ in production now that auto-split is on by default. Fixed two ways:
    `inflate_min_files_for_train_split` itself (default ratios, explicit
    ratios, zero-ratio no-op).
 
-**Not yet re-verified against a real Frontier run** -- this fix hasn't been
-rerun on Frontier yet; the next `run_distributed_tests.sh`/
-`run_training_smoke.sh` pair should confirm both failures are resolved.
+**Rerun on Frontier (jobs 5397300/5397960/5397961) found the fix above was
+itself incomplete, plus one real bug in the test-narrowing side of it:**
+
+1. `make_smoke_config`'s cap logic inflated the *cap itself*
+   (`min(min_files, inflate_min_files_for_train_split(conf, batch_size *
+   data_par_size))`) rather than the *value actually used to narrow* --
+   `min()` picks the smaller side, so whenever the caller's own `min_files`
+   (a `FEATURE_MATRIX` cell's explicit `min_files_override`, or
+   `DEFAULT_MIN_FILES` when it happened to already equal the uninflated cap,
+   e.g. every `batch_size:32` config) was already `<=` the *uninflated*
+   cap, the inflation silently never applied -- the exact bug this fix was
+   supposed to close. Caught 6 more `feature-matrix-smoke-5397300.out`
+   failures (`+do_ap`/`+do_tiling`/`+twoD` cells, whose `min_files_override`
+   is deliberately pinned smaller than the cap to begin with) and, in
+   `training-smoke-5397960.out`, `imagenet-*`/`basic_ct-diffusion`/
+   `basic_ct-mae`/`basic_ct-sap` newly failing too (previously-passing
+   `batch_size:32` configs, where `DEFAULT_MIN_FILES:256` exactly equals the
+   uninflated cap). Fixed by restructuring to two unconditional steps --
+   `min_files = min(min_files, batch_size * data_par_size)` (the original,
+   uninflated cap, unchanged), then `min_files =
+   inflate_min_files_for_train_split(conf, min_files)` (always applied to
+   whatever that produced, not folded into the `min()` itself) -- so every
+   caller's value gets inflated regardless of which side of the cap it came
+   from.
+2. `test_dataloader_real_pipeline.py`/`test_dataset_speed_real_data.py`'s
+   own new imagenet `data_par_size` multiplier
+   (`conf["parallelism"]["data_par_size"]`) read a key that doesn't exist on
+   the raw, un-parsed YAML dict these functions load directly -- `parse_config`
+   computes and adds `data_par_size` later, from `fsdp_size`/
+   `simple_ddp_size`; at this point in the code only those two exist. A bare
+   `KeyError`, caught by `pytest-distributed-5397961.out`'s remaining
+   `test_real_pipeline_imagenet_classification` failure (`basic_ct_unetr`'s
+   sibling case had already started passing by this rerun, confirming fix 1
+   above worked for it). Fixed by computing `fsdp_size * simple_ddp_size`
+   directly, matching how `make_smoke_config`/`compute_narrow_dict_idx`
+   already do it from the same raw dict.
+
+**Not yet re-verified against a real Frontier run** -- these two follow-up
+fixes haven't been rerun yet.
 
 ## Running the distributed (Tier 2) tests
 

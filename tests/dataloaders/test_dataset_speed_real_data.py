@@ -100,7 +100,9 @@ def _narrowed_config_path(base_config_path, min_files, num_workers, tag):
 
     narrow_min_files = min_files
     if conf["data"]["dataset"] == "imagenet":
-        narrow_min_files *= conf["parallelism"]["data_par_size"]
+        # data_par_size isn't a real key on this raw, un-parsed YAML dict --
+        # see test_dataloader_real_pipeline.py's identical comment.
+        narrow_min_files *= conf["parallelism"]["fsdp_size"] * conf["parallelism"]["simple_ddp_size"]
     narrow_min_files = inflate_min_files_for_train_split(conf, narrow_min_files)
 
     try:

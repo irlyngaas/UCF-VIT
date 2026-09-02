@@ -128,7 +128,11 @@ def _narrowed_config_path(base_config_path, min_files, tag):
         # See compute_narrow_dict_idx's own docstring: it no longer narrows
         # "per bucket" for imagenet, so scale up here to get min_files worth
         # of images in each of data_par_size buckets after the fact.
-        narrow_min_files *= conf["parallelism"]["data_par_size"]
+        # data_par_size isn't a real key on this raw, un-parsed YAML dict
+        # (parse_config computes and adds it later, from these two) --
+        # compute it the same way make_smoke_config/compute_narrow_dict_idx
+        # already do.
+        narrow_min_files *= conf["parallelism"]["fsdp_size"] * conf["parallelism"]["simple_ddp_size"]
     narrow_min_files = inflate_min_files_for_train_split(conf, narrow_min_files)
 
     try:

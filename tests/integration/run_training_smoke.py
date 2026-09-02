@@ -411,13 +411,22 @@ def make_smoke_config(base_config_path, scratch_dir, min_files=DEFAULT_MIN_FILES
     # ~1 batch/rank regardless of how small its batch_size is, without
     # needing a per-config override.
     data_par_size = conf["parallelism"]["fsdp_size"] * conf["parallelism"]["simple_ddp_size"]
-    # The cap targets ~1 batch/rank in *training* -- inflate_min_files_for_
-    # train_split accounts for parse_config's own automatic train/val/test
-    # split (dataloader.val_split_ratio/test_split_ratio) narrowing train's
-    # own share further, so this many files still land in training itself,
-    # not 0 (see that function's own docstring for the real Frontier
-    # ZeroDivisionError this fixes).
-    min_files = min(min_files, inflate_min_files_for_train_split(conf, conf["dataloader"]["batch_size"] * data_par_size))
+    min_files = min(min_files, conf["dataloader"]["batch_size"] * data_par_size)
+    # inflate_min_files_for_train_split accounts for parse_config's own
+    # automatic train/val/test split (dataloader.val_split_ratio/
+    # test_split_ratio) narrowing train's own share of whatever min_files
+    # ends up being -- applied unconditionally, AFTER the cap above, so it
+    # also inflates callers' explicit min_files (e.g. FEATURE_MATRIX cells'
+    # min_files_override, deliberately pinned tighter than the cap for
+    # do_ap/do_tiling/twoD's sample-count multiplication) -- not just the
+    # cap itself. Folding the inflation into the min() above instead would
+    # silently do nothing whenever the caller's own min_files was already
+    # <= the (uninflated) cap, which is exactly the common case: this many
+    # files would otherwise still land in *training* as 0, not min_files
+    # (see that function's own docstring for the real Frontier
+    # ZeroDivisionError this fixes -- job 5397300 caught this exact gap,
+    # after an earlier version of this fix only inflated the cap).
+    min_files = inflate_min_files_for_train_split(conf, min_files)
 
     conf["model"].update(TINY_MODEL_OVERRIDES)
 
