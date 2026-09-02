@@ -376,7 +376,6 @@ class VIT(nn.Module):
             self.var_embed, self.var_map = self.create_var_embedding(self.embed_dim)
             self.var_query = nn.Parameter(torch.zeros(1, self.aggregated_variables, self.embed_dim), requires_grad=True)
             #TODO: Different parameter for specifying num_heads in var_agg rather than encoder num_heads
-            #self.var_agg = nn.MultiheadAttention(self.embed_dim, self.num_heads, batch_first=True)
             self.var_agg = VariableMapping_Attention(self.embed_dim, fused_attn=self.FusedAttn_option, num_heads=self.num_heads, qkv_bias=False, tensor_par_size = self.tensor_par_size, tensor_par_group = self.tensor_par_group)
 
         if self.use_adaptive_pos_emb:
@@ -643,11 +642,7 @@ class VIT(nn.Module):
             # class_token=True if conf["model"]["type"] == "VIT" else
             # False). For every other model type, x here is whatever
             # self.token_embeds(x) produced, typically PatchEmbed's own
-            # flatten+transpose, which is non-contiguous. Real Frontier
-            # runs (basic_ct-unetr+twoD+tensor_par, basic_ct-sap+tensor_par)
-            # hit "ValueError: Tensors must be contiguous" here once
-            # get_model actually started wiring tensor_par_size into the
-            # model (this branch was previously dead code).
+            # flatten+transpose, which is non-contiguous.
             x = x.contiguous()
             dist.broadcast(x, src_rank, group=self.tensor_par_group)
 

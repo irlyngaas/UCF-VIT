@@ -49,8 +49,7 @@ def _native_resolution_patch_squared_error(output, y, size, pos, patch_size, two
     axes are used in whatever native order they arrive in -- no permutation,
     and critically, no swap. (The original, pre-vectorization implementation
     swapped `x_start`/`y_start` relative to `y`'s real axis order -- invisible
-    on square images, the same class of bug found and fixed elsewhere this
-    session; this rewrite doesn't repeat it.) For `basic_ct`'s 3D case
+    on square images. This rewrite doesn't repeat it.) For `basic_ct`'s 3D case
     specifically: nothing in this codebase's data pipeline reorders a
     volume's 3 spatial axes into a specific "height/width/depth" meaning --
     `detect_img_size`, `img_size`/`tile_size`, and the raw loaded array all

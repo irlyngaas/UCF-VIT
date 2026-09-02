@@ -166,12 +166,10 @@ class FileReader(IterableDataset):
         """
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is None:
-            # No DataLoader multiprocessing workers (num_workers=0) -- stand
-            # in with a single worker per DDP rank so this still shards by
-            # DDP rank via gx/ddp_group below. Previously this branch skipped
-            # that sharding entirely (iter_start=0, iter_end=len(file_list)),
-            # so every DDP rank silently read the *entire* file_list with
-            # num_workers=0 instead of its own shard.
+            # No DataLoader multiprocessing workers (num_workers=0) -- stand in with a
+            # single worker per DDP rank so this still shards by DDP rank via
+            # gx/ddp_group below (without this, every DDP rank would read the *entire*
+            # file_list instead of its own shard).
             assert torch.distributed.is_initialized()
             class dummy:
                 num_workers = 1

@@ -97,23 +97,13 @@ dataloader:
     'ct1': 100,
   }
   batch_size: 32
-  # SAP always does adaptive patching (do_ap:True, see the `ap:` section below) on 3D
-  # basic_ct volumes -- the heaviest per-sample CPU workload of any shipped config's
-  # DataLoader worker. Combined with tensor_par_size>1 (more NCCL process groups in the
-  # parent process), num_workers>0 forking that worker after CUDA/NCCL is already
-  # initialized (as every training script does -- get_model runs before
-  # train_dataloader) hit a real, intermittent segfault on Frontier (job 5390076).
-  # Tried multiprocessing_context:"spawn" as a fix (avoids inheriting the parent's
-  # CUDA/NCCL state at all) -- that did eliminate the original segfault signature, but
-  # traded it for a different, faster, whole-job-killing crash (job 5394881: one or
-  # more ranks died silently within 42s, no Python-level output at all, others killed
-  # by the NCCL watchdog) -- plausibly spawn conflicting with Frontier's Cray/Slurm
-  # launch environment itself. num_workers:0 sidesteps both hazards by never forking or
-  # spawning a worker process at all for this config -- data loading runs in the main
-  # process, at the cost of losing dataloader/compute overlap here. Every other shipped
-  # config keeps num_workers:1 with DataLoader's default (fork) multiprocessing_context
-  # -- see NativePytorchDataModule's multiprocessing_context docstring for the full
-  # explanation of both issues.
+  # SAP always does adaptive patching (do_ap:True) on 3D basic_ct volumes -- the
+  # heaviest per-sample CPU workload of any shipped config's DataLoader worker.
+  # num_workers>0 forks that worker after CUDA/NCCL is already initialized in the
+  # parent process, which can segfault, especially combined with tensor_par_size>1.
+  # num_workers:0 avoids forking a worker process at all, at the cost of losing
+  # dataloader/compute overlap -- see NativePytorchDataModule's multiprocessing_context
+  # docstring for the full explanation. Every other shipped config uses num_workers:1.
   num_workers: 0
   pin_memory: False
   # Optional -- default 0.1/0.1 when omitted (see UCF_VIT.parse._resolve_dataset_splits).

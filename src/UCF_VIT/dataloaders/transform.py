@@ -16,18 +16,13 @@ class Patchify(torch.nn.Module):
 
     Uses two different Canny implementations depending on `dataset`:
     `imagenet`/`catsdogs` (real, already-uint8 `[0,255]` photos, possibly
-    multi-channel) use `cv2.Canny` directly, unchanged from before. Every other
-    dataset (arbitrary-range float data, e.g. `basic_ct`) uses
-    `skimage.feature.canny` instead of `cv2.Canny((img*255).astype(np.uint8),
-    ...)` -- the old code assumed the float image was already normalized to
-    exactly `[0,1]` before scaling to `cv2.Canny`'s required 8-bit range, which
-    silently wastes dynamic range (or clips) whenever that assumption doesn't
-    hold; `skimage.feature.canny` operates on the real float values directly,
-    with no scaling/casting needed. The tradeoff: `skimage.feature.canny` only
-    accepts single-channel 2D input (unlike `cv2.Canny`, which silently
-    combines multi-channel gradients) -- this is why `imagenet`/`catsdogs`
-    (real multi-channel photos) deliberately keep `cv2.Canny` rather than
-    switching over too.
+    multi-channel) use `cv2.Canny` directly. Every other dataset (arbitrary-range
+    float data, e.g. `basic_ct`) uses `skimage.feature.canny` instead, which
+    operates on the real float values directly with no `[0,1]`-normalized
+    scaling/casting to `cv2.Canny`'s required 8-bit range needed. The tradeoff:
+    `skimage.feature.canny` only accepts single-channel 2D input (unlike
+    `cv2.Canny`, which combines multi-channel gradients), so `imagenet`/`catsdogs`
+    (real multi-channel photos) keep `cv2.Canny`.
     """
 
     def __init__(self, sths=[0,1,3,5], fixed_length=196, cannys=[50, 100], canny_quantiles=(0.7, 0.9), interp_size=16, num_channels=3, dataset="imagenet", return_edges=False) -> None:
@@ -141,58 +136,15 @@ class Patchify_3D(torch.nn.Module):
     """Adaptive (octree-based) patchification transform for 3D volumes.
 
     Detects edges per-channel with a genuinely 3D Canny filter
-    (`SimpleITK.CannyEdgeDetection`), weights each voxel by how many
-    channels independently flag it as an edge, builds a `FixedOctTree` over
-    the result, and serializes the volume into a fixed-length sequence of
-    variable-sized patches concentrated around detected edges.
+    (`SimpleITK.CannyEdgeDetection`), weights each voxel by how many channels
+    independently flag it as an edge (a voxel edge on N channels scores Nx a
+    voxel edge on 1 channel), builds a `FixedOctTree` over the result, and
+    serializes the volume into a fixed-length sequence of variable-sized
+    patches concentrated around detected edges.
 
-    Replaced an earlier per-slice, per-channel `cv2.Sobel`/`cv2.Canny`
-    pipeline (archived at
-    `../UCF-VIT-claude-archive/src/UCF_VIT/dataloaders/transform.py`) for
-    two real, verified reasons:
-
-    1. That pipeline only ever computed 2D (in-plane) gradients/edges, one
-       slice at a time -- no derivative along the depth axis was ever
-       computed. Verified directly: a synthetic volume that's a step
-       function purely along depth (uniform within every slice, only a hard
-       transition *across* slices) produced zero detected edges there,
-       while `SimpleITK.CannyEdgeDetection` (a genuine 3D Canny -- one call
-       over the whole volume per channel, not a per-slice loop) correctly
-       marks the transition plane. A real blind spot for volumes where
-       depth-direction structure matters, not just a style difference.
-    2. Its per-slice `cv2.Canny` calls needed `(slice*255).astype(np.uint8)`
-       to satisfy `cv2.Canny`'s 8-bit input requirement, silently assuming
-       the float volume was already normalized to exactly `[0,1]` --
-       wrong (wastes dynamic range, or clips) whenever that assumption
-       doesn't hold. `SimpleITK.CannyEdgeDetection` operates on the real
-       float values directly.
-
-    The old pipeline's separate Sobel-based `gradient_direction`
-    computation and the direction-consistency gate built on it
-    (`edge_data_normalized > threshold`) were dropped entirely, not
-    reimplemented in 3D: that gate was built on a strictly 2D angle
-    (`arctan2(sobely, sobelx)`) with no natural 3D generalization, and its
-    likely purpose -- suppressing noisy/spurious edges from a per-slice,
-    single-"best-channel" accumulation -- is largely redundant with what a
-    real per-channel 3D Canny already provides (its own
-    non-max-suppression + hysteresis thresholding already produces a
-    clean, thinned edge mask, not a noisy raw threshold). `FixedOctTree`'s
-    consumed score is only ever used for relative (`max()`-based)
-    comparison during tree-building (see `Cube.contains`'s own docstring),
-    never read for its precise value elsewhere, so the simpler score below
-    doesn't need to also be a "clean" signal, just a meaningfully-ordered
-    one.
-
-    The per-channel-edge-count weighting itself (give more weight to a
-    voxel flagged as an edge on more channels) is preserved exactly --
-    verified directly that a per-channel `SimpleITK.CannyEdgeDetection`-
-    then-accumulate loop produces the identical counter semantics (a voxel
-    edge on 2 channels scores 2x a voxel edge on 1 channel) as the old
-    pipeline's `edges_combined_counter`, just fed by genuinely 3D
-    per-channel edge masks instead of stacked-per-slice 2D ones.
-    `SimpleITK.CannyEdgeDetection` doesn't support multi-channel/vector
-    images directly (verified) -- confirmed this is why the per-channel
-    loop is still needed at all, not something the 3D switch removes.
+    `SimpleITK.CannyEdgeDetection` doesn't support multi-channel/vector images
+    directly, so edge detection runs per channel and the results are combined
+    by the weighting above rather than in a single multi-channel call.
     """
 
     def __init__(self, sths=[0.5,1.0,2.0], fixed_length=196, canny_thresholds=(0.05, 0.15), interp_size=16, num_channels=3, dataset="basic_ct", return_edges=False) -> None:

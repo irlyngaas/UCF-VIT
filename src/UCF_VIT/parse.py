@@ -376,13 +376,10 @@ def parse_config(args, load_balance_offline=False):
     # resume_from_checkpoint continues an existing run from its own checkpoint
     # (optimizer/scheduler state, loss history, epoch included); use_pretrained_model
     # starts a new run whose encoder is initialized from a *different* model's
-    # weights. Previously, setting both True silently dropped use_pretrained_model
-    # with no warning at all (see the "use_pretrained_model" entry in trainer_conf
-    # below, and parse_pretrained_config's own identical silent override) -- now
-    # rejected explicitly instead. .get (not a bare index) because
-    # use_pretrained_model is allowed to be omitted entirely when
-    # resume_from_checkpoint:True (trainer_conf's own ternary below never evaluates
-    # it in that case either).
+    # weights -- the two are mutually exclusive, rejected explicitly if both are
+    # True. .get (not a bare index) because use_pretrained_model is allowed to
+    # be omitted entirely when resume_from_checkpoint:True (trainer_conf's own
+    # ternary below never evaluates it in that case either).
     if resume_from_checkpoint and conf['trainer'].get('use_pretrained_model', False):
         sys.exit("trainer.resume_from_checkpoint and trainer.use_pretrained_model cannot both be True -- resume_from_checkpoint continues an existing training run from its own checkpoint, use_pretrained_model starts a new run initialized from a different model's weights. Set only one of them to True.")
 
@@ -410,10 +407,6 @@ def parse_config(args, load_balance_offline=False):
         "checkpoint_filename": conf['trainer']['checkpoint_filename'],
         "resume_from_checkpoint": resume_from_checkpoint,
         "use_pretrained_model": conf['trainer']['use_pretrained_model'] if not resume_from_checkpoint else False,
-        # Never copied through before -- parse_pretrained_config's own read
-        # of this (both its checkpoint-existence check and the actual
-        # filename get_model's pretrained branch loads) always KeyError'd,
-        # unconditionally, whenever use_pretrained_model:True.
         "pretrained_checkpoint_filename": conf['trainer'].get('pretrained_checkpoint_filename', ""),
         "save_frequency": save_frequency,
         "optimizer_type": optimizer_type,
@@ -965,20 +958,18 @@ def parse_pretrained_config(args, conf):
         tensor_par_size = pretrained_conf["parallelism"]["tensor_par_size"]
         assert tensor_par_size == conf["parallelism"]["tensor_par_size"], "Tensor_par_size of the pre-trained model needs to match the tensor_par_size of the model to be trained"
 
-        #TODO: If tensor_parallel check if all checkpoint files exist
-        #Check if all checkpoint file exists, for given parallelism setup
         # Real filename save_checkpoint (training.py) actually writes is
         # "<pretrained_checkpoint_filename>_rank_<N>.ckpt", not a bare
-        # "<pretrained_checkpoint_filename>" file -- the previous check here
-        # looked for a file that's never written by any real training run,
-        # so use_pretrained_model:True always failed with "Checkpoint file
-        # does not exist" for real (confirmed by a real Frontier run, job
-        # 5348717). Checking rank 0's file specifically (not per-tensor-
-        # parallel-rank, per the TODO above) mirrors run_training_smoke.py's
-        # own rank0_checkpoint_exists.
-        checkpointExists = os.path.isfile(os.path.join(pretrained_conf["trainer"]["checkpoint_path"],conf["trainer"]["pretrained_checkpoint_filename"]+"_rank_0.ckpt"))
-        if not checkpointExists:
-            sys.exit("Checkpoint file does not exist")
+        # "<pretrained_checkpoint_filename>" file -- check against that, not
+        # the bare filename. get_model's own pretrained-loading branch reads
+        # a separate file per tensor-parallel rank (world_rank <
+        # tensor_par_size), so every one of those must exist, not just rank 0's.
+        missing_ranks = [
+            r for r in range(tensor_par_size)
+            if not os.path.isfile(os.path.join(pretrained_conf["trainer"]["checkpoint_path"], conf["trainer"]["pretrained_checkpoint_filename"]+"_rank_"+str(r)+".ckpt"))
+        ]
+        if missing_ranks:
+            sys.exit(f"Checkpoint file does not exist for tensor-parallel rank(s) {missing_ranks}")
 
         model_type = pretrained_conf["model"]["type"]
         # pretrained_conf, not conf: kwargs here are for constructing

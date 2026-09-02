@@ -22,6 +22,7 @@ import argparse
 import os
 import tempfile
 
+import pytest
 import yaml
 
 from UCF_VIT.parse import parse_config, parse_pretrained_config
@@ -141,6 +142,40 @@ def test_parse_pretrained_config_unetr_source():
     # (only True when UNETR itself has do_ap:True; see get_kwargs's own
     # UNETR branch).
     assert p_conf["kwargs"]["sqrt_len_method"] is False
+
+
+def test_parse_pretrained_config_checks_every_tensor_par_rank_checkpoint_file():
+    # get_model's pretrained-loading branch reads a separate checkpoint file
+    # per tensor-parallel rank (world_rank < tensor_par_size), so the
+    # pre-flight existence check must confirm all of them exist, not just
+    # rank 0's -- only rank 0's file is created here, so this should fail
+    # fast on rank 1's, rather than passing and only failing later, deep
+    # inside get_model, on whichever rank actually tries to load it.
+    pretrained_conf = _base_config("MAE", do_ap=False, checkpoint_path="")
+    pretrained_conf["parallelism"]["tensor_par_size"] = 2
+    downstream_conf = _base_config("VIT", do_ap=False, checkpoint_path="", extra_model={"num_classes": 3})
+    downstream_conf["parallelism"]["tensor_par_size"] = 2
+
+    scratch = tempfile.mkdtemp()
+    pretrained_path = os.path.join(scratch, "pretrained.yaml")
+    downstream_path = os.path.join(scratch, "downstream.yaml")
+
+    pretrained_conf["trainer"]["checkpoint_path"] = os.path.join(scratch, "pretrained_ckpt")
+    os.makedirs(pretrained_conf["trainer"]["checkpoint_path"])
+    open(os.path.join(pretrained_conf["trainer"]["checkpoint_path"], "epoch_0_rank_0.ckpt"), "w").close()
+    # epoch_0_rank_1.ckpt deliberately not created.
+
+    downstream_conf["trainer"]["checkpoint_path"] = os.path.join(scratch, "downstream_ckpt")
+    downstream_conf["trainer"]["use_pretrained_model"] = True
+    downstream_conf["trainer"]["pretrained_checkpoint_filename"] = "epoch_0"
+
+    _write(pretrained_path, pretrained_conf)
+    _write(downstream_path, downstream_conf)
+
+    args = argparse.Namespace(config=downstream_path, pretrained_config=pretrained_path)
+    conf = parse_config(args, load_balance_offline=True)
+    with pytest.raises(SystemExit, match=r"\[1\]"):
+        parse_pretrained_config(args, conf)
 
 
 def test_parse_pretrained_config_diffusionvit_source():

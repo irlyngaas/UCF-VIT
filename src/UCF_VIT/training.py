@@ -94,15 +94,11 @@ def forward_step(conf, batch, model):
     
     elif conf["model"]["type"] == "SAP":
         if conf["data"]["twoD"]:
-            #seq = torch.reshape(seq, shape=(-1,in_chans,patch_size*sqrt_len, patch_size*sqrt_len))
             seq = einops.rearrange(batch["seq"], 'b c (s1 s2) (ps1 ps2)-> b c (s1 ps1) (s2 ps2)', s1=conf["model"]["kwargs"]["sqrt_len"], s2=conf["model"]["kwargs"]["sqrt_len"], ps1=conf["data"]["interp_size"], ps2=conf["data"]["interp_size"])
-            #seq_label = torch.reshape(seq_label, shape=(-1,num_classes,patch_size*sqrt_len, patch_size*sqrt_len))
             seq_label = einops.rearrange(batch["seq_label"], 'b c (ps1 ps2) (s1 s2)-> b c (s1 ps1) (s2 ps2)', s1=conf["model"]["kwargs"]["sqrt_len"], s2=conf["model"]["kwargs"]["sqrt_len"], ps1=conf["data"]["interp_size"], ps2=conf["data"]["interp_size"])
 
         else:
-            #seq = torch.reshape(seq, shape=(-1,in_chans,patch_size*sqrt_len, patch_size*sqrt_len, patch_size*sqrt_len))
             seq = einops.rearrange(batch["seq"], 'b c (s1 s2 s3) (ps1 ps2 ps3)-> b c (s1 ps1) (s2 ps2) (s3 ps3)', s1=conf["model"]["kwargs"]["sqrt_len"], s2=conf["model"]["kwargs"]["sqrt_len"], s3=conf["model"]["kwargs"]["sqrt_len"], ps1=conf["data"]["interp_size"], ps2=conf["data"]["interp_size"], ps3=conf["data"]["interp_size"])
-            #seq_label = torch.reshape(seq_label, shape=(-1,num_classes,patch_size*sqrt_len, patch_size*sqrt_len, patch_size*sqrt_len))
             seq_label = einops.rearrange(batch["seq_label"], 'b c (ps1 ps2 ps3) (s1 s2 s3)-> b c (s1 ps1) (s2 ps2) (s3 ps3)', s1=conf["model"]["kwargs"]["sqrt_len"], s2=conf["model"]["kwargs"]["sqrt_len"], s3=conf["model"]["kwargs"]["sqrt_len"], ps1=conf["data"]["interp_size"], ps2=conf["data"]["interp_size"], ps3=conf["data"]["interp_size"])
         
         output = model.forward(seq, batch["variables"], batch["seq_ps"])
@@ -216,20 +212,14 @@ def get_batch(conf, it_loader):
     except RuntimeError as e:
         # PyTorch's own DataLoader raises exactly this wording (dataloader.py's
         # _try_get_data) when a worker process dies without a normal Python
-        # exception -- most commonly a segfault (str(e.__cause__), if set,
-        # usually names the signal directly, e.g. "is killed by signal:
-        # Segmentation fault"). Only fires when num_workers > 0 -- with
-        # num_workers:0 there's no worker process to die, so this can't be a
-        # false positive. Root-caused for this codebase's own training.py
-        # (get_model always initializes CUDA/NCCL before train_dataloader is
-        # ever constructed) as a fork-after-CUDA-init hazard, especially when
-        # combining dataloader.num_workers > 0, parallelism.tensor_par_size > 1,
-        # and ap.do_ap:True on 3D data (heavy per-sample CPU work in the
-        # worker) -- see configs/basic_ct/sap/base_config.yaml's own
-        # num_workers comment and tests/README.md for the real Frontier
-        # incident (job 5390076) this was diagnosed from, including why
-        # multiprocessing_context:"spawn" is not a safe blanket fix either
-        # (job 5394881 crashed differently under spawn, on this same cluster).
+        # exception -- most commonly a segfault. Only fires when num_workers > 0.
+        # Root cause: get_model always initializes CUDA/NCCL before
+        # train_dataloader is ever constructed, so num_workers > 0 forks a worker
+        # after CUDA is already active in the parent -- a documented hazard,
+        # especially combined with tensor_par_size > 1 and ap.do_ap:True on 3D
+        # data (heavy per-sample CPU work in the worker). multiprocessing_context:
+        # "spawn" is not a safe blanket fix either -- it can crash differently on
+        # some clusters.
         if "exited unexpectedly" in str(e) and conf["dataloader"]["num_workers"] > 0:
             raise RuntimeError(
                 f"{e}\n\nThis usually means a DataLoader worker process crashed "
@@ -397,23 +387,13 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
                     dict_key = "imagenet"
 
             if dataset != "imagenet":
-                # broadcast_object_list already handles a variable-length
-                # pickled object directly (that's the whole point of the
-                # "object" collectives, unlike dist.broadcast which needs a
-                # fixed pre-known tensor shape) -- broadcasting dict_key
-                # itself as a single-element list is simpler and more robust
-                # than the previous character-splitting scheme (a separate
-                # length broadcast + list(dict_key) + ''.join(...)), which
-                # was fragile and, even after fixing its str-vs-list and
-                # missing-device bugs, still occasionally produced an empty
-                # dict_key on the receiver for reasons never fully isolated.
-                # device=device: broadcast_object_list's own docs warn that
-                # for NCCL groups its internal object-size/pickled-bytes
-                # tensors must live on this rank's GPU, and without an
-                # explicit device it falls back to
-                # torch.cuda.current_device() -- relying on that global
-                # implicitly (rather than the device this function already
-                # has in hand) risks the same kind of corruption.
+                # broadcast_object_list handles a variable-length pickled object directly
+                # (unlike dist.broadcast, which needs a fixed pre-known tensor shape), so
+                # dict_key is broadcast as a single-element list. device=device is
+                # required: broadcast_object_list's own docs warn that for NCCL groups its
+                # internal object-size/pickled-bytes tensors must live on this rank's GPU,
+                # and omitting it falls back to torch.cuda.current_device(), an implicit
+                # global that may not match the device this function already has in hand.
                 dict_key_holder = [dict_key] if dist.get_rank(tensor_par_group) == 0 else [None]
                 dist.broadcast_object_list(dict_key_holder, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group, device=device)
                 dict_key = dict_key_holder[0]
@@ -450,35 +430,20 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
                             label = torch.zeros(batch_size, dtype=torch.int64).to(device)
                         else: #Segmentation
                             # Real basic_ct label is uint8 (see dataset.py's
-                            # np.asarray(np_label, dtype=np.uint8)), not
-                            # precision_dt -- dist.broadcast fills values into
-                            # the existing tensor without casting, so a
-                            # dtype mismatch between sender and receiver here
-                            # (previously precision_dt, a float type) silently
-                            # corrupts the transfer -- this exact
-                            # do_ap:True + Segmentation + tensor_par_size>1
-                            # combination was never exercised before
-                            # basic_ct-sap+tensor_par (SAP is the only model
-                            # requiring do_ap:True).
+                            # np.asarray(np_label, dtype=np.uint8)), not precision_dt --
+                            # dist.broadcast fills values into the existing tensor without
+                            # casting, so a sender/receiver dtype mismatch here silently
+                            # corrupts the transfer.
                             label = torch.zeros(batch_size, 1, tile_size[0], tile_size[1], dtype=torch.uint8).to(device)
                             if conf["model"]["type"] in ["UNETR", "SAP"]:
-                                # Real seq_label is (batch_size, num_classes,
-                                # patch_size*patch_size, fixed_length) -- the
-                                # patch-volume dim comes BEFORE fixed_length,
-                                # not after (see dataset.py's
-                                # np.reshape(seq_label, [patch_size**2, -1,
-                                # 1]) and datamodule.py's
-                                # seq_mask.permute(2, 0, 1) stacking, which
-                                # together put patch_size**2 ahead of
-                                # fixed_length). forward_step's einops.rearrange
-                                # ('b c (ps1 ps2) (s1 s2) -> ...') relies on
-                                # this exact order -- the previous
-                                # (fixed_length, patch_size*patch_size)
-                                # ordering here matched the real tensor's
-                                # *total* element count but not its per-axis
-                                # shape, so it broadcast fine but then failed
-                                # downstream with einops.EinopsError: Shape
-                                # mismatch on non-rank-0 processes.
+                                # Real seq_label is (batch_size, num_classes, patch_size*patch_size,
+                                # fixed_length) -- the patch-volume dim comes BEFORE fixed_length, not
+                                # after (see dataset.py's np.reshape(seq_label, [patch_size**2, -1, 1])
+                                # and datamodule.py's seq_mask.permute(2, 0, 1) stacking).
+                                # forward_step's einops.rearrange ('b c (ps1 ps2) (s1 s2) -> ...')
+                                # relies on this exact order -- a placeholder with the right element
+                                # count but wrong per-axis shape broadcasts fine but fails downstream
+                                # with einops.EinopsError.
                                 seq_label = torch.zeros(batch_size, conf["model"]["kwargs"]["num_classes"], interp_size*interp_size, fixed_length, dtype=precision_dt).to(device)
                 else:
                     data = torch.zeros(batch_size, num_channels[dict_key], tile_size[0], tile_size[1], tile_size[2], dtype=precision_dt).to(device)
@@ -665,9 +630,6 @@ def save_checkpoint(conf, model, optimizer, scheduler, epoch, loss_list):
             }, conf["trainer"]["checkpoint_path"]+"/epoch_"+str(epoch)+"_rank_"+str(dist.get_rank())+".ckpt")
 
     dist.barrier()
-    #del model_states
-    #del optimizer_states
-    #del scheduler_states
 
 def train_epoch(conf, model, train_dataloader, epoch, iterations_per_epoch, optimizer, scheduler, grad_scaler, min_scale, loss_list, device, tensor_par_group, ddpm_scheduler):
     """Runs one full training epoch: batch loop, backward pass, optimizer/scheduler step, checkpointing.

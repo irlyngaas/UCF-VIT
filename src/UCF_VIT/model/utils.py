@@ -125,14 +125,8 @@ def _transplant_pos_embed(encoder_dict, pretrained_model, model):
         # reliable relationship to slot index N+1 at all (FixedQuadTree/
         # FixedOctTree's own node order reflects greedy-split order, not
         # spatial adjacency), so there's no principled way to resize it the
-        # way a real spatial grid can be. (An earlier version of this
-        # function tried a 1D linear interpolation along the slot-index axis
-        # regardless -- archived at
-        # ../UCF-VIT-claude-archive/src/UCF_VIT/utils/misc.py -- which both
-        # rested on that unfounded adjacency assumption and, independently,
-        # never sliced out num_prefix_tokens first, corrupting the
-        # class-token row into the interpolation whenever class_token:True.)
-        # Same reasoning as sqrt_len_method's rejection above, just handled
+        # way a real spatial grid can be. Same reasoning as sqrt_len_method's
+        # rejection above, just handled
         # by dropping rather than raising, since a size mismatch here is a
         # real, unremarkable scenario (e.g. fine-tuning at a different
         # fixed_length): the new model just keeps its own fresh init.
@@ -283,19 +277,14 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
         # actually call each block with the extra `t` argument Block_diffusion
         # requires, so this must stay DiffusionVIT-only.
         block_fn=Block_diffusion if conf["model"]["type"] == "DiffusionVIT" else Block,
-        # Without these, VIT/SAP/MAE/UNETR/DiffusionVIT all fall back to
-        # their constructor defaults (tensor_par_size=1, tensor_par_group=
-        # None) regardless of conf["parallelism"]["tensor_par_size"] --
-        # conf['model']['kwargs'] (built by parse.py's get_kwargs) never
-        # sets them either. That silently built a full, unsharded model on
-        # every rank even when tensor_par_size > 1: every `if
-        # self.tensor_par_size > 1:` guard in arch.py/building_blocks.py
-        # (the real Attention/Mlp sharding, MAE's noise-mask broadcast,
-        # etc.) never fired, so tensor_par_size > 1 ran to completion (data
-        # was still correctly distributed by training.py's process_batch,
-        # which gets tensor_par_group directly from train.py, not through
-        # this function) but did zero actual model-parallel sharding --
-        # pure redundant compute, not real tensor parallelism.
+        # Required: without these, every model type silently falls back to
+        # tensor_par_size=1/tensor_par_group=None regardless of
+        # conf["parallelism"]["tensor_par_size"] (conf['model']['kwargs'],
+        # built by parse.py's get_kwargs, never sets them either) -- every
+        # `if self.tensor_par_size > 1:` sharding guard in arch.py/
+        # building_blocks.py then never fires, so tensor_par_size > 1 runs
+        # to completion but does zero actual model-parallel sharding
+        # (silent, not an error).
         tensor_par_size=conf["parallelism"]["tensor_par_size"],
         tensor_par_group=tensor_par_group,
         **conf['model']['kwargs'],
@@ -375,23 +364,19 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
             _transplant_pos_embed(encoder_dict, pretrained_model, model)
             _prune_incompatible_cls_token(encoder_dict, model)
 
-            #Load encoder states from pretrained model into the model we want to train
             model_dict = model.state_dict()
             model_dict.update(encoder_dict)
             model.load_state_dict(model_dict)
 
         else: #Train from scratch
-            if world_rank==0:       
+            if world_rank==0:
                 print("Train from scratch.",flush=True)
 
-                #Check whether the specified checkpointing path exists or not
                 isExist = os.path.exists(conf["trainer"]["checkpoint_path"])
                 if not isExist:
-                    #Create a new directory because it does not exist
                     os.makedirs(conf["trainer"]["checkpoint_path"])
                     print("The new checkpoint directory is created!")
 
-                #Save initial model weights and distribute to all GPUs in the tensor parallel group to synchronize model weights that do not belong to the training block
                 init_model_dict = {k: v for k, v in model.state_dict().items() if ('attn' not in  k and 'mlp' not in k and 'var_agg' not in k)}
 
                 torch.save(init_model_dict,
@@ -403,7 +388,6 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
 
             if world_rank!=0 and world_rank < conf["parallelism"]["tensor_par_size"]:
 
-               #load initial model weights and synchronize model weights that are not in the training block among sequence parallel GPUs
                src_rank = dist.get_rank() - dist.get_rank(group=tensor_par_group)
 
                # Loaded to CPU, not the target device -- see
@@ -449,7 +433,7 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
     my_auto_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
         transformer_layer_cls={
-            Block, Sequential   # < ---- Your Transformer layer class
+            Block, Sequential  # transformer_auto_wrap_policy's target class
         },
     )
 

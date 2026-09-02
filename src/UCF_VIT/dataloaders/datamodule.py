@@ -216,11 +216,9 @@ class NativePytorchDataModule(torch.nn.Module):
             docs warn about it) -- CUDA/NCCL keep background threads that can hold a lock at
             the instant of the fork, which the child then inherits stuck forever, causing a
             segfault the next time it touches libc's allocator (i.e. almost immediately, in
-            unrelated-looking code). Root-caused this way after a real, intermittent
-            `basic_ct`+`SAP`+`tensor_par_size:2` Frontier segfault (job 5390076) that predated
-            this option -- see `configs/basic_ct/sap/base_config.yaml`'s own
-            `multiprocessing_context: "spawn"` for the one shipped config that actually needs
-            it. `"spawn"` costs real per-worker startup latency (a fresh Python interpreter
+            unrelated-looking code). See `configs/basic_ct/sap/base_config.yaml`'s own
+            `multiprocessing_context: "spawn"` for a shipped config that needs it.
+            `"spawn"` costs real per-worker startup latency (a fresh Python interpreter
             re-imports the whole `torch`/`timm`/`monai`/`xformers` chain), so it's opt-in per
             config rather than a new global default.
         allow_file_reuse (bool, optional): If False (default), a dataset key with fewer
@@ -342,22 +340,16 @@ class NativePytorchDataModule(torch.nn.Module):
 
         self.dict_lister_trains = self.process_root_dirs()
 
-        # Fixes train/val/test membership once, from a deterministic (sorted) file
-        # order, before setup()/reset() ever run their own epoch-to-epoch reshuffle
-        # (np.random.choice, unseeded -- needed for genuine per-epoch training
-        # variety and per-rank sharding fairness, so deliberately not removed).
-        # Without this, dict_start_idx/dict_end_idx's ratio slice (applied inside
-        # FileReader, called from set_iterative_dataloader below) would be applied
-        # to a freshly-randomized order on every single setup()/reset() call --
-        # harmless when dict_start_idx/dict_end_idx was always the full [0,1) range
-        # (every shipped config, before auto train/val/test splitting existed), but
-        # real data leakage once it can be a genuine partial range: which files
-        # counted as "train" vs held-out "val"/"test" would silently change on every
-        # checkpoint restart, and even between epochs of the *same* run. Sorting
-        # here also makes this independent of process_root_dirs's own listing order
-        # (os.listdir/glob.glob/FileLister aren't guaranteed stable across calls).
-        # set_iterative_dataloader passes a no-op start_idx=0.0/end_idx=1.0 to
-        # FileReader now that slicing happens here instead.
+        # Slices train/val/test membership once, from a deterministic (sorted) file
+        # order, before setup()/reset()'s own per-epoch reshuffle (np.random.choice,
+        # unseeded -- needed for genuine per-epoch training variety and per-rank
+        # sharding fairness, so deliberately not removed) ever runs. Order matters:
+        # reshuffling first and slicing after would make which files count as
+        # "train" vs held-out "val"/"test" drift on every checkpoint restart, and
+        # even between epochs of the same run. Sorting also makes this independent
+        # of process_root_dirs's own listing order (os.listdir/glob.glob/FileLister
+        # aren't guaranteed stable across calls). set_iterative_dataloader passes a
+        # no-op start_idx=0.0/end_idx=1.0 to FileReader since slicing happens here.
         for k in self.dict_lister_trains:
             if self.dataset == "imagenet":
                 start_idx, end_idx = self.dict_start_idx["imagenet"], self.dict_end_idx["imagenet"]
@@ -369,16 +361,14 @@ class NativePytorchDataModule(torch.nn.Module):
             # Buckets are purely a rank/GPU-group assignment mechanism
             # (FileReader.read_process_file derives each image's label from its
             # own parent directory at read time, not from which bucket it's
-            # in) -- bucketing here, after the slice above (process_root_dirs
-            # used to bucket internally, *before* any slicing, which is
-            # exactly what made membership depend on data_par_size), keeps
-            # train/val/test membership independent of data_par_size entirely:
-            # only how the already-resolved membership gets divided across
-            # ranks depends on it now, not which images are in it. Must call
-            # bucket_file_list identically (same already-sorted-and-sliced
-            # input, same data_par_size) to calculate_load_balancing_on_the_fly's
-            # own call, or train_dataloader's gx-based bucket selection breaks
-            # -- see bucket_file_list's own docstring for why.
+            # in) -- bucketing after the slice above keeps train/val/test
+            # membership independent of data_par_size entirely: only how the
+            # already-resolved membership gets divided across ranks depends on
+            # it, not which images are in it. Must call bucket_file_list
+            # identically (same already-sorted-and-sliced input, same
+            # data_par_size) to calculate_load_balancing_on_the_fly's own call,
+            # or train_dataloader's gx-based bucket selection breaks -- see
+            # bucket_file_list's own docstring for why.
             k = next(iter(self.dict_lister_trains))
             self.dict_lister_trains = bucket_file_list(self.dict_lister_trains[k], self.data_par_size, shuffle_seed=self.bucket_shuffle_seed)
 
@@ -387,16 +377,14 @@ class NativePytorchDataModule(torch.nn.Module):
     def process_root_dirs(self):
         """Builds per-dataset-key lists of image file paths for `self.dataset`.
 
-        Thin wrapper over the shared `UCF_VIT.utils.misc.process_root_dirs` --
-        used to also be a separate, near-duplicate implementation of the same
-        imagenet-bucketing logic, which had to be manually kept in sync with
-        `calculate_load_balancing_on_the_fly`'s own bucketing (both ultimately
-        feed `train_dataloader`'s `gx`-based rank-to-bucket selection, which
-        requires the two to agree on bucket count/order exactly). Delegating to
-        one shared function eliminates that synchronization risk by
-        construction. Bucketing itself (imagenet only) now happens later, in
-        `__init__`, *after* `dict_start_idx`/`dict_end_idx` slicing -- see that
-        code's own comment for why.
+        Thin wrapper over the shared `UCF_VIT.utils.misc.process_root_dirs`.
+        Delegating to one shared function (rather than a local reimplementation)
+        keeps this in sync with `calculate_load_balancing_on_the_fly`'s own
+        bucketing by construction -- both ultimately feed `train_dataloader`'s
+        `gx`-based rank-to-bucket selection, which requires the two to agree on
+        bucket count/order exactly. Bucketing itself (imagenet only) happens
+        later, in `__init__`, after `dict_start_idx`/`dict_end_idx` slicing --
+        see that code's own comment for why.
 
         Returns:
             Dict mapping each `self.dict_root_dirs` key to its (sorted) list of
@@ -515,25 +503,15 @@ class NativePytorchDataModule(torch.nn.Module):
         return dict_data_train
         
 
-    # NOTE(reset/setup optimization): flagged by the user as a candidate for
-    # possible future reversion -- it may make this module more complicated
-    # than it's worth. If _my_dataset_key/_shuffle_and_replicate ever get in
-    # the way, it's safe to revert setup()/reset()/train_dataloader() to
-    # rebuilding every key in dict_lister_trains each call (the simpler, if
-    # O(data_par_size)-wasteful, version this replaced).
     def _my_dataset_key(self):
         """Determines which single `dict_lister_trains`/`dict_data_train` key this rank owns.
 
-        Uses the same `gx`-based `group_id` matching `train_dataloader` used to
-        rely on computing itself -- factored out so `setup()`/`reset()` can
-        shuffle and build only *this* rank's own key's pipeline, instead of
-        every key's. Before this, every rank redundantly shuffled and rebuilt
-        *every* key's pipeline every epoch, even though `train_dataloader`
-        only ever consumed one -- O(number of keys) wasted work per rank,
-        every epoch. For imagenet specifically (up to `data_par_size` keys/
-        buckets), that meant O(`data_par_size`) wasted work per rank and
-        O(`data_par_size`^2) wasted work cluster-wide -- a real,
-        scale-dependent `reset()` cost, not a fixed one.
+        Uses the same `gx`-based `group_id` matching `train_dataloader` relies on --
+        factored out so `setup()`/`reset()` can shuffle and build only *this* rank's
+        own key's pipeline, instead of every key's, keeping per-epoch cost O(1) per
+        rank rather than O(number of keys) (O(`data_par_size`) for imagenet, since
+        it has up to `data_par_size` bucket keys -- O(`data_par_size`^2) cluster-wide
+        if every rank did this redundantly).
 
         Returns:
             The single `self.dict_lister_trains` key this rank's DDP-rank
