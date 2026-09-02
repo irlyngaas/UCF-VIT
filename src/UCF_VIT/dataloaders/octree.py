@@ -249,67 +249,6 @@ class FixedOctTree:
         assert len(seq_size)==self.fixed_length, "Not equal fixed legnth."
         return seq_patch, seq_size, seq_pos
 
-    def serialize_labels(self, img, size=(8,8,8,1)):
-        """Like `serialize`, but resizes each patch with nearest-neighbor interpolation.
-
-        Intended for label/segmentation-mask volumes, where nearest-neighbor
-        resizing avoids introducing invalid interpolated class values.
-
-        Args:
-            img: Label volume to extract patches from, shape (Z, Y, X, Channel).
-            size: Target `(h, w, d, channel)` size for every patch.
-
-        Returns:
-            A tuple `(seq_patch, seq_size, seq_pos)`, as in `serialize`.
-        """
-        seq_patch = []
-        seq_size = []
-        seq_pos = []
-        for bbox,value in self.nodes:
-            seq_patch.append(bbox.get_area(img))
-            seq_size.append(bbox.get_size()[0])
-            seq_pos.append(bbox.get_center())
-            
-        h2,w2,d2,c2 = size
-        
-        for i in range(len(seq_patch)):
-            h1, w1, d1, c1 = seq_patch[i].shape
-            assert h1==w1==d1, "Need squared input."
-
-            h1_ = np.linspace(0,h1,h1)
-            w1_ = np.linspace(0,w1,w1)
-            d1_ = np.linspace(0,d1,d1)
-            #4 to 8 -> (0,1,2,3,4) 0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4
-            #2 to 4 -> (0,2) to (0, .667, 1.3667, 2)
-            #_SPLINE_DEGREE_MAP = {"slinear": 1, "cubic": 3, "quintic": 5, 'pchip': 3}
-
-            interp_fct_list = []
-            for j in range(c2):
-                interp_fct_list.append(RegularGridInterpolator(points=[h1_,w1_,d1_], values=seq_patch[i][:,:,:,j], method='nearest'))
-
-            patch_ = np.zeros([h2,w2,d2,c2])
-            h2_ = np.linspace(0,h1,h2)
-            w2_ = np.linspace(0,w1,w2)
-            d2_ = np.linspace(0,d1,d2)
-            H2_, W2_, D2_ = np.meshgrid(h2_, w2_, d2_, indexing='ij')
-            query_points = np.vstack([H2_.ravel(),W2_.ravel(),D2_.ravel()]).T
-            for j in range(c2):
-                patch_[:,:,:,j] = interp_fct_list[j](query_points).reshape(H2_.shape)
-            seq_patch[i] = patch_
-
-        if len(seq_patch)<self.fixed_length:
-            # import pdb
-            # pdb.set_trace()
-            seq_patch += [np.zeros(shape=(h2,w2,d2,c2))] * (self.fixed_length-len(seq_patch))
-            seq_size += [0]*(self.fixed_length-len(seq_size))
-            seq_pos += [tuple([-1,-1,-1])]*(self.fixed_length-len(seq_pos))
-        elif len(seq_patch)>self.fixed_length:
-            pass
-            # random_drop
-        assert len(seq_patch)==self.fixed_length, "Not equal fixed legnth."
-        assert len(seq_size)==self.fixed_length, "Not equal fixed legnth."
-        return seq_patch, seq_size, seq_pos
-
     def deserialize(self, seq, patch_size, channel):
         """Reassembles a flat sequence of predicted patches back into a full-size volume.
 

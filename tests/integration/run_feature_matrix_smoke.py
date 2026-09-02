@@ -341,11 +341,12 @@ FEATURE_MATRIX = [
     # Neither has a free do_ap choice (SAP is always do_ap:True, DiffusionVIT
     # always do_ap:False -- both hard-required by parse.py, not config
     # choices), so neither needed a do_ap cell, but that's not true of
-    # tensor_par_size: it's orthogonal to model type, and both SAP and
-    # DiffusionVIT have their own model-specific broadcast code in
-    # training.py's process_batch (SAP: seq_label; DiffusionVIT: the t/e
-    # diffusion noise terms) that no cell above has ever exercised with a
-    # real forward+loss. One tensor_par_size cell each closes that gap
+    # tensor_par_size: it's orthogonal to model type, and DiffusionVIT has
+    # its own model-specific broadcast code in training.py's process_batch
+    # (the t/e diffusion noise terms) that no cell above has ever exercised
+    # with a real forward+loss; SAP similarly has its own
+    # native_resolution_dice_loss forward+loss path never exercised under
+    # tensor_par_size > 1 elsewhere. One tensor_par_size cell each closes that gap
     # without re-testing do_tiling/twoD, which are generic dataloader-level
     # mechanics already proven independent of model type above.
     FeatureMatrixCell(
@@ -354,11 +355,11 @@ FEATURE_MATRIX = [
         timeout_override=1800,
         # SAP's baseline already keeps interp_size:4 (its own decoder-memory
         # exception), so tensor_par_size doesn't compound with any known
-        # memory risk here. Exercises training.py's seq_label broadcast
-        # (only taken for UNETR/SAP) under tensor_par_size > 1 for the
-        # first time -- and, since SAP is the only model requiring
-        # do_ap:True, also the first time the do_ap:True Segmentation
-        # `label` placeholder branch runs under tensor_par_size > 1 at all.
+        # memory risk here. Exercises SAP's native_resolution_dice_loss path
+        # under tensor_par_size > 1 for the first time -- and, since SAP is
+        # the only model requiring do_ap:True, also the first time the
+        # do_ap:True Segmentation `label` placeholder branch runs under
+        # tensor_par_size > 1 at all.
         # timeout:1800 (no min_files override -- keeps DEFAULT_MIN_FILES:256)
         # is a safety margin for job 5339608's dtype-mismatch broadcast fix
         # (training.py) getting its first real-Frontier verification, not a

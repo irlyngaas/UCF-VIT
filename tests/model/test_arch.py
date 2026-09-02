@@ -200,3 +200,172 @@ def test_unetr_proj_feat_non_adaptive_unchanged():
 
     expected = tokens.view(1, model.feat_size[0], model.feat_size[1], model.embed_dim).permute(0, 3, 1, 2)
     assert torch.equal(canvas, expected)
+
+
+# ---------------------------------------------------------------------------
+# UNETR.token_selection -- "point" (default), "smallest_overlap", "area_weighted"
+# ---------------------------------------------------------------------------
+
+
+def test_unetr_token_selection_defaults_to_point():
+    model = _make_unetr()
+    assert model.token_selection == "point"
+
+
+def test_unetr_token_selection_smallest_overlap_prefers_small_token_over_large():
+    """"point" samples a fixed grid of cell-center points, so a token's odds
+    of winning any cell scale with its area -- small (typically detail-rich)
+    tokens can lose to a large token that happens to cover more sample
+    points. "smallest_overlap" tests real box-vs-cell overlap instead of a
+    single point, and picks the smallest overlapping token, so a small token
+    always wins any cell it touches regardless of how much area a
+    competing large token covers.
+    """
+    model = _make_unetr(token_selection="smallest_overlap")
+    assert model.token_selection == "smallest_overlap"
+    feat_size = model.feat_size  # (4, 4) over img_size=(12, 12) -> 3x3-pixel cells
+
+    # One token covering the whole domain, and one tiny token sitting inside
+    # cell (0, 0) (native pixels [0,3)x[0,3), center (1.5, 1.5)).
+    big = (0.0, 12.0, 0.0, 12.0)
+    small = (1.4, 1.6, 1.4, 1.6)
+    size = torch.tensor([[big[1] - big[0], small[1] - small[0]]])
+    pos = torch.tensor([[
+        [(big[0] + big[1]) / 2, (big[2] + big[3]) / 2],
+        [(small[0] + small[1]) / 2, (small[2] + small[3]) / 2],
+    ]])
+    seq_ps = torch.cat([size.unsqueeze(-1), pos], dim=-1)
+
+    token_grid_index = model._adaptive_token_grid_index(seq_ps, feat_size).view(feat_size[0], feat_size[1])
+
+    assert token_grid_index[0, 0].item() == 1  # the small token wins the cell it overlaps
+    assert (token_grid_index.flatten() == 1).sum().item() == 1  # and only that one cell
+    assert (token_grid_index.flatten() == 0).sum().item() == feat_size[0] * feat_size[1] - 1  # big token gets the rest
+
+
+def test_unetr_token_selection_point_can_lose_small_token_entirely():
+    """Companion to the test above: under "point", the same tiny token can
+    lose every cell (including the one it physically overlaps) if no cell
+    *center* happens to fall inside it -- demonstrating the bias
+    "smallest_overlap" exists to fix, not just a difference in style.
+    """
+    model = _make_unetr(token_selection="point")
+    feat_size = model.feat_size  # cell (0,0)'s center is at (1.5, 1.5)
+
+    big = (0.0, 12.0, 0.0, 12.0)
+    small = (0.1, 0.3, 0.1, 0.3)  # tiny box in cell (0,0), doesn't contain (1.5, 1.5)
+    size = torch.tensor([[big[1] - big[0], small[1] - small[0]]])
+    pos = torch.tensor([[
+        [(big[0] + big[1]) / 2, (big[2] + big[3]) / 2],
+        [(small[0] + small[1]) / 2, (small[2] + small[3]) / 2],
+    ]])
+    seq_ps = torch.cat([size.unsqueeze(-1), pos], dim=-1)
+
+    token_grid_index = model._adaptive_token_grid_index(seq_ps, feat_size)
+    assert (token_grid_index == 1).sum().item() == 0  # the small token (index 1) wins no cell at all
+
+
+def test_unetr_token_selection_area_weighted_matches_gather_when_tiling_is_exact():
+    """When tokens exactly tile the canvas 1:1 (no ambiguity), area-weighted
+    blending's per-cell weights collapse to one-hot -- proj_feat's weighted-
+    sum reconstruction must produce the exact same result the gather-based
+    methods do, not just a close approximation.
+    """
+    model = _make_unetr(token_selection="area_weighted")
+    assert model.token_selection == "area_weighted"
+    feat_size = model.feat_size  # (4, 4)
+
+    boxes = []
+    for r in range(feat_size[0]):
+        for c in range(feat_size[1]):
+            x1, x2 = c * 3, (c + 1) * 3
+            y1, y2 = r * 3, (r + 1) * 3
+            boxes.append((x1, x2, y1, y2))
+
+    perm = torch.randperm(len(boxes))
+    shuffled = [boxes[i] for i in perm.tolist()]
+    size = torch.tensor([[b[1] - b[0] for b in shuffled]], dtype=torch.float32)
+    pos = torch.tensor([[[(b[0] + b[1]) / 2, (b[2] + b[3]) / 2] for b in shuffled]], dtype=torch.float32)
+    seq_ps = torch.cat([size.unsqueeze(-1), pos], dim=-1)
+
+    weights = model._adaptive_token_grid_weights(seq_ps, feat_size)
+    assert torch.allclose(weights.sum(dim=-1), torch.ones(1, feat_size[0] * feat_size[1]))
+    assert torch.equal(weights, (weights > 0.999).to(weights.dtype))  # one-hot
+
+    tokens = torch.zeros(1, len(boxes), model.embed_dim)
+    for seq_idx, orig_idx in enumerate(perm.tolist()):
+        tokens[0, seq_idx, :] = orig_idx
+
+    canvas = model.proj_feat(tokens, model.embed_dim, feat_size, weights)
+    expected = torch.arange(feat_size[0] * feat_size[1]).view(1, 1, feat_size[0], feat_size[1]).float()
+    expected = expected.expand(1, model.embed_dim, feat_size[0], feat_size[1])
+    assert torch.equal(canvas, expected)
+
+
+def test_unetr_token_selection_area_weighted_blends_proportionally_by_area():
+    """Two real, non-overlapping (square, tiling) leaves both landing inside
+    one canvas cell -- the cell's weight for each must be proportional to
+    how much of the cell's own area that leaf actually covers, not
+    winner-take-all.
+    """
+    model = _make_unetr(token_selection="area_weighted", img_size=(12, 12))
+    feat_size = (2, 2)  # cell (0,0) = [0,6)x[0,6), area 36
+
+    # leafA: square side 4, box [0,4)x[0,4) -- fully inside cell (0,0), area 16.
+    # leafB: square side 2, box [4,6)x[0,2) -- fully inside cell (0,0), area 4,
+    # non-overlapping with leafA (leafA's x ends exactly where leafB's starts).
+    size = torch.tensor([[4.0, 2.0]])
+    pos = torch.tensor([[[2.0, 2.0], [5.0, 1.0]]])
+    seq_ps = torch.cat([size.unsqueeze(-1), pos], dim=-1)
+
+    weights = model._adaptive_token_grid_weights(seq_ps, feat_size).view(feat_size[0], feat_size[1], 2)
+    cell00 = weights[0, 0]
+    total_covered = 16.0 + 4.0  # only 20 of the cell's 36 area is covered by these two leaves
+    assert cell00[0].item() == pytest.approx(16.0 / total_covered, abs=1e-5)
+    assert cell00[1].item() == pytest.approx(4.0 / total_covered, abs=1e-5)
+
+
+def test_unetr_area_weighted_alpha_defaults_to_zero():
+    model = _make_unetr(token_selection="area_weighted")
+    assert model.area_weighted_alpha == 0.0
+
+
+def test_unetr_area_weighted_alpha_zero_matches_plain_area_weighting():
+    """alpha=0 must reduce to exactly the original (pre-alpha) area-proportional formula."""
+    model = _make_unetr(token_selection="area_weighted", area_weighted_alpha=0.0, img_size=(12, 12))
+    feat_size = (2, 2)
+    size = torch.tensor([[4.0, 2.0]])
+    pos = torch.tensor([[[2.0, 2.0], [5.0, 1.0]]])
+    seq_ps = torch.cat([size.unsqueeze(-1), pos], dim=-1)
+
+    weights = model._adaptive_token_grid_weights(seq_ps, feat_size).view(feat_size[0], feat_size[1], 2)
+    cell00 = weights[0, 0]
+    total_covered = 16.0 + 4.0
+    assert cell00[0].item() == pytest.approx(16.0 / total_covered, abs=1e-5)
+    assert cell00[1].item() == pytest.approx(4.0 / total_covered, abs=1e-5)
+
+
+def test_unetr_area_weighted_alpha_increases_small_token_weight_toward_smallest_overlap():
+    """As alpha grows, the smaller of two overlapping tokens' weight should
+    monotonically increase past its plain area-proportional share, toward 1
+    -- "smallest_overlap"'s winner-take-all outcome in the limit.
+    """
+    feat_size = (4, 4)
+    big = (0.0, 12.0, 0.0, 12.0)
+    small = (1.0, 2.0, 1.0, 2.0)  # side 1, fully inside cell (0,0) = [0,3)x[0,3)
+    size = torch.tensor([[big[1] - big[0], small[1] - small[0]]])
+    pos = torch.tensor([[
+        [(big[0] + big[1]) / 2, (big[2] + big[3]) / 2],
+        [(small[0] + small[1]) / 2, (small[2] + small[3]) / 2],
+    ]])
+    seq_ps = torch.cat([size.unsqueeze(-1), pos], dim=-1)
+
+    small_weights = []
+    for alpha in (0.0, 1.0, 5.0, 50.0):
+        model = _make_unetr(token_selection="area_weighted", area_weighted_alpha=alpha, img_size=(12, 12))
+        w = model._adaptive_token_grid_weights(seq_ps, feat_size).view(feat_size[0], feat_size[1], 2)[0, 0]
+        small_weights.append(w[1].item())
+
+    assert small_weights == sorted(small_weights)  # monotonically increasing
+    assert small_weights[0] == pytest.approx(0.1, abs=1e-5)  # alpha=0: plain area share (1/(1+9))
+    assert small_weights[-1] == pytest.approx(1.0, abs=1e-3)  # alpha=50: effectively all the weight

@@ -13,13 +13,17 @@ Covers three things introduced/fixed together:
    for `model_type == "MAE"` (every other pretrained source silently
    transplanted nothing at all).
 3. `UCF_VIT.model.utils._transplant_pos_embed` -- resizes the extracted
-   `pos_embed` entry to the new model's own shape, dispatching between the 2D/3D
-   grid case and the flat (adaptive, non-sqrt_len_method) case, and rejecting
-   `sqrt_len_method:True` (`SAP`/`UNETR+do_ap`) explicitly rather than silently
-   producing a wrong-shaped result (see this session's own investigation notes
-   for why that regime's `grid_size` doesn't reflect its real token count).
+   `pos_embed` entry to the new model's own shape, dispatching between the
+   2D/3D grid case (non-adaptive models, real `PatchEmbed`-based `grid_size`)
+   and the flat, per-token case (any `adaptive_patching:True` model,
+   including `SAP`/`UNETR+do_ap` -- these used to be a third, rejected
+   `sqrt_len_method:True` case with their own `PatchEmbed`-derived
+   `grid_size` that didn't actually match their real token count; since
+   fixed, `SAP`/`UNETR` no longer build a `PatchEmbed` at all under adaptive
+   patching, so they now fall cleanly into the flat case below like every
+   other adaptive model).
 
-Note: the flat (adaptive, non-sqrt_len_method) case used to interpolate
+Note: the flat (adaptive) case used to interpolate
 `pos_embed` via 1D linear interpolation along the sequence-slot-index axis
 (`UCF_VIT.utils.misc.interpolate_pos_embed_adaptive`) instead of the grid
 case's spatial resize. Reviewing that function found two real problems: no
@@ -243,7 +247,7 @@ def test_extract_encoder_state_dict_strips_real_sap_decoder():
     model = SAP(
         img_size=(16, 16), patch_size=4, interp_size=4, twoD=True,
         num_classes=2, class_token=False, pos_embed="learn",
-        adaptive_patching=True, fixed_length=4, sqrt_len=2, sqrt_len_method=True,
+        adaptive_patching=True, fixed_length=4, sqrt_len=2,
         weight_init="skip", embed_dim=8, depth=1, num_heads=1, mlp_ratio=1.0, in_chans=1,
     )
 
@@ -423,8 +427,8 @@ def test_pretrained_loading_3d_non_cubic_ratio_change():
 
 
 def test_pretrained_loading_adaptive_patching_fixed_length_mismatch_drops_pos_embed():
-    """adaptive_patching:True + not sqrt_len_method: pos_embed is a flat,
-    learned, per-sequence-slot-index embedding with no spatial/geometric
+    """adaptive_patching:True: pos_embed is a flat, learned,
+    per-sequence-slot-index embedding with no spatial/geometric
     meaning attached to any given slot (FixedQuadTree/FixedOctTree's own
     node order reflects greedy-split order, not spatial adjacency) --
     unlike the grid case above, there's no principled way to resize it, so
@@ -440,7 +444,7 @@ def test_pretrained_loading_adaptive_patching_fixed_length_mismatch_drops_pos_em
     kwargs = dict(
         patch_size=4, interp_size=4, twoD=True, num_classes=2,
         class_token=True, pos_embed="learn", adaptive_patching=True,
-        sqrt_len_method=False, embed_dim=8, depth=1, num_heads=1,
+        embed_dim=8, depth=1, num_heads=1,
         mlp_ratio=1.0, in_chans=1,
     )
     pretrained = VIT(img_size=(32, 32), fixed_length=16, **kwargs)
@@ -454,17 +458,30 @@ def test_pretrained_loading_adaptive_patching_fixed_length_mismatch_drops_pos_em
     assert new_model.pos_embed.shape[1] == new_model.fixed_length + new_model.num_prefix_tokens
 
 
-def test_pretrained_loading_sqrt_len_method_mismatch_raises_clearly():
-    # embed_dim=12: get_3d_sincos_pos_embed requires embed_dim % 3 == 0.
-    sqrt_len_kwargs = dict(
-        patch_size=4, interp_size=4, twoD=False, num_classes=2,
+def test_pretrained_loading_sap_fixed_length_mismatch_drops_pos_embed():
+    """SAP (formerly sqrt_len_method:True) used to be a third, rejected case
+    here: its pos_embed was sized from a PatchEmbed grid_size that didn't
+    actually match its real sqrt_len-based token count, so a mismatch raised
+    NotImplementedError rather than risk a silently wrong-shaped transplant.
+    Since SAP no longer builds a PatchEmbed under adaptive patching at all
+    (uses the same flat per-token embedding as every other adaptive model),
+    it now has no grid_size, and falls into the same "flat, dropped on
+    mismatch" path as test_pretrained_loading_adaptive_patching_fixed_length_
+    mismatch_drops_pos_embed above -- this is a real behavior improvement,
+    not just a rename: pretrained-checkpoint fine-tuning at a different
+    fixed_length now works for SAP/UNETR+do_ap instead of hard-erroring.
+    """
+    kwargs = dict(
+        img_size=(16, 16), patch_size=4, interp_size=4, twoD=True, num_classes=2,
         class_token=False, pos_embed="learn", adaptive_patching=True,
-        sqrt_len_method=True, fixed_length=8,
-        embed_dim=12, depth=1, num_heads=1, mlp_ratio=1.0, in_chans=1,
+        embed_dim=8, depth=1, num_heads=1, mlp_ratio=1.0, in_chans=1,
     )
-    pretrained = VIT(img_size=(32, 32, 32), **sqrt_len_kwargs)
-    new_model = VIT(img_size=(64, 64, 64), **sqrt_len_kwargs)
+    pretrained = SAP(fixed_length=4, sqrt_len=2, **kwargs)
+    new_model = SAP(fixed_length=16, sqrt_len=4, **kwargs)
+    assert not hasattr(pretrained, "grid_size") and not hasattr(new_model, "grid_size")
+    fresh_new_pos_embed = new_model.pos_embed.clone()
 
-    encoder_dict = extract_encoder_state_dict(pretrained.state_dict())
-    with pytest.raises(NotImplementedError, match="sqrt_len_method"):
-        _transplant_pos_embed(encoder_dict, pretrained, new_model)
+    _load_pretrained_encoder(pretrained, new_model)
+
+    assert torch.equal(new_model.pos_embed, fresh_new_pos_embed)
+    assert new_model.pos_embed.shape[1] == new_model.fixed_length + new_model.num_prefix_tokens

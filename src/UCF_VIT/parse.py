@@ -43,7 +43,6 @@ def get_kwargs(model_type, conf):
 
         assert conf["ap"]["do_ap"], "SAP requires adaptive patching to be turned on"
 
-        kwargs.update({"sqrt_len_method": True})
         if conf["data"]["twoD"]:
             sqrt_len = int(math.sqrt(conf["ap"]["fixed_length"]))
         else:
@@ -130,14 +129,34 @@ def get_kwargs(model_type, conf):
         kwargs.update({"feature_size": feature_size})
 
         if conf["ap"]["do_ap"]:
-            kwargs.update({"sqrt_len_method": True})
+            try:
+                token_selection = conf["model"]["token_selection"]
+            except KeyError:
+                token_selection = "point"
+            assert token_selection in ("point", "smallest_overlap", "area_weighted"), f"Unknown token_selection {token_selection!r}"
+            kwargs.update({"token_selection": token_selection})
+
+            try:
+                area_weighted_alpha = conf["model"]["area_weighted_alpha"]
+            except KeyError:
+                area_weighted_alpha = 0.0
+            kwargs.update({"area_weighted_alpha": area_weighted_alpha})
+
             if conf["data"]["twoD"]:
                 sqrt_len = int(math.sqrt(conf["ap"]["fixed_length"]))
+                token_capacity = sqrt_len**2
             else:
                 sqrt_len=int(np.rint(math.pow(conf["ap"]["fixed_length"],1/3)))
+                token_capacity = sqrt_len**3
+            # "area_weighted" blends every overlapping token proportionally by
+            # area rather than picking one winner per cell -- every real token
+            # is guaranteed nonzero weight in some cell (leaves and cells both
+            # fully partition the domain), so it's not subject to this warning.
+            if token_capacity < conf["ap"]["fixed_length"] and token_selection != "area_weighted":
+                if dist.get_rank() == 0:
+                    print(f"Warning: UNETR's decoder bottleneck (sqrt_len={sqrt_len}, {token_capacity} cells) is smaller than fixed_length ({conf['ap']['fixed_length']}) -- at least {conf['ap']['fixed_length'] - token_capacity} adaptive-patch tokens per sample will never reach the reconstructed feature map.")
             kwargs.update({"sqrt_len": sqrt_len})
         else:
-            kwargs.update({"sqrt_len_method": False})
             kwargs.update({"sqrt_len": None})
 
     elif model_type == "DiffusionVIT":
@@ -730,8 +749,8 @@ def parse_config(args, load_balance_offline=False):
         else:
             assert ap_conf["fixed_length"] % 7 == 1 % 7, "Octtree fixed length needs to be 7n+1, where n is some integer"
 
-        #If model is UNETR check whether fixed_length is a sqr or cube root
-        if model_type in ["UNETR", "SAP"]:
+        # Only SAP's mask_head needs fixed_length to be an exact square/cube (UNETR's proj_feat doesn't).
+        if model_type == "SAP":
             if twoD:
                 sqrt_len = math.sqrt(ap_conf["fixed_length"])
                 assert sqrt_len.is_integer(), "Square root of fixed length needs to be a whole number"

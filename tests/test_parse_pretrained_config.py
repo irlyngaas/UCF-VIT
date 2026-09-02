@@ -121,7 +121,6 @@ def test_parse_pretrained_config_sap_source():
     p_conf = _parse_as_pretrained_source(pretrained_conf, downstream_conf)
 
     assert p_conf["model_type"] == "SAP"
-    assert p_conf["kwargs"]["sqrt_len_method"] is True
     # fixed_length=4 (2D quadtree, twoD:True) -> sqrt_len=2.
     assert p_conf["kwargs"]["sqrt_len"] == 2
 
@@ -138,10 +137,9 @@ def test_parse_pretrained_config_unetr_source():
     assert p_conf["model_type"] == "UNETR"
     assert p_conf["kwargs"]["feature_size"] == 4
     assert p_conf["kwargs"]["linear_decoder"] is True
-    # do_ap:False on the pretrained source -> sqrt_len_method must be False
-    # (only True when UNETR itself has do_ap:True; see get_kwargs's own
-    # UNETR branch).
-    assert p_conf["kwargs"]["sqrt_len_method"] is False
+    # do_ap:False on the pretrained source -> sqrt_len is None (only set
+    # when UNETR itself has do_ap:True; see get_kwargs's own UNETR branch).
+    assert p_conf["kwargs"]["sqrt_len"] is None
 
 
 def test_parse_pretrained_config_checks_every_tensor_par_rank_checkpoint_file():

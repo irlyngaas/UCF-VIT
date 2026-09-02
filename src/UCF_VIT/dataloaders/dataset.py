@@ -472,8 +472,7 @@ class ProcessChannels(IterableDataset):
         Yields:
             A tuple whose composition depends on `self.adaptive_patching`,
             `self.return_label`, `self._dataset`, and `self.return_qdt`; broadly:
-            `(image, [seq_image, seq_size, seq_pos,] [label, [seq_label,]]
-            variables, [qdt])`.
+            `(image, [seq_image, seq_size, seq_pos,] [label,] variables, [qdt])`.
         """
         yield_x_list = []
         yield_var_list = []
@@ -519,34 +518,6 @@ class ProcessChannels(IterableDataset):
                                 if self._dataset == "basic_ct":
                                     np_label = np.expand_dims(np_label,axis=0)
 
-                                #TODO: If separate_channel=True, which qdt from qdt_list to use? Default to using the first in the list for now
-                                if self.separate_channels:
-                                    qdt_ = qdt[0]
-                                else:
-                                    qdt_ = qdt
-
-                                seq_label_list = []
-                                for j in range(np_label.shape[0]):
-                                    if self.twoD:
-                                        if self._dataset == "basic_ct":
-                                            seq_label, _, _ = qdt_.serialize_labels(np.expand_dims(np_label[j],axis=-1), size=(self.interp_size,self.interp_size,1))
-                                            seq_label = np.asarray(seq_label)
-                                            seq_label = np.reshape(seq_label, [self.interp_size*self.interp_size, -1, 1])
-                                        else:
-                                            seq_label, _, _ = qdt_.serialize(np.expand_dims(np_label[j],axis=-1), size=(self.interp_size,self.interp_size,1))
-                                            seq_label = np.asarray(seq_label, dtype=np.float32)
-                                            seq_label = np.reshape(seq_label, [-1, self.interp_size*self.interp_size])
-                                    else:
-                                        if self._dataset == "basic_ct":
-                                            seq_label, _, _ = qdt_.serialize_labels(np.expand_dims(np_label[j],axis=-1), size=(self.interp_size,self.interp_size,self.interp_size, 1))
-                                            seq_label = np.asarray(seq_label)
-                                            seq_label = np.reshape(seq_label, [self.interp_size*self.interp_size*self.interp_size, -1, 1])
-                                        else:
-                                            seq_label, _, _ = qdt_.serialize(np.expand_dims(np_label[j],axis=-1), size=(self.interp_size,self.interp_size,self.interp_size, 1))
-                                            seq_label = np.asarray(seq_label, dtype=np.float32)
-                                            seq_label = np.reshape(seq_label, [-1, self.interp_size*self.interp_size*self.interp_size])
-                                    seq_label_list.append(seq_label)
-
                             if self._dataset == "imagenet":
                                 if self.return_qdt:
                                     yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_label_list.pop(), yield_var_list.pop(), qdt
@@ -555,14 +526,14 @@ class ProcessChannels(IterableDataset):
                             else:
                                 if self._dataset == "basic_ct":
                                     if self.return_qdt:
-                                        yield np_image, seq_image, seq_size, seq_pos, np.asarray(np_label,dtype=np.uint8), seq_label_list, yield_var_list.pop(), qdt
+                                        yield np_image, seq_image, seq_size, seq_pos, np.asarray(np_label,dtype=np.uint8), yield_var_list.pop(), qdt
                                     else:
-                                        yield np_image, seq_image, seq_size, seq_pos, np.asarray(np_label,dtype=np.uint8), seq_label_list, yield_var_list.pop()
+                                        yield np_image, seq_image, seq_size, seq_pos, np.asarray(np_label,dtype=np.uint8), yield_var_list.pop()
                                 else:
                                     if self.return_qdt:
-                                        yield np_image, seq_image, seq_size, seq_pos, np_label, seq_label_list, yield_var_list.pop(), qdt
+                                        yield np_image, seq_image, seq_size, seq_pos, np_label, yield_var_list.pop(), qdt
                                     else:
-                                        yield np_image, seq_image, seq_size, seq_pos, np_label, seq_label_list, yield_var_list.pop()
+                                        yield np_image, seq_image, seq_size, seq_pos, np_label, yield_var_list.pop()
                         else:
                             if self._dataset == "imagenet":
                                 np_image = yield_x_list.pop()

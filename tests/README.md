@@ -88,7 +88,7 @@ pytest tests/test_config_validation.py -v
 | `tests/test_config_validation.py` | Every YAML under `configs/` actually parses via `parse_config`, plus a negative-case regression test that `ap.do_ap:True` with no `ap.interp_size` set fails with a clear error, not a bare `KeyError` |
 | `tests/model/test_arch.py` | `VIT.effective_patch_size` (`interp_size` used when `adaptive_patching`, `patch_size` otherwise, `patch_size`/`interp_size` themselves never overwritten, missing-`interp_size`-under-`adaptive_patching` raises clearly) — needs the real `timm`/`monai`/`xformers` stack (`UCF_VIT.model.arch`'s own imports), skips cleanly via `importorskip` otherwise |
 | `tests/model/test_diffusion_vit.py` | `Block_diffusion` (`building_blocks.py`) — `DiffusionVIT`'s new per-block timestep conditioning (a `SinusoidalEmbeddings` + learned `EmbeddingDenseLayer` projection re-injected into the token sequence before every block's attention, replacing the earlier design that added a timestep embedding once, before the first block). Confirms `get_model`'s `block_fn=Block_diffusion` (`DiffusionVIT`-only) actually produces `Block_diffusion` instances for both `self.blocks` and, when `linear_decoder:False`, `self.decoder_blocks`; a real forward+backward pass runs and stays finite in both decoder modes; and, the actual point of the feature, that different timesteps produce genuinely different output, not just get plumbed through and ignored. See the narrative section below for the real bugs found wiring this in. |
-| `tests/model/test_pretrained_loading.py` | `interpolate_pos_embed`/`interpolate_pos_embed_3d` (independent, non-1:1 height:width[:depth] ratio changes in both directions, class-token prefix preserved, same-size no-op), `extract_encoder_state_dict` against both a fake dict (allowlist keeps only the shared `VIT` encoder — including the `UNETR.encoder1`-vs-`"decoder" not in k` collision case that motivated an allowlist over a denylist) and every real model type's own real `state_dict()` as a pretrained source (`VIT`/`MAE`/`SAP`/`UNETR`/`DiffusionVIT` — not just the two types any shipped config actually uses, since nothing in `get_model` restricts which type the pretrained source is), and end-to-end pretrained-checkpoint transplant (same-architecture 2D and 3D non-cubic ratio changes, cross-architecture `MAE`→`VIT` *and* `VIT`→`MAE` — both class-token-count-mismatch directions, not just one — `sqrt_len_method:True` raising a clear error instead of silently transplanting a wrong-shaped `pos_embed`) — same `importorskip` gating as `test_arch.py`. The `VIT`→`MAE` direction caught a real bug: `extract_encoder_state_dict`'s allowlist includes `cls_token` (genuinely a shared `VIT.__init__` attribute when present), but a downstream model with no `cls_token` at all (any non-`VIT` type, or `class_token=False`) made `load_state_dict(strict=True)` raise `"Unexpected key(s): cls_token"` — unlike `pos_embed`, which always has *some* value to reconcile shapes against, `cls_token` can be entirely absent on one side. Fixed with a new `_prune_incompatible_cls_token`, called in `get_model` right after `_transplant_pos_embed`. Used to also cover `_patch_embed_img_size` (a `tile_size`-to-`PatchEmbed`-`img_size` conversion, needed because `tile_size` was `[width, height]` for `imagenet`/`catsdogs`; a real bug caught by a real Tier 3 run, see the Tier 3c section below) — that function was later deleted once the config/data-loading layer itself was changed to store `img_size`/`resize`/`tile_size` as `[height, width]` (see "Flipped `img_size`/`resize`/`tile_size` to `[height, width]`" further down), which made it a true no-op for every dataset. Also covers the flat (adaptive, non-`sqrt_len_method`) `pos_embed` case on a `fixed_length` mismatch: reviewing `interpolate_pos_embed_adaptive` (formerly used there, 1D linear interpolation along the sequence-slot-index axis) found it rested on an adjacency assumption adaptive-patching sequences don't actually satisfy (`FixedQuadTree`/`FixedOctTree`'s node order reflects greedy-split order, not spatial position) and, independently, never sliced out `num_prefix_tokens` first — a real, reachable bug corrupting the class-token row into the interpolation whenever `class_token:True`. Replaced with simply dropping the pretrained `pos_embed` on a mismatch (new model keeps its own fresh init); `interpolate_pos_embed_adaptive` deleted, archived at `../UCF-VIT-claude-archive/src/UCF_VIT/utils/misc.py`. `test_pretrained_loading_adaptive_patching_fixed_length_mismatch_drops_pos_embed` exercises this directly with `class_token=True` on both sides — the exact scenario that used to be corrupted. |
+| `tests/model/test_pretrained_loading.py` | `interpolate_pos_embed`/`interpolate_pos_embed_3d` (independent, non-1:1 height:width[:depth] ratio changes in both directions, class-token prefix preserved, same-size no-op), `extract_encoder_state_dict` against both a fake dict (allowlist keeps only the shared `VIT` encoder — including the `UNETR.encoder1`-vs-`"decoder" not in k` collision case that motivated an allowlist over a denylist) and every real model type's own real `state_dict()` as a pretrained source (`VIT`/`MAE`/`SAP`/`UNETR`/`DiffusionVIT` — not just the two types any shipped config actually uses, since nothing in `get_model` restricts which type the pretrained source is), and end-to-end pretrained-checkpoint transplant (same-architecture 2D and 3D non-cubic ratio changes, cross-architecture `MAE`→`VIT` *and* `VIT`→`MAE` — both class-token-count-mismatch directions, not just one) — same `importorskip` gating as `test_arch.py`. The `VIT`→`MAE` direction caught a real bug: `extract_encoder_state_dict`'s allowlist includes `cls_token` (genuinely a shared `VIT.__init__` attribute when present), but a downstream model with no `cls_token` at all (any non-`VIT` type, or `class_token=False`) made `load_state_dict(strict=True)` raise `"Unexpected key(s): cls_token"` — unlike `pos_embed`, which always has *some* value to reconcile shapes against, `cls_token` can be entirely absent on one side. Fixed with a new `_prune_incompatible_cls_token`, called in `get_model` right after `_transplant_pos_embed`. Used to also cover `_patch_embed_img_size` (a `tile_size`-to-`PatchEmbed`-`img_size` conversion, needed because `tile_size` was `[width, height]` for `imagenet`/`catsdogs`; a real bug caught by a real Tier 3 run, see the Tier 3c section below) — that function was later deleted once the config/data-loading layer itself was changed to store `img_size`/`resize`/`tile_size` as `[height, width]` (see "Flipped `img_size`/`resize`/`tile_size` to `[height, width]`" further down), which made it a true no-op for every dataset. Also covers the flat (adaptive) `pos_embed` case on a `fixed_length` mismatch: reviewing `interpolate_pos_embed_adaptive` (formerly used there, 1D linear interpolation along the sequence-slot-index axis) found it rested on an adjacency assumption adaptive-patching sequences don't actually satisfy (`FixedQuadTree`/`FixedOctTree`'s node order reflects greedy-split order, not spatial position) and, independently, never sliced out `num_prefix_tokens` first — a real, reachable bug corrupting the class-token row into the interpolation whenever `class_token:True`. Replaced with simply dropping the pretrained `pos_embed` on a mismatch (new model keeps its own fresh init); `interpolate_pos_embed_adaptive` deleted, archived at `../UCF-VIT-claude-archive/src/UCF_VIT/utils/misc.py`. `test_pretrained_loading_adaptive_patching_fixed_length_mismatch_drops_pos_embed` exercises this directly with `class_token=True` on both sides — the exact scenario that used to be corrupted. |
 | `tests/test_parse_pretrained_config.py` | `parse_pretrained_config` (+ `get_kwargs`'s per-model-type branch) for `SAP`/`UNETR`/`DiffusionVIT` as the pretrained source specifically — `tests/model/test_pretrained_loading.py`/`test_pretrained_loading_real.py` only ever use `VIT`/`MAE`. Pure `parse.py`-level (no `UCF_VIT.model.arch` import at all), so no `importorskip` needed — runs in any environment. |
 | `tests/test_forward_step.py` | `training.py`'s `forward_step` (renamed from `train_step` — see the `eval_epoch` narrative section below) MAE loss dispatch: `loss_fn:"MSE"` (plain `nn.MSELoss` over every patch) and `loss_fn:"maskMSE"` (`masked_mse`, averaged only over the masked/encoder-hidden patches — the standard MAE-paper loss), for both `ap.do_ap:True` and `False`; and, `ap.do_ap:True`-only, `loss_fn:"nativeResMSE"`/`"nativeResMaskMSE"` (`native_resolution_patch_mse`/`native_resolution_patch_masked_mse` — compares against the real, native-resolution image region each adaptive patch covers, not the already-resized fixed-`interp_size` token `"MSE"`/`"maskMSE"` compare against under `do_ap:True`). `"maskMSE"` was previously dead code (the `do_ap:True` branch was a bare `#TODO`, the `do_ap:False` branch was fully written but commented out), and `"nativeRes*"` didn't exist at all — now all wired up. Uses a fake model (`forward_step` only ever calls `model.forward(...)`, so a stub returning a fixed `(output, mask)` is enough, no real MAE/`timm`/`monai`/`xformers` needed). The `"MSE"`/`"maskMSE"` tests construct output so masked and unmasked patches have a different, known error, so the two losses produce different, independently-verifiable numbers from the same fixture rather than coincidentally agreeing; the `"nativeRes*"` tests verify `forward_step`'s dispatch against directly calling `native_resolution_patch_mse`/`_masked_mse` itself, including that `batch["seq_ps"]` (`process_batch`'s own combined, squeezed `[size, pos]` tensor, built for the adaptive positional embedding) gets correctly sliced back apart and its `adaptive_patching_channels` dim restored. Every test also asserts the fake model was called with the expected input tensor (`batch["seq"]` vs `batch["data"]`) — `forward_step`'s previously-found real bugs (see below) were all about picking the wrong branch/input, not just computing the wrong number. |
 | `tests/integration/test_run_training_smoke_helpers.py` | `run_training_smoke.py`'s `compute_narrow_dict_idx` (real-data-found narrowing, empty-but-existing-dir and nonexistent-dir both raising `NoRealDataFoundError`, no-op for non-`iterative_dataloader` configs) and `deep_merge_config_overrides` (nested-key merge, wholesale-replace of non-dict values, new-key insertion, multiple independent sections) |
@@ -518,21 +518,23 @@ differ (e.g. pretrained `MAE` → downstream `UNETR`: `conf["model"]` has no
 `NameError` the moment this code path executed for real, for any model
 type including `MAE`).
 
-**Found and explicitly excluded from this fix, not fixed**: for `SAP` and
-`UNETR+do_ap` (`sqrt_len_method:True`), `self.pos_embed` is allocated at
-`patch_embed`'s raw `img_size/effective_patch_size` grid size (`64×64×64 =
-262144` for `basic_ct/sap`'s shipped config) but the real runtime token
-count is `sqrt_len³` (`8³ = 512`) — a real, separate, pre-existing
-inconsistency, verified by directly constructing a real `SAP` instance.
-Silently harmless today only because every shipped `SAP`/`UNETR+do_ap`
-config also sets `use_adaptive_pos_emb:True`, so `self.pos_embed` is never
-actually read in the forward pass — dead, oversized, wasted memory, not a
-crash. `_transplant_pos_embed` raises a clear `NotImplementedError` for a
-pretrained/new size mismatch under `sqrt_len_method:True` rather than
-interpolating via a `grid_size` that doesn't reflect the real token count;
-`test_pretrained_loading_sqrt_len_method_mismatch_raises_clearly` covers
-this. Fixing the underlying `SAP`/`UNETR` sizing issue itself is a separate
-task.
+**Found and explicitly excluded from this fix, not fixed at the time**: for
+`SAP` and `UNETR+do_ap` (`sqrt_len_method:True`), `self.pos_embed` was
+allocated at `patch_embed`'s raw `img_size/effective_patch_size` grid size
+(`64×64×64 = 262144` for `basic_ct/sap`'s shipped config) but the real
+runtime token count was `sqrt_len³` (`8³ = 512`) — a real, separate,
+pre-existing inconsistency, verified by directly constructing a real `SAP`
+instance. Silently harmless at the time only because every shipped
+`SAP`/`UNETR+do_ap` config also sets `use_adaptive_pos_emb:True`, so
+`self.pos_embed` was never actually read in the forward pass — dead,
+oversized, wasted memory, not a crash. `_transplant_pos_embed` raised a
+clear `NotImplementedError` for a pretrained/new size mismatch under
+`sqrt_len_method:True` rather than interpolating via a `grid_size` that
+didn't reflect the real token count. **Since fixed** (see "Removed
+`sqrt_len_method`..." further down): `sqrt_len_method` no longer exists at
+all -- `SAP`/`UNETR` never build a `patch_embed` under adaptive patching,
+so this inconsistency (and the rejection it required) is gone, not just
+worked around.
 
 Verified locally at Tier 1 first — per the user, sufficient for the h:w[:d]
 ratio logic itself, since Tier 1 deliberately calls `extract_encoder_state_
@@ -1750,6 +1752,184 @@ boxes, each tagged with its original (pre-shuffle) index, and the
 reconstructed canvas is asserted to place each token's value at the cell
 its true box actually covers -- the direct regression test that
 reconstruction now follows real position, not sequence index.
+
+### Removed `sqrt_len_method` entirely, and the now-dead `seq_label` adaptive-label pipeline
+
+Follow-up to the `proj_feat` fix above. The user asked whether it removed
+the requirement that `fixed_length` be a perfect square/cube (2D) or cube
+(3D) -- it didn't, fully: `training.py`'s `seq`/`x_seq` construction (the
+*encoder's* input) still built a grid via `einops.rearrange`, which
+enforces exact factorization, independently of the (already-fixed)
+decoder-side constraint. Tracing why that rearrange existed at all found it
+was purely to satisfy `PatchEmbed`'s (`building_blocks.py`) `Conv2d`/`Conv3d`
+API, which needs a `(B,C,H,W)`-shaped input -- not because of any genuine
+spatial-adjacency requirement (`PatchEmbed`'s conv has `stride ==
+kernel_size`, the same degenerate/no-cross-token-mixing pattern as
+everywhere else in this bug, and its own `forward` exactly inverts whatever
+row-major order the grid was built in via `flatten(2).transpose(1,2)`).
+`MAE`/`VIT`/`DiffusionVIT`'s `adaptive_patching and not sqrt_len_method`
+path already had the alternative built: a plain per-token
+`nn.Sequential(nn.LayerNorm, nn.Linear, nn.LayerNorm)` operating directly on
+the flat sequence, no grid needed.
+
+Routed `SAP`/`UNETR` onto that same path -- every condition in `arch.py`
+gating on `adaptive_patching and not sqrt_len_method` collapsed to just
+`adaptive_patching`, since `sqrt_len_method` no longer distinguished
+anything: `VIT.__init__`'s `token_embeds`/`patch_embed` construction,
+`forward_features`/`forward_intermediates`'s embedding step, and
+`init_weights`'s fixed sin-cos `pos_embed` overwrite. `training.py`'s
+`seq`/`x_seq` `einops.rearrange` calls (both `SAP` and `UNETR`) were
+deleted outright -- `model.forward` now receives `batch["seq"]` directly,
+matching `MAE`'s own `do_ap:True` call pattern exactly.
+
+This made `sqrt_len_method` itself fully vestigial, so it was removed as a
+concept entirely, not just left unused: the constructor parameter (`VIT`,
+`PatchEmbed`), `parse.py`'s `get_kwargs` (stopped setting it for
+`SAP`/`UNETR`), and -- the one real behavior change beyond the encoder --
+`model/utils.py`'s `_transplant_pos_embed`, which had an explicit
+`sqrt_len_method:True` rejection (`NotImplementedError`) for pretrained-
+checkpoint size mismatches, added deliberately in the pretrained-loading
+work above specifically because that regime's `pos_embed` was sized from a
+`PatchEmbed` grid that didn't reflect its real token count. Since `SAP`/
+`UNETR` no longer build a `PatchEmbed` under adaptive patching at all, they
+now have no `grid_size` and fall cleanly into the same "flat, dropped on
+`fixed_length` mismatch" path every other adaptive model already uses via
+`_transplant_pos_embed`'s existing `hasattr(model, "grid_size")` dispatch --
+a real capability gain (pretrained-checkpoint fine-tuning at a different
+`fixed_length` now works for `SAP`/`UNETR+do_ap` instead of hard-erroring),
+not just a rename. `sqrt_len` itself (the *decoder*-side bottleneck-canvas
+resolution `SAP.mask_head`/`UNETR.proj_feat` use) is unrelated and
+untouched -- `sqrt_len_method` only ever controlled the encoder's embedding
+path.
+
+Separately, tracing the loss/label side of this same question (whether
+`UNETR`, like `SAP`, needed the adaptively-patched labels) surfaced that
+`seq_label` -- a full second per-sample tree-based label serialization
+(`FixedQuadTree`/`FixedOctTree.serialize_labels`, `dataset.py`'s
+`seq_label_list` construction, `datamodule.py`'s one-hot collate) -- was now
+dead for *both* model types: `SAP`'s new `native_resolution_dice_loss`
+samples the real, native-resolution `batch["label"]` directly (no
+`seq_label` involved), and `UNETR` never consumed `seq_label` in the first
+place (`forward_step`'s `UNETR` branch always compared its dense decoder
+output against dense `batch["label"]` via `DiceCELoss`, both before and
+after today's changes). Removed the entire pipeline: `serialize_labels`
+deleted from both `quadtree.py` and `octree.py` (unused anywhere else,
+confirmed by grep before deleting); `dataset.py`'s `ProcessChannels.__iter__`
+no longer builds or yields `seq_label_list` (the `basic_ct`/other-dataset
+`do_ap+return_label` yield tuple is now exactly `(image, seq_image,
+seq_size, seq_pos, label, variables, [qdt])` -- the same shape `imagenet`
+already used, since `imagenet` never had `seq_label` to begin with);
+`datamodule.py`'s `collate_fn` no longer builds `seq_label`/one-hot-encodes
+it (its `num_classes` parameter, only ever used for that one-hot encode,
+was removed too -- unused anywhere else in the function); `training.py`'s
+`get_batch`/`process_batch` no longer read, cast, broadcast, or return
+`seq_label` at all (`get_batch`'s `"VIT"` and `["UNETR", "SAP"]` branches
+became identical once `seq_label` was the only thing distinguishing them,
+so they're now one merged `["VIT", "UNETR", "SAP"]` branch).
+
+**Tier 1 coverage:** `test_datamodule.py`'s `collate_fn` tests updated for
+the new (shorter) tuple shapes and the removed `num_classes` parameter --
+no new tests needed since this is pure deletion of a dead path, not new
+logic. `test_pretrained_loading.py`'s
+`test_pretrained_loading_sqrt_len_method_mismatch_raises_clearly` (the
+explicit-rejection test) replaced with
+`test_pretrained_loading_sap_fixed_length_mismatch_drops_pos_embed`,
+confirming a real `SAP` instance now has no `grid_size` and its `pos_embed`
+is dropped-not-raised on a `fixed_length` mismatch, mirroring the existing
+non-`SAP` adaptive test right above it. `test_parse_pretrained_config.py`'s
+two `sqrt_len_method`-asserting tests updated to check `sqrt_len` directly
+instead (the value that actually matters now).
+
+**Follow-up:** `parse_config`'s own separate `fixed_length`-is-a-perfect-
+square/cube validation (`parse.py`, distinct from `get_kwargs`) still gated
+on `model_type in ["UNETR", "SAP"]`, unnarrowed by the `proj_feat` fix --
+still correctly required for `SAP` (`mask_head`'s `einops` grid reshape
+needs exact factorization) but now a stale, overly strict rejection for
+`UNETR` (nothing in its code needs this anymore). Narrowed to `model_type
+== "SAP"` only -- `UNETR+do_ap` configs with a non-square/cube
+`fixed_length` are now accepted, not just correctly computed.
+
+**Follow-up:** when `sqrt_len**ndims < fixed_length` (the common case for a
+non-square `fixed_length`), `_adaptive_token_grid_index`'s bottleneck canvas
+has fewer cells than there are real tokens, so some tokens never reach the
+reconstructed feature map at all -- `parse.py`'s `get_kwargs` now prints a
+one-time warning naming exactly how many. Tracing *which* tokens are most
+likely to be the dropped ones surfaced a real, fixable bias: the original
+(now `"point"`) selection tests each canvas cell's *center point* against
+every token's box, so a token's odds of winning any cell scale with its
+area -- small tokens are disproportionately likely to lose, and adaptive
+patching concentrates small tokens exactly in the detail/edge-dense regions
+adaptive patching exists to capture well. Added a second method,
+`"smallest_overlap"`: tests real box-vs-cell overlap (not just a point) and
+picks the smallest overlapping token, inverting the bias -- large,
+low-detail tokens become the ones more likely to lose a cell, which costs
+far less (their neighbors, typically also flat, interpolate over a missing
+cell gracefully). Exposed as `conf["model"]["token_selection"]` (`"point"`
+default, `"smallest_overlap"` opt-in) specifically so both can be A/B
+tested for real rather than committing to one from first-principles
+reasoning alone -- shown (commented, `do_ap:False` baseline) in
+`configs/basic_ct/unetr/base_config.yaml`.
+
+**Tier 1 coverage:** `test_arch.py` has a `"point"`-vs-`"smallest_overlap"`
+pair: a small token placed to physically overlap a canvas cell it doesn't
+contain the center point of -- `"point"` loses it to a large, whole-domain-
+covering token entirely (demonstrating the bias directly), while
+`"smallest_overlap"` on the identical setup always wins that cell for the
+small token.
+
+**Follow-up: a third `token_selection`, `"area_weighted"`.** Both `"point"`
+and `"smallest_overlap"` are winner-take-all -- exactly one token
+represents each cell, and every other token that also touches that cell
+contributes nothing. Added `_adaptive_token_grid_weights`: for each cell,
+computes the real overlap area (2D) / volume (3D) with every token that
+touches it (per-axis overlap length, clamped at 0, multiplied across axes),
+normalizes into per-cell weights summing to 1, and `proj_feat` combines
+them via a weighted sum (`einsum`) instead of a `gather` -- the adaptive-
+patching analog of ordinary average-pooling. Since real leaves fully tile
+the domain and canvas cells do too, every real token is guaranteed nonzero
+weight in at least one cell -- no token is ever entirely invisible to the
+canvas the way `"point"` (and, in dense small-leaf clusters, even
+`"smallest_overlap"`) can leave one. `proj_feat`/`unetr_head`'s parameter
+generalized from `token_grid_index` (always a `(B,G)` long index tensor) to
+`token_selection_state` (that, for `"point"`/`"smallest_overlap"`; a
+`(B,G,S)` float weight tensor for `"area_weighted"`), computed once per
+forward pass by a new small dispatcher, `_compute_token_selection_state`.
+`parse.py`'s "N tokens will never reach the reconstructed feature map"
+warning is gated off for `"area_weighted"` specifically, since it isn't
+true there -- reordered so `token_selection` is read before that check
+runs, rather than always printing regardless of which method a config
+actually selected.
+
+**Tier 1 coverage:** `test_arch.py` -- an exact-tiling case (weights
+collapse to one-hot, `proj_feat`'s weighted-sum output exactly matches the
+gather-based reconstruction, not just approximately) and a genuine
+proportional-blend case (two real, non-overlapping square leaves both
+landing inside one cell, weights asserted equal to their actual
+overlap-area fractions, verified against the closed-form expected value
+computed by hand, not just "sums to 1").
+
+**Follow-up: `area_weighted_alpha`.** Multiplies each token's overlap area
+by `size ** -alpha` before normalizing (`alpha=0`, the default, is plain
+area-proportional weighting -- unchanged). Turns `"area_weighted"` into a
+one-parameter family that subsumes `"smallest_overlap"` as its `alpha ->
+infinity` limit (the smallest overlapping token's weight -> 1, every other
+token's -> 0 -- the same relationship softmax-with-temperature-0 has to
+argmax) without removing `"smallest_overlap"` as a separate method: it
+stays cheaper (`gather`, not a full weighted sum) and exact rather than a
+large-`alpha` approximation whose required magnitude depends on the actual
+dynamic range of leaf sizes present. `"point"` has no `alpha` equivalent at
+all -- it's not in this family, since it selects by whether a cell's center
+point falls inside a box, never by area/overlap. Padding tokens (`size ==
+0`) need `size` clamped to a small epsilon *before* the `** -alpha` power,
+not after -- `0 ** -alpha` is `inf`, and `inf * 0` (their already-zeroed
+overlap area) is `nan`, not `0`.
+
+**Tier 1 coverage:** `test_arch.py` -- `alpha` defaults to 0; `alpha=0`
+reproduces the pre-`alpha` proportional-blend test's exact result; and a
+monotonicity test across `alpha in (0, 1, 5, 50)` on the same small/big
+two-token setup used elsewhere confirms the small token's weight strictly
+increases with `alpha`, starting at its plain area share and reaching
+~1 (`"smallest_overlap"`'s outcome) by `alpha=50`.
 
 ## Running the distributed (Tier 2) tests
 

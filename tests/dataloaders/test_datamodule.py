@@ -105,18 +105,15 @@ def _imagenet_batch(batch_size, return_label):
 def test_collate_fn_adaptive_patching_basic_ct_with_label():
     batch_size, num_classes = 3, 4
     batch = _basic_ct_batch(batch_size, num_channels=1, return_label=True, num_classes=num_classes)
-    inp, seq, size, pos, label, seq_label, variables, dict_key = collate_fn(
+    inp, seq, size, pos, label, variables, dict_key = collate_fn(
         batch, return_label=True, adaptive_patching=True, separate_channels=False,
-        dataset="basic_ct", num_classes=num_classes, num_labels=1, return_qdt=False, dict_key="ct1",
+        dataset="basic_ct", num_labels=1, return_qdt=False, dict_key="ct1",
     )
     assert inp.shape == (batch_size, 1, 32, 32)
     assert seq.shape == (batch_size, 1, FIXED_LENGTH, PATCH_SIZE * PATCH_SIZE)
     assert size.shape == (batch_size, 1, FIXED_LENGTH)
     assert pos.shape == (batch_size, 1, FIXED_LENGTH, 2)
     assert label.shape == (batch_size, 1, 32, 32)
-    assert seq_label.shape == (batch_size, num_classes, PATCH_SIZE * PATCH_SIZE, FIXED_LENGTH)
-    # seq_label is one-hot over the class axis (dim=1) -- every position sums to exactly 1
-    torch.testing.assert_close(seq_label.sum(dim=1), torch.ones(batch_size, PATCH_SIZE * PATCH_SIZE, FIXED_LENGTH))
     assert variables == ("ct_res0",)
     assert dict_key == "ct1"
     # every sample's full-image label is preserved through stacking, in order
@@ -129,7 +126,7 @@ def test_collate_fn_adaptive_patching_imagenet_with_label():
     batch = _imagenet_batch(batch_size, return_label=True)
     inp, seq, size, pos, label, variables, dict_key = collate_fn(
         batch, return_label=True, adaptive_patching=True, separate_channels=False,
-        dataset="imagenet", num_classes=0, num_labels=1, return_qdt=False, dict_key="imagenet",
+        dataset="imagenet", num_labels=1, return_qdt=False, dict_key="imagenet",
     )
     assert inp.shape == (batch_size, 3, 32, 32)
     assert seq.shape == (batch_size, 3, FIXED_LENGTH, PATCH_SIZE * PATCH_SIZE)
@@ -154,7 +151,7 @@ def test_collate_fn_adaptive_patching_basic_ct_no_label():
     batch = _basic_ct_batch(batch_size, num_channels=1, return_label=False)
     inp, seq, size, pos, variables, dict_key = collate_fn(
         batch, return_label=False, adaptive_patching=True, separate_channels=False,
-        dataset="basic_ct", num_classes=0, num_labels=1, return_qdt=False, dict_key="ct1",
+        dataset="basic_ct", num_labels=1, return_qdt=False, dict_key="ct1",
     )
     assert inp.shape == (batch_size, 1, 32, 32)
     assert seq.shape == (batch_size, 1, FIXED_LENGTH, PATCH_SIZE * PATCH_SIZE)
@@ -182,7 +179,7 @@ def test_collate_fn_return_qdt_includes_qdt_list():
     batch = list(pc)
     inp, seq, size, pos, variables, qdt_list, dict_key = collate_fn(
         batch, return_label=False, adaptive_patching=True, separate_channels=False,
-        dataset="basic_ct", num_classes=0, num_labels=1, return_qdt=True, dict_key="ct1",
+        dataset="basic_ct", num_labels=1, return_qdt=True, dict_key="ct1",
     )
     assert len(qdt_list) == batch_size
 
@@ -198,7 +195,7 @@ def test_collate_fn_separate_channels_true_no_label():
     batch = _basic_ct_batch(batch_size, num_channels=num_channels, return_label=False, separate_channels=True)
     inp, seq, size, pos, variables, dict_key = collate_fn(
         batch, return_label=False, adaptive_patching=True, separate_channels=True,
-        dataset="basic_ct", num_classes=0, num_labels=1, return_qdt=False, dict_key="ct1",
+        dataset="basic_ct", num_labels=1, return_qdt=False, dict_key="ct1",
     )
     assert inp.shape == (batch_size, num_channels, 32, 32)
     assert seq.shape == (batch_size, num_channels, FIXED_LENGTH, PATCH_SIZE * PATCH_SIZE)
@@ -216,9 +213,9 @@ def test_collate_fn_separate_channels_true_with_label_basic_ct():
         batch_size, num_channels=num_channels, return_label=True,
         num_classes=num_classes, separate_channels=True,
     )
-    inp, seq, size, pos, label, seq_label, variables, dict_key = collate_fn(
+    inp, seq, size, pos, label, variables, dict_key = collate_fn(
         batch, return_label=True, adaptive_patching=True, separate_channels=True,
-        dataset="basic_ct", num_classes=num_classes, num_labels=1, return_qdt=False, dict_key="ct1",
+        dataset="basic_ct", num_labels=1, return_qdt=False, dict_key="ct1",
     )
     assert seq.shape == (batch_size, num_channels, FIXED_LENGTH, PATCH_SIZE * PATCH_SIZE)
     assert size.shape == (batch_size, num_channels, FIXED_LENGTH)
@@ -248,7 +245,7 @@ def test_collate_fn_non_adaptive_with_label_basic_ct():
     batch = list(pc)
     inp, label, variables, dict_key = collate_fn(
         batch, return_label=True, adaptive_patching=False, separate_channels=False,
-        dataset="basic_ct", num_classes=0, num_labels=1, return_qdt=False, dict_key="ct1",
+        dataset="basic_ct", num_labels=1, return_qdt=False, dict_key="ct1",
     )
     assert inp.shape == (batch_size, 1, 8, 8)
     assert label.shape == (batch_size, 1, 8, 8)
@@ -276,7 +273,7 @@ def test_collate_fn_non_adaptive_no_label_imagenet():
     batch = list(pc)
     inp, variables, dict_key = collate_fn(
         batch, return_label=False, adaptive_patching=False, separate_channels=False,
-        dataset="imagenet", num_classes=0, num_labels=1, return_qdt=False, dict_key="imagenet",
+        dataset="imagenet", num_labels=1, return_qdt=False, dict_key="imagenet",
     )
     assert inp.shape == (batch_size, 3, 8, 8)
     assert variables == ("r", "g", "b")

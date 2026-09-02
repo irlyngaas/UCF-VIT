@@ -49,7 +49,6 @@ class PatchEmbed(nn.Module):
             twoD: Optional[bool] = True,
             norm_layer: Optional[Callable] = None,
             bias: bool = True,
-            sqrt_len_method: bool = False,
     ):
         """Initializes the patch projection convolution and derived grid dimensions.
 
@@ -63,13 +62,9 @@ class PatchEmbed(nn.Module):
             norm_layer: Optional normalization layer constructor applied to the
                 output embeddings.
             bias: Whether the projection convolution has a bias term.
-            sqrt_len_method: If True, skip the input-size assertion in `forward`
-                (used when the sequence length is derived differently, e.g. via
-                adaptive patching's square/cube-root grid).
         """
         super().__init__()
         self.twoD = twoD
-        self.sqrt_len_method = sqrt_len_method
         if self.twoD:
             self.patch_size = to_2tuple(patch_size)
         else:
@@ -123,11 +118,10 @@ class PatchEmbed(nn.Module):
         else:
             B, C, H, W, D = x.shape
         if self.img_size is not None:
-            if not self.sqrt_len_method:
-                _assert(H == self.img_size[0], f"Input height ({H}) doesn't match model ({self.img_size[0]}).")
-                _assert(W == self.img_size[1], f"Input width ({W}) doesn't match model ({self.img_size[1]}).")
-                if not self.twoD:
-                    _assert(D == self.img_size[2], f"Input width ({D}) doesn't match model ({self.img_size[2]}).")
+            _assert(H == self.img_size[0], f"Input height ({H}) doesn't match model ({self.img_size[0]}).")
+            _assert(W == self.img_size[1], f"Input width ({W}) doesn't match model ({self.img_size[1]}).")
+            if not self.twoD:
+                _assert(D == self.img_size[2], f"Input width ({D}) doesn't match model ({self.img_size[2]}).")
         x = self.proj(x)
         x = x.flatten(2).transpose(1, 2)  # NCHW -> NLC or NCHW -> NLC
         x = self.norm(x)

@@ -173,7 +173,6 @@ class VIT(nn.Module):
             tensor_par_group: Optional[dist.ProcessGroup] = None,
             FusedAttn_option = FusedAttn.NONE,
             use_adaptive_pos_emb: bool = False,
-            sqrt_len_method: bool = False,
             num_time_steps: int = None,
     ) -> None:
         """Builds the patch/token embedding, positional embedding, transformer blocks, and optional classification head.
@@ -229,9 +228,6 @@ class VIT(nn.Module):
             use_adaptive_pos_emb: Whether to compute positional embeddings from
                 each patch's adaptive size/position rather than using a fixed
                 learned/sin-cos table.
-            sqrt_len_method: Whether the (adaptively-patched) input is arranged as
-                a dense square/cube grid, so a standard `embed_layer` can be used
-                instead of the flattened linear token embedding path.
         """
         super().__init__()
         assert pos_embed in ('', 'none', 'learn')
@@ -269,14 +265,13 @@ class VIT(nn.Module):
         self.tensor_par_group = tensor_par_group
         self.FusedAttn_option = FusedAttn_option
         self.use_adaptive_pos_emb = use_adaptive_pos_emb
-        self.sqrt_len_method = sqrt_len_method
         self.num_time_steps = num_time_steps
 
         if self.adaptive_patching:
             assert self.interp_size is not None, "interp_size is required when adaptive_patching is turned on"
 
         #ASSUMES INPUT HAS ALREADY BEEN ADAPTIVELY PATCHED
-        if self.adaptive_patching and not self.sqrt_len_method:
+        if self.adaptive_patching:
             num_patches = self.fixed_length
             #TODO: throw error if using linear decoder in unetr
         else:
@@ -287,7 +282,6 @@ class VIT(nn.Module):
                     in_chans=1,
                     embed_dim=embed_dim,
                     twoD=twoD,
-                    sqrt_len_method=sqrt_len_method,
                 )
             else:
                 self.patch_embed = embed_layer(
@@ -296,7 +290,6 @@ class VIT(nn.Module):
                     in_chans=in_chans,
                     embed_dim=embed_dim,
                     twoD=twoD,
-                    sqrt_len_method=sqrt_len_method,
                 )
             num_patches = self.patch_embed.num_patches
             grid_size = self.patch_embed.grid_size
@@ -354,8 +347,7 @@ class VIT(nn.Module):
             self.patch_dim = self.in_chans*self.effective_patch_size**3
             self.patch_dim_woc = self.effective_patch_size**3
 
-        if self.adaptive_patching and not self.sqrt_len_method:
-            #TODO: Find a way to do convolutional patch embedding with adaptive token input, PatchEmbed doesn't work correctly
+        if self.adaptive_patching:
             if self.use_varemb:
                 self.token_embeds = nn.ModuleList(
                     [nn.Sequential(nn.LayerNorm(self.patch_dim_woc),nn.Linear(self.patch_dim_woc, self.embed_dim),nn.LayerNorm(self.embed_dim)) for i in range(len(self.default_vars))]
@@ -409,15 +401,15 @@ class VIT(nn.Module):
         """Initializes positional embeddings, cls token, patch embedding weights, and all submodules.
 
         Overwrites the learned positional embedding with a fixed 2D/3D sin-cos
-        embedding (when not adaptively patched or when `sqrt_len_method` is set),
-        initializes the class token and variable embedding (if used), and applies
-        `init_weights_vit_timm` recursively to every submodule.
+        embedding (when not adaptively patched), initializes the class token and
+        variable embedding (if used), and applies `init_weights_vit_timm`
+        recursively to every submodule.
 
         Args:
             mode: Unused; kept for interface compatibility with subclass overrides.
         """
         head_bias = 0.
-        if not self.adaptive_patching or self.sqrt_len_method:
+        if not self.adaptive_patching:
             if self.pos_embed is not None:
                 #trunc_normal_(self.pos_embed, std=.02)
                 if self.twoD:
@@ -616,7 +608,7 @@ class VIT(nn.Module):
             x = x + var_embed.unsqueeze(2)  # 1, V, D -> 1, V, 1, D
             x = self.aggregate_variables(x)  # B, V~ , L, D, where V~ is the aggregated variables
         else:
-            if self.adaptive_patching and not self.sqrt_len_method:
+            if self.adaptive_patching:
                 x = rearrange(x, 'b c s p -> b s (p c)')
                 x = self.token_embeds(x)
             else:
@@ -1137,12 +1129,19 @@ class UNETR(VIT):
                 to add U-Net-style convolutional skip connections from
                 intermediate encoder features), and, when adaptive patching is
                 used, `sqrt_len` (the grid side length the flat adaptive-patch
-                sequence is reshaped to).
+                sequence is reshaped to), `token_selection` (which method
+                `_compute_token_selection_state` uses to reconstruct each
+                canvas cell -- see that method's docstring), and
+                `area_weighted_alpha` (only used when
+                `token_selection == "area_weighted"`; see
+                `_adaptive_token_grid_weights`'s docstring).
         """
         self.linear_decoder = kwargs.pop('linear_decoder', '')
         self.feature_size = kwargs.pop('feature_size', '')
         self.skip_connection = kwargs.pop('skip_connection', '')
         self.sqrt_len = kwargs.pop('sqrt_len', '')
+        self.token_selection = kwargs.pop('token_selection', 'point')
+        self.area_weighted_alpha = kwargs.pop('area_weighted_alpha', 0.0)
         super().__init__(*args, **kwargs)
         #Remove decoder from VIT
         self.head = None 
@@ -1340,11 +1339,36 @@ class UNETR(VIT):
         """Finds which adaptive-patch token owns each cell of a `feat_size` canvas.
 
         `FixedQuadTree`/`FixedOctTree` leaves exactly tile the domain (no
-        gaps or overlaps, always square/cubic), so each canvas cell has
-        exactly one owning token -- found here via a point-in-box test
-        against every token's true `pos +/- size/2` footprint, rather than
-        assuming tokens already sit on a `feat_size` grid by raw sequence
-        index (which greedy-split tree order doesn't guarantee).
+        gaps or overlaps, always square/cubic), so real spatial position
+        (not raw sequence index, which greedy-split tree order doesn't
+        preserve) is what should determine each canvas cell's owning token.
+        `self.token_selection` picks how:
+
+        - `"point"` (default): each cell's *center point* is tested against
+          every token's true `pos +/- size/2` box; since leaves tile the
+          domain, at most one token contains any given point. Simple and
+          exact when `feat_size`'s cell density is high enough to sample
+          every token at least once, but when `prod(feat_size) <
+          fixed_length` (see `parse.py`'s `get_kwargs` warning), some
+          tokens -- disproportionately small ones, since a token's odds of
+          containing a sample point scale with its area -- contain no
+          sample point at all and are silently absent from the
+          reconstructed canvas. Adaptive patching concentrates small tokens
+          in detail/edge-dense regions, so this method is biased toward
+          dropping exactly the tokens most worth keeping.
+        - `"smallest_overlap"`: each cell's own *box* (not just its center)
+          is tested for overlap against every token's box; among every
+          token overlapping a given cell, the smallest one wins. This
+          inverts the bias above -- a cell straddling one large token and
+          one small token now represents the small one, so large/low-detail
+          tokens are the ones more likely to lose a cell, which costs less
+          (a large flat region's neighbors -- typically also flat --
+          interpolate over a missing cell far more gracefully than a
+          detail-rich region's neighbors would).
+
+        Both are provided to let a config (`conf["model"]["token_selection"]`)
+        A/B test which one performs better in practice, rather than
+        committing to one.
 
         Axis convention matches `utils.metrics._native_resolution_sample`
         (`pos`'s components are the last/second-to-last[/third-to-last]
@@ -1357,83 +1381,188 @@ class UNETR(VIT):
             feat_size: Target canvas grid size, `(H, W)` or `(H, W, D)`.
 
         Returns:
-            Long tensor of token indices, shape (B, prod(feat_size)).
+            Long tensor of token indices, shape (B, prod(feat_size)). A cell
+            with no winning token (no sample point/overlap found -- an edge
+            case from floating-point/domain-boundary rounding, not expected
+            to matter in practice) falls back to index 0.
         """
         size = seq_ps[..., 0]  # (B, S)
         pos = seq_ps[..., 1:]  # (B, S, ndims)
         device, dtype = seq_ps.device, seq_ps.dtype
         half = size / 2
+        size_b = size.unsqueeze(1)  # (B, 1, S)
 
         def cell_centers(n, extent):
             return ((torch.arange(n, device=device, dtype=dtype) + 0.5) / n) * extent
 
-        if self.twoD:
-            cell_y, cell_x = torch.meshgrid(
-                cell_centers(feat_size[0], self.img_size[0]),
-                cell_centers(feat_size[1], self.img_size[1]),
-                indexing='ij',
-            )
-            cell_x = cell_x.reshape(1, -1, 1)  # (1, G, 1)
-            cell_y = cell_y.reshape(1, -1, 1)
-            x1 = (pos[..., 0] - half).unsqueeze(1)  # (B, 1, S)
-            x2 = (pos[..., 0] + half).unsqueeze(1)
-            y1 = (pos[..., 1] - half).unsqueeze(1)
-            y2 = (pos[..., 1] + half).unsqueeze(1)
-            contains = (size.unsqueeze(1) > 0) & (cell_x >= x1) & (cell_x < x2) & (cell_y >= y1) & (cell_y < y2)
+        def cell_edges(n, extent):
+            idx = torch.arange(n, device=device, dtype=dtype)
+            return (idx / n) * extent, ((idx + 1) / n) * extent
+
+        ndims = 2 if self.twoD else 3
+        axis_extents = [self.img_size[i] for i in range(ndims)]
+
+        if self.token_selection == "point":
+            centers = torch.meshgrid(*[cell_centers(feat_size[i], axis_extents[i]) for i in range(ndims)], indexing='ij')
+            # centers[0] is the slowest-varying axis (feat_size[0]) -- matches pos's
+            # (x, y[, z]) = (last, second-to-last[, third-to-last]) convention reversed.
+            cell = [c.reshape(1, -1, 1) for c in reversed(centers)]  # cell[0]=x, cell[1]=y, [cell[2]=z]
+
+            edges = [((pos[..., i] - half).unsqueeze(1), (pos[..., i] + half).unsqueeze(1)) for i in range(ndims)]
+            winner = size_b > 0
+            for i in range(ndims):
+                lo, hi = edges[i]
+                winner = winner & (cell[i] >= lo) & (cell[i] < hi)
+            return winner.to(torch.uint8).argmax(dim=-1)  # (B, G)
+
+        elif self.token_selection == "smallest_overlap":
+            starts_ends = [cell_edges(feat_size[i], axis_extents[i]) for i in range(ndims)]
+            starts = torch.meshgrid(*[se[0] for se in starts_ends], indexing='ij')
+            ends = torch.meshgrid(*[se[1] for se in starts_ends], indexing='ij')
+            cell_lo = [c.reshape(1, -1, 1) for c in reversed(starts)]  # x, y[, z]
+            cell_hi = [c.reshape(1, -1, 1) for c in reversed(ends)]
+
+            edges = [((pos[..., i] - half).unsqueeze(1), (pos[..., i] + half).unsqueeze(1)) for i in range(ndims)]
+            overlaps = size_b > 0
+            for i in range(ndims):
+                lo, hi = edges[i]
+                overlaps = overlaps & (cell_lo[i] < hi) & (lo < cell_hi[i])
+            size_for_rank = torch.where(overlaps, size_b, torch.full_like(size_b, float('inf')))
+            return size_for_rank.argmin(dim=-1)  # (B, G)
+
         else:
-            cell_z, cell_y, cell_x = torch.meshgrid(
-                cell_centers(feat_size[0], self.img_size[0]),
-                cell_centers(feat_size[1], self.img_size[1]),
-                cell_centers(feat_size[2], self.img_size[2]),
-                indexing='ij',
-            )
-            cell_x = cell_x.reshape(1, -1, 1)
-            cell_y = cell_y.reshape(1, -1, 1)
-            cell_z = cell_z.reshape(1, -1, 1)
-            x1 = (pos[..., 0] - half).unsqueeze(1)
-            x2 = (pos[..., 0] + half).unsqueeze(1)
-            y1 = (pos[..., 1] - half).unsqueeze(1)
-            y2 = (pos[..., 1] + half).unsqueeze(1)
-            z1 = (pos[..., 2] - half).unsqueeze(1)
-            z2 = (pos[..., 2] + half).unsqueeze(1)
-            contains = (
-                (size.unsqueeze(1) > 0)
-                & (cell_x >= x1) & (cell_x < x2)
-                & (cell_y >= y1) & (cell_y < y2)
-                & (cell_z >= z1) & (cell_z < z2)
-            )
+            raise ValueError(f"Unknown token_selection {self.token_selection!r}")
 
-        return contains.to(torch.uint8).argmax(dim=-1)  # (B, G)
+    def _adaptive_token_grid_weights(self, seq_ps, feat_size):
+        """Computes each canvas cell's area-weighted blend of every overlapping token.
 
-    def proj_feat(self, x, hidden_size, feat_size, token_grid_index=None):
+        Unlike `_adaptive_token_grid_index`'s winner-take-all selection
+        (`"point"`/`"smallest_overlap"`), every real token overlapping a
+        cell contributes here, weighted by how much of the cell's area (2D)
+        / volume (3D) it actually covers -- the adaptive-patching analog of
+        ordinary average-pooling/downsampling, rather than picking one
+        token and discarding every other real overlap.
+
+        `self.area_weighted_alpha` (default 0) additionally biases the
+        weighting toward smaller tokens: each token's overlap area is
+        multiplied by `size ** -alpha` before normalizing. `alpha=0` is
+        plain area-proportional weighting (no size bias). As `alpha`
+        increases, the smallest overlapping token's weight approaches 1 and
+        every other token's approaches 0 -- `"smallest_overlap"`'s
+        winner-take-all rule is this method's `alpha -> infinity` limit
+        (the same relationship softmax-with-temperature-0 has to argmax),
+        though `"smallest_overlap"` stays a separate, cheaper (`gather`, not
+        a full weighted sum) and exact (not a large-`alpha` approximation)
+        method rather than being removed in favor of this generalization.
+
+        Args:
+            seq_ps: Per-patch size/position tensor, shape (B, S, ndims+1)
+                (`[size, pos_x, pos_y[, pos_z]]`).
+            feat_size: Target canvas grid size, `(H, W)` or `(H, W, D)`.
+
+        Returns:
+            Float tensor of per-cell token weights, shape (B, prod(feat_size),
+            S), each row summing to 1 (or all-zero in the degenerate case of
+            no overlap at all -- not expected in practice, since leaves tile
+            the domain, but guarded against division by zero rather than
+            producing `NaN`).
+        """
+        size = seq_ps[..., 0]  # (B, S)
+        pos = seq_ps[..., 1:]  # (B, S, ndims)
+        device, dtype = seq_ps.device, seq_ps.dtype
+        half = size / 2
+        size_b = size.unsqueeze(1)  # (B, 1, S)
+
+        def cell_edges(n, extent):
+            idx = torch.arange(n, device=device, dtype=dtype)
+            return (idx / n) * extent, ((idx + 1) / n) * extent
+
+        ndims = 2 if self.twoD else 3
+        axis_extents = [self.img_size[i] for i in range(ndims)]
+
+        starts_ends = [cell_edges(feat_size[i], axis_extents[i]) for i in range(ndims)]
+        starts = torch.meshgrid(*[se[0] for se in starts_ends], indexing='ij')
+        ends = torch.meshgrid(*[se[1] for se in starts_ends], indexing='ij')
+        cell_lo = [c.reshape(1, -1, 1) for c in reversed(starts)]  # x, y[, z]
+        cell_hi = [c.reshape(1, -1, 1) for c in reversed(ends)]
+
+        edges = [((pos[..., i] - half).unsqueeze(1), (pos[..., i] + half).unsqueeze(1)) for i in range(ndims)]
+        area = (size_b > 0).to(dtype)
+        for i in range(ndims):
+            lo, hi = edges[i]
+            overlap_len = (torch.minimum(hi, cell_hi[i]) - torch.maximum(lo, cell_lo[i])).clamp(min=0)
+            area = area * overlap_len  # (B, G, S), broadcasting from (B, 1, S) after the first axis
+
+        if self.area_weighted_alpha != 0:
+            # clamp before the power, not after: padding tokens have size==0,
+            # and 0 ** -alpha is inf, which * 0 (their zeroed-out area above)
+            # is nan, not 0 -- clamping keeps the size-bias factor finite so
+            # the (size_b > 0) masking above stays the only thing zeroing them.
+            safe_size = size_b.clamp(min=1e-6)
+            area = area * safe_size ** (-self.area_weighted_alpha)
+
+        return area / area.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+
+    def _compute_token_selection_state(self, seq_ps, feat_size):
+        """Computes whatever `proj_feat` needs to reconstruct `feat_size` from a flat token sequence.
+
+        Dispatches on `self.token_selection`: `_adaptive_token_grid_index`
+        (a `(B, prod(feat_size))` long index tensor) for `"point"`/
+        `"smallest_overlap"`, or `_adaptive_token_grid_weights` (a `(B,
+        prod(feat_size), Seq_Length)` float weight tensor) for
+        `"area_weighted"`. Computed once per forward pass and reused across
+        every `proj_feat` call in `unetr_head` (`dec4`/`enc4`/`enc3`/`enc2`
+        all share the same `feat_size`).
+
+        Args:
+            seq_ps: Per-patch size/position tensor, shape (B, S, ndims+1).
+            feat_size: Target canvas grid size, `(H, W)` or `(H, W, D)`.
+
+        Returns:
+            See `_adaptive_token_grid_index`/`_adaptive_token_grid_weights`.
+        """
+        if self.token_selection == "area_weighted":
+            return self._adaptive_token_grid_weights(seq_ps, feat_size)
+        return self._adaptive_token_grid_index(seq_ps, feat_size)
+
+    def proj_feat(self, x, hidden_size, feat_size, token_selection_state=None):
         """Reshapes a flat patch-token sequence back into a spatial feature map.
 
         For adaptive patching, the flat sequence is in greedy-split tree
         order, not raster order, so a plain reshape would place each token
-        at the wrong grid cell -- `token_grid_index` (from
-        `_adaptive_token_grid_index`) is used instead to gather each cell's
-        feature from its true owning token.
+        at the wrong grid cell -- `token_selection_state` (from
+        `_compute_token_selection_state`) is used instead to reconstruct
+        each cell's feature from the token(s) that actually cover it, per
+        `self.token_selection`.
 
         Args:
             x: Flat token sequence, shape (B, prod(feat_size), hidden_size)
                 when not `self.adaptive_patching` (a plain reshape needs an
                 exact match); shape (B, Seq_Length, hidden_size) when
                 `self.adaptive_patching` (`Seq_Length` need not equal
-                `prod(feat_size)` -- each canvas cell gathers its own owning
-                token via `token_grid_index`, so this reshape no longer
-                constrains token count to the canvas size).
+                `prod(feat_size)` -- each canvas cell is reconstructed from
+                its own true owning token(s) via `token_selection_state`, so
+                this reshape no longer constrains token count to the canvas
+                size).
             hidden_size: Channel dimension of each token.
             feat_size: Target spatial grid size, `(H, W)` for 2D or `(H, W, D)`
                 for 3D.
-            token_grid_index: Required when `self.adaptive_patching`; long
-                tensor of token indices per canvas cell, shape (B,
-                prod(feat_size)), from `_adaptive_token_grid_index`.
+            token_selection_state: Required when `self.adaptive_patching`;
+                from `_compute_token_selection_state` -- for
+                `self.token_selection in ("point", "smallest_overlap")`, a
+                long index tensor per canvas cell, shape (B, prod(feat_size)),
+                gathered directly; for `"area_weighted"`, a float weight
+                tensor, shape (B, prod(feat_size), Seq_Length), combined via
+                a weighted sum instead.
 
         Returns:
             Spatial feature map, shape (B, hidden_size, H, W[, D]).
         """
         if self.adaptive_patching:
-            x = torch.gather(x, 1, token_grid_index.unsqueeze(-1).expand(-1, -1, hidden_size))
+            if self.token_selection == "area_weighted":
+                x = torch.einsum('bgs,bsc->bgc', token_selection_state, x)
+            else:
+                x = torch.gather(x, 1, token_selection_state.unsqueeze(-1).expand(-1, -1, hidden_size))
 
         if self.twoD:
             x = x.view(x.size(0), feat_size[0], feat_size[1], hidden_size)
@@ -1463,13 +1592,13 @@ class UNETR(VIT):
                 when `self.skip_connection` is True.
             seq_ps: Per-patch size/position tensor; required when
                 `self.adaptive_patching` (all `proj_feat` calls below share
-                the same `feat_size`, so its token-grid index is computed
-                once here).
+                the same `feat_size`, so `_compute_token_selection_state` is
+                only called once here).
 
         Returns:
             Per-class segmentation logits, shape (B, num_classes, H, W[, D]).
         """
-        token_grid_index = self._adaptive_token_grid_index(seq_ps, self.feat_size) if self.adaptive_patching else None
+        token_selection_state = self._compute_token_selection_state(seq_ps, self.feat_size) if self.adaptive_patching else None
 
         if not self.skip_connection:
             if self.linear_decoder:
@@ -1481,7 +1610,7 @@ class UNETR(VIT):
                 x = self.upsample(x)
 
             else:
-                x = self.proj_feat(x, self.embed_dim, self.feat_size, token_grid_index)
+                x = self.proj_feat(x, self.embed_dim, self.feat_size, token_selection_state)
                 dec3 = self.decoder5(x)
                 dec2 = self.decoder4(dec3)
                 dec1 = self.decoder3(dec2)
@@ -1491,12 +1620,12 @@ class UNETR(VIT):
                 x = self.out(out)
         else:
             int_len = len(intermediates)
-            dec4 = self.proj_feat(x, self.embed_dim, self.feat_size, token_grid_index)
-            enc4 = self.encoder4(self.proj_feat(intermediates[int_len-1], self.embed_dim, self.feat_size, token_grid_index))
+            dec4 = self.proj_feat(x, self.embed_dim, self.feat_size, token_selection_state)
+            enc4 = self.encoder4(self.proj_feat(intermediates[int_len-1], self.embed_dim, self.feat_size, token_selection_state))
             dec3 = self.decoder5(dec4, enc4)
-            enc3 = self.encoder3(self.proj_feat(intermediates[int_len-2], self.embed_dim, self.feat_size, token_grid_index))
+            enc3 = self.encoder3(self.proj_feat(intermediates[int_len-2], self.embed_dim, self.feat_size, token_selection_state))
             dec2 = self.decoder4(dec3, enc3)
-            enc2 = self.encoder2(self.proj_feat(intermediates[int_len-3], self.embed_dim, self.feat_size, token_grid_index))
+            enc2 = self.encoder2(self.proj_feat(intermediates[int_len-3], self.embed_dim, self.feat_size, token_selection_state))
             dec1 = self.decoder3(dec2, enc2)
             if self.feat_size[0]*16 != self.img_size[0]:
                 dec1 = self.upsample(dec1)
@@ -1559,7 +1688,7 @@ class UNETR(VIT):
             x = x + var_embed.unsqueeze(2)  # 1, V, D -> 1, V, 1, D
             x = self.aggregate_variables(x)  # B, V~ , L, D, where V~ is the aggregated variables
         else:
-            if self.adaptive_patching and not self.sqrt_len_method:
+            if self.adaptive_patching:
                 x = rearrange(x, 'b c s p -> b s (p c)')
                 x = self.token_embeds(x)
             else:

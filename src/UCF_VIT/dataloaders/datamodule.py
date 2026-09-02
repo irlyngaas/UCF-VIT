@@ -4,7 +4,6 @@ from typing import Dict, Optional
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
-import torch.nn.functional as F
 import torch.distributed as dist
 
 from .dataset import (
@@ -16,13 +15,11 @@ from .dataset import (
 from UCF_VIT.utils.misc import bucket_file_list, slice_file_list
 from UCF_VIT.utils.misc import process_root_dirs as process_root_dirs_shared
 
-def collate_fn(batch, return_label, adaptive_patching, separate_channels, dataset, num_classes, num_labels, return_qdt, dict_key):
+def collate_fn(batch, return_label, adaptive_patching, separate_channels, dataset, num_labels, return_qdt, dict_key):
     """Collate function for `NativePytorchDataModule`'s iterative dataloaders.
 
     Stacks per-sample numpy arrays into batched tensors, handling several
-    combinations of adaptive patching, labeling, and dataset type (e.g. one-hot
-    encoding segmentation masks for "basic_ct", stacking per-channel label lists for
-    other segmentation datasets).
+    combinations of adaptive patching, labeling, and dataset type.
 
     Args:
         batch: List of samples as yielded by the underlying `ProcessChannels`
@@ -34,10 +31,8 @@ def collate_fn(batch, return_label, adaptive_patching, separate_channels, datase
         separate_channels: Whether adaptive patching was done per channel
             (True) or jointly across channels (False); affects how `size`/`pos`
             are stacked.
-        dataset: Dataset name, e.g. "imagenet" or "basic_ct"; determines label/
-            seq_label handling.
-        num_classes: Number of segmentation classes, used to one-hot encode masks
-            for "basic_ct".
+        dataset: Dataset name, e.g. "imagenet" or "basic_ct"; determines label
+            handling.
         num_labels: Number of per-channel label tensors to stack for non-"basic_ct"
             segmentation datasets.
         return_qdt: Whether to also collect and return the list of quadtree/octree
@@ -80,40 +75,16 @@ def collate_fn(batch, return_label, adaptive_patching, separate_channels, datase
                         qdt_list.append(batch[i][6])
             else:
                 label = torch.stack([torch.from_numpy(batch[i][4]) for i in range(len(batch))])
-                seq_label_list = []
-                for i in range(len(batch)):
-                    if dataset == "basic_ct":
-                        seq_mask = torch.from_numpy(batch[i][5][0]).long()
-                        seq_mask = F.one_hot(seq_mask.squeeze(-1), num_classes=num_classes)
-                        seq_label_list.append(seq_mask.permute(2, 0, 1).float())
-                    else:
-                        seq_label_list.append([])
-                        for j in range(num_labels):
-                            seq_label_list[i].append(torch.from_numpy(batch[i][5][j]))
-                if dataset == "basic_ct":
-                    seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
-                else:
-                    channel_list = []
-                    for i in range(len(batch)):
-                        channel_list.append(torch.stack([seq_label_list[i][j] for j in range(num_labels)]))
-                    seq_label = torch.stack([channel_list[i] for i in range(len(batch))])
-
-                variables = batch[0][6]
+                variables = batch[0][5]
                 if return_qdt:
                     qdt_list = []
                     for i in range(len(batch)):
-                        qdt_list.append(batch[i][7])
+                        qdt_list.append(batch[i][6])
 
-            if dataset == "imagenet":                
-                if return_qdt:
-                    return (inp, seq, size, pos, label, variables, qdt_list, dict_key)
-                else:
-                    return (inp, seq, size, pos, label, variables, dict_key)
+            if return_qdt:
+                return (inp, seq, size, pos, label, variables, qdt_list, dict_key)
             else:
-                if return_qdt:
-                    return (inp, seq, size, pos, label, seq_label, variables, qdt_list, dict_key)
-                else:
-                    return (inp, seq, size, pos, label, seq_label, variables, dict_key)
+                return (inp, seq, size, pos, label, variables, dict_key)
         else:
             inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
             #TODO: Generalize this
@@ -612,7 +583,7 @@ class NativePytorchDataModule(torch.nn.Module):
             # A plain function + functools.partial (rather than a closure lambda) so this
             # is picklable, which multiprocessing_context="spawn" requires -- see the
             # multiprocessing_context docstring entry above for why that matters.
-            collate_fn=functools.partial(collate_fn, return_label=self.return_label, adaptive_patching=self.adaptive_patching, separate_channels=self.separate_channels, dataset=self.dataset, num_classes=self.num_classes, num_labels=num_labels, return_qdt=self.return_qdt, dict_key=k),
+            collate_fn=functools.partial(collate_fn, return_label=self.return_label, adaptive_patching=self.adaptive_patching, separate_channels=self.separate_channels, dataset=self.dataset, num_labels=num_labels, return_qdt=self.return_qdt, dict_key=k),
             multiprocessing_context=self.multiprocessing_context,
         )
 

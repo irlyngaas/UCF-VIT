@@ -53,7 +53,9 @@ model:
   linear_decoder: False
   feature_size: 16
   skip_connection: True
-  
+  token_selection: point # "point" (default), "smallest_overlap", or "area_weighted" -- see UCF_VIT.model.arch.UNETR._adaptive_token_grid_index/_adaptive_token_grid_weights. Only used when do_ap:True; not used by this baseline (do_ap:False) -- shown here so it's easy to find if you turn adaptive patching on.
+  area_weighted_alpha: 0 # Only used when token_selection:area_weighted. 0 = pure area-proportional blending; larger values bias toward smaller (typically detail-rich) tokens, approaching "smallest_overlap"'s winner-take-all as alpha grows.
+
 # ---------------------------- TILING --------------------------------------------
 tiling:
   do_tiling: False

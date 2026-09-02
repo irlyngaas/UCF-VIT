@@ -67,15 +67,6 @@ def _transplant_pos_embed(encoder_dict, pretrained_model, model):
             was loaded into (at the pretrained model's own original size).
         model: The constructed new model instance being fine-tuned (at its own,
             possibly different, size).
-
-    Raises:
-        NotImplementedError: If either model has sqrt_len_method=True (SAP, or
-            UNETR with do_ap:True) and their pos_embed shapes differ. That regime's
-            pos_embed is sized from patch_embed's raw img_size/patch_size grid,
-            which does not actually match its real sqrt_len-based token count (a
-            separate, pre-existing issue) -- interpolating via grid_size there
-            would silently produce a wrong-shaped result, so this is rejected
-            explicitly rather than attempted.
     """
     if "pos_embed" not in encoder_dict:
         return
@@ -83,15 +74,6 @@ def _transplant_pos_embed(encoder_dict, pretrained_model, model):
     pos_embed = encoder_dict["pos_embed"]
     if tuple(pos_embed.shape) == tuple(model.pos_embed.shape):
         return
-
-    if pretrained_model.sqrt_len_method or model.sqrt_len_method:
-        raise NotImplementedError(
-            "pos_embed interpolation for a pretrained/new size mismatch is not "
-            "supported when sqrt_len_method is True (SAP, or UNETR with "
-            "ap.do_ap:True) -- grid_size does not reflect the real sqrt_len-based "
-            "token count for this regime. Use a pretrained checkpoint with the "
-            "same size for these model types."
-        )
 
     if hasattr(pretrained_model, "grid_size") and hasattr(model, "grid_size"):
         interp = interpolate_pos_embed if model.twoD else interpolate_pos_embed_3d
@@ -113,15 +95,14 @@ def _transplant_pos_embed(encoder_dict, pretrained_model, model):
             )
         encoder_dict["pos_embed"] = resized
     else:
-        # adaptive_patching and not sqrt_len_method: pos_embed is a flat, learned,
-        # per-sequence-slot-index embedding (only used when use_adaptive_pos_emb:
-        # False; see VIT._pos_embed), not a spatial grid -- slot index N has no
-        # reliable relationship to N+1 (FixedQuadTree/FixedOctTree's node order
-        # reflects greedy-split order, not spatial adjacency), so there's no
-        # principled way to resize it. Dropped rather than raised (unlike
-        # sqrt_len_method's rejection above) since a size mismatch here is a
-        # normal scenario (e.g. fine-tuning at a different fixed_length): the
-        # new model just keeps its own fresh init.
+        # adaptive_patching: pos_embed is a flat, learned, per-sequence-slot-index
+        # embedding (only used when use_adaptive_pos_emb:False; see
+        # VIT._pos_embed), not a spatial grid -- slot index N has no reliable
+        # relationship to N+1 (FixedQuadTree/FixedOctTree's node order reflects
+        # greedy-split order, not spatial adjacency), so there's no principled
+        # way to resize it. Dropped rather than raised since a size mismatch
+        # here is a normal scenario (e.g. fine-tuning at a different
+        # fixed_length): the new model just keeps its own fresh init.
         del encoder_dict["pos_embed"]
 
 

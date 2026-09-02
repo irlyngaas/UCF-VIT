@@ -93,12 +93,7 @@ def forward_step(conf, batch, model):
         return loss, output
     
     elif conf["model"]["type"] == "SAP":
-        if conf["data"]["twoD"]:
-            seq = einops.rearrange(batch["seq"], 'b c (s1 s2) (ps1 ps2)-> b c (s1 ps1) (s2 ps2)', s1=conf["model"]["kwargs"]["sqrt_len"], s2=conf["model"]["kwargs"]["sqrt_len"], ps1=conf["data"]["interp_size"], ps2=conf["data"]["interp_size"])
-        else:
-            seq = einops.rearrange(batch["seq"], 'b c (s1 s2 s3) (ps1 ps2 ps3)-> b c (s1 ps1) (s2 ps2) (s3 ps3)', s1=conf["model"]["kwargs"]["sqrt_len"], s2=conf["model"]["kwargs"]["sqrt_len"], s3=conf["model"]["kwargs"]["sqrt_len"], ps1=conf["data"]["interp_size"], ps2=conf["data"]["interp_size"], ps3=conf["data"]["interp_size"])
-
-        output = model.forward(seq, batch["variables"], batch["seq_ps"])
+        output = model.forward(batch["seq"], batch["variables"], batch["seq_ps"])
         seq_size = batch["seq_ps"][..., 0]
         seq_pos = batch["seq_ps"][..., 1:]
         loss = native_resolution_dice_loss(output, batch["label"], seq_size, seq_pos, conf["data"]["interp_size"], conf["data"]["twoD"], conf["model"]["kwargs"]["num_classes"])
@@ -147,12 +142,7 @@ def forward_step(conf, batch, model):
 
     elif conf["model"]["type"] == "UNETR":
         if conf["ap"]["do_ap"]:
-            if conf["data"]["twoD"]:
-                seq = einops.rearrange(batch["seq"], 'b c (s1 s2) (ps1 ps2)-> b c (s1 ps1) (s2 ps2)', s1=conf["model"]["kwargs"]["sqrt_len"], s2=conf["model"]["kwargs"]["sqrt_len"], ps1=conf["data"]["interp_size"], ps2=conf["data"]["interp_size"])
-            else:
-                seq = einops.rearrange(batch["seq"], 'b c (s1 s2 s3) (ps1 ps2 ps3)-> b c (s1 ps1) (s2 ps2) (s3 ps3)', s1=conf["model"]["kwargs"]["sqrt_len"], s2=conf["model"]["kwargs"]["sqrt_len"], s3=conf["model"]["kwargs"]["sqrt_len"], ps1=conf["data"]["interp_size"], ps2=conf["data"]["interp_size"], ps3=conf["data"]["interp_size"])
-
-            output = model.forward(batch["data"], batch["variables"], batch["seq_ps"], seq)
+            output = model.forward(batch["data"], batch["variables"], batch["seq_ps"], batch["seq"])
 
         else:
             output = model.forward(batch["data"], batch["variables"])
@@ -183,19 +173,13 @@ def get_batch(conf, it_loader):
 
     Returns:
         Dict with keys "data", "variables", "dict_key", "seq", "seq_size",
-        "seq_pos", "label", and "seq_label"; entries not applicable to the current
-        model type/adaptive-patching setting are set to None.
+        "seq_pos", and "label"; entries not applicable to the current model
+        type/adaptive-patching setting are set to None.
     """
     try:
-        if conf["model"]["type"] == "VIT":
+        if conf["model"]["type"] in ["VIT", "UNETR", "SAP"]:
             if conf["ap"]["do_ap"]:
                 data, seq, seq_size, seq_pos, label, variables, dict_key = next(it_loader)
-            else:
-                data, label, variables, dict_key = next(it_loader)
-
-        elif conf["model"]["type"] in ["UNETR", "SAP"]:
-            if conf["ap"]["do_ap"]:
-                data, seq, seq_size, seq_pos, label, seq_label, variables, dict_key = next(it_loader)
             else:
                 data, label, variables, dict_key = next(it_loader)
 
@@ -238,7 +222,6 @@ def get_batch(conf, it_loader):
              "seq_size": seq_size if conf["ap"]["do_ap"] else None,
              "seq_pos": seq_pos if conf["ap"]["do_ap"] else None,
              "label": label if conf["dataloader"]["return_label"] else None,
-             "seq_label": seq_label if conf["dataloader"]["return_label"] and conf["ap"]["do_ap"] and conf["model"]["type"] in ["UNETR", "SAP"] else None,
            }
 
 def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_scheduler):
@@ -264,8 +247,8 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
 
     Returns:
         Dict with keys "data", "variables", "dict_key", "seq", "seq_ps", "label",
-        "seq_label", "t", and "e"; entries not applicable to the current model
-        type/adaptive-patching setting are set to None.
+        "t", and "e"; entries not applicable to the current model type/adaptive-
+        patching setting are set to None.
     """
     tensor_par_size = conf["parallelism"]["tensor_par_size"]
 
@@ -298,8 +281,6 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
             variables = batch["variables"]
             if conf["dataloader"]["return_label"]:
                 label = batch["label"].to(device, non_blocking=True)
-                if conf["model"]["type"] in ["UNETR", "SAP"]: #Classification
-                    seq_label = batch["seq_label"].to(device, non_blocking=True)
         else:
             batch = get_batch(conf, it_loader)
             # See the do_ap:True branch above for why .to(device) comes
@@ -353,17 +334,6 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
                 dict_key = batch["dict_key"]
                 if conf["dataloader"]["return_label"]:
                     label = batch["label"].to(device, non_blocking=True)
-                    if conf["model"]["type"] in ["UNETR", "SAP"]:
-                        # Must match the receiver's dtype=precision_dt
-                        # placeholder below -- real seq_label is float32
-                        # (datamodule.py's seq_mask.permute(2,0,1).float()),
-                        # which only happens to already match precision_dt
-                        # when data_type:float32 is configured; explicit here
-                        # so bfloat16 configs don't hit the same
-                        # sender/receiver dtype mismatch just fixed for
-                        # label above. Order flipped for the same pin_memory
-                        # reason as data/seq/seq_size/seq_pos above.
-                        seq_label = batch["seq_label"].to(device, non_blocking=True).to(precision_dt)
 
                 if dataset == "imagenet":
                     dict_key = "imagenet"
@@ -414,14 +384,6 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
                             # casting, so a sender/receiver dtype mismatch here silently
                             # corrupts the transfer.
                             label = torch.zeros(batch_size, 1, tile_size[0], tile_size[1], dtype=torch.uint8).to(device)
-                            if conf["model"]["type"] in ["UNETR", "SAP"]:
-                                # Real seq_label is (batch_size, num_classes, patch_size*patch_size,
-                                # fixed_length) -- patch-volume comes BEFORE fixed_length, not after
-                                # (see dataset.py's np.reshape(seq_label, [patch_size**2, -1, 1]) and
-                                # datamodule.py's seq_mask.permute(2, 0, 1)). forward_step's
-                                # einops.rearrange relies on this exact order -- right element count
-                                # but wrong per-axis shape broadcasts fine but fails downstream.
-                                seq_label = torch.zeros(batch_size, conf["model"]["kwargs"]["num_classes"], interp_size*interp_size, fixed_length, dtype=precision_dt).to(device)
                 else:
                     data = torch.zeros(batch_size, num_channels[dict_key], tile_size[0], tile_size[1], tile_size[2], dtype=precision_dt).to(device)
                     seq = torch.zeros(batch_size, num_channels[dict_key], fixed_length, interp_size*interp_size*interp_size, dtype=precision_dt).to(device)
@@ -443,10 +405,6 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
                             # Same real-uint8-vs-precision_dt reasoning as
                             # the twoD branch above.
                             label = torch.zeros(batch_size, 1, tile_size[0], tile_size[1], tile_size[2], dtype=torch.uint8).to(device)
-                            if conf["model"]["type"] in ["UNETR", "SAP"]:
-                                # Same patch-volume-before-fixed_length
-                                # reasoning as the twoD branch above.
-                                seq_label = torch.zeros(batch_size, conf["model"]["kwargs"]["num_classes"], interp_size*interp_size*interp_size, fixed_length, dtype=precision_dt).to(device)
                 variables = [None] * num_channels[dict_key]
 
             #Broadcast data batch to the rest of the tensor parallel group
@@ -458,8 +416,6 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
 
             if conf["dataloader"]["return_label"]:
                 dist.broadcast(label, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
-                if conf["model"]["type"] in ["UNETR", "SAP"]:
-                    dist.broadcast(seq_label, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
 
         else:
             if dist.get_rank(tensor_par_group) == 0:
@@ -569,7 +525,6 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
              "seq": seq if conf["ap"]["do_ap"] else None,
              "seq_ps": seq_ps if conf["ap"]["do_ap"] else None,
              "label": label if conf["dataloader"]["return_label"] else None,
-             "seq_label": seq_label if conf["dataloader"]["return_label"] and conf["ap"]["do_ap"] and conf["model"]["type"] in ["UNETR", "SAP"] else None,
              "t": t if conf["model"]["type"] == "DiffusionVIT" else None,
              "e": e if conf["model"]["type"] == "DiffusionVIT" else None,
            }
