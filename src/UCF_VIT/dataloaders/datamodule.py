@@ -207,42 +207,24 @@ class NativePytorchDataModule(torch.nn.Module):
             only used when `dataset` is "imagenet". If absent or has no "imagenet" entry,
             images are left at their native size.
         multiprocessing_context (str, optional): `DataLoader`'s own `multiprocessing_context`
-            argument -- `None` (the default) leaves PyTorch's own default in place (`fork` on
-            Linux). Only worth setting to `"spawn"` for a config combining `num_workers > 0`
-            with heavy per-sample CPU work (e.g. adaptive-patching a 3D volume) run alongside
-            `tensor_par_size > 1`: forking a worker process after CUDA/NCCL is already
-            initialized in the parent (as happens here -- `get_model` runs before
-            `train_dataloader` in every training script) is a known hazard (PyTorch's own
-            docs warn about it) -- CUDA/NCCL keep background threads that can hold a lock at
-            the instant of the fork, which the child then inherits stuck forever, causing a
-            segfault the next time it touches libc's allocator (i.e. almost immediately, in
-            unrelated-looking code). See `configs/basic_ct/sap/base_config.yaml`'s own
-            `multiprocessing_context: "spawn"` for a shipped config that needs it.
-            `"spawn"` costs real per-worker startup latency (a fresh Python interpreter
-            re-imports the whole `torch`/`timm`/`monai`/`xformers` chain), so it's opt-in per
-            config rather than a new global default.
+            argument -- `None` (default) leaves PyTorch's default (`fork`) in place. Set to
+            `"spawn"` if `num_workers > 0` forks a worker after CUDA/NCCL is already
+            initialized in the parent (`get_model` runs before `train_dataloader`), which
+            can deadlock/segfault the worker -- see `configs/basic_ct/sap/base_config.yaml`.
+            Costs real per-worker startup latency (re-imports torch/timm/monai/xformers),
+            so it's opt-in, not a new default.
         allow_file_reuse (bool, optional): If False (default), a dataset key with fewer
-            files than the DDP ranks/workers assigned to it fails loudly
-            (`calculate_load_balancing_on_the_fly`'s and `FileReader.__iter__`'s own
-            asserts) rather than silently letting some ranks/workers train on no data
-            at all. If True, every rank/worker gets at least one file instead, reusing
-            (duplicating) files round-robin as needed, with a printed warning
-            quantifying how much reuse is happening. Not just a small/debug-dataset
-            concern -- at the node counts this repo targets, `data_par_size` can
-            exceed a real dataset's file count too. See `FileReader.__iter__`'s own
-            comment for the reuse mechanism.
-        bucket_shuffle_seed (int, optional): Imagenet only -- seeds the shuffle
-            `bucket_file_list` applies (to the already train/val/test-sliced image
-            list) before dividing it into per-DDP-rank-group buckets. Without this,
-            bucketing is a contiguous split of a class-sorted list, so each bucket
-            (and therefore each rank) only ever sees a narrow range of classes every
-            epoch -- a real concern for data-parallel SGD (class-homogeneous local
-            batches skew BatchNorm statistics and correlate gradients within a
-            rank's own step sequence). A fixed seed keeps this fully deterministic
-            (same seed always gives the same shuffle, independent of
-            `data_par_size`/process restarts, same as everything else about the
-            split) while giving each bucket a representative cross-section of
-            classes instead. `None` preserves the original contiguous ordering.
+            files than its assigned DDP ranks/workers fails loudly instead of silently
+            training some ranks on no data. If True, every rank/worker gets at least one
+            file, reusing (duplicating) files round-robin, with a printed warning. Relevant
+            at scale too, not just small datasets -- `data_par_size` can exceed a real
+            dataset's file count. See `FileReader.__iter__` for the reuse mechanism.
+        bucket_shuffle_seed (int, optional): Imagenet only -- seeds the shuffle applied
+            before dividing the sliced image list into per-rank buckets. Without it,
+            bucketing is a contiguous split of a class-sorted list, so each rank only sees
+            a narrow range of classes (skews BatchNorm stats, correlates gradients within a
+            rank). Deterministic regardless of `data_par_size`/restarts. `None` disables
+            shuffling (original contiguous ordering).
     """
 
     def __init__(
@@ -340,16 +322,13 @@ class NativePytorchDataModule(torch.nn.Module):
 
         self.dict_lister_trains = self.process_root_dirs()
 
-        # Slices train/val/test membership once, from a deterministic (sorted) file
-        # order, before setup()/reset()'s own per-epoch reshuffle (np.random.choice,
-        # unseeded -- needed for genuine per-epoch training variety and per-rank
-        # sharding fairness, so deliberately not removed) ever runs. Order matters:
-        # reshuffling first and slicing after would make which files count as
-        # "train" vs held-out "val"/"test" drift on every checkpoint restart, and
-        # even between epochs of the same run. Sorting also makes this independent
-        # of process_root_dirs's own listing order (os.listdir/glob.glob/FileLister
-        # aren't guaranteed stable across calls). set_iterative_dataloader passes a
-        # no-op start_idx=0.0/end_idx=1.0 to FileReader since slicing happens here.
+        # Slices train/val/test membership once (sorted, deterministic) before
+        # setup()/reset()'s own per-epoch reshuffle (np.random.choice, unseeded --
+        # kept for training variety/per-rank sharding fairness) ever runs, so which
+        # files count as "train" vs held-out "val"/"test" doesn't drift across
+        # restarts or epochs. Sorting also avoids relying on process_root_dirs's own
+        # (unstable) listing order. set_iterative_dataloader passes a no-op
+        # start_idx=0.0/end_idx=1.0 to FileReader since slicing happens here.
         for k in self.dict_lister_trains:
             if self.dataset == "imagenet":
                 start_idx, end_idx = self.dict_start_idx["imagenet"], self.dict_end_idx["imagenet"]
@@ -358,17 +337,13 @@ class NativePytorchDataModule(torch.nn.Module):
             self.dict_lister_trains[k] = slice_file_list(sorted(self.dict_lister_trains[k]), start_idx, end_idx)
 
         if self.dataset == "imagenet":
-            # Buckets are purely a rank/GPU-group assignment mechanism
-            # (FileReader.read_process_file derives each image's label from its
-            # own parent directory at read time, not from which bucket it's
-            # in) -- bucketing after the slice above keeps train/val/test
-            # membership independent of data_par_size entirely: only how the
-            # already-resolved membership gets divided across ranks depends on
-            # it, not which images are in it. Must call bucket_file_list
-            # identically (same already-sorted-and-sliced input, same
-            # data_par_size) to calculate_load_balancing_on_the_fly's own call,
-            # or train_dataloader's gx-based bucket selection breaks -- see
-            # bucket_file_list's own docstring for why.
+            # Buckets are purely a rank/GPU-group assignment mechanism (labels
+            # come from each image's parent directory at read time, not its
+            # bucket) -- bucketing after the slice above keeps train/val/test
+            # membership independent of data_par_size: only how it's divided
+            # across ranks depends on it. Must call bucket_file_list identically
+            # to calculate_load_balancing_on_the_fly's own call (same input, same
+            # data_par_size), or train_dataloader's gx-based bucket selection breaks.
             k = next(iter(self.dict_lister_trains))
             self.dict_lister_trains = bucket_file_list(self.dict_lister_trains[k], self.data_par_size, shuffle_seed=self.bucket_shuffle_seed)
 
@@ -408,12 +383,10 @@ class NativePytorchDataModule(torch.nn.Module):
             `dict_data_train`, with `dict_data_train[k]` set to the new
             `ProcessChannels`-wrapped iterable dataset.
         """
-        # start_idx/end_idx are a no-op [0.0, 1.0) here -- dict_start_idx/dict_end_idx
-        # were already applied once, deterministically, in __init__ (before
-        # setup()/reset()'s own epoch-to-epoch reshuffle of lister_train could
-        # re-randomize which files count as this key's train/val/test membership --
-        # see __init__'s own comment for the full rationale). FileReader still takes
-        # start_idx/end_idx as real parameters for its other, direct callers/tests.
+        # start_idx/end_idx are a no-op [0.0, 1.0) here -- already applied once,
+        # deterministically, in __init__ (before setup()/reset()'s reshuffle could
+        # re-randomize membership; see __init__'s comment). FileReader still takes
+        # them as real parameters for its other direct callers/tests.
         start_idx = 0.0
         end_idx = 1.0
         if self.dataset == "imagenet":

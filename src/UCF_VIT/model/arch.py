@@ -475,14 +475,11 @@ class VIT(nn.Module):
         if self.use_adaptive_pos_emb:
             pos_embed = self.adaptive_pos_dep_emb(seq_ps)
             if self.cls_token is not None:
-                # adaptive_pos_dep_emb computes one position embedding per real
-                # patch from seq_ps, with no row for the class token (it has no
-                # spatial position of its own) -- pos_embed is otherwise one
-                # token short once the class token gets prepended to x below.
-                # Prepending a zero row mirrors get_2d_sincos_pos_embed/
-                # get_3d_sincos_pos_embed's own cls_token handling (utils/
-                # pos_embed.py) for the non-adaptive case: "prepend a zero
-                # embedding row for a class token".
+                # adaptive_pos_dep_emb has no row for the class token (no spatial
+                # position of its own), so pos_embed is one token short once the
+                # class token is prepended to x below -- prepending a zero row
+                # mirrors get_2d_sincos_pos_embed/get_3d_sincos_pos_embed's own
+                # cls_token handling for the non-adaptive case.
                 cls_pos_embed = torch.zeros(
                     pos_embed.shape[0], 1, pos_embed.shape[-1], device=pos_embed.device, dtype=pos_embed.dtype
                 )
@@ -630,19 +627,13 @@ class VIT(nn.Module):
 
         if self.tensor_par_size > 1:
             src_rank = dist.get_rank() - dist.get_rank(group=self.tensor_par_group)
-            # dist.broadcast requires a contiguous tensor, and fills it
-            # in place -- must reassign x = x.contiguous() first (not just
-            # pass x.contiguous() inline), since .contiguous() returns a
-            # NEW tensor whenever x isn't already contiguous; broadcasting
-            # that unassigned copy would silently leave the original x
-            # variable un-updated on every non-src rank. _pos_embed's
-            # cls-token torch.cat (which would otherwise produce a fresh,
-            # contiguous tensor) only runs when self.cls_token is not None
-            # -- i.e. only for model_type "VIT" (get_model's
-            # class_token=True if conf["model"]["type"] == "VIT" else
-            # False). For every other model type, x here is whatever
-            # self.token_embeds(x) produced, typically PatchEmbed's own
-            # flatten+transpose, which is non-contiguous.
+            # dist.broadcast requires a contiguous tensor and fills it in place --
+            # must reassign x = x.contiguous() (not pass it inline), since
+            # .contiguous() returns a NEW tensor when x isn't contiguous, silently
+            # leaving x un-updated otherwise. x is only guaranteed contiguous here
+            # for model_type "VIT" (class_token's torch.cat in _pos_embed produces
+            # a fresh tensor); every other model type's x is token_embeds' own
+            # PatchEmbed output (flatten+transpose), non-contiguous.
             x = x.contiguous()
             dist.broadcast(x, src_rank, group=self.tensor_par_group)
 
@@ -1744,13 +1735,11 @@ class DiffusionVIT(VIT):
 
         if self.tensor_par_size > 1:
             src_rank = dist.get_rank() - dist.get_rank(group=self.tensor_par_group)
-            # Must reassign x = x.contiguous() (not pass x.contiguous()
-            # inline) -- dist.broadcast fills its argument in place, and
-            # .contiguous() returns a NEW tensor whenever x isn't already
-            # contiguous, so broadcasting an unassigned copy would silently
-            # leave this rank's own x un-updated. x here can be
-            # non-contiguous even after x + time_emb (elementwise ops can
-            # preserve a non-contiguous input's memory layout).
+            # Must reassign x = x.contiguous() (not pass it inline) -- dist.broadcast
+            # fills its argument in place, and .contiguous() returns a NEW tensor when
+            # x isn't already contiguous, silently leaving this rank's x un-updated
+            # otherwise. x can be non-contiguous even after x + time_emb (elementwise
+            # ops can preserve a non-contiguous layout).
             x = x.contiguous()
             dist.broadcast(x, src_rank, group=self.tensor_par_group)
 

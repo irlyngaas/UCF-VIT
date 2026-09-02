@@ -30,6 +30,8 @@ pipeline's separate Sobel-direction-consistency gate was dropped entirely
 (not reimplemented in 3D) -- see Patchify_3D's own docstring for why.
 """
 
+import random
+
 import numpy as np
 import pytest
 
@@ -119,6 +121,60 @@ def test_patchify_3d_weights_by_channel_agreement():
     assert set(np.unique(edges)).issubset({0, 1, 2})
     assert set(np.unique(edges[8, 8:16, 8:16])) == {2}  # shared box's edge face: both channels agree
     assert set(np.unique(edges[2, 2:6, 2:6])) == {1}    # channel-1-only box's edge face
+
+
+def test_patchify_multi_channel_reshape_does_not_scramble_channels():
+    """Regression test: seq_img comes out of qdt.serialize as (fixed_length,
+    interp_size, interp_size, num_channels) -- channel last. The num_channels>1
+    branch reshapes straight to (num_channels, fixed_length, interp_size**2)
+    without first moving the channel axis to the front; since a plain
+    np.reshape never moves data, that silently scrambled patches/channels
+    together instead of separating them (verified by disabling np.moveaxis and
+    confirming this same test fails). Each channel here is a distinct,
+    perfectly flat constant (no internal edges, so bicubic resizing can't
+    introduce any intermediate values) -- every real (non-padded) entry in
+    seq_img[c] must be exactly that channel's constant, and every padded entry
+    exactly 0.
+    """
+    np.random.seed(0)
+    random.seed(0)
+    H, W, C, fixed_length = 32, 32, 3, 16
+    img = np.zeros((H, W, C), dtype=np.uint8)
+    for c in range(C):
+        img[:, :, c] = (c + 1) * 50  # 50, 100, 150 -- distinct per channel
+
+    # sths=[0]: random (image-content-independent) edge map, so the tree still
+    # splits into multiple real leaf nodes even though the image itself is flat.
+    p = Patchify(sths=[0], fixed_length=fixed_length, cannys=[50, 100], interp_size=4, num_channels=C, dataset="imagenet")
+    seq_img, seq_size, seq_pos, qdt = p(img)
+
+    assert seq_img.shape == (C, fixed_length, 4 * 4)
+    for c in range(C):
+        for idx in range(fixed_length):
+            expected = (c + 1) * 50 if seq_size[idx] > 0 else 0
+            assert np.all(seq_img[c, idx] == expected), f"channel {c} patch {idx} contaminated"
+
+
+def test_patchify_3d_multi_channel_reshape_does_not_scramble_channels():
+    """Same regression as test_patchify_multi_channel_reshape_does_not_scramble_channels,
+    for Patchify_3D's identical channel-last-reshape bug.
+    """
+    np.random.seed(1)
+    random.seed(1)
+    D = H = W = 16
+    C, fixed_length = 2, 8
+    vol = np.zeros((D, H, W, C), dtype=np.float32)
+    for c in range(C):
+        vol[:, :, :, c] = (c + 1) * 5.0  # 5.0, 10.0 -- distinct per channel
+
+    p = Patchify_3D(sths=[0.5], fixed_length=fixed_length, canny_thresholds=(0.05, 0.15), interp_size=4, num_channels=C, dataset="basic_ct")
+    seq_img, seq_size, seq_pos, octtree = p(vol)
+
+    assert seq_img.shape == (C, fixed_length, 4 * 4 * 4)
+    for c in range(C):
+        for idx in range(fixed_length):
+            expected = (c + 1) * 5.0 if seq_size[idx] > 0 else 0.0
+            assert np.allclose(seq_img[c, idx], expected), f"channel {c} patch {idx} contaminated"
 
 
 def test_patchify_3d_shape_and_dtype():

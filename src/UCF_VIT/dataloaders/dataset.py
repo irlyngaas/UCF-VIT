@@ -195,12 +195,9 @@ class FileReader(IterableDataset):
 
         per_worker = int(math.floor(len(self.file_list)/ float(self.keys_to_add) / float(num_shards)))
         if per_worker == 0:
-            # Not enough files for this many DDP ranks x dataloader workers to each
-            # get a disjoint, non-empty shard. allow_file_reuse:True (default False)
-            # trades that guarantee for one file per worker, reused (duplicated)
-            # round-robin across shards instead of failing -- see parse.py's own
-            # allow_file_reuse comment for why this is a real concern at the node
-            # counts this repo targets, not just a small/debug-dataset one.
+            # Not enough files for every DDP rank x worker shard to be disjoint and
+            # non-empty. allow_file_reuse:True trades that guarantee for one file
+            # per worker, reused (duplicated) round-robin instead of failing.
             assert len(self.file_list) > 0, "This dataset key has zero files at all -- check dict_root_dirs/dict_start_idx/dict_end_idx (allow_file_reuse can't reuse files that don't exist)."
             assert self.allow_file_reuse, "Each worker doesn't have at least one unique file, run utils/load_balance.py to diagnose the issue. Set dataloader.allow_file_reuse: True to let workers reuse (duplicate) files instead."
             per_worker = 1

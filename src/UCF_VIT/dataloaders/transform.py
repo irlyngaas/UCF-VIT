@@ -122,6 +122,7 @@ class Patchify(torch.nn.Module):
         seq_img = np.asarray(seq_img, dtype=np.float32)
 
         if self.num_channels > 1:
+            seq_img = np.moveaxis(seq_img, -1, 0)
             seq_img = np.reshape(seq_img, [self.num_channels, -1, self.interp_size*self.interp_size])
         else:
             seq_img = np.reshape(seq_img, [-1, self.interp_size*self.interp_size])
@@ -223,6 +224,7 @@ class Patchify_3D(torch.nn.Module):
         seq_size = np.asarray(seq_size)
         seq_img = np.asarray(seq_img, dtype=np.float32)
         if self.num_channels > 1:
+            seq_img = np.moveaxis(seq_img, -1, 0)
             seq_img = np.reshape(seq_img, [self.num_channels, -1, self.interp_size*self.interp_size*self.interp_size])
         else:
             seq_img = np.reshape(seq_img, [-1, self.interp_size*self.interp_size*self.interp_size])

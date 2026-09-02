@@ -1678,6 +1678,25 @@ adding the same `resize: {'catsdogs': [256, 256]}` block the other two
 catsdogs configs already have. **Not yet re-verified against a real
 Frontier run.**
 
+#### Fixed a real channel-scrambling bug in `Patchify`/`Patchify_3D`'s multi-channel reshape
+
+`qdt.serialize`/`octree.serialize` return each patch as `(H, W[, D], Channel)`
+-- channel last. The `num_channels > 1` branch (`separate_channels:False`
+adaptive patching on a multi-channel dataset) reshaped straight from
+`(fixed_length, ..., num_channels)` to `(num_channels, fixed_length, ...)`
+with a plain `np.reshape`, which never moves data -- it just reinterprets the
+existing flat buffer, so instead of separating channels it silently scrambled
+patches/channels together. Verified with a small repro (each element tagged
+with its true `(patch, position, channel)` identity) before fixing. Not a
+crash -- `do_ap:True` + `separate_channels:False` on any multi-channel dataset
+fed the model channel-incoherent data. Fixed by adding `np.moveaxis(seq_img,
+-1, 0)` before the reshape in both `Patchify.forward` and `Patchify_3D.forward`.
+**Tier 1 coverage:** two new tests in `test_transform.py` build a
+perfectly-flat, distinct-constant-per-channel image (no internal edges, so
+resizing can't introduce intermediate values) and assert every real patch's
+value is exactly its own channel's constant -- confirmed each fails against
+the pre-fix behavior (simulated by disabling `np.moveaxis`) and passes fixed.
+
 ## Running the distributed (Tier 2) tests
 
 ```bash

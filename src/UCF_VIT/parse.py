@@ -604,13 +604,12 @@ def parse_config(args, load_balance_offline=False):
     elif len(img_size) == 3:
         twoD = conf['data']['twoD']
 
-    #resize is an optional, separate step -- for imagenet/catsdogs, resizes
-    #the real data from its native img_size to a different target size
-    #before training. Not supported for basic_ct (no resize step exists in
-    #its read path -- see dataset.py). Computed here (rather than down with
-    #the rest of dataset_options_conf) because tile_size below must be
-    #computed from whatever size the data actually is once resize (if any)
-    #has been applied, not from img_size directly.
+    #resize is an optional, separate step -- for imagenet/catsdogs, resizes the
+    #real data from its native img_size to a different target size before
+    #training. Not supported for basic_ct (no resize step in its read path).
+    #Computed here, not with the rest of dataset_options_conf, because
+    #tile_size below must be computed from whatever size the data actually is
+    #once resize (if any) has been applied.
     resize_conf = conf.get('dataset_options', {}).get('resize', {}) or {}
     assert "basic_ct" not in resize_conf, "resize is not supported for basic_ct -- it has no resize step (dataset.py reads NIfTI volumes at native resolution). Remove it from dataset_options.resize."
     effective_size = resize_conf.get(dataset, img_size)
@@ -636,14 +635,12 @@ def parse_config(args, load_balance_offline=False):
         # the signal that tells it there's no z-axis to slice at all.
         tile_size = (effective_size[0]//tiling_conf["div"]+tiling_conf["tile_overlap"][0], effective_size[1]//tiling_conf["div"]+tiling_conf["tile_overlap"][1])
     elif twoD:
-        # 3D data (basic_ct) sliced into 2D z-planes: tile_size must still be
-        # a 3-tuple -- collapsing it to 2D here (as if it were genuinely 2D
-        # data) previously made TileDataIter's `len(self.tile_size) == 3`
-        # dispatch take the wrong branch, silently keeping the full,
-        # untouched z-axis on every tile and producing a 5D batch by the
-        # time it reached PatchEmbed. The z entry itself isn't tiled (every
-        # z-index is walked one at a time in TileDataIter's twoD branch), so
-        # it's the raw, undivided depth.
+        # 3D data (basic_ct) sliced into 2D z-planes: tile_size must still be a
+        # 3-tuple -- collapsing it to 2D (as if genuinely 2D data) would make
+        # TileDataIter's `len(self.tile_size) == 3` dispatch take the wrong
+        # branch, keeping the full, untouched z-axis on every tile and producing
+        # a 5D batch. The z entry itself isn't tiled (every z-index is walked one
+        # at a time in TileDataIter's twoD branch), so it's the raw, undivided depth.
         tile_size = (effective_size[0]//tiling_conf["div"]+tiling_conf["tile_overlap"][0], effective_size[1]//tiling_conf["div"]+tiling_conf["tile_overlap"][1], effective_size[2])
     else:
         tile_size = (effective_size[0]//tiling_conf["div"]+tiling_conf["tile_overlap"][0], effective_size[1]//tiling_conf["div"]+tiling_conf["tile_overlap"][1], effective_size[2]//tiling_conf["div"]+tiling_conf["tile_overlap"][2])
@@ -749,12 +746,10 @@ def parse_config(args, load_balance_offline=False):
             
         
     # Resolves per-dataset-key train/val/test root dirs and start/end idx ratios --
-    # used for both dataloader.type values (iterative_dataloader and the map-style
-    # dataloader/catsdogs path both slice by dataset key and start/end ratio, just
-    # via different mechanisms downstream -- FileReader for the former, a plain
-    # list slice for the latter). See _resolve_dataset_splits's own docstring for
-    # the full train/val/test semantics; get_split_conf is what val.py/test.py use
-    # to consume the val_root_dirs/test_root_dirs results below.
+    # used for both dataloader.type values (iterative_dataloader via FileReader,
+    # the map-style dataloader/catsdogs path via a plain list slice). See
+    # _resolve_dataset_splits's own docstring for the full semantics;
+    # get_split_conf is what val.py/test.py use to consume the results below.
     (resolved_train_start_idx, resolved_train_end_idx,
      resolved_val_root_dirs, resolved_val_start_idx, resolved_val_end_idx,
      resolved_test_root_dirs, resolved_test_start_idx, resolved_test_end_idx) = _resolve_dataset_splits(
@@ -813,10 +808,8 @@ def parse_config(args, load_balance_offline=False):
         "type": dataloader_type,
         # dict_start_idx/dict_end_idx are train's own (possibly narrowed by
         # _resolve_dataset_splits's auto-split above) start/end idx -- populated
-        # for both dataloader.type values now (previously None for "dataloader",
-        # since no slicing existed on that path at all; train.py's own catsdogs
-        # branch now applies these via slice_file_list, same as
-        # iterative_dataloader's FileReader does).
+        # for both dataloader.type values; train.py's catsdogs branch applies
+        # these via slice_file_list, same as iterative_dataloader's FileReader.
         "dict_start_idx": resolved_train_start_idx,
         "dict_end_idx": resolved_train_end_idx,
         "dict_val_start_idx": resolved_val_start_idx,
@@ -835,32 +828,19 @@ def parse_config(args, load_balance_offline=False):
         # NativePytorchDataModule's multiprocessing_context docstring entry for why a
         # config would ever set this to "spawn".
         "multiprocessing_context": conf['dataloader'].get('multiprocessing_context'),
-        # Optional, default False. When a dataset key has fewer files than the
-        # number of DDP ranks/workers assigned to it, training normally fails
-        # loudly (calculate_load_balancing_on_the_fly's and FileReader's own
-        # asserts) rather than silently letting some ranks train on no data at
-        # all. Setting this True instead lets every rank/worker get at least
-        # one file, reusing (duplicating) files across ranks/workers as needed
-        # -- with a printed warning quantifying how much reuse is happening.
-        # Not just a small/debug-dataset concern: at the node counts this repo
-        # targets, data_par_size can exceed a real (not toy) dataset's file
-        # count too. See calculate_load_balancing_on_the_fly's and
-        # FileReader.__iter__'s own comments for the mechanism.
+        # Optional, default False. When a dataset key has fewer files than its
+        # assigned DDP ranks/workers, training normally fails loudly (calculate_
+        # load_balancing_on_the_fly's/FileReader's own asserts). True lets every
+        # rank/worker get at least one file instead, reusing files round-robin
+        # with a printed warning -- see NativePytorchDataModule's own docstring entry.
         "allow_file_reuse": conf['dataloader'].get('allow_file_reuse', False),
-        # Imagenet only -- seeds the shuffle bucket_file_list applies (to the
-        # already train/val/test-sliced image list) before dividing it into
-        # per-DDP-rank-group buckets. Without this, bucketing is a contiguous
-        # split of a class-sorted list, so each bucket (and therefore each
-        # rank) only ever sees a narrow range of classes every epoch -- a real
-        # concern for data-parallel SGD (class-homogeneous local batches skew
-        # BatchNorm statistics and correlate gradients within a rank's own
-        # step sequence). Defaults to a fixed seed (not None/disabled) since
-        # shuffling is a strict improvement with no reproducibility cost --
-        # same seed always gives the same shuffle, independent of
-        # data_par_size/process restarts, same as everything else about the
-        # split. Set to `null` in the config to opt out and keep the original
-        # contiguous ordering. See NativePytorchDataModule's/bucket_file_list's
-        # own comments for the full rationale.
+        # Imagenet only -- seeds the shuffle bucket_file_list applies before
+        # dividing the sliced image list into per-rank buckets. Without it,
+        # bucketing is a contiguous split of a class-sorted list, so each rank
+        # only sees a narrow range of classes (skews BatchNorm, correlates
+        # gradients). Defaults to a fixed seed since shuffling is a strict
+        # improvement; `null` opts out -- see NativePytorchDataModule's own
+        # docstring entry for the full rationale.
         "bucket_shuffle_seed": conf['dataloader'].get('bucket_shuffle_seed', 42),
 
     }
@@ -958,12 +938,10 @@ def parse_pretrained_config(args, conf):
         tensor_par_size = pretrained_conf["parallelism"]["tensor_par_size"]
         assert tensor_par_size == conf["parallelism"]["tensor_par_size"], "Tensor_par_size of the pre-trained model needs to match the tensor_par_size of the model to be trained"
 
-        # Real filename save_checkpoint (training.py) actually writes is
-        # "<pretrained_checkpoint_filename>_rank_<N>.ckpt", not a bare
-        # "<pretrained_checkpoint_filename>" file -- check against that, not
-        # the bare filename. get_model's own pretrained-loading branch reads
-        # a separate file per tensor-parallel rank (world_rank <
-        # tensor_par_size), so every one of those must exist, not just rank 0's.
+        # Real filename save_checkpoint writes is "<pretrained_checkpoint_filename>
+        # _rank_<N>.ckpt", not the bare filename. get_model's pretrained-loading
+        # branch reads a separate file per tensor-parallel rank, so every one of
+        # those must exist, not just rank 0's.
         missing_ranks = [
             r for r in range(tensor_par_size)
             if not os.path.isfile(os.path.join(pretrained_conf["trainer"]["checkpoint_path"], conf["trainer"]["pretrained_checkpoint_filename"]+"_rank_"+str(r)+".ckpt"))
@@ -972,16 +950,14 @@ def parse_pretrained_config(args, conf):
             sys.exit(f"Checkpoint file does not exist for tensor-parallel rank(s) {missing_ranks}")
 
         model_type = pretrained_conf["model"]["type"]
-        # pretrained_conf, not conf: kwargs here are for constructing
-        # pretrained_model at its own true architecture (model/utils.py's
-        # get_model pretrained branch), so its checkpoint loads without a
-        # shape mismatch -- reading conf's fields would be wrong whenever
-        # the downstream model type differs from the pretrained one (e.g.
-        # pretrained MAE -> downstream UNETR: conf["model"] wouldn't even
-        # have MAE's mask_ratio/decoder_* keys at all), and subtly wrong
-        # even when they match (the pretrained checkpoint's own decoder
-        # shape must match for the initial strict load_state_dict to
-        # succeed, even though only the encoder is kept afterward).
+        # pretrained_conf, not conf: kwargs here construct pretrained_model at its
+        # own true architecture (model/utils.py's get_model pretrained branch), so
+        # its checkpoint loads without a shape mismatch. conf's fields would be
+        # wrong whenever the downstream model type differs (e.g. pretrained MAE ->
+        # downstream UNETR: conf["model"] wouldn't even have MAE's mask_ratio/
+        # decoder_* keys), and subtly wrong even when they match (the pretrained
+        # checkpoint's own decoder shape must match for the initial strict
+        # load_state_dict to succeed, even though only the encoder is kept after).
         kwargs = get_kwargs(model_type, pretrained_conf)
 
 # ---------------------------- TILING ------------------------------------------
@@ -1034,15 +1010,14 @@ def parse_pretrained_config(args, conf):
         #float would otherwise silently turn pretrained_tile_size into floats downstream
         assert all(isinstance(v, int) for v in pretrained_tile_overlap), "tiling.tile_overlap must be an int (or tuple of ints) in the pretrained model's config, not a float"
 
-        # Deliberately NOT asserted equal to conf's own img_size/tile_size/
-        # patch_size/interp_size (unlike twoD/do_ap/in_chans/
-        # use_channel_aggregation below, which are still required to match):
-        # the whole point of pos_embed interpolation (see model/utils.py's
-        # get_model pretrained branch and _transplant_pos_embed) is to let
-        # the pretrained and new models differ in resolution. pretrained_*
-        # below are the pretrained model's own true values, used to build it
-        # at its own original size so its checkpoint loads without a shape
-        # mismatch, then its encoder gets resized into the new model's shape.
+        # Deliberately NOT asserted equal to conf's own img_size/tile_size/patch_size/
+        # interp_size (unlike twoD/do_ap/in_chans/use_channel_aggregation below,
+        # still required to match): pos_embed interpolation (model/utils.py's
+        # get_model pretrained branch, _transplant_pos_embed) exists specifically to
+        # let the pretrained and new models differ in resolution. pretrained_* below
+        # are the pretrained model's own true values, used to build it at its own
+        # original size so its checkpoint loads without a shape mismatch, then its
+        # encoder gets resized into the new model's shape.
         if twoD:
             pretrained_tile_size = (pretrained_img_size[0]//pretrained_div+pretrained_tile_overlap[0], pretrained_img_size[1]//pretrained_div+pretrained_tile_overlap[1])
         else:

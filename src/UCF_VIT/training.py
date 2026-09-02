@@ -119,14 +119,12 @@ def forward_step(conf, batch, model):
                 target = einops.rearrange(batch["seq"], 'b c s p -> b s (p c)')
                 loss = criterion(output, target, mask)
             elif conf["model"]["loss_fn"] in ("nativeResMSE", "nativeResMaskMSE"):
-                # batch["seq_ps"] is process_batch's own combined
-                # [size, pos] tensor (built for the adaptive positional
-                # embedding), reused here as native_resolution_patch_mse's
-                # size/pos arguments -- unsqueeze(1) restores the
-                # adaptive_patching_channels==1 dim process_batch's own
-                # torch.squeeze already dropped (see process_batch's own
-                # comment; only the separate_channels:False case is
-                # supported here, same limitation seq_ps itself already has).
+                # batch["seq_ps"] is process_batch's own combined [size, pos] tensor
+                # (built for the adaptive positional embedding), reused here as
+                # native_resolution_patch_mse's size/pos args -- unsqueeze(1) restores
+                # the adaptive_patching_channels==1 dim process_batch's own
+                # torch.squeeze dropped. Only separate_channels:False is supported
+                # here (same limitation seq_ps itself already has).
                 output, mask = model.forward(batch["seq"], batch["variables"], batch["seq_ps"])
                 seq_size = batch["seq_ps"][..., 0].unsqueeze(1)
                 seq_pos = batch["seq_ps"][..., 1:].unsqueeze(1)
@@ -285,18 +283,12 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
 
         if conf["ap"]["do_ap"]:
             batch = get_batch(conf, it_loader)
-            # .to(device) before .to(precision_dt), not after: casting dtype
-            # first would allocate a fresh, unpinned CPU tensor whenever
-            # precision_dt actually differs from the loaded tensor's own
-            # dtype (bfloat16 configs), silently defeating
-            # dataloader.pin_memory -- moving first (still pinned, if
-            # pin_memory:True) then casting on-device keeps the transfer
-            # itself eligible for a real non_blocking=True async copy.
-            # non_blocking=True is always safe to pass here regardless of
-            # dataloader.pin_memory -- when the source isn't pinned, PyTorch
-            # silently falls back to an ordinary blocking copy (identical to
-            # non_blocking=False), so this only actually does anything when
-            # pin_memory:True. No need to gate it on the config value.
+            # .to(device) before .to(precision_dt): casting first would allocate a
+            # fresh, unpinned CPU tensor whenever precision_dt differs from the
+            # loaded dtype (bfloat16 configs), defeating pin_memory. non_blocking=True
+            # is always safe regardless of pin_memory -- PyTorch falls back to a
+            # blocking copy when the source isn't pinned, so this only matters when
+            # pin_memory:True.
             data = batch["data"].to(device, non_blocking=True).to(precision_dt)
             seq = batch["seq"].to(device, non_blocking=True).to(precision_dt)
             # Assigned as locals (not just left inside `batch`) so the
@@ -350,16 +342,11 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
             if dist.get_rank(tensor_par_group) == 0:
                 batch = get_batch(conf, it_loader)
                 # .to(device) before .to(precision_dt), non_blocking=True
-                # unconditional (see the tensor_par_size==1 branch above for
-                # why) -- the *final* dtype/device still matches the
-                # receivers' placeholder (dtype=precision_dt, .to(device))
-                # exactly either way, or the broadcast below would either
-                # fail outright (NCCL has no CPU backend -- "No backend type
-                # associated with device type cpu") or silently mismatch
-                # dtype across ranks. The broadcasts a few lines down are
-                # stream-ordered after these copies (same default stream, no
-                # explicit sync needed), so a still-in-flight async copy is
-                # safe to broadcast from.
+                # unconditional (see the tensor_par_size==1 branch above for why) --
+                # final dtype/device matches the receivers' placeholder either way,
+                # so the broadcast below stays correct. Broadcasts a few lines down
+                # are stream-ordered after these copies (same default stream), so a
+                # still-in-flight async copy is safe to broadcast from.
                 data = batch["data"].to(device, non_blocking=True).to(precision_dt)
                 seq = batch["seq"].to(device, non_blocking=True).to(precision_dt)
                 seq_size = batch["seq_size"].to(device, non_blocking=True).to(precision_dt)
@@ -406,27 +393,21 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
                         seq_size = torch.zeros(batch_size, num_channels[dict_key], fixed_length, dtype=precision_dt).to(device)
                         seq_pos = torch.zeros(batch_size, num_channels[dict_key], fixed_length, 2, dtype=precision_dt).to(device)
                     else:
-                        # Real seq_size is (batch_size, 1, fixed_length) --
-                        # a scalar per-patch side length, no trailing
-                        # coordinate dim (see datamodule.py's
-                        # np.expand_dims(batch[i][2], axis=0)-based
-                        # construction). Real seq_pos is (batch_size, 1,
-                        # fixed_length, 2) for twoD -- a per-patch (x, y)
-                        # center position, so the trailing dim must be 2,
-                        # not 1.
+                        # Real seq_size is (batch_size, 1, fixed_length) -- no trailing
+                        # coordinate dim (see datamodule.py's np.expand_dims(batch[i][2],
+                        # axis=0)). Real seq_pos is (batch_size, 1, fixed_length, 2) for
+                        # twoD -- a per-patch (x, y) center, so the trailing dim must be
+                        # 2, not 1.
                         seq_size = torch.zeros(batch_size, 1, fixed_length, dtype=precision_dt).to(device)
                         seq_pos = torch.zeros(batch_size, 1, fixed_length, 2, dtype=precision_dt).to(device)
 
                     if conf["dataloader"]["return_label"]:
                         if conf["model"]["type"] == "VIT": #Classification
-                            # Real classification labels are flat per-sample
-                            # class indices (shape (batch_size,), int64 --
-                            # see e.g. datamodule.py's
-                            # torch.tensor(batch[i][4])-based construction),
-                            # not (batch_size, 1) floats -- this placeholder
-                            # must match exactly, since dist.broadcast fills
-                            # values into the existing tensor without
-                            # reshaping/casting it.
+                            # Real classification labels are flat per-sample class
+                            # indices (shape (batch_size,), int64 -- datamodule.py's
+                            # torch.tensor(batch[i][4])), not (batch_size, 1) floats --
+                            # must match exactly, since dist.broadcast fills values into
+                            # the existing tensor without reshaping/casting.
                             label = torch.zeros(batch_size, dtype=torch.int64).to(device)
                         else: #Segmentation
                             # Real basic_ct label is uint8 (see dataset.py's
@@ -437,13 +418,11 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
                             label = torch.zeros(batch_size, 1, tile_size[0], tile_size[1], dtype=torch.uint8).to(device)
                             if conf["model"]["type"] in ["UNETR", "SAP"]:
                                 # Real seq_label is (batch_size, num_classes, patch_size*patch_size,
-                                # fixed_length) -- the patch-volume dim comes BEFORE fixed_length, not
-                                # after (see dataset.py's np.reshape(seq_label, [patch_size**2, -1, 1])
-                                # and datamodule.py's seq_mask.permute(2, 0, 1) stacking).
-                                # forward_step's einops.rearrange ('b c (ps1 ps2) (s1 s2) -> ...')
-                                # relies on this exact order -- a placeholder with the right element
-                                # count but wrong per-axis shape broadcasts fine but fails downstream
-                                # with einops.EinopsError.
+                                # fixed_length) -- patch-volume comes BEFORE fixed_length, not after
+                                # (see dataset.py's np.reshape(seq_label, [patch_size**2, -1, 1]) and
+                                # datamodule.py's seq_mask.permute(2, 0, 1)). forward_step's
+                                # einops.rearrange relies on this exact order -- right element count
+                                # but wrong per-axis shape broadcasts fine but fails downstream.
                                 seq_label = torch.zeros(batch_size, conf["model"]["kwargs"]["num_classes"], interp_size*interp_size, fixed_length, dtype=precision_dt).to(device)
                 else:
                     data = torch.zeros(batch_size, num_channels[dict_key], tile_size[0], tile_size[1], tile_size[2], dtype=precision_dt).to(device)
@@ -571,14 +550,12 @@ def process_batch(conf, train_dataloader, device, tensor_par_group, ddpm_schedul
             #TODO: Move seq_size and seq_pos to a single channel
             seq_ps = None
         else:
-            # Reads the local seq_size/seq_pos (not batch["seq_size"]/
-            # batch["seq_pos"]) since `batch` is only ever assigned on
-            # tensor_par_group-rank-0 when tensor_par_size > 1 -- every other
-            # rank would hit UnboundLocalError here otherwise. The local
-            # variables already hold the right values on every rank
-            # regardless of tensor_par_size: for tensor_par_size == 1 they're
-            # assigned straight from batch[...] above; for tensor_par_size > 1
-            # they're each rank's own already-broadcast copy.
+            # Reads the local seq_size/seq_pos (not batch["seq_size"]/batch["seq_pos"])
+            # since `batch` is only assigned on tensor_par_group-rank-0 when
+            # tensor_par_size > 1 -- every other rank would hit UnboundLocalError
+            # otherwise. The locals already hold the right values on every rank:
+            # assigned straight from batch[...] when tensor_par_size==1, or each
+            # rank's own broadcast copy when > 1.
             seq_size = torch.squeeze(seq_size)
             seq_size = seq_size.to(torch.float32)
             seq_size = seq_size.to(device)

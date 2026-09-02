@@ -374,17 +374,15 @@ def process_root_dirs(dataset, dict_root_dirs, data_par_size=None):
     in `dict_root_dirs`. For other datasets, lists all files under each root
     directory's "imagesTr" subfolder, same shape.
 
-    Deliberately *not* bucketed by rank count here anymore -- imagenet used to
-    be split into `data_par_size` buckets internally, which made *which files
-    count as train/val/test* depend on `data_par_size` (a real problem on a
-    checkpoint restart with a different node count, or even just running
-    `val.py`/`test.py` at a different parallelism than the training run they're
-    evaluating). Bucketing now happens via `bucket_file_list`, called by
-    `calculate_load_balancing_on_the_fly`/`NativePytorchDataModule.__init__`
-    *after* they've each applied `dict_start_idx`/`dict_end_idx` slicing to this
-    function's (sorted, deterministic) output -- so which images are in a given
-    split no longer depends on rank count at all, only how that already-fixed
-    membership gets divided across ranks does.
+    Deliberately *not* bucketed by rank count here -- that would make *which
+    files count as train/val/test* depend on `data_par_size` (a real problem on
+    a checkpoint restart with a different node count, or running `val.py`/
+    `test.py` at a different parallelism than the training run being evaluated).
+    Bucketing happens via `bucket_file_list`, called by `calculate_load_
+    balancing_on_the_fly`/`NativePytorchDataModule.__init__` *after* they apply
+    `dict_start_idx`/`dict_end_idx` slicing to this function's (sorted,
+    deterministic) output -- so split membership never depends on rank count,
+    only how it's divided across ranks does.
 
     Args:
         dataset: Dataset name, e.g. "imagenet" or another supported dataset key.
@@ -412,19 +410,15 @@ def process_root_dirs(dataset, dict_root_dirs, data_par_size=None):
 def bucket_file_list(file_list, num_buckets, shuffle_seed=None):
     """Splits `file_list` into up to `num_buckets` roughly-equal, deterministic chunks.
 
-    Used to divide a dataset key's *already train/val/test-sliced* file list
-    into per-DDP-rank-group buckets for imagenet -- kept a separate step from
-    slicing itself (`slice_file_list`) specifically so it can run identically,
-    on the same already-resolved membership, from both
-    `calculate_load_balancing_on_the_fly` (to compute per-bucket rank ratios)
-    and `NativePytorchDataModule.__init__` (to build the real per-bucket
-    dataloader pipelines). Those two must agree exactly on bucket count/order --
-    `NativePytorchDataModule.train_dataloader` picks which bucket a rank
-    consumes by matching `calculate_load_balancing_on_the_fly`'s own per-bucket
-    rank-count string (`gx`) against `dict_data_train`'s bucket enumeration
-    order -- calling this one shared function from both guarantees that by
-    construction instead of by manually keeping two separate implementations
-    in sync.
+    Used to divide a dataset key's *already train/val/test-sliced* file list into
+    per-DDP-rank-group buckets for imagenet -- kept separate from slicing itself
+    (`slice_file_list`) so it can run identically, on the same resolved
+    membership, from both `calculate_load_balancing_on_the_fly` (per-bucket rank
+    ratios) and `NativePytorchDataModule.__init__` (real per-bucket dataloader
+    pipelines). The two must agree exactly on bucket count/order
+    (`train_dataloader` matches a rank to its bucket via `gx` against
+    `dict_data_train`'s enumeration order) -- calling this one shared function
+    guarantees that by construction.
 
     Args:
         file_list: List of file paths, already sliced to the desired train/
@@ -432,20 +426,14 @@ def bucket_file_list(file_list, num_buckets, shuffle_seed=None):
             both callers pass an already-sorted list so bucket *contents* also
             end up identical between the two, not just bucket counts).
         num_buckets: Requested number of buckets.
-        shuffle_seed: Optional int. If given, `file_list` is shuffled (a
-            seeded, deterministic permutation -- the same seed always produces
-            the same shuffle, independent of `data_par_size`/process restarts,
-            same as everything else about this split) before chunking, so each
-            bucket gets a representative random cross-section of `file_list`
-            instead of a contiguous range. Matters specifically for imagenet:
-            `file_list` arrives sorted class-by-class (`process_root_dirs`),
-            so without shuffling, contiguous chunking means each bucket (and
-            therefore each DDP rank) only ever sees a narrow range of classes
-            every epoch -- a real concern for data-parallel SGD (class-
-            homogeneous local batches skew BatchNorm statistics and correlate
-            gradients within a rank's own step sequence). `None` (not the
-            default at the config level -- see `parse.py`'s own
-            `bucket_shuffle_seed` comment) preserves the original ordering.
+        shuffle_seed: Optional int. If given, `file_list` is shuffled (a seeded,
+            deterministic permutation, independent of `data_par_size`/restarts)
+            before chunking, so each bucket gets a representative cross-section
+            instead of a contiguous range. Matters for imagenet: `file_list`
+            arrives sorted class-by-class (`process_root_dirs`), so without
+            shuffling, each bucket/rank only sees a narrow range of classes
+            every epoch (skews BatchNorm, correlates gradients). `None`
+            preserves the original ordering.
 
     Returns:
         Dict mapping bucket index (`0` to `min(num_buckets, len(file_list)) - 1`,
@@ -706,17 +694,14 @@ def calculate_load_balancing_on_the_fly(conf, VERBOSE=False):
     dict_lister_trains = process_root_dirs(dataset, dict_root_dirs)
 
     # For imagenet, dict_start_idx/dict_end_idx's ratio slice (on a sorted,
-    # deterministic order) must happen *before* any rank-count-dependent
-    # bucketing, or which images count as train/val/test would depend on
-    # data_par_size -- see process_root_dirs's/bucket_file_list's own comments
-    # for the full rationale. dict_root_dirs always has exactly one key for
-    # imagenet (matching dict_start_idx["imagenet"]'s own hardcoded-key read
-    # elsewhere), so slicing it here and re-keying dict_lister_trains by
-    # bucket index replaces the single "imagenet" entry entirely -- the loop
-    # below's imagenet branch then just consumes each bucket's already-correct
-    # membership as-is. Non-imagenet keys are unaffected (dict_root_dirs's own
-    # keys map 1:1 to dict_lister_trains's, no bucketing at all); their slicing
-    # happens in the loop below, unchanged except for the added sorted().
+    # deterministic order) must happen *before* any rank-count-dependent bucketing,
+    # or which images count as train/val/test would depend on data_par_size -- see
+    # process_root_dirs's/bucket_file_list's own comments. dict_root_dirs always has
+    # exactly one key for imagenet, so slicing then re-keying dict_lister_trains by
+    # bucket index replaces that single entry entirely -- the loop below's imagenet
+    # branch just consumes each bucket's already-correct membership as-is.
+    # Non-imagenet keys are unaffected (1:1 dict_root_dirs->dict_lister_trains, no
+    # bucketing); their slicing happens unchanged in the loop below.
     if dataset == "imagenet":
         k = next(iter(dict_lister_trains))
         sliced = slice_file_list(sorted(dict_lister_trains[k]), dict_start_idx["imagenet"], dict_end_idx["imagenet"])
@@ -887,20 +872,14 @@ def calculate_load_balancing_on_the_fly(conf, VERBOSE=False):
             new_data = [(k, int(batches_per_worker[i]*num_workers))]
             batches_per_rank_epoch.update(new_data)
 
-    # The num_images_per_rank/num_images_per_rank_worker asserts above only
-    # guarantee at least 1 *image* per rank/worker -- not at least 1 full
-    # *batch* per rank, which needs batch_size images (drop_last=True in the
-    # DataLoader means a rank with fewer than batch_size images this epoch
-    # yields zero batches, not a smaller one). Without this check that
-    # silently propagates into a bare ZeroDivisionError deep in
-    # NativePytorchDataModule._shuffle_and_replicate
-    # (self.max_balance/self.batches_per_rank_epoch[k]) instead of a clear,
-    # actionable message here. A real way to hit this: dataloader.
-    # val_split_ratio/test_split_ratio's automatic train/val/test split
-    # narrows how many of a dataset key's images go to training, which can
-    # push an already-tight allocation (e.g. a dataset key sized close to
-    # batch_size * data_par_size) below one batch/rank even though it had
-    # enough images before the split.
+    # The asserts above only guarantee at least 1 *image* per rank/worker -- not
+    # at least 1 full *batch* (drop_last=True means fewer than batch_size images
+    # yields zero batches, not a smaller one). Without this check that silently
+    # propagates into a bare ZeroDivisionError deep in NativePytorchDataModule.
+    # _shuffle_and_replicate instead of a clear message here. Real way to hit
+    # this: the automatic train/val/test split (val_split_ratio/test_split_ratio)
+    # can push an already-tight allocation below one batch/rank even though it
+    # had enough images before the split.
     zero_batch_keys = [k for k, v in batches_per_rank_epoch.items() if v < 1]
     assert not zero_batch_keys, (
         f"Dataset key(s) {zero_batch_keys} yield 0 batches per rank with "

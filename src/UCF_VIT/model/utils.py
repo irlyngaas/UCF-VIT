@@ -20,16 +20,13 @@ from UCF_VIT.model.building_blocks import Block, Block_diffusion
 from UCF_VIT.utils.pos_embed import interpolate_pos_embed, interpolate_pos_embed_3d
 from timm.layers import use_fused_attn
 
-# Top-level state_dict key prefixes that UCF_VIT.model.arch.VIT.__init__ itself
-# creates -- i.e. the shared transformer encoder, before any subclass
-# (SAP/MAE/UNETR/DiffusionVIT) adds its own task-specific decoder/head on top.
-# An allowlist rather than a "decoder"/"head"-name denylist: UNETR has its own
-# self.encoder1/encoder2/encoder3/encoder4 (U-Net skip-connection convs feeding
-# its *decoder*, not the transformer encoder) that a substring-based denylist
-# would mishandle. Matched against each key's first dotted component only, so
-# e.g. "encoder1.weight" (UNETR) can never collide with "encoder" (not even a
-# real prefix here) or "norm" (never collides with "decoder_norm.weight",
-# whose first component is "decoder_norm").
+# Top-level state_dict key prefixes VIT.__init__ itself creates (the shared
+# transformer encoder, before any subclass adds its own decoder/head). An
+# allowlist rather than a "decoder"/"head" denylist: UNETR's own encoder1-4
+# (U-Net skip-connection convs feeding its *decoder*) would confuse a
+# substring-based denylist. Matched against each key's first dotted component
+# only, so "encoder1.weight" never collides with "encoder", nor "norm" with
+# "decoder_norm.weight".
 ENCODER_STATE_DICT_PREFIXES = {
     "patch_embed", "token_embeds", "cls_token", "pos_embed",
     "var_embed", "adaptive_pos_dep_emb", "blocks", "norm",
@@ -116,20 +113,15 @@ def _transplant_pos_embed(encoder_dict, pretrained_model, model):
             )
         encoder_dict["pos_embed"] = resized
     else:
-        # adaptive_patching and not sqrt_len_method: pos_embed is a flat,
-        # learned, per-sequence-slot-index embedding (used only when
-        # use_adaptive_pos_emb:False -- see VIT._pos_embed; when True,
-        # pos_embed is allocated but never actually read in forward, the
-        # geometry-derived adaptive_pos_dep_emb is used instead), not a
-        # spatial grid -- unlike grid_size's case above, slot index N has no
-        # reliable relationship to slot index N+1 at all (FixedQuadTree/
-        # FixedOctTree's own node order reflects greedy-split order, not
-        # spatial adjacency), so there's no principled way to resize it the
-        # way a real spatial grid can be. Same reasoning as sqrt_len_method's
-        # rejection above, just handled
-        # by dropping rather than raising, since a size mismatch here is a
-        # real, unremarkable scenario (e.g. fine-tuning at a different
-        # fixed_length): the new model just keeps its own fresh init.
+        # adaptive_patching and not sqrt_len_method: pos_embed is a flat, learned,
+        # per-sequence-slot-index embedding (only used when use_adaptive_pos_emb:
+        # False; see VIT._pos_embed), not a spatial grid -- slot index N has no
+        # reliable relationship to N+1 (FixedQuadTree/FixedOctTree's node order
+        # reflects greedy-split order, not spatial adjacency), so there's no
+        # principled way to resize it. Dropped rather than raised (unlike
+        # sqrt_len_method's rejection above) since a size mismatch here is a
+        # normal scenario (e.g. fine-tuning at a different fixed_length): the
+        # new model just keeps its own fresh init.
         del encoder_dict["pos_embed"]
 
 
@@ -278,13 +270,10 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
         # requires, so this must stay DiffusionVIT-only.
         block_fn=Block_diffusion if conf["model"]["type"] == "DiffusionVIT" else Block,
         # Required: without these, every model type silently falls back to
-        # tensor_par_size=1/tensor_par_group=None regardless of
-        # conf["parallelism"]["tensor_par_size"] (conf['model']['kwargs'],
-        # built by parse.py's get_kwargs, never sets them either) -- every
-        # `if self.tensor_par_size > 1:` sharding guard in arch.py/
-        # building_blocks.py then never fires, so tensor_par_size > 1 runs
-        # to completion but does zero actual model-parallel sharding
-        # (silent, not an error).
+        # tensor_par_size=1/tensor_par_group=None -- every `if self.tensor_par_size
+        # > 1:` sharding guard in arch.py/building_blocks.py then never fires, so
+        # tensor_par_size > 1 runs to completion but does zero actual model-parallel
+        # sharding (silent, not an error).
         tensor_par_size=conf["parallelism"]["tensor_par_size"],
         tensor_par_group=tensor_par_group,
         **conf['model']['kwargs'],
