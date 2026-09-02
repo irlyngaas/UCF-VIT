@@ -106,3 +106,10 @@ dataloader:
   val_split_ratio: 0.1
   test_split_ratio: 0.1
 
+# ---------------------------- DATASET SPECIFIC OPTIONS -------------------------------------------
+dataset_options:
+
+  resize: {
+      'catsdogs': [256,256],
+    } #Optional -- real cat/dog photos have varying native sizes, so this resizes them to a common size before training. Omit to train at each photo's native size instead (only viable if every real file under dict_root_dirs already shares the same size).
+

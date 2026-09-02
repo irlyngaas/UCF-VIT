@@ -1662,8 +1662,21 @@ itself incomplete, plus one real bug in the test-narrowing side of it:**
    directly, matching how `make_smoke_config`/`compute_narrow_dict_idx`
    already do it from the same raw dict.
 
-**Not yet re-verified against a real Frontier run** -- these two follow-up
-fixes haven't been rerun yet.
+**Rerun on Frontier (jobs 5398917/5398918/5398920) confirms both follow-up
+fixes worked**: Tier 2 63/63 passed (`test_real_pipeline_imagenet_
+classification`'s `KeyError` fixed), Tier 3b 19/19 passed (every `+do_ap`/
+`+do_tiling`/`+twoD` cell fixed). Tier 3 was 9/10 -- `catsdogs-mae` fresh run
+failed, but with an unrelated, pre-existing bug this session's work never
+touched: `configs/catsdogs/mae/base_config.yaml` was simply missing the
+`dataset_options.resize` section entirely (present in
+`catsdogs/classification`/`catsdogs/diffusion`'s shipped configs, which both
+passed in this same run), so real cat/dog photos at their varying native
+sizes never got resized to a common size before `CatsDogsCollate`'s
+`torch.stack` -- `RuntimeError: stack expects each tensor to be equal size,
+but got [3, 374, 500] at entry 0 and [3, 499, 431] at entry 1`. Fixed by
+adding the same `resize: {'catsdogs': [256, 256]}` block the other two
+catsdogs configs already have. **Not yet re-verified against a real
+Frontier run.**
 
 ## Running the distributed (Tier 2) tests
 
