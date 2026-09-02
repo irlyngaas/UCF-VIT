@@ -1945,6 +1945,29 @@ warning actually prints for `"point"` and is actually silent for
 `% 7 == 1`, `sqrt_len` stays 8, `8**3=512 < 519`) rather than asserting
 against the warning-gating logic's own source.
 
+**Follow-up: Tier 3b coverage.** `test_arch.py`/`test_config_validation.py`
+above cover `token_selection`/`area_weighted_alpha` at the model-
+construction and config-parsing levels respectively -- neither runs a real
+forward+backward+loss step against real data/`DistributedSampler`, which is
+exactly the kind of thing that's caught real, otherwise-invisible bugs
+elsewhere in this matrix (see e.g. the tensor-parallel dtype-mismatch
+broadcast fixes above). `"smallest_overlap"`/`"area_weighted"`/
+`area_weighted_alpha` had zero Tier 3b coverage -- `basic_ct-unetr+do_ap`
+only ever exercised the config default (`"point"`). Added 3 sibling cells,
+identical to `basic_ct-unetr+do_ap` except for `model.token_selection`
+(and, for the third, `model.area_weighted_alpha`): `basic_ct-unetr+do_ap+
+smallest_overlap`, `basic_ct-unetr+do_ap+area_weighted` (`alpha` left at
+its default, 0), `basic_ct-unetr+do_ap+area_weighted_alpha` (`alpha:2.0` --
+meaningfully size-biased per `test_arch.py`'s own monotonicity test, without
+being large enough to be numerically indistinguishable from
+`"smallest_overlap"`). Deliberately not crossed with `twoD`/`do_tiling` --
+`token_selection` is orthogonal to dataset specifics, the same
+representative-subset reasoning `tensor_par_size`'s cells below already
+use, rather than a full cross product. `test_feature_matrix_smoke_helpers.py`
+confirms all 3 new cells' configs parse via a real `parse_config` call
+before ever touching real Frontier data (27/27 passing locally, up from
+24/24).
+
 ## Running the distributed (Tier 2) tests
 
 ```bash

@@ -106,7 +106,42 @@ FEATURE_MATRIX = [
         {"ap": {"do_ap": True, "interp_size": 32}},
         # fixed_length:512 already valid (512 % 7 == 1, octree; cube root 8
         # is a whole number, satisfying UNETR's extra sqrt_len constraint) --
-        # no override needed.
+        # no override needed. Also proves the base config's own default
+        # token_selection ("point", not overridden here) against real
+        # Frontier data.
+    ),
+
+    # --- model.token_selection -- UNETR._adaptive_token_grid_index/_weights'
+    # 3 real reconstruction methods (see arch.py's own docstrings). "point"
+    # (the default) is already proven by basic_ct-unetr+do_ap above; these
+    # 3 cells are the only real-Frontier coverage the other 2 methods (and
+    # area_weighted_alpha specifically) have at all -- test_arch.py only
+    # covers them at the model-construction level, and
+    # test_config_validation.py only covers parse.py's kwarg plumbing, never
+    # a real forward+backward+loss step against real data/DistributedSampler.
+    # twoD/do_tiling deliberately not crossed with this -- token_selection is
+    # orthogonal to dataset specifics, same "representative subset, not a
+    # full cross product" reasoning as tensor_par_size below.
+    FeatureMatrixCell(
+        "basic_ct/unetr/base_config.yaml", "basic_ct-unetr+do_ap+smallest_overlap",
+        {"ap": {"do_ap": True, "interp_size": 32}, "model": {"token_selection": "smallest_overlap"}},
+    ),
+    FeatureMatrixCell(
+        "basic_ct/unetr/base_config.yaml", "basic_ct-unetr+do_ap+area_weighted",
+        {"ap": {"do_ap": True, "interp_size": 32}, "model": {"token_selection": "area_weighted"}},
+        # area_weighted_alpha left at its default (0) -- plain area-proportional
+        # blending, no size bias. The alpha>0 regime is exercised separately below.
+    ),
+    FeatureMatrixCell(
+        "basic_ct/unetr/base_config.yaml", "basic_ct-unetr+do_ap+area_weighted_alpha",
+        {"ap": {"do_ap": True, "interp_size": 32}, "model": {"token_selection": "area_weighted", "area_weighted_alpha": 2.0}},
+        # alpha:2.0 -- meaningfully biased toward smaller tokens (see
+        # test_arch.py's monotonicity test: alpha=2 already gives a small
+        # token ~94% of a contested cell's weight in that test's setup, up
+        # from ~90% at alpha=0), without being so large it's numerically
+        # indistinguishable from smallest_overlap -- this cell's real point
+        # is proving area_weighted_alpha threads through into a real
+        # forward+backward+loss step at all, not a specific alpha value.
     ),
     FeatureMatrixCell(
         "basic_ct/mae/base_config.yaml", "basic_ct-mae+do_ap",
