@@ -1697,6 +1697,60 @@ resizing can't introduce intermediate values) and assert every real patch's
 value is exactly its own channel's constant -- confirmed each fails against
 the pre-fix behavior (simulated by disabling `np.moveaxis`) and passes fixed.
 
+#### Fixed a real architectural bug: `SAP`/`UNETR`'s adaptive-patching sequence was treated as a spatial grid it isn't
+
+`FixedQuadTree`/`FixedOctTree.serialize` return `fixed_length` patches in
+greedy-split tree-traversal order (edge-dense regions get many small
+patches, flat regions get few large ones) -- not raster-scan order.
+`SAP.mask_head` and `UNETR.proj_feat` both reshaped this sequence into a
+`sqrt_len x sqrt_len[ x sqrt_len]` grid by raw index and ran real spatial
+ops on it, silently assuming sequence position == grid position.
+
+For `SAP`, this made the decoder's raw output not spatially meaningful (its
+`neck`/`mask_header` conv has `stride == kernel_size`, so there's no
+cross-token mixing to actually corrupt -- but the output still can't be
+used as a real mask without undoing the same arbitrary, per-sample,
+re-randomized-every-read reshape). Fixed by having `SAP.mask_head` un-grid
+its output back to per-token predictions (indexed by real sequence
+position, exploiting the same no-cross-token-mixing property to invert the
+grid reshape exactly), and adding `native_resolution_dice_loss`
+(`utils/metrics.py`, mirroring the existing `native_resolution_patch_mse`'s
+`grid_sample`-based technique) to compare each token's prediction directly
+against the real label sampled at that token's own native position/size,
+instead of a `seq_label` that had undergone the same lossy grid reshape.
+
+For `UNETR`, this was a real correctness bug, not just an output-usability
+one: `proj_feat`'s reshape fed a REAL multi-stage convolutional decoder
+(`decoder5`-`decoder2`, genuine `kernel_size=3` cross-cell receptive
+fields) that actively blended "neighbor" grid cells that usually weren't
+real neighbors, and `forward_step` compared the result directly against
+`batch["label"]`, the true-order ground truth. (`encoder1`'s skip
+connection was already correct -- `UNETR.forward` passes it the real,
+native-resolution `batch["data"]`, not the fake grid.) Forcing a uniform
+(non-adaptive) grid was considered and rejected -- it would defeat the
+entire point of adaptive patching. Fixed instead by replacing `proj_feat`'s
+`.view()` with a differentiable gather: since quadtree/octree leaves
+exactly tile the domain (no gaps or overlaps, always square/cubic), a new
+`_adaptive_token_grid_index` does a vectorized point-in-box test (each
+canvas cell's true position vs. every token's real `pos +/- size/2` box,
+from the same `seq_ps` already computed for adaptive positional
+embeddings) to find each cell's true owning token, then `torch.gather`
+reconstructs the feature map from it -- fully differentiable, and it keeps
+the real benefit of adaptive patching (dense regions really do get more,
+smaller, correctly-placed tokens in the reconstructed feature map).
+
+**Tier 1 coverage:** `test_metrics.py` has new tests for
+`native_resolution_dice_loss` (2D and 3D, correct/wrong-prediction and
+padding-token cases, mirroring `native_resolution_patch_mse`'s existing
+test structure). `test_arch.py` has new tests for `SAP.mask_head`'s
+per-token output shape (2D and 3D) and for
+`UNETR._adaptive_token_grid_index`/`proj_feat`: tokens are given in a
+deliberately shuffled (non-raster) order with known true `pos`/`size`
+boxes, each tagged with its original (pre-shuffle) index, and the
+reconstructed canvas is asserted to place each token's value at the cell
+its true box actually covers -- the direct regression test that
+reconstruction now follows real position, not sequence index.
+
 ## Running the distributed (Tier 2) tests
 
 ```bash

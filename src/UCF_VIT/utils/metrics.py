@@ -25,19 +25,12 @@ def masked_mse(pred, y, mask):
 
     return loss
 
-def _native_resolution_patch_squared_error(output, y, size, pos, patch_size, twoD):
-    """Computes per-patch MSE between adaptively-sized predicted patches and `y`, fully vectorized.
+def _native_resolution_sample(y, size, pos, patch_size, twoD, mode):
+    """Samples `y` at each adaptive patch's native-resolution location, fully vectorized.
 
-    Rather than resizing each prediction up to its patch's real size (the
-    direction the original, un-vectorized version of this function used),
-    samples the *ground truth* directly at the prediction's fixed `patch_size`
-    resolution via one batched `grid_sample` call, using an affine box per
-    patch (`torch.nn.functional.grid_sample`, `mode="bicubic"` for 2D /
-    `"bilinear"` for 3D -- `grid_sample` doesn't support bicubic for 5D input).
-    Mathematically equivalent in spirit (still comparing the prediction against
-    the correctly-scaled real-image region for that patch), just resampling in
-    the other direction, and entirely without a Python-level loop over
-    (batch, seq, channel).
+    One batched `grid_sample` call, using an affine box per patch built from
+    each patch's true center/size (`torch.nn.functional.grid_sample`) --
+    entirely without a Python-level loop over (batch, seq).
 
     Axis convention: `pos`'s `x`/`y`[`/z`] components follow
     `UCF_VIT.dataloaders.quadtree.Rect`/`octree.Cube`'s own convention --
@@ -47,17 +40,90 @@ def _native_resolution_patch_squared_error(output, y, size, pos, patch_size, two
     matches `torch.nn.functional.grid_sample`'s own `x`/`y`[`/z`]-to-last/
     second-to-last[/third-to-last]-axis convention exactly, so `y`'s spatial
     axes are used in whatever native order they arrive in -- no permutation,
-    and critically, no swap. (The original, pre-vectorization implementation
-    swapped `x_start`/`y_start` relative to `y`'s real axis order -- invisible
-    on square images. This rewrite doesn't repeat it.) For `basic_ct`'s 3D case
-    specifically: nothing in this codebase's data pipeline reorders a
-    volume's 3 spatial axes into a specific "height/width/depth" meaning --
-    `detect_img_size`, `img_size`/`tile_size`, and the raw loaded array all
-    carry the same native, unreordered axis order end to end (confirmed by
-    tracing `dataloaders/dataset.py`'s `np.moveaxis(np_image, 0, -1)`, which
-    only relocates the channel axis, never the 3 spatial ones), so `y`'s
-    axes here just need to be in that same native order -- which they
-    already are, coming from the same `batch["data"]` tensor.
+    and critically, no swap. For `basic_ct`'s 3D case specifically: nothing
+    in this codebase's data pipeline reorders a volume's 3 spatial axes into
+    a specific "height/width/depth" meaning -- `detect_img_size`,
+    `img_size`/`tile_size`, and the raw loaded array all carry the same
+    native, unreordered axis order end to end (confirmed by tracing
+    `dataloaders/dataset.py`'s `np.moveaxis(np_image, 0, -1)`, which only
+    relocates the channel axis, never the 3 spatial ones), so `y`'s axes
+    here just need to be in that same native order -- which they already
+    are, coming from the same `batch["data"]` tensor.
+
+    Args:
+        y: Source volume to sample, shape (N, 1, H, W) for 2D or (N, 1, <3
+            native spatial axes, unreordered>) for 3D -- N is any flattened
+            leading batch dim (e.g. Batch, or Batch*Channel).
+        size: Side length of each adaptive patch, shape (N, Seq_Length).
+        pos: Center coordinates of each adaptive patch, shape (N,
+            Seq_Length, 2) (`(x_center, y_center)`) or `(..., 3)` for 3D
+            (`(x_center, y_center, z_center)`).
+        patch_size: Output side length to sample each patch at.
+        twoD: Whether `y` is 2D (True) or 3D (False).
+        mode: `torch.nn.functional.grid_sample` interpolation mode (e.g.
+            `"bicubic"`/`"bilinear"` for 2D, `"bilinear"` for 3D --
+            `grid_sample` doesn't support bicubic for 5D input; `"nearest"`
+            for discrete class labels).
+
+    Returns:
+        Sampled patches, shape (N, Seq_Length, patch_size, patch_size[,
+        patch_size]).
+    """
+    n, seq_len = size.shape
+    device, dtype = y.device, y.dtype
+    # Pixel-center fraction of each output position, mapped to [-1, 1] --
+    # combined with center/size below into a per-patch affine sampling box.
+    t = (torch.arange(patch_size, device=device, dtype=dtype) + 0.5) / patch_size
+    u = 2 * t - 1  # (patch_size,)
+
+    if twoD:
+        w, h = y.shape[3], y.shape[2]
+        tx = 2 * pos[..., 0] / w - 1
+        ty = 2 * pos[..., 1] / h - 1
+        sx = size / w
+        sy = size / h
+        grid_x = tx.unsqueeze(-1) + sx.unsqueeze(-1) * u  # (N, S, patch_size), varies along W_out
+        grid_y = ty.unsqueeze(-1) + sy.unsqueeze(-1) * u  # (N, S, patch_size), varies along H_out
+        grid = torch.stack([
+            grid_x.unsqueeze(2).expand(n, seq_len, patch_size, patch_size),
+            grid_y.unsqueeze(3).expand(n, seq_len, patch_size, patch_size),
+        ], dim=-1)  # (N, S, patch_size, patch_size, 2)
+        grid = grid.reshape(n, seq_len * patch_size, patch_size, 2)
+        sampled = torchF.grid_sample(y, grid, mode=mode, align_corners=False, padding_mode="zeros")
+        sampled = sampled.reshape(n, seq_len, patch_size, patch_size)
+    else:
+        axis2, axis3, axis4 = y.shape[2], y.shape[3], y.shape[4]  # native order, see docstring
+        tx = 2 * pos[..., 0] / axis4 - 1
+        ty = 2 * pos[..., 1] / axis3 - 1
+        tz = 2 * pos[..., 2] / axis2 - 1
+        sx = size / axis4
+        sy = size / axis3
+        sz = size / axis2
+        grid_x = tx.unsqueeze(-1) + sx.unsqueeze(-1) * u
+        grid_y = ty.unsqueeze(-1) + sy.unsqueeze(-1) * u
+        grid_z = tz.unsqueeze(-1) + sz.unsqueeze(-1) * u
+        grid = torch.stack([
+            grid_x.view(n, seq_len, 1, 1, patch_size).expand(n, seq_len, patch_size, patch_size, patch_size),
+            grid_y.view(n, seq_len, 1, patch_size, 1).expand(n, seq_len, patch_size, patch_size, patch_size),
+            grid_z.view(n, seq_len, patch_size, 1, 1).expand(n, seq_len, patch_size, patch_size, patch_size),
+        ], dim=-1)  # (N, S, patch_size, patch_size, patch_size, 3)
+        grid = grid.reshape(n, seq_len * patch_size, patch_size, patch_size, 3)
+        sampled = torchF.grid_sample(y, grid, mode=mode, align_corners=False, padding_mode="zeros")
+        sampled = sampled.reshape(n, seq_len, patch_size, patch_size, patch_size)
+
+    return sampled
+
+
+def _native_resolution_patch_squared_error(output, y, size, pos, patch_size, twoD):
+    """Computes per-patch MSE between adaptively-sized predicted patches and `y`, fully vectorized.
+
+    Rather than resizing each prediction up to its patch's real size (the
+    direction the original, un-vectorized version of this function used),
+    samples the *ground truth* directly at the prediction's fixed
+    `patch_size` resolution via `_native_resolution_sample` (`mode="bicubic"`
+    for 2D / `"bilinear"` for 3D). Mathematically equivalent in spirit
+    (still comparing the prediction against the correctly-scaled real-image
+    region for that patch), just resampling in the other direction.
 
     Args:
         output: Predicted patch values, shape (Batch, Seq_Length, patch_dim),
@@ -111,46 +177,8 @@ def _native_resolution_patch_squared_error(output, y, size, pos, patch_size, two
     centers = pos_full.reshape(n, seq_len, ndims)
     sizes = size_full.reshape(n, seq_len)
 
-    device, dtype = output.device, output.dtype
-    # Pixel-center fraction of each output position, mapped to [-1, 1] --
-    # combined with center/size below into a per-patch affine sampling box.
-    t = (torch.arange(patch_size, device=device, dtype=dtype) + 0.5) / patch_size
-    u = 2 * t - 1  # (patch_size,)
-
-    if twoD:
-        w, h = y.shape[3], y.shape[2]
-        tx = 2 * centers[..., 0] / w - 1
-        ty = 2 * centers[..., 1] / h - 1
-        sx = sizes / w
-        sy = sizes / h
-        grid_x = tx.unsqueeze(-1) + sx.unsqueeze(-1) * u  # (N, S, patch_size), varies along W_out
-        grid_y = ty.unsqueeze(-1) + sy.unsqueeze(-1) * u  # (N, S, patch_size), varies along H_out
-        grid = torch.stack([
-            grid_x.unsqueeze(2).expand(n, seq_len, patch_size, patch_size),
-            grid_y.unsqueeze(3).expand(n, seq_len, patch_size, patch_size),
-        ], dim=-1)  # (N, S, patch_size, patch_size, 2)
-        grid = grid.reshape(n, seq_len * patch_size, patch_size, 2)
-        sampled = torchF.grid_sample(src, grid, mode="bicubic", align_corners=False, padding_mode="zeros")
-        sampled = sampled.reshape(n, seq_len, patch_size, patch_size)
-    else:
-        axis2, axis3, axis4 = y.shape[2], y.shape[3], y.shape[4]  # native order, see docstring
-        tx = 2 * centers[..., 0] / axis4 - 1
-        ty = 2 * centers[..., 1] / axis3 - 1
-        tz = 2 * centers[..., 2] / axis2 - 1
-        sx = sizes / axis4
-        sy = sizes / axis3
-        sz = sizes / axis2
-        grid_x = tx.unsqueeze(-1) + sx.unsqueeze(-1) * u
-        grid_y = ty.unsqueeze(-1) + sy.unsqueeze(-1) * u
-        grid_z = tz.unsqueeze(-1) + sz.unsqueeze(-1) * u
-        grid = torch.stack([
-            grid_x.view(n, seq_len, 1, 1, patch_size).expand(n, seq_len, patch_size, patch_size, patch_size),
-            grid_y.view(n, seq_len, 1, patch_size, 1).expand(n, seq_len, patch_size, patch_size, patch_size),
-            grid_z.view(n, seq_len, patch_size, 1, 1).expand(n, seq_len, patch_size, patch_size, patch_size),
-        ], dim=-1)  # (N, S, patch_size, patch_size, patch_size, 3)
-        grid = grid.reshape(n, seq_len * patch_size, patch_size, patch_size, 3)
-        sampled = torchF.grid_sample(src, grid, mode="bilinear", align_corners=False, padding_mode="zeros")
-        sampled = sampled.reshape(n, seq_len, patch_size, patch_size, patch_size)
+    mode = "bicubic" if twoD else "bilinear"
+    sampled = _native_resolution_sample(src, sizes, centers, patch_size, twoD, mode)
 
     squared_error = (sampled - out_r) ** 2
     reduce_dims = tuple(range(2, squared_error.dim()))
@@ -198,6 +226,66 @@ def native_resolution_patch_masked_mse(output, y, size, pos, patch_size, twoD, m
         mask = mask.expand(batch_size, num_channels_y, seq_len)
     valid = (valid & (mask == 1)).to(per_patch_mse.dtype)
     return (per_patch_mse * valid).sum() / valid.sum()
+
+
+def native_resolution_dice_loss(output, y, size, pos, patch_size, twoD, num_classes, weight=0.5, smooth=1.0):
+    """Dice+BCE loss between per-token predicted patches and the native-resolution label.
+
+    The adaptive-patching analog of `DiceBLoss`: instead of comparing
+    against a label that's been resized (lossy) onto a dense grid, samples
+    the real segmentation label directly at each token's own native
+    position/size via `_native_resolution_sample` (`mode="nearest"`, the
+    standard choice for discrete class labels), one-hot encodes it, and
+    computes Dice+BCE over all non-padding tokens, excluding the background
+    class (channel 0) as `DiceBLoss` does.
+
+    Unlike `_native_resolution_patch_squared_error`, `size`/`pos` here have
+    no `adaptive_patching_channels` dimension: `y` (the label) always has
+    exactly 1 channel (class indices, not per-image-channel data), so there's
+    no per-channel grid to select between -- `size`/`pos` apply directly per
+    (batch, token).
+
+    Args:
+        output: Predicted per-token logits, shape (Batch, Seq_Length,
+            num_classes, patch_size, patch_size[, patch_size]).
+        y: Ground-truth class-index label volume, shape (Batch, 1, H, W[, D]).
+        size: Side length of each adaptive patch, shape (Batch, Seq_Length).
+        pos: Center coordinates of each adaptive patch, shape (Batch,
+            Seq_Length, 2) (2D) or (..., 3) (3D) -- see
+            `_native_resolution_sample` for the axis convention.
+        patch_size: Fixed spatial size predicted patches are stored at.
+        twoD: Whether the data is 2D (True) or 3D (False).
+        num_classes: Number of segmentation classes.
+        weight: Weight given to the BCE term; the Dice term is weighted by
+            `1 - weight` (matches `DiceBLoss`).
+        smooth: Smoothing constant added to the Dice coefficient's numerator/
+            denominator.
+
+    Returns:
+        Scalar tensor with `weight * BCE + (1 - weight) * dice_loss`, averaged
+        over all non-padding (`size != 0`) tokens.
+    """
+    sampled = _native_resolution_sample(y.to(output.dtype), size, pos, patch_size, twoD, mode="nearest")
+    sampled = sampled.round().long().clamp(0, num_classes - 1)
+    target = torchF.one_hot(sampled, num_classes)  # (B, S, patch..., num_classes)
+    target = torch.movedim(target, -1, 2).to(output.dtype)  # (B, S, num_classes, patch...)
+
+    valid_mask = (size != 0).to(output.dtype)  # (B, S)
+    while valid_mask.dim() < output.dim():
+        valid_mask = valid_mask.unsqueeze(-1)
+
+    pred = torchF.sigmoid(output)[:, :, 1:] * valid_mask  # drop background class, zero out padding tokens
+    true = target[:, :, 1:] * valid_mask
+
+    pred = torch.flatten(pred)
+    true = torch.flatten(true)
+
+    intersection = (pred * true).sum()
+    dice_loss = 1 - (2. * intersection + smooth) / (pred.sum() + true.sum() + smooth)
+    mask_full = valid_mask.expand_as(output[:, :, 1:]).flatten()
+    BCE = torchF.binary_cross_entropy(pred, true, reduction='sum') / mask_full.sum().clamp(min=1)
+    return weight * BCE + (1 - weight) * dice_loss
+
 
 class DiceBLoss(nn.Module):
     """Combined Dice loss and binary cross-entropy loss for segmentation.

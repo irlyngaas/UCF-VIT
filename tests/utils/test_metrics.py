@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from UCF_VIT.utils.metrics import DiceBLoss, native_resolution_patch_masked_mse, native_resolution_patch_mse, masked_mse
+from UCF_VIT.utils.metrics import DiceBLoss, native_resolution_dice_loss, native_resolution_patch_masked_mse, native_resolution_patch_mse, masked_mse
 
 
 def test_masked_mse_only_averages_masked_positions():
@@ -208,3 +208,78 @@ def test_native_resolution_patch_masked_mse_only_averages_masked_nonpadding_patc
     including_real_patch_mask = torch.tensor([[[1.0, 0.0]]])
     loss = native_resolution_patch_masked_mse(output, y, size, pos, patch_size, twoD=True, mask=including_real_patch_mask)
     assert loss.item() == pytest.approx(0.0, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# native_resolution_dice_loss
+# ---------------------------------------------------------------------------
+#
+# size/pos here have no adaptive_patching_channels dim (unlike
+# native_resolution_patch_mse's): the label always has exactly 1 channel
+# (class indices), so size/pos apply directly per (batch, token) -- see the
+# function's own docstring.
+
+
+def _confident_logits(num_classes, foreground_class, patch_size, twoD, confident=10.0):
+    shape = (1, 1, num_classes, patch_size, patch_size) if twoD else (1, 1, num_classes, patch_size, patch_size, patch_size)
+    logits = torch.full(shape, -confident)
+    logits[:, :, foreground_class] = confident
+    return logits
+
+
+def test_native_resolution_dice_loss_near_zero_for_correct_confident_prediction():
+    y = torch.zeros(1, 1, 20, 40)
+    y[0, 0, 2:8, 20:26] = 1.0  # class 1 region
+
+    patch_size = 4
+    size = torch.tensor([[6.0]])  # (B=1, S=1)
+    pos = torch.tensor([[[23.0, 5.0]]])  # (x_center, y_center), matches the region exactly
+    output = _confident_logits(num_classes=2, foreground_class=1, patch_size=patch_size, twoD=True)
+
+    loss = native_resolution_dice_loss(output, y, size, pos, patch_size, twoD=True, num_classes=2)
+    assert loss.item() == pytest.approx(0.0, abs=1e-3)
+
+
+def test_native_resolution_dice_loss_high_for_confidently_wrong_prediction():
+    y = torch.zeros(1, 1, 20, 40)
+    y[0, 0, 2:8, 20:26] = 1.0
+
+    patch_size = 4
+    size = torch.tensor([[6.0]])
+    pos = torch.tensor([[[23.0, 5.0]]])
+    output = _confident_logits(num_classes=2, foreground_class=0, patch_size=patch_size, twoD=True)  # predicts background instead
+
+    loss = native_resolution_dice_loss(output, y, size, pos, patch_size, twoD=True, num_classes=2)
+    assert loss.item() > 1.0
+
+
+def test_native_resolution_dice_loss_skips_padding_tokens():
+    y = torch.zeros(1, 1, 20, 40)
+    y[0, 0, 2:8, 20:26] = 1.0
+
+    patch_size = 4
+    # Second token is padding (size == 0, pos == (-1, -1), matching
+    # FixedQuadTree.serialize's own padding convention) with wildly wrong
+    # logits that must not affect the loss.
+    size = torch.tensor([[6.0, 0.0]])
+    pos = torch.tensor([[[23.0, 5.0], [-1.0, -1.0]]])
+    correct = _confident_logits(num_classes=2, foreground_class=1, patch_size=patch_size, twoD=True)
+    wrong = _confident_logits(num_classes=2, foreground_class=0, patch_size=patch_size, twoD=True)
+    output = torch.cat([correct, wrong], dim=1)  # (1, 2, num_classes, patch_size, patch_size)
+
+    loss = native_resolution_dice_loss(output, y, size, pos, patch_size, twoD=True, num_classes=2)
+    assert loss.item() == pytest.approx(0.0, abs=1e-3)
+
+
+def test_native_resolution_dice_loss_3d_matches_true_region():
+    axis2, axis3, axis4 = 12, 20, 30
+    y = torch.zeros(1, 1, axis2, axis3, axis4)
+    y[0, 0, 3:9, 5:11, 10:16] = 2.0  # class 2, z 3:9, y 5:11, x 10:16
+
+    patch_size = 4
+    size = torch.tensor([[6.0]])
+    pos = torch.tensor([[[13.0, 8.0, 6.0]]])  # (x_center, y_center, z_center)
+    output = _confident_logits(num_classes=3, foreground_class=2, patch_size=patch_size, twoD=False)
+
+    loss = native_resolution_dice_loss(output, y, size, pos, patch_size, twoD=False, num_classes=3)
+    assert loss.item() == pytest.approx(0.0, abs=1e-3)

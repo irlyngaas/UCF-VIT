@@ -10,7 +10,7 @@ from monai.utils.enums import MetricReduction
 from monai.metrics import DiceMetric
 from monai.transforms import AsDiscrete
 from monai.data import decollate_batch
-from UCF_VIT.utils.metrics import DiceBLoss, masked_mse, native_resolution_patch_masked_mse, native_resolution_patch_mse
+from UCF_VIT.utils.metrics import masked_mse, native_resolution_dice_loss, native_resolution_patch_masked_mse, native_resolution_patch_mse
 
 def load_optimizer_scheduler_from_checkpoint(conf, optimizer, scheduler, data_seq_ort_group, device):
     """Restores optimizer and scheduler state, loss history, and epoch from a checkpoint.
@@ -95,15 +95,13 @@ def forward_step(conf, batch, model):
     elif conf["model"]["type"] == "SAP":
         if conf["data"]["twoD"]:
             seq = einops.rearrange(batch["seq"], 'b c (s1 s2) (ps1 ps2)-> b c (s1 ps1) (s2 ps2)', s1=conf["model"]["kwargs"]["sqrt_len"], s2=conf["model"]["kwargs"]["sqrt_len"], ps1=conf["data"]["interp_size"], ps2=conf["data"]["interp_size"])
-            seq_label = einops.rearrange(batch["seq_label"], 'b c (ps1 ps2) (s1 s2)-> b c (s1 ps1) (s2 ps2)', s1=conf["model"]["kwargs"]["sqrt_len"], s2=conf["model"]["kwargs"]["sqrt_len"], ps1=conf["data"]["interp_size"], ps2=conf["data"]["interp_size"])
-
         else:
             seq = einops.rearrange(batch["seq"], 'b c (s1 s2 s3) (ps1 ps2 ps3)-> b c (s1 ps1) (s2 ps2) (s3 ps3)', s1=conf["model"]["kwargs"]["sqrt_len"], s2=conf["model"]["kwargs"]["sqrt_len"], s3=conf["model"]["kwargs"]["sqrt_len"], ps1=conf["data"]["interp_size"], ps2=conf["data"]["interp_size"], ps3=conf["data"]["interp_size"])
-            seq_label = einops.rearrange(batch["seq_label"], 'b c (ps1 ps2 ps3) (s1 s2 s3)-> b c (s1 ps1) (s2 ps2) (s3 ps3)', s1=conf["model"]["kwargs"]["sqrt_len"], s2=conf["model"]["kwargs"]["sqrt_len"], s3=conf["model"]["kwargs"]["sqrt_len"], ps1=conf["data"]["interp_size"], ps2=conf["data"]["interp_size"], ps3=conf["data"]["interp_size"])
-        
+
         output = model.forward(seq, batch["variables"], batch["seq_ps"])
-        criterion = DiceBLoss(num_class=conf["model"]["kwargs"]["num_classes"])
-        loss = criterion(output,seq_label)
+        seq_size = batch["seq_ps"][..., 0]
+        seq_pos = batch["seq_ps"][..., 1:]
+        loss = native_resolution_dice_loss(output, batch["label"], seq_size, seq_pos, conf["data"]["interp_size"], conf["data"]["twoD"], conf["model"]["kwargs"]["num_classes"])
         return loss
 
     elif conf["model"]["type"] == "MAE":

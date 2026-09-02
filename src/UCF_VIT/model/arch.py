@@ -690,10 +690,11 @@ class VIT(nn.Module):
 class SAP(VIT):
     """Segmentation-via-Adaptive-Patching model: a `VIT` encoder with a transposed-conv decoder head.
 
-    Reshapes the encoder's flat patch sequence back into a dense
-    `sqrt_len x sqrt_len[ x sqrt_len]` grid and upsamples it via a strided
-    transposed convolution ("neck") followed by a 1x1 conv classifier
-    ("mask_header") to produce a dense per-pixel segmentation mask.
+    Decodes each encoder token independently via a strided transposed
+    convolution ("neck") followed by a 1x1 conv classifier ("mask_header"),
+    producing per-token segmentation logits at each token's own sequence
+    position -- see `mask_head` for why the grid reshape this uses
+    internally doesn't require true spatial adjacency between tokens.
     """
 
     def __init__(self, *args, **kwargs):
@@ -736,33 +737,47 @@ class SAP(VIT):
         self.init_weights('')
 
     def mask_head(self, x: torch.Tensor):
-        """Reshapes the flat patch sequence into a grid and decodes it into a dense segmentation mask.
+        """Reshapes the flat patch sequence into a grid, decodes it, then un-grids back to per-token predictions.
+
+        The grid reshape/un-reshape is a self-consistent round trip (`neck`'s
+        `ConvTranspose2d`/`3d` has `stride == kernel_size`, so it has no
+        cross-token receptive field -- each output block is computed purely
+        from its own input token) rather than an assumption about true
+        spatial adjacency between tokens, which the flat sequence's
+        greedy-split tree order doesn't provide.
 
         Args:
             x: Pooled encoder output, flat patch sequence of length
                 `sqrt_len**2` (2D) or `sqrt_len**3` (3D).
 
         Returns:
-            Per-class segmentation logits, shape (B, num_classes, H, W[, D]).
+            Per-token segmentation logits, shape (Batch, Seq_Length,
+            num_classes, effective_patch_size, effective_patch_size[,
+            effective_patch_size]).
         """
         if self.twoD:
             x = rearrange(x, 'b (p1 p2) c -> b p1 p2 c', p1=self.sqrt_len, p2=self.sqrt_len)
             x = self.neck(x.permute(0,3,1,2))
+            x = self.mask_header(x)
+            x = rearrange(x, 'b c (p1 ph) (p2 pw) -> b (p1 p2) c ph pw', p1=self.sqrt_len, p2=self.sqrt_len)
         else:
             x = rearrange(x, 'b (p1 p2 p3) c -> b p1 p2 p3 c', p1=self.sqrt_len, p2=self.sqrt_len, p3=self.sqrt_len)
             x = self.neck(x.permute(0,4,1,2,3))
-            
-        x = self.mask_header(x)
+            x = self.mask_header(x)
+            x = rearrange(x, 'b c (p1 ph) (p2 pw) (p3 pd) -> b (p1 p2 p3) c ph pw pd', p1=self.sqrt_len, p2=self.sqrt_len, p3=self.sqrt_len)
+
         return x
 
     def forward_head(self, x: torch.Tensor) -> torch.Tensor:
-        """Pools the encoder output and decodes it into a segmentation mask.
+        """Pools the encoder output and decodes it into per-token segmentation predictions.
 
         Args:
             x: Encoder output token sequence.
 
         Returns:
-            Per-class segmentation logits, shape (B, num_classes, H, W[, D]).
+            Per-token segmentation logits, shape (Batch, Seq_Length,
+            num_classes, effective_patch_size, effective_patch_size[,
+            effective_patch_size]).
         """
         x = self.pool(x)
         return self.mask_head(x)
@@ -1321,18 +1336,105 @@ class UNETR(VIT):
 
         self.init_weights('')
 
-    def proj_feat(self, x, hidden_size, feat_size):
-        """Reshapes a flat patch-token sequence back into a spatial feature map.
+    def _adaptive_token_grid_index(self, seq_ps, feat_size):
+        """Finds which adaptive-patch token owns each cell of a `feat_size` canvas.
+
+        `FixedQuadTree`/`FixedOctTree` leaves exactly tile the domain (no
+        gaps or overlaps, always square/cubic), so each canvas cell has
+        exactly one owning token -- found here via a point-in-box test
+        against every token's true `pos +/- size/2` footprint, rather than
+        assuming tokens already sit on a `feat_size` grid by raw sequence
+        index (which greedy-split tree order doesn't guarantee).
+
+        Axis convention matches `utils.metrics._native_resolution_sample`
+        (`pos`'s components are the last/second-to-last[/third-to-last]
+        spatial axes, traced from `Rect`/`Cube`); `self.img_size` follows
+        the same axis order.
 
         Args:
-            x: Flat token sequence, shape (B, prod(feat_size), hidden_size).
+            seq_ps: Per-patch size/position tensor, shape (B, S, ndims+1)
+                (`[size, pos_x, pos_y[, pos_z]]`).
+            feat_size: Target canvas grid size, `(H, W)` or `(H, W, D)`.
+
+        Returns:
+            Long tensor of token indices, shape (B, prod(feat_size)).
+        """
+        size = seq_ps[..., 0]  # (B, S)
+        pos = seq_ps[..., 1:]  # (B, S, ndims)
+        device, dtype = seq_ps.device, seq_ps.dtype
+        half = size / 2
+
+        def cell_centers(n, extent):
+            return ((torch.arange(n, device=device, dtype=dtype) + 0.5) / n) * extent
+
+        if self.twoD:
+            cell_y, cell_x = torch.meshgrid(
+                cell_centers(feat_size[0], self.img_size[0]),
+                cell_centers(feat_size[1], self.img_size[1]),
+                indexing='ij',
+            )
+            cell_x = cell_x.reshape(1, -1, 1)  # (1, G, 1)
+            cell_y = cell_y.reshape(1, -1, 1)
+            x1 = (pos[..., 0] - half).unsqueeze(1)  # (B, 1, S)
+            x2 = (pos[..., 0] + half).unsqueeze(1)
+            y1 = (pos[..., 1] - half).unsqueeze(1)
+            y2 = (pos[..., 1] + half).unsqueeze(1)
+            contains = (size.unsqueeze(1) > 0) & (cell_x >= x1) & (cell_x < x2) & (cell_y >= y1) & (cell_y < y2)
+        else:
+            cell_z, cell_y, cell_x = torch.meshgrid(
+                cell_centers(feat_size[0], self.img_size[0]),
+                cell_centers(feat_size[1], self.img_size[1]),
+                cell_centers(feat_size[2], self.img_size[2]),
+                indexing='ij',
+            )
+            cell_x = cell_x.reshape(1, -1, 1)
+            cell_y = cell_y.reshape(1, -1, 1)
+            cell_z = cell_z.reshape(1, -1, 1)
+            x1 = (pos[..., 0] - half).unsqueeze(1)
+            x2 = (pos[..., 0] + half).unsqueeze(1)
+            y1 = (pos[..., 1] - half).unsqueeze(1)
+            y2 = (pos[..., 1] + half).unsqueeze(1)
+            z1 = (pos[..., 2] - half).unsqueeze(1)
+            z2 = (pos[..., 2] + half).unsqueeze(1)
+            contains = (
+                (size.unsqueeze(1) > 0)
+                & (cell_x >= x1) & (cell_x < x2)
+                & (cell_y >= y1) & (cell_y < y2)
+                & (cell_z >= z1) & (cell_z < z2)
+            )
+
+        return contains.to(torch.uint8).argmax(dim=-1)  # (B, G)
+
+    def proj_feat(self, x, hidden_size, feat_size, token_grid_index=None):
+        """Reshapes a flat patch-token sequence back into a spatial feature map.
+
+        For adaptive patching, the flat sequence is in greedy-split tree
+        order, not raster order, so a plain reshape would place each token
+        at the wrong grid cell -- `token_grid_index` (from
+        `_adaptive_token_grid_index`) is used instead to gather each cell's
+        feature from its true owning token.
+
+        Args:
+            x: Flat token sequence, shape (B, prod(feat_size), hidden_size)
+                when not `self.adaptive_patching` (a plain reshape needs an
+                exact match); shape (B, Seq_Length, hidden_size) when
+                `self.adaptive_patching` (`Seq_Length` need not equal
+                `prod(feat_size)` -- each canvas cell gathers its own owning
+                token via `token_grid_index`, so this reshape no longer
+                constrains token count to the canvas size).
             hidden_size: Channel dimension of each token.
             feat_size: Target spatial grid size, `(H, W)` for 2D or `(H, W, D)`
                 for 3D.
+            token_grid_index: Required when `self.adaptive_patching`; long
+                tensor of token indices per canvas cell, shape (B,
+                prod(feat_size)), from `_adaptive_token_grid_index`.
 
         Returns:
             Spatial feature map, shape (B, hidden_size, H, W[, D]).
         """
+        if self.adaptive_patching:
+            x = torch.gather(x, 1, token_grid_index.unsqueeze(-1).expand(-1, -1, hidden_size))
+
         if self.twoD:
             x = x.view(x.size(0), feat_size[0], feat_size[1], hidden_size)
             x = x.permute(0,3,1,2)
@@ -1341,7 +1443,7 @@ class UNETR(VIT):
             x = x.permute(0,4,1,2,3)
         return x
 
-    def unetr_head(self, x: torch.Tensor, intermediates, enc1):
+    def unetr_head(self, x: torch.Tensor, intermediates, enc1, seq_ps=None):
         """Decodes the encoder output (and intermediate features) into a segmentation mask.
 
         With `self.linear_decoder`, applies a single linear layer and upsamples.
@@ -1359,10 +1461,15 @@ class UNETR(VIT):
             enc1: Original-resolution convolutional encoder feature (from
                 `self.encoder1`), used as the final skip connection; only used
                 when `self.skip_connection` is True.
+            seq_ps: Per-patch size/position tensor; required when
+                `self.adaptive_patching` (all `proj_feat` calls below share
+                the same `feat_size`, so its token-grid index is computed
+                once here).
 
         Returns:
             Per-class segmentation logits, shape (B, num_classes, H, W[, D]).
         """
+        token_grid_index = self._adaptive_token_grid_index(seq_ps, self.feat_size) if self.adaptive_patching else None
 
         if not self.skip_connection:
             if self.linear_decoder:
@@ -1374,7 +1481,7 @@ class UNETR(VIT):
                 x = self.upsample(x)
 
             else:
-                x = self.proj_feat(x, self.embed_dim, self.feat_size)
+                x = self.proj_feat(x, self.embed_dim, self.feat_size, token_grid_index)
                 dec3 = self.decoder5(x)
                 dec2 = self.decoder4(dec3)
                 dec1 = self.decoder3(dec2)
@@ -1384,12 +1491,12 @@ class UNETR(VIT):
                 x = self.out(out)
         else:
             int_len = len(intermediates)
-            dec4 = self.proj_feat(x, self.embed_dim, self.feat_size)
-            enc4 = self.encoder4(self.proj_feat(intermediates[int_len-1], self.embed_dim, self.feat_size))
+            dec4 = self.proj_feat(x, self.embed_dim, self.feat_size, token_grid_index)
+            enc4 = self.encoder4(self.proj_feat(intermediates[int_len-1], self.embed_dim, self.feat_size, token_grid_index))
             dec3 = self.decoder5(dec4, enc4)
-            enc3 = self.encoder3(self.proj_feat(intermediates[int_len-2], self.embed_dim, self.feat_size))
+            enc3 = self.encoder3(self.proj_feat(intermediates[int_len-2], self.embed_dim, self.feat_size, token_grid_index))
             dec2 = self.decoder4(dec3, enc3)
-            enc2 = self.encoder2(self.proj_feat(intermediates[int_len-3], self.embed_dim, self.feat_size))
+            enc2 = self.encoder2(self.proj_feat(intermediates[int_len-3], self.embed_dim, self.feat_size, token_grid_index))
             dec1 = self.decoder3(dec2, enc2)
             if self.feat_size[0]*16 != self.img_size[0]:
                 dec1 = self.upsample(dec1)
@@ -1506,7 +1613,7 @@ class UNETR(VIT):
 
         return x, intermediates
 
-    def forward_head(self, x: torch.Tensor, intermediates, enc1):
+    def forward_head(self, x: torch.Tensor, intermediates, enc1, seq_ps=None):
         """Pools the encoder output and decodes it (and any intermediates) into a segmentation mask.
 
         Args:
@@ -1515,12 +1622,14 @@ class UNETR(VIT):
                 None if `self.skip_connection` is False.
             enc1: Original-resolution convolutional encoder feature for the final
                 skip connection, or None if `self.skip_connection` is False.
+            seq_ps: Per-patch size/position tensor; required when
+                `self.adaptive_patching` (see `unetr_head`).
 
         Returns:
             Per-class segmentation logits, shape (B, num_classes, H, W[, D]).
         """
         x = self.pool(x)
-        return self.unetr_head(x, intermediates, enc1)
+        return self.unetr_head(x, intermediates, enc1, seq_ps)
 
     def forward(self, x: torch.Tensor, variables, seq_ps=None, x_seq=None) -> torch.Tensor:
         """Runs the full UNETR forward pass: convolutional stem (if skip connections), transformer encoder, decoder.
@@ -1542,22 +1651,22 @@ class UNETR(VIT):
             if self.skip_connection:
                 enc1 = self.encoder1(x)
                 x, intermediates = self.forward_intermediates(x_seq, variables, seq_ps, indices=self.skip_indices)
-                x = self.forward_head(x, intermediates, enc1)
+                x = self.forward_head(x, intermediates, enc1, seq_ps)
             else:
                 enc1 = None
                 x = self.forward_features(x_seq, variables, seq_ps)
                 intermediates = None
-                x = self.forward_head(x, intermediates, enc1)
+                x = self.forward_head(x, intermediates, enc1, seq_ps)
         else:
             if self.skip_connection:
                 enc1 = self.encoder1(x)
                 x, intermediates = self.forward_intermediates(x, variables, seq_ps, indices=self.skip_indices)
-                x = self.forward_head(x, intermediates, enc1)
+                x = self.forward_head(x, intermediates, enc1, seq_ps)
             else:
                 enc1 = None
                 x = self.forward_features(x, variables, seq_ps)
                 intermediates = None
-                x = self.forward_head(x, intermediates, enc1)
+                x = self.forward_head(x, intermediates, enc1, seq_ps)
         return x
 
 class DiffusionVIT(VIT):
