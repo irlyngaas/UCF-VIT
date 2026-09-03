@@ -111,3 +111,15 @@ dataloader:
   # val.py/test.py, narrowing what train.py itself uses down from dict_end_idx accordingly.
   val_split_ratio: 0.1
   test_split_ratio: 0.1
+
+# ---------------------------- INFERENCE OUTPUT -----------------------------------
+# Optional, off by default -- only used by test.py/val.py's eval_epoch, and only
+# meaningful for model.type:"UNETR". When save:True, each rank saves its own local
+# batches' input/label/prediction volumes as NIfTI files (see
+# UCF_VIT.utils.inference_output.save_inference_batch) for visual inspection.
+# Uncomment to turn on:
+#inference_output:
+#  save: True
+#  all_batches: False # True saves every batch in the test set (every rank's local shard); False saves only the first num_batches
+#  num_batches: 1 # only used when all_batches:False
+#  output_dir: "inference_output"

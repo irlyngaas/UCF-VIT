@@ -2022,6 +2022,43 @@ participate in a real backward pass under real distributed training (28/28
 feature-matrix-helper tests passing locally, up from 27/27), not just that
 the reconstruction logic itself is correct (already covered above).
 
+### Added an optional `inference_output` sample-inference dump for `test.py`/`val.py`
+
+Lets a `UNETR` run write its own real predictions to disk for visual
+inspection (e.g. in 3D Slicer/ITK-SNAP), rather than only ever seeing the
+scalar Dice accuracy `eval_epoch` already prints. Off by default -- a new
+`inference_output` config section (`save`/`all_batches`/`num_batches`/
+`output_dir`), parsed with the same `try/except KeyError` pattern as
+`tiling`/`ap`, defaults to fully off (and a `save:False` config forces
+every other field back to its own default too, the same "off means off"
+convention `tiling_conf`/`ap_conf` already use) so every shipped config
+that doesn't mention it keeps parsing exactly as before.
+
+New `UCF_VIT.utils.inference_output.save_inference_batch` writes one
+batch's `data`/`label`/argmax(`output`) volumes as NIfTI files
+(`rank{r}_batch{b}_sample{i}_{input,label,pred}.nii.gz`) with an identity
+affine -- `dataset.py`'s `basic_ct` loader already discards each file's
+real affine on load (keeps only `.dataobj`), so there's no real affine
+available to preserve on the way back out. Wired into `eval_epoch`'s
+existing `UNETR` branch (shared by both `val.py` and `test.py`), right
+after the Dice-accuracy computation, gated on
+`conf["inference_output"]["save"]` and either `all_batches` or
+`counter <= num_batches`. Deliberately **not** gated to rank 0 only, unlike
+most of this codebase's file I/O -- with `all_batches:True`, every rank
+saves its own local shard of test batches, which together make up the
+whole distributed test set; gating to rank 0 would silently drop every
+other rank's batches instead.
+
+**Tier 1 coverage:** new `tests/utils/test_inference_output.py` -- confirms
+the 3 files-per-sample are written with the expected `rank`/`batch`/
+`sample`-keyed names, that the saved prediction volume actually matches
+`output.argmax(dim=1)` rather than raw logits, and that `output_dir` is
+created if it doesn't already exist. `test_config_validation.py` gained 3
+tests: `inference_output` defaults to fully off when omitted from a real
+shipped config, threads all 4 fields through when set, and collapses back
+to defaults when `save:False` even if the other fields are set to
+something else.
+
 ## Running the distributed (Tier 2) tests
 
 ```bash

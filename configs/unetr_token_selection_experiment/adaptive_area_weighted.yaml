@@ -121,7 +121,7 @@ dataloader:
     'ct1': 100,
   }
   batch_size: 4 # UNETR exception: its skip-connection decoder (encoder1) runs a plain Conv3d directly on the full 256^3-resolution volume regardless of patch_size/embed_dim -- batch_size:32 OOM'd (~34GB for that one activation alone)
-  num_workers: 1
+  num_workers: 0 # 0, not 1 -- num_workers > 0 forks a DataLoader worker after CUDA/NCCL is already initialized (get_model runs before the DataLoader is built), a known-flaky fork-after-CUDA-init hazard (real segfault hit on job 5411961). See training.py's get_batch error message and configs/basic_ct/sap/base_config.yaml for the same precedent.
   pin_memory: False
   # Optional -- default 0.1/0.1 when omitted (see UCF_VIT.parse._resolve_dataset_splits).
   # Only used for dataset keys with no separate data.dict_val_root_dirs/dict_test_root_dirs
@@ -129,3 +129,15 @@ dataloader:
   # val.py/test.py, narrowing what train.py itself uses down from dict_end_idx accordingly.
   val_split_ratio: 0.1
   test_split_ratio: 0.1
+
+# ---------------------------- INFERENCE OUTPUT -----------------------------------
+# Optional, off by default -- only used by test.py/val.py's eval_epoch. When
+# save:True, each rank saves its own local batches' input/label/prediction
+# volumes as NIfTI files (see UCF_VIT.utils.inference_output.save_inference_batch)
+# for visual inspection.
+# Uncomment to turn on:
+#inference_output:
+#  save: True
+#  all_batches: False # True saves every batch in the test set (every rank's local shard); False saves only the first num_batches
+#  num_batches: 1 # only used when all_batches:False
+#  output_dir: "../../inference_output/unetr_token_selection_experiment/adaptive_area_weighted"

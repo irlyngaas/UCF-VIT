@@ -872,20 +872,35 @@ def parse_config(args, load_balance_offline=False):
         "resize": resize_conf,
     }
 
+# ---------------------------- INFERENCE OUTPUT -----------------------------------
+    # Optional, off by default -- see UCF_VIT.utils.inference_output.save_inference_batch.
+    # Only meaningful for model.type:"UNETR" (eval_epoch is the only caller); a
+    # harmless no-op default for every other model type.
+    try:
+        save_inference = conf["inference_output"]["save"]
+        inference_output_conf = {
+            "save": save_inference,
+            "all_batches": conf["inference_output"].get("all_batches", False) if save_inference else False,
+            "num_batches": conf["inference_output"].get("num_batches", 1) if save_inference else 1,
+            "output_dir": conf["inference_output"].get("output_dir", "inference_output") if save_inference else "inference_output",
+        }
+    except KeyError:
+        inference_output_conf = {"save": False, "all_batches": False, "num_batches": 1, "output_dir": "inference_output"}
 
-    return { 
-        "trainer": trainer_conf, 
-        "parallelism": parallelism_conf, 
-        "optimizer": optimizer_conf, 
-        "scheduler": scheduler_conf, 
+    return {
+        "trainer": trainer_conf,
+        "parallelism": parallelism_conf,
+        "optimizer": optimizer_conf,
+        "scheduler": scheduler_conf,
         "grad_scaler": grad_scaler_conf,
-        "model": model_conf, 
-        "tiling": tiling_conf, 
-        "ap": ap_conf, 
-        "data": data_conf, 
-        "dataloader": dataloader_conf, 
+        "model": model_conf,
+        "tiling": tiling_conf,
+        "ap": ap_conf,
+        "data": data_conf,
+        "dataloader": dataloader_conf,
         "dataset_options": dataset_options_conf,
-    } 
+        "inference_output": inference_output_conf,
+    }
 
 def parse_pretrained_config(args, conf):
     """Load and validate the configuration of a pretrained model to fine-tune from.

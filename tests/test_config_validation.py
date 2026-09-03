@@ -242,3 +242,77 @@ def test_token_capacity_warning_fires_for_point_but_not_area_weighted(capsys):
             assert "will never reach the reconstructed feature map" not in capsys.readouterr().out
     finally:
         os.remove(path)
+
+
+# ---------------------------------------------------------------------------
+# inference_output -- optional test.py/val.py sample-inference dump, see
+# UCF_VIT.utils.inference_output.save_inference_batch
+# ---------------------------------------------------------------------------
+
+
+def test_inference_output_defaults_to_off_when_omitted():
+    """No shipped config sets inference_output -- confirms the except KeyError
+    default keeps it off and harmless for every config we ship."""
+    parsed = validate_config(UNETR_CONFIG)
+    assert parsed["inference_output"]["save"] is False
+    assert parsed["inference_output"]["all_batches"] is False
+    assert parsed["inference_output"]["num_batches"] == 1
+    assert parsed["inference_output"]["output_dir"] == "inference_output"
+
+
+def test_inference_output_threads_through_when_set():
+    with open(UNETR_CONFIG) as f:
+        conf = yaml.load(f, Loader=yaml.FullLoader)
+    conf["inference_output"] = {
+        "save": True,
+        "all_batches": True,
+        "num_batches": 3,
+        "output_dir": "my_inference_dump",
+    }
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    os.close(fd)
+    try:
+        with open(path, "w") as f:
+            yaml.dump(conf, f)
+        args = argparse.Namespace(config=path, pretrained_config="")
+        parsed = parse_config(args, load_balance_offline=True)
+        assert parsed["inference_output"] == {
+            "save": True,
+            "all_batches": True,
+            "num_batches": 3,
+            "output_dir": "my_inference_dump",
+        }
+    finally:
+        os.remove(path)
+
+
+def test_inference_output_save_false_ignores_other_fields():
+    """save:False forces all_batches/num_batches/output_dir back to their
+    defaults even if the config sets them to something else -- matches
+    tiling_conf/ap_conf's same "off means off" convention elsewhere in
+    parse.py."""
+    with open(UNETR_CONFIG) as f:
+        conf = yaml.load(f, Loader=yaml.FullLoader)
+    conf["inference_output"] = {
+        "save": False,
+        "all_batches": True,
+        "num_batches": 3,
+        "output_dir": "my_inference_dump",
+    }
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    os.close(fd)
+    try:
+        with open(path, "w") as f:
+            yaml.dump(conf, f)
+        args = argparse.Namespace(config=path, pretrained_config="")
+        parsed = parse_config(args, load_balance_offline=True)
+        assert parsed["inference_output"] == {
+            "save": False,
+            "all_batches": False,
+            "num_batches": 1,
+            "output_dir": "inference_output",
+        }
+    finally:
+        os.remove(path)

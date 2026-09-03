@@ -11,6 +11,7 @@ from monai.metrics import DiceMetric
 from monai.transforms import AsDiscrete
 from monai.data import decollate_batch
 from UCF_VIT.utils.metrics import masked_mse, native_resolution_dice_loss, native_resolution_patch_masked_mse, native_resolution_patch_mse
+from UCF_VIT.utils.inference_output import save_inference_batch
 
 def load_optimizer_scheduler_from_checkpoint(conf, optimizer, scheduler, data_seq_ort_group, device):
     """Restores optimizer and scheduler state, loss history, and epoch from a checkpoint.
@@ -705,6 +706,9 @@ def eval_epoch(conf, model, eval_dataloader, epoch, iterations_per_epoch, device
                 eval_outputs_list = decollate_batch(output)
                 eval_output_convert = [post_pred(eval_pred_tensor) for eval_pred_tensor in eval_outputs_list]
                 acc = dice_acc(y_pred=eval_output_convert, y=eval_labels_convert)
+
+                if conf["inference_output"]["save"] and (conf["inference_output"]["all_batches"] or counter <= conf["inference_output"]["num_batches"]):
+                    save_inference_batch(conf["inference_output"]["output_dir"], batch, output, counter, dist.get_rank())
 
             if dist.get_rank() == 0:
                 if conf["model"]["type"] in ["VIT", "UNETR"]:
