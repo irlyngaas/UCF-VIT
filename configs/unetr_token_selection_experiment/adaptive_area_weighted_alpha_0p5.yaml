@@ -1,0 +1,131 @@
+# UNETR adaptive-patching token_selection comparison experiment.
+#
+# 9 configs in this directory, all identical except for do_ap/patch_size/
+# fixed_length/interp_size/token_selection/area_weighted_alpha, so any
+# difference in results is attributable to those alone -- same data
+# (dict_root_dirs/dict_start_idx/dict_end_idx/val_split_ratio/
+# test_split_ratio), same model size, same optimizer/scheduler/parallelism.
+#
+# This file: adaptive patching, token_selection:area_weighted (alpha:0.5).
+# fixed_length:1947 (<= half of non_adaptive.yaml's patch_size:16 sequence
+# length, 4096 -- this experiment's ceiling), sqrt_len=12 (bottleneck
+# capacity 12**3=1728, a real ~11% gap below fixed_length, so "point"/
+# "smallest_overlap" actually lose tokens here -- see UCF_VIT.model.arch.
+# UNETR._adaptive_token_grid_index/_adaptive_token_grid_weights/
+# _cross_attention_query_and_mask). interp_size:16 matches non_adaptive.yaml's
+# patch_size:16, so both approaches represent each token/patch at the same
+# resized resolution.
+
+# ---------------------------- TRAINER -------------------------------------------
+trainer:
+  max_epochs: 40
+  data_type: "float32" #float 32 or bfloat16
+  gpu_type: "amd" #amd or nvidia
+  checkpoint_path: "../../checkpoint/unetr_token_selection_experiment/adaptive_area_weighted_alpha_0p5"
+  resume_from_checkpoint: False
+  checkpoint_filename: "epoch_0"
+  use_pretrained_model: False
+  pretrained_checkpoint_filename: ""
+  save_frequency: 2
+
+# ---------------------------- PARALLELISM ---------------------------------------
+parallelism:
+  fsdp_size: 1
+  simple_ddp_size: 16
+  tensor_par_size: 1
+
+# ---------------------------- OPTIMIZER -----------------------------------------
+optimizer:
+  type: "AdamW"
+  lr: 0.0002
+  beta_1: 0.9
+  beta_2: 0.95
+  weight_decay: 1e-5
+
+# ---------------------------- SCHEDULER -----------------------------------------
+scheduler:
+  type: "linear-warmup-cosine-annealing"
+  warmup_epochs: 2
+  warmup_start_lr: 1e-8
+  eta_min: 1e-8
+
+# ---------------------------- GRAD SCALER ---------------------------------------
+grad_scaler:
+  use_grad_scaler: False
+  init_scale: 8192
+  min_scale: 128
+  growth_interval: 100
+
+# ---------------------------- MODEL ---------------------------------------------
+model:
+  type: "UNETR"
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  mlp_ratio: 4
+  drop_path: 0.0
+  drop_rate: 0.0
+  use_channel_aggregation: False
+
+  num_classes: 4
+  linear_decoder: False
+  feature_size: 16
+  skip_connection: True
+  token_selection: area_weighted
+  area_weighted_alpha: 0.5 # unused unless token_selection:area_weighted
+
+# ---------------------------- TILING --------------------------------------------
+tiling:
+  do_tiling: False
+  div: 1
+  tile_overlap: 0
+  use_all_data: False
+
+# ---------------------------- AP ------------------------------------------------
+
+ap:
+  do_ap: True
+  fixed_length: 1947
+  separate_channels: False
+  use_adaptive_pos_emb: True
+  interp_size: 16
+
+# ---------------------------- DATA ----------------------------------------------
+data:
+  dataset: "basic_ct"
+  img_size: [256, 256, 256] #Can be 2D or 3D. Optional -- if omitted, auto-detected from the real data files under dict_root_dirs (see UCF_VIT.utils.misc.detect_img_size). Always the actual/native size of the data, never a resize target.
+  twoD: False #If true when img_size is 3D, dataloader slices on the z dimension. If data is 2D, this variable will be ignored and default to True
+  patch_size: 16 #Only used when do_ap:False (standard patching); changes sequence length. Ignored when do_ap:True -- see ap.interp_size for that case's equivalent.
+  dict_root_dirs: {
+    'ct1': '/lustre/orion/stf006/proj-shared/irl1/Tr8_Training',
+  }
+  num_channels: {
+    'ct1': 1,
+  } #Important to define because not all datasets need to have the same channels or amount of channels when using variable aggregation depending on the training task chosen
+  dict_in_variables: {
+    'ct1': [
+     "ct_res1",
+    ],
+  } #Needs to match the order of the channels in the raw data files, if using variable aggregation. If not using variable aggregation you may just fill this in with placeholders using the correct amount of channels as this will not be used
+
+# ---------------------------- DATALOADER ----------------------------------------
+dataloader:
+  type: "iterative_dataloader"
+  dict_start_idx: {
+    'ct1': 0,
+  }
+  dict_end_idx: {
+    'ct1': 1,
+  }
+  dict_buffer_sizes: {
+    'ct1': 100,
+  }
+  batch_size: 4 # UNETR exception: its skip-connection decoder (encoder1) runs a plain Conv3d directly on the full 256^3-resolution volume regardless of patch_size/embed_dim -- batch_size:32 OOM'd (~34GB for that one activation alone)
+  num_workers: 1
+  pin_memory: False
+  # Optional -- default 0.1/0.1 when omitted (see UCF_VIT.parse._resolve_dataset_splits).
+  # Only used for dataset keys with no separate data.dict_val_root_dirs/dict_test_root_dirs
+  # entry: reserves this fraction of that key's own [dict_start_idx, dict_end_idx) window for
+  # val.py/test.py, narrowing what train.py itself uses down from dict_end_idx accordingly.
+  val_split_ratio: 0.1
+  test_split_ratio: 0.1
