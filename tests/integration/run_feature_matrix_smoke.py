@@ -111,17 +111,18 @@ FEATURE_MATRIX = [
         # Frontier data.
     ),
 
-    # --- model.token_selection -- UNETR._adaptive_token_grid_index/_weights'
-    # 3 real reconstruction methods (see arch.py's own docstrings). "point"
-    # (the default) is already proven by basic_ct-unetr+do_ap above; these
-    # 3 cells are the only real-Frontier coverage the other 2 methods (and
-    # area_weighted_alpha specifically) have at all -- test_arch.py only
-    # covers them at the model-construction level, and
-    # test_config_validation.py only covers parse.py's kwarg plumbing, never
-    # a real forward+backward+loss step against real data/DistributedSampler.
-    # twoD/do_tiling deliberately not crossed with this -- token_selection is
-    # orthogonal to dataset specifics, same "representative subset, not a
-    # full cross product" reasoning as tensor_par_size below.
+    # --- model.token_selection -- UNETR._adaptive_token_grid_index/_weights/
+    # _cross_attention_query_and_mask's 4 real reconstruction methods (see
+    # arch.py's own docstrings). "point" (the default) is already proven by
+    # basic_ct-unetr+do_ap above; these cells are the only real-Frontier
+    # coverage the other methods (and area_weighted_alpha specifically) have
+    # at all -- test_arch.py only covers them at the model-construction
+    # level, and test_config_validation.py only covers parse.py's kwarg
+    # plumbing, never a real forward+backward+loss step against real
+    # data/DistributedSampler. twoD/do_tiling deliberately not crossed with
+    # this -- token_selection is orthogonal to dataset specifics, same
+    # "representative subset, not a full cross product" reasoning as
+    # tensor_par_size below.
     FeatureMatrixCell(
         "basic_ct/unetr/base_config.yaml", "basic_ct-unetr+do_ap+smallest_overlap",
         {"ap": {"do_ap": True, "interp_size": 32}, "model": {"token_selection": "smallest_overlap"}},
@@ -142,6 +143,16 @@ FEATURE_MATRIX = [
         # indistinguishable from smallest_overlap -- this cell's real point
         # is proving area_weighted_alpha threads through into a real
         # forward+backward+loss step at all, not a specific alpha value.
+    ),
+    FeatureMatrixCell(
+        "basic_ct/unetr/base_config.yaml", "basic_ct-unetr+do_ap+cross_attention",
+        {"ap": {"do_ap": True, "interp_size": 32}, "model": {"token_selection": "cross_attention"}},
+        # The only token_selection method with real trainable parameters
+        # (token_query_mlp/token_key_proj/token_value_proj) -- this cell's
+        # real point is proving those participate correctly in a real
+        # forward+backward step (gradients flow, optimizer updates them,
+        # nothing about their construction/dtype/device breaks under real
+        # distributed training) rather than just existing as unused Modules.
     ),
     FeatureMatrixCell(
         "basic_ct/mae/base_config.yaml", "basic_ct-mae+do_ap",

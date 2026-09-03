@@ -133,7 +133,7 @@ def get_kwargs(model_type, conf):
                 token_selection = conf["model"]["token_selection"]
             except KeyError:
                 token_selection = "point"
-            assert token_selection in ("point", "smallest_overlap", "area_weighted"), f"Unknown token_selection {token_selection!r}"
+            assert token_selection in ("point", "smallest_overlap", "area_weighted", "cross_attention"), f"Unknown token_selection {token_selection!r}"
             kwargs.update({"token_selection": token_selection})
 
             try:
@@ -148,11 +148,12 @@ def get_kwargs(model_type, conf):
             else:
                 sqrt_len=int(np.rint(math.pow(conf["ap"]["fixed_length"],1/3)))
                 token_capacity = sqrt_len**3
-            # "area_weighted" blends every overlapping token proportionally by
-            # area rather than picking one winner per cell -- every real token
-            # is guaranteed nonzero weight in some cell (leaves and cells both
-            # fully partition the domain), so it's not subject to this warning.
-            if token_capacity < conf["ap"]["fixed_length"] and token_selection != "area_weighted":
+            # "area_weighted"/"cross_attention" both let every token overlapping
+            # a cell contribute (proportionally by area, or via a learned
+            # attention weight) rather than picking one winner -- every real
+            # token is guaranteed nonzero weight in some cell (leaves and cells
+            # both fully partition the domain), so neither is subject to this warning.
+            if token_capacity < conf["ap"]["fixed_length"] and token_selection not in ("area_weighted", "cross_attention"):
                 if dist.get_rank() == 0:
                     print(f"Warning: UNETR's decoder bottleneck (sqrt_len={sqrt_len}, {token_capacity} cells) is smaller than fixed_length ({conf['ap']['fixed_length']}) -- at least {conf['ap']['fixed_length'] - token_capacity} adaptive-patch tokens per sample will never reach the reconstructed feature map.")
             kwargs.update({"sqrt_len": sqrt_len})

@@ -369,3 +369,88 @@ def test_unetr_area_weighted_alpha_increases_small_token_weight_toward_smallest_
     assert small_weights == sorted(small_weights)  # monotonically increasing
     assert small_weights[0] == pytest.approx(0.1, abs=1e-5)  # alpha=0: plain area share (1/(1+9))
     assert small_weights[-1] == pytest.approx(1.0, abs=1e-3)  # alpha=50: effectively all the weight
+
+
+# ---------------------------------------------------------------------------
+# UNETR.token_selection -- "cross_attention" (learned soft pooling)
+# ---------------------------------------------------------------------------
+
+
+def test_unetr_cross_attention_builds_expected_submodules():
+    model = _make_unetr(token_selection="cross_attention")
+    assert model.token_selection == "cross_attention"
+    assert isinstance(model.token_query_mlp, torch.nn.Sequential)
+    assert isinstance(model.token_key_proj, torch.nn.Linear)
+    assert isinstance(model.token_value_proj, torch.nn.Linear)
+
+
+def test_unetr_cross_attention_not_built_for_other_selections():
+    model = _make_unetr(token_selection="point")
+    assert not hasattr(model, "token_query_mlp")
+    assert not hasattr(model, "token_key_proj")
+    assert not hasattr(model, "token_value_proj")
+
+
+# 3 real, non-overlapping tokens exactly covering a 2x2 canvas over a 12x12
+# domain, with token A spanning both cells in column 0 -- reused by both
+# tests below.
+_CROSS_ATTN_FEAT_SIZE = (2, 2)
+_CROSS_ATTN_IMG_SIZE = (12, 12)
+_CROSS_ATTN_TOKEN_BOXES = [
+    (0.0, 4.0, 0.0, 12.0),   # A: x[0,4), y[0,12) -- spans cell(0,0) and cell(1,0)
+    (7.0, 9.0, 7.0, 9.0),    # B: x[7,9), y[7,9) -- cell(1,1) only
+    (7.0, 9.0, 1.0, 3.0),    # C: x[7,9), y[1,3) -- cell(0,1) only
+]
+
+
+def _cross_attn_seq_ps():
+    size = torch.tensor([[b[1] - b[0] for b in _CROSS_ATTN_TOKEN_BOXES]])
+    pos = torch.tensor([[[(b[0] + b[1]) / 2, (b[2] + b[3]) / 2] for b in _CROSS_ATTN_TOKEN_BOXES]])
+    return torch.cat([size.unsqueeze(-1), pos], dim=-1)
+
+
+def test_unetr_cross_attention_query_and_mask_shapes_and_masking():
+    model = _make_unetr(token_selection="cross_attention", img_size=_CROSS_ATTN_IMG_SIZE)
+    seq_ps = _cross_attn_seq_ps()
+
+    query, mask = model._cross_attention_query_and_mask(seq_ps, _CROSS_ATTN_FEAT_SIZE)
+
+    assert query.shape == (_CROSS_ATTN_FEAT_SIZE[0] * _CROSS_ATTN_FEAT_SIZE[1], model.embed_dim)
+    mask = mask.view(_CROSS_ATTN_FEAT_SIZE[0], _CROSS_ATTN_FEAT_SIZE[1], 3)
+    # cell(0,0)->A, cell(0,1)->C, cell(1,0)->A, cell(1,1)->B; each cell has
+    # exactly one real overlapping token, A owns two cells.
+    assert mask[0, 0].tolist() == [True, False, False]
+    assert mask[0, 1].tolist() == [False, False, True]
+    assert mask[1, 0].tolist() == [True, False, False]
+    assert mask[1, 1].tolist() == [False, True, False]
+
+
+def test_unetr_cross_attention_proj_feat_respects_mask_and_multi_cell_overlap():
+    """End-to-end through proj_feat, with token_key_proj/token_value_proj
+    fixed to the identity (rather than random init) so the masked-attention
+    output is fully deterministic: each cell's reconstructed feature must
+    exactly equal its one real owning token's embedding, and the token
+    spanning two cells (A) must produce the identical result in both.
+    """
+    model = _make_unetr(token_selection="cross_attention", img_size=_CROSS_ATTN_IMG_SIZE)
+    with torch.no_grad():
+        model.token_key_proj.weight.copy_(torch.eye(model.embed_dim))
+        model.token_key_proj.bias.zero_()
+        model.token_value_proj.weight.copy_(torch.eye(model.embed_dim))
+        model.token_value_proj.bias.zero_()
+
+    seq_ps = _cross_attn_seq_ps()
+    token_selection_state = model._compute_token_selection_state(seq_ps, _CROSS_ATTN_FEAT_SIZE)
+
+    tokens = torch.stack([
+        torch.full((model.embed_dim,), 1.0),  # A
+        torch.full((model.embed_dim,), 2.0),  # B
+        torch.full((model.embed_dim,), 3.0),  # C
+    ]).unsqueeze(0)  # (1, 3, embed_dim)
+
+    canvas = model.proj_feat(tokens, model.embed_dim, _CROSS_ATTN_FEAT_SIZE, token_selection_state)
+
+    assert torch.allclose(canvas[0, :, 0, 0], torch.full((model.embed_dim,), 1.0), atol=1e-5)  # cell(0,0) -> A
+    assert torch.allclose(canvas[0, :, 0, 1], torch.full((model.embed_dim,), 3.0), atol=1e-5)  # cell(0,1) -> C
+    assert torch.allclose(canvas[0, :, 1, 0], torch.full((model.embed_dim,), 1.0), atol=1e-5)  # cell(1,0) -> A (same as cell(0,0))
+    assert torch.allclose(canvas[0, :, 1, 1], torch.full((model.embed_dim,), 2.0), atol=1e-5)  # cell(1,1) -> B

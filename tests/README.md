@@ -1968,6 +1968,60 @@ confirms all 3 new cells' configs parse via a real `parse_config` call
 before ever touching real Frontier data (27/27 passing locally, up from
 24/24).
 
+### Added a 4th `token_selection`: `"cross_attention"` (learned soft pooling)
+
+Follow-up to the 3 heuristic methods above. Those are all fixed formulas
+(geometric containment, or a hand-tuned `size ** -alpha` bias); this one
+lets the model learn each overlapping token's contribution instead of
+prescribing it. Reuses the exact same overlap test `"area_weighted"`
+already has (a token contributes to a cell iff it geometrically overlaps
+it -- same many-to-many relationship: a token overlapping 2 cells is an
+independent candidate at each, with its own attention weight per cell,
+same as every other method), but replaces the fixed area-proportional
+weight with real learned attention: a new `_cross_attention_query_and_mask`
+computes each cell's query (via `self.token_query_mlp`, a small MLP over
+the cell's own normalized center position -- position-*derived*, not a
+`feat_size`-shaped lookup table, so it isn't tied to one canvas resolution)
+and the same overlap mask as `_adaptive_token_grid_weights`; `proj_feat`'s
+new branch projects each call's own token embeddings through
+`self.token_key_proj`/`self.token_value_proj`, computes masked (`-1e9` on
+non-overlapping/padding entries, avoiding `NaN` the way literal `-inf`
+would risk) scaled dot-product attention, and combines values via the
+resulting softmax weights. Query/mask are still computed once per forward
+pass and reused across `unetr_head`'s 4 `proj_feat` calls (`dec4`/`enc4`/
+`enc3`/`enc2`) -- only key/value depend on each call's own token
+embeddings, so those are the only part recomputed fresh each time.
+
+Architecturally different from the other 3 in one real way: this is the
+first `token_selection` method with actual trainable parameters
+(`token_query_mlp`/`token_key_proj`/`token_value_proj`), built only when
+`token_selection == "cross_attention"` and initialized via the same generic
+recursive `init_weights_vit_timm` every other submodule already gets --
+the other 3 add zero parameters and are pure geometry.
+
+**Tier 1 coverage:** `test_arch.py` -- the 3 submodules exist for
+`"cross_attention"` and don't exist for the other methods; `query`/`mask`
+shapes and masking correctness (a 3-real-token, 4-cell scenario with one
+token spanning 2 cells, matching the same shape of setup used for
+`"smallest_overlap"`/`"area_weighted"` above); and a full `proj_feat`
+integration test with `token_key_proj`/`token_value_proj` fixed to the
+identity (rather than left at random init) so the masked-attention output
+is exactly predictable -- each cell's reconstructed feature must exactly
+equal its one real owning token's embedding, and the token spanning two
+cells must produce the identical result in both (verified robust to
+`token_query_mlp`'s random init by construction: each cell here has
+exactly one unmasked candidate, so softmax gives it weight exactly 1
+regardless of the actual query/score values -- `exp(-1e9)` underflows to
+exactly `0.0` in float32, not just approximately). `test_config_validation.py`
+extended the existing threading/warning-gating tests to include
+`"cross_attention"` rather than adding new ones (same generalization the
+tests were already written for). `run_feature_matrix_smoke.py` gained a
+4th sibling cell, `basic_ct-unetr+do_ap+cross_attention` -- its real point,
+unlike the other 3, is proving the new trainable submodules actually
+participate in a real backward pass under real distributed training (28/28
+feature-matrix-helper tests passing locally, up from 27/27), not just that
+the reconstruction logic itself is correct (already covered above).
+
 ## Running the distributed (Tier 2) tests
 
 ```bash

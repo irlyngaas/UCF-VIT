@@ -133,7 +133,7 @@ def test_token_selection_defaults_to_point_under_do_ap():
 
 
 def test_token_selection_smallest_overlap_and_area_weighted_thread_through():
-    for value in ("smallest_overlap", "area_weighted"):
+    for value in ("smallest_overlap", "area_weighted", "cross_attention"):
         with open(UNETR_CONFIG) as f:
             conf = yaml.load(f, Loader=yaml.FullLoader)
         conf["ap"]["do_ap"] = True
@@ -215,8 +215,8 @@ def test_token_capacity_warning_fires_for_point_but_not_area_weighted(capsys):
     (fixed_length % 7 == 1) that isn't a perfect cube (519: sqrt_len stays
     8, 8**3=512 < 519) must trigger parse.py's "N tokens will never reach
     the reconstructed feature map" warning for the default ("point")
-    token_selection, but not for "area_weighted" -- see parse.py's own
-    comment on why that method isn't subject to it.
+    token_selection, but not for "area_weighted"/"cross_attention" -- see
+    parse.py's own comment on why those methods aren't subject to it.
     """
     with open(UNETR_CONFIG) as f:
         conf = yaml.load(f, Loader=yaml.FullLoader)
@@ -234,10 +234,11 @@ def test_token_capacity_warning_fires_for_point_but_not_area_weighted(capsys):
         parse_config(args, load_balance_offline=True)
         assert "will never reach the reconstructed feature map" in capsys.readouterr().out
 
-        conf["model"]["token_selection"] = "area_weighted"
-        with open(path, "w") as f:
-            yaml.dump(conf, f)
-        parse_config(args, load_balance_offline=True)
-        assert "will never reach the reconstructed feature map" not in capsys.readouterr().out
+        for value in ("area_weighted", "cross_attention"):
+            conf["model"]["token_selection"] = value
+            with open(path, "w") as f:
+                yaml.dump(conf, f)
+            parse_config(args, load_balance_offline=True)
+            assert "will never reach the reconstructed feature map" not in capsys.readouterr().out
     finally:
         os.remove(path)

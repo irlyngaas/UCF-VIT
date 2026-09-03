@@ -1327,11 +1327,24 @@ class UNETR(VIT):
                     self.upsample = nn.Upsample(size=self.img_size,mode='trilinear',align_corners=True)
 
         else: #Use Linear Decoder
-            self.mlp_head = nn.Linear(self.embed_dim, self.num_classes) 
+            self.mlp_head = nn.Linear(self.embed_dim, self.num_classes)
             if self.twoD:
                 self.upsample = nn.Upsample(scale_factor=self.effective_patch_size,mode='bilinear',align_corners=True)
             else:
                 self.upsample = nn.Upsample(scale_factor=self.effective_patch_size,mode='trilinear',align_corners=True)
+
+        if self.adaptive_patching and self.token_selection == "cross_attention":
+            ndims = 2 if self.twoD else 3
+            # Maps a cell's normalized position to a query vector -- position-
+            # derived rather than a feat_size-shaped lookup table, so it works
+            # at any canvas resolution instead of being baked to one.
+            self.token_query_mlp = nn.Sequential(
+                nn.Linear(ndims, self.embed_dim),
+                nn.GELU(),
+                nn.Linear(self.embed_dim, self.embed_dim),
+            )
+            self.token_key_proj = nn.Linear(self.embed_dim, self.embed_dim)
+            self.token_value_proj = nn.Linear(self.embed_dim, self.embed_dim)
 
         self.init_weights('')
 
@@ -1503,26 +1516,99 @@ class UNETR(VIT):
 
         return area / area.sum(dim=-1, keepdim=True).clamp(min=1e-12)
 
+    def _cross_attention_query_and_mask(self, seq_ps, feat_size):
+        """Computes each canvas cell's query vector and valid-token mask for `"cross_attention"`.
+
+        The learned counterpart to `_adaptive_token_grid_weights`: instead
+        of a fixed geometric (area-proportional) weighting, `proj_feat`
+        uses these to run real cross-attention -- each cell's query
+        attending only over the tokens that actually overlap it (the same
+        overlap test `_adaptive_token_grid_weights` uses), with learned
+        (not geometric) attention weights deciding each overlapping token's
+        contribution. A token overlapping multiple cells is a valid,
+        independently-weighted candidate at each of them, same as every
+        other `token_selection` method -- there's no "budget" split between
+        the cells a token touches.
+
+        The query itself comes from `self.token_query_mlp`, applied to each
+        cell's own normalized center position -- not a `feat_size`-shaped
+        lookup table, so it isn't tied to one specific canvas resolution.
+
+        Args:
+            seq_ps: Per-patch size/position tensor, shape (B, S, ndims+1)
+                (`[size, pos_x, pos_y[, pos_z]]`).
+            feat_size: Target canvas grid size, `(H, W)` or `(H, W, D)`.
+
+        Returns:
+            A tuple `(query, mask)`: `query`, shape (prod(feat_size),
+            embed_dim) -- batch-independent, since cell positions don't
+            vary per sample; `mask`, a bool tensor shape (B, prod(feat_size),
+            S), `True` where that token is real (non-padding) and overlaps
+            that cell.
+        """
+        size = seq_ps[..., 0]  # (B, S)
+        pos = seq_ps[..., 1:]  # (B, S, ndims)
+        device, dtype = seq_ps.device, seq_ps.dtype
+        half = size / 2
+        size_b = size.unsqueeze(1)  # (B, 1, S)
+
+        def cell_edges(n, extent):
+            idx = torch.arange(n, device=device, dtype=dtype)
+            return (idx / n) * extent, ((idx + 1) / n) * extent
+
+        ndims = 2 if self.twoD else 3
+        axis_extents = [self.img_size[i] for i in range(ndims)]
+
+        starts_ends = [cell_edges(feat_size[i], axis_extents[i]) for i in range(ndims)]
+        starts = torch.meshgrid(*[se[0] for se in starts_ends], indexing='ij')
+        ends = torch.meshgrid(*[se[1] for se in starts_ends], indexing='ij')
+        cell_lo = [c.reshape(1, -1, 1) for c in reversed(starts)]  # x, y[, z]
+        cell_hi = [c.reshape(1, -1, 1) for c in reversed(ends)]
+        # Cell centers, normalized to [-1, 1] per axis (same convention as
+        # utils.metrics._native_resolution_sample), in the same x, y[, z]
+        # order as cell_lo/cell_hi above.
+        centers_norm = [((cell_lo[i] + cell_hi[i]) / axis_extents[i]) - 1 for i in range(ndims)]
+
+        edges = [((pos[..., i] - half).unsqueeze(1), (pos[..., i] + half).unsqueeze(1)) for i in range(ndims)]
+        mask = size_b > 0
+        for i in range(ndims):
+            lo, hi = edges[i]
+            mask = mask & (cell_lo[i] < hi) & (lo < cell_hi[i])  # (B, G, S)
+
+        # (G, ndims) -- one row per cell, in the same (x, y[, z]) column order
+        # token_query_mlp's nn.Linear(ndims, embed_dim) expects.
+        coords = torch.cat([c.reshape(-1, 1) for c in centers_norm], dim=-1)
+        query = self.token_query_mlp(coords)  # (G, embed_dim)
+
+        return query, mask
+
     def _compute_token_selection_state(self, seq_ps, feat_size):
         """Computes whatever `proj_feat` needs to reconstruct `feat_size` from a flat token sequence.
 
         Dispatches on `self.token_selection`: `_adaptive_token_grid_index`
         (a `(B, prod(feat_size))` long index tensor) for `"point"`/
-        `"smallest_overlap"`, or `_adaptive_token_grid_weights` (a `(B,
+        `"smallest_overlap"`; `_adaptive_token_grid_weights` (a `(B,
         prod(feat_size), Seq_Length)` float weight tensor) for
-        `"area_weighted"`. Computed once per forward pass and reused across
-        every `proj_feat` call in `unetr_head` (`dec4`/`enc4`/`enc3`/`enc2`
-        all share the same `feat_size`).
+        `"area_weighted"`; `_cross_attention_query_and_mask` (a `(query,
+        mask)` tuple) for `"cross_attention"`. Computed once per forward
+        pass and reused across every `proj_feat` call in `unetr_head`
+        (`dec4`/`enc4`/`enc3`/`enc2` all share the same `feat_size`) --
+        `"cross_attention"`'s key/value projections still depend on each
+        call's own token embeddings and are computed fresh inside
+        `proj_feat` itself, only the query/mask are shared.
 
         Args:
             seq_ps: Per-patch size/position tensor, shape (B, S, ndims+1).
             feat_size: Target canvas grid size, `(H, W)` or `(H, W, D)`.
 
         Returns:
-            See `_adaptive_token_grid_index`/`_adaptive_token_grid_weights`.
+            See `_adaptive_token_grid_index`/`_adaptive_token_grid_weights`/
+            `_cross_attention_query_and_mask`.
         """
         if self.token_selection == "area_weighted":
             return self._adaptive_token_grid_weights(seq_ps, feat_size)
+        if self.token_selection == "cross_attention":
+            return self._cross_attention_query_and_mask(seq_ps, feat_size)
         return self._adaptive_token_grid_index(seq_ps, feat_size)
 
     def proj_feat(self, x, hidden_size, feat_size, token_selection_state=None):
@@ -1553,7 +1639,10 @@ class UNETR(VIT):
                 long index tensor per canvas cell, shape (B, prod(feat_size)),
                 gathered directly; for `"area_weighted"`, a float weight
                 tensor, shape (B, prod(feat_size), Seq_Length), combined via
-                a weighted sum instead.
+                a weighted sum instead; for `"cross_attention"`, a `(query,
+                mask)` tuple (shapes (prod(feat_size), hidden_size) and (B,
+                prod(feat_size), Seq_Length)) used to run real cross-attention
+                against this call's own token embeddings.
 
         Returns:
             Spatial feature map, shape (B, hidden_size, H, W[, D]).
@@ -1561,6 +1650,14 @@ class UNETR(VIT):
         if self.adaptive_patching:
             if self.token_selection == "area_weighted":
                 x = torch.einsum('bgs,bsc->bgc', token_selection_state, x)
+            elif self.token_selection == "cross_attention":
+                query, mask = token_selection_state
+                key = self.token_key_proj(x)
+                value = self.token_value_proj(x)
+                scores = torch.einsum('gc,bsc->bgs', query, key) / (hidden_size ** 0.5)
+                scores = scores.masked_fill(~mask, -1e9)
+                attn = torch.softmax(scores, dim=-1)
+                x = torch.einsum('bgs,bsc->bgc', attn, value)
             else:
                 x = torch.gather(x, 1, token_selection_state.unsqueeze(-1).expand(-1, -1, hidden_size))
 
