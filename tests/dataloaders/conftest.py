@@ -1,4 +1,50 @@
+import os
+import socket
+
+import pytest
+import torch.distributed as dist
 import yaml
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _ensure_single_process_distributed():
+    """Guarantees a single-process `torch.distributed` group for every test in
+    this directory, regardless of SLURM environment variables.
+
+    `tests/conftest.py`'s own autouse fixture steps aside (does no init at
+    all) whenever `SLURM_PROCID`/`SLURM_NTASKS`/`SLURM_LOCALID` are all set,
+    on the assumption that means real multi-rank `tests/distributed/` tests
+    are running, which do their own real init instead. But
+    `launch/tests/run_dataloader_speed.sh` submits via a real `sbatch` job
+    too, just without `srun` -- and a real Frontier run (job 5421658) showed
+    this specific cluster setup populates those same `SLURM_*` variables for
+    a bare `sbatch` script even with no `srun` involved at all, so that
+    fixture wrongly stepped aside here too, leaving `torch.distributed` never
+    initialized -- `NativePytorchDataModule._my_dataset_key()`'s own
+    `if not torch.distributed.is_initialized()` guard then raised
+    `NotImplementedError` before any real decode/timing work ever ran.
+
+    None of `tests/dataloaders/`'s own tests are ever real multi-rank (see
+    `test_dataset_speed_real_data.py`'s own module docstring -- deliberately
+    single-process, even under a real Frontier job) and this file only
+    applies within `tests/dataloaders/` and its subdirectories (pytest scopes
+    conftest.py fixtures to the directory tree they're defined in), so this
+    can't affect `tests/distributed/`'s own real multi-rank init at all --
+    safe to just always ensure single-process init here, independent of the
+    SLURM-launch heuristic that exists for the parent conftest's own,
+    different reasons.
+    """
+    if dist.is_available() and not dist.is_initialized():
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        if "MASTER_PORT" not in os.environ:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("", 0))
+                os.environ["MASTER_PORT"] = str(s.getsockname()[1])
+        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+        yield
+        dist.destroy_process_group()
+    else:
+        yield
 
 
 def pytest_addoption(parser):
