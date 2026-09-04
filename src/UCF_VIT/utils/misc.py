@@ -11,6 +11,25 @@ import cv2 as cv
 import torchdata.datapipes as dp
 from UCF_VIT.utils.lr_scheduler import LinearWarmupCosineAnnealingLR
 
+def find_repo_root():
+    """Returns this repository's root directory (the parent of `src/`).
+
+    Computed from *this file's own* location (`src/UCF_VIT/utils/misc.py` is
+    always exactly 3 directories below the repo root), not the caller's --
+    so any script, anywhere in the repo (including ones added later, at any
+    depth someone chooses), gets the same correct answer just by importing
+    and calling this, without needing to work out its own location relative
+    to the repo root itself.
+
+    Config files' own relative paths (`trainer.checkpoint_path`,
+    `inference_output.output_dir`) are resolved against this in `parse.py`
+    (not against the process's current working directory, which depends on
+    wherever a launch script happens to invoke `python` from) -- see
+    `parse_config`'s own comments at each of those fields for the exact
+    resolution.
+    """
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
 def patchify( data, patch_size, twoD):
     """Splits a batch of images into a sequence of flattened, non-overlapping patches.
 

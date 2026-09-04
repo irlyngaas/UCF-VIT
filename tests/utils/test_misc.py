@@ -13,6 +13,7 @@ from UCF_VIT.utils.misc import (
     calculate_tile_overlap,
     detect_img_size,
     detect_num_channels,
+    find_repo_root,
     is_power_of_two,
     patchify,
     process_root_dirs,
@@ -637,3 +638,33 @@ def test_shard_attention_state_dict_rejects_qk_norm_params():
 
     with pytest.raises(NotImplementedError):
         shard_attention_state_dict(full, num_heads=4, tensor_par_size=2, tp_rank=0)
+
+
+# ---------------------------------------------------------------------------
+# find_repo_root -- lets parse.py (and any future user-added script anywhere
+# in the repo) resolve config files' own relative paths (trainer.checkpoint_
+# path, inference_output.output_dir) against a fixed point, regardless of
+# the process's current working directory.
+# ---------------------------------------------------------------------------
+
+
+def test_find_repo_root_finds_the_actual_repo_root():
+    root = find_repo_root()
+    # A file only the real repo root's own src/ layout would have.
+    assert os.path.isfile(os.path.join(root, "src", "UCF_VIT", "utils", "misc.py"))
+    assert os.path.isdir(os.path.join(root, "training_scripts"))
+
+
+def test_find_repo_root_independent_of_cwd():
+    # The whole point: callers anywhere (a future script at any depth) get
+    # the same answer, since it's computed from this file's own location,
+    # not the caller's or the process's current directory.
+    original_cwd = os.getcwd()
+    try:
+        expected = find_repo_root()
+        os.chdir(os.path.dirname(os.path.abspath(__file__)))  # tests/utils/, a different depth
+        assert find_repo_root() == expected
+        os.chdir(expected)  # the repo root itself
+        assert find_repo_root() == expected
+    finally:
+        os.chdir(original_cwd)

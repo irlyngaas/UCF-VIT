@@ -3,7 +3,7 @@ trainer:
   max_epochs: 100
   data_type: "float32" #float 32 or bfloat16
   gpu_type: "amd" #amd or nvidia
-  checkpoint_path: "../../checkpoint/catsdogs/diffusion/base"
+  checkpoint_path: "checkpoint/catsdogs/diffusion/base"
   resume_from_checkpoint: False
   checkpoint_filename: "epoch_0"
   use_pretrained_model: False

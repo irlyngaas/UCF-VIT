@@ -21,7 +21,7 @@ trainer:
   max_epochs: 200
   data_type: "float32" #float 32 or bfloat16
   gpu_type: "amd" #amd or nvidia
-  checkpoint_path: "../../checkpoint/unetr_token_selection_experiment/adaptive_area_weighted_alpha_0p5"
+  checkpoint_path: "checkpoint/unetr_token_selection_experiment/adaptive_area_weighted_alpha_0p5"
   resume_from_checkpoint: False
   checkpoint_filename: "epoch_0"
   use_pretrained_model: False
@@ -140,4 +140,4 @@ dataloader:
 #  save: True
 #  all_batches: False # True saves every batch in the test set (every rank's local shard); False saves only the first num_batches
 #  num_batches: 1 # only used when all_batches:False
-#  output_dir: "../../inference_output/unetr_token_selection_experiment/adaptive_area_weighted_alpha_0p5"
+#  output_dir: "inference_output/unetr_token_selection_experiment/adaptive_area_weighted_alpha_0p5"

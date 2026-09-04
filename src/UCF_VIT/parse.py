@@ -4,7 +4,7 @@ import sys
 import math
 import numpy as np
 import torch.distributed as dist
-from UCF_VIT.utils.misc import detect_img_size, detect_num_channels, is_power_of_two
+from UCF_VIT.utils.misc import detect_img_size, detect_num_channels, is_power_of_two, find_repo_root
 
 def get_kwargs(model_type, conf):
     """Build the architecture-specific keyword arguments for a given model type.
@@ -423,7 +423,13 @@ def parse_config(args, load_balance_offline=False):
         "max_epochs": conf['trainer']['max_epochs'],
         "data_type": conf['trainer']['data_type'],
         "gpu_type": conf['trainer']['gpu_type'],
-        "checkpoint_path": conf['trainer']['checkpoint_path'],
+        # Config files write this relative to the repo root (e.g.
+        # "checkpoint/basic_ct/unetr/base"), not to wherever a launch script
+        # happens to invoke python from -- os.path.join with find_repo_root()
+        # makes that true regardless of the process's own current working
+        # directory. A no-op if checkpoint_path is already absolute (os.path.join
+        # discards the first argument whenever the second is itself absolute).
+        "checkpoint_path": os.path.join(find_repo_root(), conf['trainer']['checkpoint_path']),
         "checkpoint_filename": conf['trainer']['checkpoint_filename'],
         "resume_from_checkpoint": resume_from_checkpoint,
         "use_pretrained_model": conf['trainer']['use_pretrained_model'] if not resume_from_checkpoint else False,
@@ -897,14 +903,17 @@ def parse_config(args, load_balance_offline=False):
     # harmless no-op default for every other model type.
     try:
         save_inference = conf["inference_output"]["save"]
+        # Resolved against the repo root, same as trainer.checkpoint_path above
+        # and for the same reason -- see its own comment.
+        output_dir = conf["inference_output"].get("output_dir", "inference_output") if save_inference else "inference_output"
         inference_output_conf = {
             "save": save_inference,
             "all_batches": conf["inference_output"].get("all_batches", False) if save_inference else False,
             "num_batches": conf["inference_output"].get("num_batches", 1) if save_inference else 1,
-            "output_dir": conf["inference_output"].get("output_dir", "inference_output") if save_inference else "inference_output",
+            "output_dir": os.path.join(find_repo_root(), output_dir),
         }
     except KeyError:
-        inference_output_conf = {"save": False, "all_batches": False, "num_batches": 1, "output_dir": "inference_output"}
+        inference_output_conf = {"save": False, "all_batches": False, "num_batches": 1, "output_dir": os.path.join(find_repo_root(), "inference_output")}
 
     return {
         "trainer": trainer_conf,
@@ -969,7 +978,11 @@ def parse_pretrained_config(args, conf):
         if args.pretrained_config != "":
             with open(args.pretrained_config,'r') as f:
                 pretrained_conf = yaml.load(f,Loader=yaml.FullLoader)
-        
+            # Same resolution as trainer.checkpoint_path in parse_config -- this
+            # file is loaded independently (not through parse_config), so it
+            # needs its own copy of the same fix.
+            pretrained_conf["trainer"]["checkpoint_path"] = os.path.join(find_repo_root(), pretrained_conf["trainer"]["checkpoint_path"])
+
 # ---------------------------- MODEL ---------------------------------------------
 
         #Get and check model arguments

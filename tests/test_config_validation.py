@@ -17,6 +17,7 @@ import yaml
 from validate_config import validate_config
 
 from UCF_VIT.parse import parse_config
+from UCF_VIT.utils.misc import find_repo_root
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATHS = sorted(glob.glob(os.path.join(REPO_ROOT, "configs", "**", "*.yaml"), recursive=True))
@@ -356,7 +357,9 @@ def test_inference_output_defaults_to_off_when_omitted():
     assert parsed["inference_output"]["save"] is False
     assert parsed["inference_output"]["all_batches"] is False
     assert parsed["inference_output"]["num_batches"] == 1
-    assert parsed["inference_output"]["output_dir"] == "inference_output"
+    # Resolved against the repo root -- see trainer.checkpoint_path's identical
+    # resolution and its own tests below for the full rationale.
+    assert parsed["inference_output"]["output_dir"] == os.path.join(find_repo_root(), "inference_output")
 
 
 def test_inference_output_threads_through_when_set():
@@ -380,7 +383,7 @@ def test_inference_output_threads_through_when_set():
             "save": True,
             "all_batches": True,
             "num_batches": 3,
-            "output_dir": "my_inference_dump",
+            "output_dir": os.path.join(find_repo_root(), "my_inference_dump"),
         }
     finally:
         os.remove(path)
@@ -411,7 +414,7 @@ def test_inference_output_save_false_ignores_other_fields():
             "save": False,
             "all_batches": False,
             "num_batches": 1,
-            "output_dir": "inference_output",
+            "output_dir": os.path.join(find_repo_root(), "inference_output"),
         }
     finally:
         os.remove(path)

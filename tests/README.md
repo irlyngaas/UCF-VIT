@@ -2292,6 +2292,61 @@ group -- must resolve, not raise). Full local suite: 260 passed, 4 skipped,
 0 failures, including `test_shipped_config_parses` for all 9
 `unetr_token_selection_experiment` configs now using `"auto"`.
 
+### Replaced the `launch/eval/` directory-depth workaround with resolving config paths against the repo root in `parse.py`
+
+Moving `val.sh`/`test.sh` into `launch/eval/` (see the earlier "moved
+`launch/val.sh`/`launch/test.sh` to `launch/eval/`" entry) fixed the
+symptom -- config files' relative paths (`trainer.checkpoint_path`,
+`inference_output.output_dir`) are written relative to the repo root, and
+only resolved correctly because `launch/eval/` happened to sit exactly as
+many directories below the repo root as `launch/[DATASET]/` does. That's
+fragile: any future script (a new user's own eval tool, something launched
+from an IDE, a script nested one level deeper) breaks the same way again,
+silently -- there's no error, just files written/read from the wrong place.
+
+First attempt: a new `UCF_VIT.utils.misc.chdir_to_repo_root()`, called by
+`training_scripts/train.py`/`val.py`/`test.py` and `utils/load_balance.py`
+right after parsing CLI args, changing the whole process's working
+directory to the repo root before any config-relative path was ever read.
+Raised two problems before it shipped: (1) it creates a second "reference
+point" a user has to track -- SLURM log files (`#SBATCH -o`/`-e`) still
+land in the *submission* directory (resolved by SLURM before the job's
+script or the Python process even starts, entirely unaffected by a later
+`os.chdir()` inside that process), while checkpoints now land at the repo
+root -- two different answers to "where do my outputs go" for the same
+job, previously just one; (2) `os.chdir()` is a global, process-wide side
+effect that silently changes the meaning of *every* relative path
+operation anywhere in the codebase, not just the two fields it was meant
+to fix -- a much wider blast radius than necessary, and nothing audited
+whether anything else relied on the old cwd.
+
+Replaced with a narrower fix: resolve `trainer.checkpoint_path` and
+`inference_output.output_dir` explicitly, in `parse_config` itself, by
+joining them with the new `UCF_VIT.utils.misc.find_repo_root()` (computed
+from *its own* fixed location -- `src/UCF_VIT/utils/misc.py` is always
+exactly 3 directories below the repo root -- rather than the caller's, so
+any script gets the right answer just by calling it). `os.path.join`
+discards the first argument whenever the second is already absolute, so
+this is a no-op for anyone who sets an absolute `checkpoint_path`
+deliberately (e.g. pointing at scratch storage outside the repo).
+`parse_pretrained_config`'s own separately-`yaml.load`ed pretrained config
+(never routed through `parse_config`'s own `trainer_conf` construction)
+needed the identical fix applied a second time, at its own read site.
+`chdir_to_repo_root()` and the CLI-arg-absolutizing code in the 4 scripts
+that briefly called it were removed entirely -- the process's own working
+directory is never touched now, so every *other* relative path a script
+might use behaves exactly like it always did, and only these two config
+fields get the repo-root treatment.
+
+**Tier 1 coverage:** `test_misc.py` keeps 2 `find_repo_root` tests (it
+actually resolves to the real repo root, and is stable across different
+starting `cwd`s) and drops the `chdir_to_repo_root` test entirely (nothing
+left to test -- the process's `cwd` is never touched). The 3 existing
+`inference_output` tests in `test_config_validation.py` were updated to
+expect `output_dir` as an absolute path (`os.path.join(find_repo_root(),
+...)`) instead of the bare relative string. Full local suite: 262 passed,
+4 skipped, 0 failures.
+
 ## Running the distributed (Tier 2) tests
 
 ```bash
