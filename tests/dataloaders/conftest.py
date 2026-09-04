@@ -35,11 +35,20 @@ def _ensure_single_process_distributed():
     different reasons.
     """
     if dist.is_available() and not dist.is_initialized():
-        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        if "MASTER_PORT" not in os.environ:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(("", 0))
-                os.environ["MASTER_PORT"] = str(s.getsockname()[1])
+        # Forced (not setdefault): a real Frontier run (job 5421778) showed
+        # MASTER_ADDR already set in the ambient shell environment to a
+        # hostname ("localhost.localdomain") whose DNS/NSS resolution trips a
+        # real gloo error on this cluster ("Address family not supported by
+        # protocol", an IPv6-resolution mismatch) -- setdefault left it alone
+        # since it was already set. This process group is a throwaway,
+        # loopback-only, single-process group with nothing to do with
+        # whatever that ambient MASTER_ADDR is for -- force our own numeric
+        # loopback literal (no DNS involved at all) and a freshly-bound free
+        # port, regardless of what's already in the environment.
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            os.environ["MASTER_PORT"] = str(s.getsockname()[1])
         dist.init_process_group(backend="gloo", rank=0, world_size=1)
         yield
         dist.destroy_process_group()
