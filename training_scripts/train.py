@@ -200,15 +200,22 @@ def main():
             train_dataloader = data_module.train_dataloader()
             if conf["dataloader"]["num_workers"] > 0:
                 # Forces the DataLoader's persistent worker pool to fork right now,
-                # while this process still has no CUDA context at all -- the
-                # returned iterator is discarded, but the workers stay alive via
-                # train_dataloader's own persistent_workers bookkeeping, ready for
-                # train_epoch's real iteration later (every epoch, forever --
-                # train_dataloader itself is never rebuilt; NativePytorchDataModule's
-                # epoch_shuffle_seed is what lets FileReader.__iter__ reshuffle
-                # per-epoch on its own from here on, instead of reset() rebuilding a
-                # fresh DataLoader -- see its own docstring entry).
-                iter(train_dataloader)
+                # while this process still has no CUDA context at all. Iterating a
+                # DataLoader immediately queues real prefetch work (and, via
+                # epoch_shuffle_seed, a real reshuffle) in the background worker --
+                # not just the fork itself -- so this iterator is kept (as
+                # warm_it_loader) and handed to train_epoch for epoch_start below,
+                # instead of being discarded and having that same work redone from
+                # scratch the moment the real training loop calls iter() again.
+                # train_dataloader itself is never rebuilt after this -- every epoch
+                # after epoch_start builds its own fresh iterator from it as usual
+                # (NativePytorchDataModule's epoch_shuffle_seed is what lets
+                # FileReader.__iter__ reshuffle per-epoch on its own, instead of the
+                # old reset() rebuilding a whole new DataLoader -- see its own
+                # docstring entry).
+                warm_it_loader = iter(train_dataloader)
+            else:
+                warm_it_loader = None
         else:
             # Only tensor_par_group-rank-0 reads real data (see
             # UCF_VIT.training.process_batch's docstring); the rest of each
@@ -219,6 +226,7 @@ def main():
             # unconditionally for every rank.
             data_module = None
             train_dataloader = None
+            warm_it_loader = None
 
     elif conf["dataloader"]["type"] == "dataloader":
         if dist.get_rank(tensor_par_group) == 0:
@@ -257,10 +265,15 @@ def main():
             # its own to worry about (it was never rebuilt between epochs).
             train_dataloader = DataLoader(dataset = train_data, sampler=train_sampler, num_workers=conf["dataloader"]["num_workers"], persistent_workers=conf["dataloader"]["num_workers"] > 0, pin_memory=conf["dataloader"]["pin_memory"], batch_size=conf["dataloader"]["batch_size"], drop_last=True, collate_fn=functools.partial(conf["dataloader"]["collate_fn"], adaptive_patching=conf["ap"]["do_ap"], return_label=conf["dataloader"]["return_label"]))
             if conf["dataloader"]["num_workers"] > 0:
-                iter(train_dataloader)  # forces the fork now -- see the iterative_dataloader branch's own comment above
+                # Kept as warm_it_loader (not discarded) -- see the
+                # iterative_dataloader branch's own comment above for why.
+                warm_it_loader = iter(train_dataloader)
+            else:
+                warm_it_loader = None
         else:
             # Same reasoning as the iterative_dataloader branch above.
             train_dataloader = None
+            warm_it_loader = None
 
 #3. Bind this process to its GPU, then initialize model, optimizer, and scheduler
 ##############################################################################################################
@@ -319,7 +332,10 @@ def main():
         if dist.get_rank() == 0:
             print("epoch ",epoch,flush=True)
 
-        train_epoch(conf, model, train_dataloader, epoch, iterations_per_epoch, optimizer, scheduler, grad_scaler, min_scale, loss_list, device, tensor_par_group, ddpm_scheduler)
+        # warm_it_loader (the pre-CUDA-init warm-up iterator, if one was built
+        # above) is only valid for epoch_start -- every later epoch builds its
+        # own fresh iterator inside train_epoch as usual.
+        train_epoch(conf, model, train_dataloader, epoch, iterations_per_epoch, optimizer, scheduler, grad_scaler, min_scale, loss_list, device, tensor_par_group, ddpm_scheduler, it_loader=(warm_it_loader if epoch == epoch_start else None))
 
 if __name__ == "__main__":
 

@@ -9,9 +9,11 @@ first place -- see val.py's own docstring).
 
 Uses a fake, always-iterable dataloader and a fake MAE model (mirroring
 test_forward_step.py's _FakeMAEModel) rather than a real DataLoader/model --
-process_batch's tensor_par_size==1 path only ever calls iter(train_dataloader)
-and next() on it, and forward_step only ever calls model.forward(...), so
-neither needs to be real. tensor_par_group is unused entirely at
+eval_epoch builds one real iterator (iter(eval_dataloader), once per call,
+not once per batch -- see process_batch's own it_loader docstring entry for
+why that matters) and process_batch only ever calls next() on it, and
+forward_step only ever calls model.forward(...), so neither the dataloader
+nor the model needs to be real. tensor_par_group is unused entirely at
 tensor_par_size==1 (only read inside process_batch's tensor_par_size>1
 branch), so None is a safe placeholder.
 """
@@ -35,9 +37,9 @@ PER_ITERATION_MSE = 4.0
 class _FakeIterableDataloader:
     """Always yields the same fixed (data, variables, dict_key) 3-tuple that
     get_batch's MAE/do_ap:False branch unpacks -- __iter__ returns self (like
-    a real, already-constructed DataLoader iterator) so process_batch's fresh
-    iter(train_dataloader) call every iteration keeps advancing the same
-    underlying sequence rather than restarting it.
+    a real DataLoader's own __iter__ would return a real, freshly-constructed
+    iterator) so eval_epoch's one iter(eval_dataloader) call works the same
+    way a real one does.
     """
 
     def __iter__(self):
@@ -103,6 +105,28 @@ def test_eval_epoch_returns_zero_iterations_untouched():
 
     epoch_loss, epoch_accuracy = eval_epoch(_conf(), model, _FakeIterableDataloader(), epoch=0, iterations_per_epoch=0,
                                              device=torch.device("cpu"), tensor_par_group=None, ddpm_scheduler=None)
-
     assert len(model.grad_enabled_during_calls) == 0
     assert epoch_loss.item() == 0.0
+
+
+def test_eval_epoch_reuses_a_given_it_loader_instead_of_building_a_fresh_one():
+    """The actual fix this test locks in: an already-iter()'d it_loader (val.py/
+    test.py's own pre-CUDA-init warm-up iterator, real callers) is used
+    directly, not discarded in favor of a fresh iter(eval_dataloader) call --
+    verified here by passing an eval_dataloader that would raise if anything
+    ever actually tried to iterate it, and a real, independent iterator (not
+    the self-returning _FakeIterableDataloader trick the other tests use) as
+    it_loader.
+    """
+    class _ExplodingDataloaderIfIterated:
+        def __iter__(self):
+            raise AssertionError("eval_epoch should not have called iter(eval_dataloader) -- it_loader was given")
+
+    mask = torch.zeros(1, 4)
+    model = _FakeMAEModel(TARGET, mask)
+    it_loader = iter([(DATA, ["v0"], "ct1")] * 3)
+
+    eval_epoch(_conf(), model, _ExplodingDataloaderIfIterated(), epoch=0, iterations_per_epoch=3,
+               device=torch.device("cpu"), tensor_par_group=None, ddpm_scheduler=None, it_loader=it_loader)
+
+    assert len(model.grad_enabled_during_calls) == 3

@@ -128,10 +128,14 @@ def main():
 
             eval_dataloader = data_module.train_dataloader()
             if val_conf["dataloader"]["num_workers"] > 0:
-                # Forces the DataLoader's worker pool to fork right now, while this
-                # process still has no CUDA context at all -- see train.py's
-                # set_cuda_device docstring for why that matters.
-                iter(eval_dataloader)
+                # Kept as warm_it_loader (not discarded) and handed to eval_epoch
+                # below, instead of being thrown away and immediately rebuilt --
+                # see train.py's identical comment on its own warm_it_loader for
+                # why that matters (real prefetch/reshuffle work, not just the
+                # fork itself, gets queued the moment this is constructed).
+                warm_it_loader = iter(eval_dataloader)
+            else:
+                warm_it_loader = None
         else:
             # Only tensor_par_group-rank-0 reads real data (see
             # UCF_VIT.training.process_batch's docstring); the rest of each
@@ -139,6 +143,7 @@ def main():
             # directly.
             data_module = None
             eval_dataloader = None
+            warm_it_loader = None
 
     elif val_conf["dataloader"]["type"] == "dataloader":
         if dist.get_rank(tensor_par_group) == 0:
@@ -155,9 +160,14 @@ def main():
 
             eval_dataloader = DataLoader(dataset = val_data, sampler=val_sampler, num_workers=val_conf["dataloader"]["num_workers"], persistent_workers=val_conf["dataloader"]["num_workers"] > 0, pin_memory=val_conf["dataloader"]["pin_memory"], batch_size=val_conf["dataloader"]["batch_size"], drop_last=False, collate_fn=lambda batch: val_conf["dataloader"]["collate_fn"](batch, adaptive_patching=val_conf["ap"]["do_ap"], return_label=val_conf["dataloader"]["return_label"]))
             if val_conf["dataloader"]["num_workers"] > 0:
-                iter(eval_dataloader)  # forces the fork now -- see the iterative_dataloader branch's own comment above
+                # Kept as warm_it_loader -- see the iterative_dataloader branch's
+                # own comment above for why.
+                warm_it_loader = iter(eval_dataloader)
+            else:
+                warm_it_loader = None
         else:
             eval_dataloader = None
+            warm_it_loader = None
 
 #3. Bind this process to its GPU, then load the model from checkpoint
 ##############################################################################################################
@@ -193,7 +203,7 @@ def main():
     if dist.get_rank() == 0:
         print("validating checkpoint from epoch ", epoch_start - 1, flush=True)
 
-    eval_epoch(conf, model, eval_dataloader, epoch_start - 1, iterations_per_epoch, device, tensor_par_group, ddpm_scheduler)
+    eval_epoch(conf, model, eval_dataloader, epoch_start - 1, iterations_per_epoch, device, tensor_par_group, ddpm_scheduler, it_loader=warm_it_loader)
 
 if __name__ == "__main__":
 

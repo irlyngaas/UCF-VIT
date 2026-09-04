@@ -2347,6 +2347,67 @@ expect `output_dir` as an absolute path (`os.path.join(find_repo_root(),
 ...)`) instead of the bare relative string. Full local suite: 262 passed,
 4 skipped, 0 failures.
 
+### Fixed a real, severe pre-existing bug: `process_batch` was calling `iter(dataloader)` on every batch, not once per epoch
+
+Reported directly by the user: a real SAP training run on Frontier was
+taking a very long time to reach the first batch -- clearly slower than
+before this session's dataloader changes. Traced to `training.py`'s
+`process_batch`, which has *always* (this predates the whole
+`persistent_workers`/`epoch_shuffle_seed` effort) called `it_loader =
+iter(train_dataloader)` fresh on every single batch, not once per epoch --
+`train_epoch`'s `while counter < iterations_per_epoch:` loop calls
+`process_batch` once per batch, and `process_batch` rebuilt the iterator
+every time it ran.
+
+Under the old design (`num_workers:0`, no `persistent_workers`, no
+`epoch_shuffle_seed`) this was wasteful but cheap -- `iter()` on a
+`num_workers:0` `DataLoader` just wraps the dataset, no real state to
+discard. Once this session's fork-after-CUDA-init fix made
+`persistent_workers:True` real (`num_workers:1` restored everywhere) and
+moved the per-epoch reshuffle into `FileReader.__iter__` (see
+`epoch_shuffle_seed` above), the exact same per-batch call became
+catastrophic: `DataLoader.__iter__()` on a `persistent_workers:True` loader
+calls `_reset()`, which discards whatever's already prefetched/in-flight
+and re-invokes the underlying `IterableDataset.__iter__()` from scratch --
+including a full `epoch_shuffle_seed` reshuffle of the entire file list.
+So every batch was: discard in-flight prefetch -> reshuffle the whole file
+list -> restart `ShuffleIterableDataset`'s buffer fill from empty. For
+`SAP` specifically (real octree construction over full 3D volumes, the
+heaviest per-sample cost of any shipped config, per its own config
+comments), that's expensive enough to make training visibly stall.
+
+Fixed by making `process_batch` accept an already-built `it_loader`
+instead of building its own: `train_epoch`/`eval_epoch` each now build the
+iterator exactly once, before their batch loop, and pass it through for
+every batch that epoch -- the standard, correct `DataLoader` usage pattern.
+
+**Immediate follow-up, same session:** `train.py`/`val.py`/`test.py`'s own
+pre-CUDA-init warm-up `iter(dataloader)` call (forces the persistent
+worker pool to fork before `set_cuda_device`, see "Fixed the
+fork-after-CUDA-init segfault at its root" above) had the same discard-and-
+redo problem one level up: iterating a `DataLoader` queues real prefetch
+work immediately (not just the fork), so throwing that iterator away and
+letting `train_epoch`'s first real epoch build a fresh one wasted one full
+reshuffle-and-buffer-fill cycle at startup. Fixed by threading an optional
+`it_loader` parameter through `train_epoch`/`eval_epoch`: the three launch
+scripts now keep their warm-up iterator (renamed `warm_it_loader`) and
+pass it through for `epoch_start` (`train.py`) or the single eval pass
+(`val.py`/`test.py`), instead of discarding it -- every epoch after
+`epoch_start` still builds its own fresh iterator as normal.
+
+**Tier 1 coverage:** `test_eval_epoch.py` gained a test that passes a real,
+independent `it_loader` alongside an `eval_dataloader` stub that raises if
+`iter()` is ever called on it -- directly proving `it_loader`, when given,
+is used as-is rather than rebuilt. `test_forward_step.py`/`test_get_batch.py`
+(which exercise `process_batch`/`get_batch` at the `it_loader` layer
+directly) needed no changes, since their fakes already behaved as
+already-constructed iterators. Full local suite: 263 passed, 4 skipped, 0
+failures.
+
+Like everything else in this dataloader effort, whether this actually
+resolves the real slowdown can only be confirmed by the user re-running
+the real SAP job on Frontier -- not yet done.
+
 ## Running the distributed (Tier 2) tests
 
 ```bash
@@ -2373,6 +2434,7 @@ is needed. Output lands in `pytest-distributed-<jobid>.out` in that directory.
 | `tests/distributed/test_fsdp_correctness.py` | Numerical correctness of a small stack of real `Block`s wrapped in PyTorch's own FSDP with `sharding_strategy=FULL_SHARD` (`fsdp_size > 1`, `tensor_par_size=1`) against an identically-seeded, unwrapped reference, forward **and backward** — mirrors `model/utils.py`'s `get_model` `FULL_SHARD` branch exactly (same `FSDP(...)` call shape, `transformer_auto_wrap_policy` targeting `Block`), but with a `float32` `MixedPrecision` policy for a tight tolerance instead of production's `bfloat16`. The backward test checks the input's gradient directly (never sharded, no FSDP-specific handling needed) and every parameter's gradient via `FSDP.summon_full_params(..., with_grads=True)` (the documented way to materialize FSDP's internally-sharded gradients for inspection) against the reference. Combined `fsdp_size > 1` + `tensor_par_size > 1` (`HYBRID_SHARD`) is covered separately by `test_hybrid_shard_correctness.py` below. |
 | `tests/distributed/test_hybrid_shard_correctness.py` | Numerical correctness of the combined `fsdp_size > 1` + `tensor_par_size > 1` case — production's `HYBRID_SHARD` branch — forward **and backward**. A small stack of real `Block`s is built with real tensor-parallel sharding (weights sliced via `shard_attention_state_dict`/`shard_mlp_state_dict`, same as `test_tensor_parallel_correctness.py`), then wrapped in FSDP with `sharding_strategy=HYBRID_SHARD` (`process_group=(fsdp_group, simple_ddp_group)`), and checked against an identically-seeded, unwrapped, unsharded reference. Scoped to the one `(tensor_par_size, fsdp_size, simple_ddp_size)` triple with all three `> 1` that fits this repo's 8-rank `run_distributed_tests.sh` launch: `(2, 2, 2)`. The backward test combines both siblings' techniques: `FSDP.summon_full_params(..., with_grads=True)` undoes FSDP's own sharding, then the resulting (still tensor-parallel-sized) gradients are checked against the reference using the same `shard_*_state_dict`-based slicing `test_tensor_parallel_correctness.py`'s backward tests already verified. |
 | `tests/distributed/test_dataloader_real_data.py` | `FileReader`'s DDP-rank sharding and `ShuffleIterableDataset`'s no-loss/no-duplication guarantee, against real `basic_ct` and `imagenet` file lists on Frontier and `torch.distributed.get_rank()` for real (not simulated) across all `world_size` ranks, across `num_workers` (0/1/4) and `buffer_size` (1/20/100) — the real-scale counterpart to `tests/dataloaders/test_dataset.py`'s simulated-rank coverage of the same `num_workers=0` fix. File I/O itself is stubbed out (`FileReader.read_process_file` monkeypatched to a no-op) so this stays fast and focused on correctness, not decode speed. |
+| `tests/distributed/test_epoch_shuffle_seed_real.py` | `epoch_shuffle_seed`'s cross-rank/cross-worker determinism (the property that lets a `persistent_workers:True` `DataLoader` be reused for a whole run instead of rebuilt every epoch — see "Fixed the fork-after-CUDA-init segfault at its root" above), against real `basic_ct` files and real ranks, across `num_workers` (0/1/4) and 3 real consecutive epochs. Drives the *same* `FileReader` instance(s) through multiple real `__iter__` calls (one `FileReader` per simulated worker, mirroring a real fork's independent per-worker copy) rather than building fresh ones per epoch — checks every epoch's shard stays disjoint across real ranks *and* real simulated workers within a rank, and that each rank's own shard actually changes from epoch to epoch (real reshuffling, not a frozen order). Deliberately doesn't spawn a real `num_workers > 0` `DataLoader` — this directory's own `dist_info` fixture already initializes CUDA/NCCL before any test runs, so a real fork here would be exactly the fork-after-CUDA-init hazard being tested against; see the module's own docstring. |
 | `tests/distributed/test_catsdogs_real_data.py` | The real production `DistributedSampler` + `DataLoader` + `CatsDogsDataset`/`CatsDogsCollate` wiring, against real CatsDogs JPEGs and real ranks — disjoint/complete file sharding across `num_workers` (0/1/4), and `adaptive_patching=True` against real photo content (not synthetic random-noise JPEGs, unlike `tests/datasets/test_catsdogs.py`), which actually exercises Canny edge detection on real image structure. Unlike the row above, file I/O is *not* stubbed — `CatsDogsDataset.__getitem__` has no meaningful decode-free path. |
 | `tests/distributed/test_dataloader_real_pipeline.py` | The full real pipeline — decode, tile, (for `basic_ct`) adaptive patch, collate — for `basic_ct`/`unetr`, `imagenet`/`classification`, and `catsdogs`/`classification`, each built via the exact real construction `train.py` itself uses for that dataloader type (`parse_config` + `calculate_load_balancing_on_the_fly` + `NativePytorchDataModule` for `basic_ct`/`imagenet`'s `iterative_dataloader`; a plain `CatsDogsDataset` + `DistributedSampler` + `DataLoader` for `catsdogs`'s `dataloader` type, which never touches the other two calls in production either). No stubbing anywhere; checks the actual decoded/collated batch (shapes, finite values, normalized ranges, valid label ranges, one-hot `seq_label` correctness for `basic_ct`'s real segmentation masks) rather than just sharding math. |
 | `tests/distributed/test_pretrained_loading_real.py` | The real, end-to-end pretrained-checkpoint-loading wiring — `parse_pretrained_config` building `p_conf`, `get_model` constructing `pretrained_model` at `p_conf`'s own (not the new model's) size, loading a real per-rank checkpoint file (`training.py`'s own `save_checkpoint` format), `extract_encoder_state_dict`/`_transplant_pos_embed`, and FSDP-wrapping the result — the integration layer `tests/model/test_pretrained_loading.py`'s Tier 1 tests deliberately bypass. Two cases: (1) same-architecture `VIT`→`VIT`, two small fully-synthetic configs (no real data files needed) at different, non-square `img_size`s (`[32,64]`→`[64,32]`); (2) cross-architecture `MAE`→`UNETR` (segmentation, `basic_ct`) at the same two sizes — the real production workflow, not just a resolution change on the same architecture, exercising `UNETR`'s own real kwargs (`feature_size`, `linear_decoder`) that case (1) never touches. Both check `get_model` returns an `FSDP`-wrapped model whose `pos_embed` shape matches the *new* config, whose task-specific head/decoder keeps the *new* model's own shape (not transplanted), and that a real forward+backward pass runs. Writing the first case surfaced two more real, previously-undiscovered, unconditionally-crashing bugs on top of the one found while planning it (`conf["pretrained_model"]["checkpoint_path"]` never populated) — see the narrative section below. |
@@ -2428,6 +2490,31 @@ buffer_size)` combination needs more real files than are actually available,
 that combination is skipped rather than failed — see the test's docstring
 (in practice this doesn't trigger: `Tr8_Training` turned out to have 852
 real file pairs, not the ~8 its name suggests).
+
+`test_epoch_shuffle_seed_real.py` (added later, alongside the fork-after-
+CUDA-init fix's `epoch_shuffle_seed` mechanism) reuses
+`test_dataloader_real_data.py`'s established real-basic_ct-file-list/
+monkeypatched-worker-info pattern, but drives the *same* `FileReader`
+instance(s) through `NUM_EPOCHS=3` real, consecutive `__iter__` calls
+instead of pulling one shard and stopping -- the specific gap `epoch_shuffle_
+seed` left uncovered on real hardware (Tier 1's synthetic-data tests already
+cover the seeding logic itself; `test_dataloader_real_data.py` predates
+`epoch_shuffle_seed` and never exercises more than one simulated epoch per
+`FileReader` instance). One `FileReader` per simulated worker (not one
+shared instance re-iterated), matching how a real fork gives each worker
+process its own independent copy with its own independent `_epoch` counter.
+Checks, per epoch: no two simulated workers within a rank overlap, no two
+real ranks overlap (`dist.all_gather_object`, same collective-ordering
+discipline as the sibling file -- the skip guard and the number of
+`all_gather_object` calls both depend only on `world_size`/`num_workers`,
+identical across ranks, never anything rank-specific), and total coverage
+stays within the expected floor-division bounds -- then, across all 3
+epochs, that this rank's own shard actually differs from the previous
+epoch's (real reshuffling, not a frozen order). Not yet run on Frontier --
+sanity-checked locally against synthetic files and a single-process `gloo`
+group (world_size=1, same fixture `tests/conftest.py` provides), but that
+can't exercise the real multi-rank property the test actually exists to
+check.
 
 `test_catsdogs_real_data.py` is a different kind of check: `catsdogs` is the
 only shipped dataset using
