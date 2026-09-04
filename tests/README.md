@@ -259,6 +259,47 @@ included in the timed region, so it can dominate the measurement at small
 batch counts, especially at higher worker
 counts.
 
+Added later, alongside a real production bug this surfaced (see "Fixed a
+real, severe pre-existing bug" above): a fourth, generic
+`test_real_decode_throughput_config`, for investigating one specific real
+config instead of the three fixed ones — driven by new `tests/dataloaders/
+conftest.py` CLI options (`--speed-config`, `--speed-buffer-sizes`,
+`--speed-num-workers`), since sweeping every shipped config for one real
+question (raised directly by the user: is `basic_ct/sap`'s
+`dict_buffer_sizes: 100` too large relative to its real per-rank shard
+size, given `ShuffleIterableDataset` can't yield anything until its buffer
+fills — see that entry above) would be far more expensive than needed.
+Skipped entirely unless `--speed-config` is given; `--speed-buffer-sizes`/
+`--speed-num-workers` each default to just the pointed-at config's own
+shipped value (a single run) rather than sweeping, so pointing this at a
+config costs one real decode run by default -- passing either flag
+explicitly widens it into a real sweep. `_narrowed_generic_config_path`
+computes `min_files` from the *given* config's own `batch_size`/
+`fsdp_size`/`simple_ddp_size` (no per-dataset constant to reach for, unlike
+the three fixed tests) and inflates it to comfortably exceed the largest
+swept `buffer_size` too, not just enough for `NUM_BATCHES_TO_PULL`
+batches — otherwise every swept `buffer_size` would exceed the narrowed
+per-rank shard and `ShuffleIterableDataset` would never reach its
+steady-state swap-and-yield behavior for *any* of them, hiding the exact
+effect the sweep exists to show. Only supports
+`dataloader.type:"iterative_dataloader"` configs (asserted) — `"dataloader"`-
+type configs (catsdogs) have no `buffer_size`/`ShuffleIterableDataset` in
+the pipeline to sweep at all.
+
+**Tier 1 coverage:** none of this is unit-testable in the usual sense (it's
+itself a Tier 3-adjacent, real-Frontier-data speed measurement) — verified
+locally instead: collection produces exactly one parametrized instance when
+`--speed-config`/`--speed-buffer-sizes`/`--speed-num-workers` are all
+omitted (the single-run default), the correct full matrix when sweep values
+are given explicitly, and the new test skips cleanly (not fails) with no
+`--speed-config` and again when pointed at a real config path locally (no
+real `/lustre/...` data reachable off Frontier) — confirmed the existing
+three fixed tests and the rest of the local suite are unaffected (263
+passed, 4 skipped, 0 failures). The actual empirical question (is
+`buffer_size:100` really the dominant cost for a real SAP run) still needs
+a real Frontier run with `--speed-config` pointed at `basic_ct/sap`'s
+config — not yet done.
+
 `tests/dataloaders/test_pin_memory_speed.py` measures whether
 `dataloader.pin_memory:True` (every shipped config currently has this
 `False`) is actually worth turning on — raised while looking at whether

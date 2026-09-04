@@ -38,6 +38,16 @@ not excluded as a one-time setup cost) -- for small NUM_BATCHES_TO_PULL,
 worker startup can dominate the measurement rather than steady-state decode
 throughput. Interpret num_workers > 0 results with that in mind, especially
 at higher worker counts.
+
+test_real_decode_throughput_config is a fourth, generic test, separate from
+the three fixed per-dataset ones above: it runs against whatever real config
+you point it at via --speed-config, instead of one of the three fixed
+configs above. For investigating one specific real config/problem (e.g. "is
+basic_ct/sap's buffer_size:100 too large for its real per-rank shard
+size?") without paying for a sweep over every shipped config -- skipped
+entirely unless --speed-config is given. See its own docstring, and
+conftest.py's --speed-config/--speed-buffer-sizes/--speed-num-workers
+option docs, for usage.
 """
 
 import argparse
@@ -263,3 +273,98 @@ def test_real_decode_throughput_catsdogs_classification(num_workers):
     conf, loader = _build_catsdogs_loader(config_path)
     elapsed = _time_batches(loader, NUM_BATCHES_TO_PULL)
     _report("catsdogs/classification", num_workers, elapsed, NUM_BATCHES_TO_PULL, conf["dataloader"]["batch_size"])
+
+
+def _narrowed_generic_config_path(base_config_path, num_workers, buffer_size, tag):
+    """Same idea as `_narrowed_config_path`, but for an arbitrary
+    `iterative_dataloader`-type config instead of one of the three fixed
+    ones above -- `min_files` is derived from the config's own
+    `batch_size`/`fsdp_size`/`simple_ddp_size` (there's no shipped-config-
+    specific constant to reach for), and inflated enough to comfortably
+    exceed `buffer_size` too, not just `NUM_BATCHES_TO_PULL` batches --
+    otherwise every swept `buffer_size` would exceed the narrowed per-rank
+    shard and `ShuffleIterableDataset` would never reach its steady-state
+    swap-and-yield behavior for *any* of them, hiding the exact effect this
+    is meant to measure (see this module's own docstring).
+
+    Returns:
+        `(config_path, real_buffer_size)` -- `real_buffer_size` is what was
+        actually written into the config (the given `buffer_size`, or the
+        config's own shipped value when `buffer_size` is `None`), for
+        `_report`'s label.
+    """
+    with open(base_config_path) as f:
+        conf = yaml.load(f, Loader=yaml.FullLoader)
+
+    assert conf["dataloader"]["type"] == "iterative_dataloader", (
+        f"{base_config_path}: --speed-config only supports dataloader.type:"
+        f"\"iterative_dataloader\" configs (got {conf['dataloader']['type']!r}) -- "
+        f"\"dataloader\"-type configs (catsdogs) have no buffer_size/ShuffleIterableDataset "
+        f"in the pipeline at all, so this test has nothing meaningful to sweep for them."
+    )
+
+    dkey = next(iter(conf["dataloader"]["dict_buffer_sizes"]))
+    real_buffer_size = buffer_size if buffer_size is not None else conf["dataloader"]["dict_buffer_sizes"][dkey]
+
+    data_par_size = conf["parallelism"]["fsdp_size"] * conf["parallelism"]["simple_ddp_size"]
+    per_rank_target = max(real_buffer_size, conf["dataloader"]["batch_size"] * NUM_BATCHES_TO_PULL) * 2
+    min_files = per_rank_target * data_par_size
+    if conf["data"]["dataset"] == "imagenet":
+        # data_par_size isn't a real key on this raw, un-parsed YAML dict --
+        # see test_dataloader_real_pipeline.py's identical comment.
+        min_files *= data_par_size
+    min_files = inflate_min_files_for_train_split(conf, min_files)
+
+    try:
+        narrow_end_idx = compute_narrow_dict_idx(conf, min_files)
+    except NoRealDataFoundError as e:
+        pytest.skip(str(e))
+
+    conf["dataloader"]["dict_start_idx"] = {k: 0.0 for k in narrow_end_idx}
+    conf["dataloader"]["dict_end_idx"] = narrow_end_idx
+    conf["dataloader"]["num_workers"] = num_workers
+    conf["dataloader"]["dict_buffer_sizes"] = {k: real_buffer_size for k in conf["dataloader"]["dict_buffer_sizes"]}
+
+    job_id = os.environ.get("SLURM_JOB_ID", str(os.getpid()))
+    scratch_dir = f"/tmp/{job_id}/dataloader_speed_real"
+    os.makedirs(scratch_dir, exist_ok=True)
+    out_path = os.path.join(scratch_dir, f"{tag}.yaml")
+    with open(out_path, "w") as f:
+        yaml.dump(conf, f)
+    return out_path, real_buffer_size
+
+
+def test_real_decode_throughput_config(request, speed_buffer_size, speed_num_workers):
+    """Real decode throughput for one specific config you point at, instead
+    of one of the three fixed configs above -- for investigating one real
+    problem (e.g. "is basic_ct/sap's buffer_size:100 too large for its real
+    per-rank shard size?") without paying for a sweep over every shipped
+    config, which would be far more expensive than needed for a single
+    question. Skipped entirely unless --speed-config is given.
+
+    Usage (see launch/tests/run_dataloader_speed.sh for the full sbatch
+    wrapper -- add these flags to its own `pytest -m dataloader_speed ...`
+    line):
+        --speed-config ../../configs/basic_ct/sap/base_config.yaml
+        --speed-buffer-sizes 16,32,64,100   # optional -- defaults to the config's own shipped value
+        --speed-num-workers 0,1             # optional -- defaults to the config's own shipped value
+
+    Only supports dataloader.type:"iterative_dataloader" configs (asserted
+    in _narrowed_generic_config_path) -- "dataloader"-type configs (catsdogs)
+    have no buffer_size/ShuffleIterableDataset in the pipeline to sweep.
+    """
+    speed_config = request.config.getoption("--speed-config")
+    if not speed_config:
+        pytest.skip("no --speed-config given -- see this test's own docstring for usage")
+
+    label = os.path.splitext(os.path.basename(speed_config))[0]
+    config_path, real_buffer_size = _narrowed_generic_config_path(
+        speed_config, speed_num_workers, speed_buffer_size, f"{label}-{speed_num_workers}-{speed_buffer_size}",
+    )
+    conf, data_module = _build_data_module(config_path)
+    loader = data_module.train_dataloader()
+    elapsed = _time_batches(loader, NUM_BATCHES_TO_PULL)
+    _report(
+        label, speed_num_workers, elapsed, NUM_BATCHES_TO_PULL, conf["dataloader"]["batch_size"],
+        extra=f", buffer_size={real_buffer_size}",
+    )

@@ -56,4 +56,14 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 # transfer timing -- needs real Frontier data/a real GPU, which is why this
 # has to run here and not just anywhere) runs together; any future
 # speed-test file gets picked up the same way.
-time python -m pytest -m dataloader_speed -s ../../tests/dataloaders/ -v
+#
+# "$@" forwards this script's own sbatch arguments straight to pytest, so you
+# can investigate one specific real config/problem (e.g. "is this config's
+# buffer_size too large for its real per-rank shard size?") without editing
+# this file or paying for the fixed sweep over every shipped config above --
+# pass test_dataset_speed_real_data.py's -k/--speed-config/--speed-buffer-sizes/
+# --speed-num-workers as extra sbatch arguments, e.g.:
+#   sbatch run_dataloader_speed.sh -k test_real_decode_throughput_config --speed-config ../../configs/basic_ct/sap/base_config.yaml --speed-buffer-sizes 16,32,64,100
+# See that test's own docstring for the full option reference. With no extra
+# arguments, this still runs the full fixed sweep exactly as before.
+time python -m pytest -m dataloader_speed -s ../../tests/dataloaders/ -v "$@"
