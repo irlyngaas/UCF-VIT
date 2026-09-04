@@ -26,22 +26,31 @@ from UCF_VIT.ddpm.ddpm import DDPM_Scheduler
 
 
 def init_dist(args):
-    """Determines this process's rank/device info and initializes the NCCL process group.
+    """Determines this process's rank/local_rank and initializes the NCCL process group.
 
     Supports two launch mechanisms: MPI (via mpi4py, deriving rank/world size from
     `MPI.COMM_WORLD` and broadcasting the master address from rank 0) and Slurm
     (via `SLURM_*` environment variables).
+
+    Deliberately does *not* call `torch.cuda.set_device`/touch a CUDA device --
+    see `set_cuda_device`'s own docstring for why that's a separate, later step.
+    `dist.init_process_group('nccl', ...)` itself doesn't establish a CUDA context
+    either (no `device_id` is passed, so NCCL communicator creation stays lazy,
+    deferred to each process group's first real collective) -- only pure
+    rank/world-size bookkeeping happens here, which is exactly what lets
+    `train.py`'s `main()` build (and fork the workers of) the training
+    `DataLoader` *before* any CUDA context exists in this process at all.
 
     Args:
         args: Parsed command-line arguments; must have a `launcher` attribute equal
             to "mpi" or any other value (treated as Slurm).
 
     Returns:
-        A tuple `(device, local_rank)`.
+        This process's `local_rank`.
     """
     if args.launcher == "mpi":
         from mpi4py import MPI
-        import socket 
+        import socket
 
         num_gpus_per_node = torch.cuda.device_count()
         comm = MPI.COMM_WORLD
@@ -60,9 +69,6 @@ def init_dist(args):
         master_addr = comm.bcast(master_addr, root=0)
         os.environ['MASTER_ADDR'] = master_addr
 
-        torch.cuda.set_device(local_rank)
-        device = torch.device(local_rank) if torch.cuda.is_available() else torch.device("cpu")
-
     else:#elif launcher == "slurm":
 
         os.environ['MASTER_ADDR'] = str(os.environ['HOSTNAME'])
@@ -73,26 +79,52 @@ def init_dist(args):
         world_rank = int(os.environ['SLURM_PROCID'])
         local_rank = int(os.environ['SLURM_LOCALID'])
 
-        torch.cuda.set_device(local_rank)
-        device = torch.cuda.current_device()
-
     os.environ['MASTER_PORT'] = "29500"
     dist.init_process_group('nccl', timeout=timedelta(seconds=7200000), rank=world_rank, world_size=world_size)
 
     print("Using dist.init_process_group. world_size ",world_size,flush=True)
-    return device, local_rank
+    return local_rank
+
+
+def set_cuda_device(local_rank):
+    """Binds this process to its GPU, establishing this process's first real CUDA context.
+
+    Split out from `init_dist` so `main()` can build the training `DataLoader`
+    (and, with `dataloader.num_workers > 0`, fork its worker processes) *before*
+    calling this -- forking a process that already has an active CUDA context is
+    a documented hazard (CUDA/NCCL keep background threads that can be
+    mid-critical-section, holding a lock, at the instant of the fork; the forked
+    child inherits that lock held forever by a thread that no longer exists,
+    causing hangs/segfaults with no relation to what the child actually runs --
+    see `tests/README.md`'s "Fixed a real, intermittent basic_ct-sap+tensor_par
+    segfault" entry for the original incident). Calling this only once the
+    `DataLoader`'s worker pool already exists (and is reused for the rest of the
+    run via `persistent_workers`, never re-forked) avoids the hazard entirely,
+    instead of trading it for `num_workers:0`'s lost dataloader/compute overlap.
+
+    Args:
+        local_rank: This process's local rank, as returned by `init_dist`.
+
+    Returns:
+        This process's `torch.device`.
+    """
+    torch.cuda.set_device(local_rank)
+    return torch.device(local_rank) if torch.cuda.is_available() else torch.device("cpu")
 
 
 
 #def main(device, local_rank):
 def main():
-    """Parses CLI args and config, builds the model/optimizer/dataloader, and runs the full training loop.
+    """Parses CLI args and config, builds the dataloader/model/optimizer, and runs the full training loop.
 
     Entry point for FSDP-based training: initializes distributed process groups
-    (data/tensor/FSDP parallel), builds the model via `get_model`, sets up the
-    optimizer/scheduler/grad scaler (restoring from a checkpoint if configured),
-    builds either the iterative or standard PyTorch dataloader, and then runs
-    `train_epoch` for each remaining epoch, resetting the dataloader between epochs.
+    (data/tensor/FSDP parallel), builds either the iterative or standard PyTorch
+    dataloader (before this process's first CUDA context exists -- see
+    `set_cuda_device`), binds this process to its GPU, builds the model via
+    `get_model`, sets up the optimizer/scheduler/grad scaler (restoring from a
+    checkpoint if configured), and then runs `train_epoch` for each remaining
+    epoch, reusing the same dataloader (and its worker pool, if any) for the
+    whole run.
     """
 #1. Load arguments from config file and setup parallelization
 ##############################################################################################################
@@ -113,7 +145,7 @@ def main():
 
     args = parser.parse_args()
 
-    device, local_rank = init_dist(args)
+    local_rank = init_dist(args)
     world_size = dist.get_world_size()
     world_rank = dist.get_rank()
 
@@ -127,25 +159,10 @@ def main():
     #Set up communication groups based on the parallelism settings chosen
     ddp_group, tensor_par_group, data_seq_ort_group, fsdp_group, simple_ddp_group = init_par_groups(world_rank = world_rank, data_par_size = conf["parallelism"]["data_par_size"], tensor_par_size = conf["parallelism"]["tensor_par_size"], fsdp_size = conf["parallelism"]["fsdp_size"], simple_ddp_size = conf["parallelism"]["simple_ddp_size"])
 
-#2. Initialize model, optimizer, and scheduler
+#2. Initialize Dataloader
 ##############################################################################################################
-    model, epoch_start, loss_list = get_model(conf, pretrained_conf, device, local_rank, fsdp_group, simple_ddp_group, tensor_par_group)
-
-    optimizer = configure_optimizer(model, conf["trainer"]["optimizer_type"], conf["optimizer"])
-    scheduler = configure_scheduler(optimizer, conf["trainer"]["scheduler_type"], conf["scheduler"])
-
-    if conf["trainer"]["resume_from_checkpoint"]:
-        optimizer, scheduler, loss_list, epoch_start = load_optimizer_scheduler_from_checkpoint(conf, optimizer, scheduler, data_seq_ort_group, device)
-
-    if conf["grad_scaler"]["use_grad_scaler"]:
-        grad_scaler = ShardedGradScaler(init_scale=conf["grad_scaler"]["init_scale"], growth_interval=conf["grad_scaler"]["growth_interval"])
-        min_scale = conf["grad_scaler"]["min_scale"]
-    else:
-        grad_scaler = None
-        min_scale = None
-
-#3. Initialize Dataloader
-##############################################################################################################
+    # Deliberately built before set_cuda_device() below establishes this process's
+    # first real CUDA context -- see set_cuda_device's own docstring for why.
     if conf["dataloader"]["type"] == "iterative_dataloader":
         if dist.get_rank(tensor_par_group) == 0:
             data_module = NativePytorchDataModule(dict_root_dirs=conf["data"]["dict_root_dirs"],
@@ -173,22 +190,33 @@ def main():
                 resize = conf["dataset_options"]["resize"],
                 num_classes = conf["model"]["kwargs"]["num_classes"] if conf["model"]["type"] in ["UNETR", "SAP"] else None,
                 ddp_group = ddp_group,
-                multiprocessing_context = conf["dataloader"]["multiprocessing_context"],
                 allow_file_reuse = conf["dataloader"]["allow_file_reuse"],
                 bucket_shuffle_seed = conf["dataloader"]["bucket_shuffle_seed"],
-            ).to(device)
+                epoch_shuffle_seed = conf["dataloader"]["epoch_shuffle_seed"],
+            )
 
             data_module.setup()
 
             train_dataloader = data_module.train_dataloader()
+            if conf["dataloader"]["num_workers"] > 0:
+                # Forces the DataLoader's persistent worker pool to fork right now,
+                # while this process still has no CUDA context at all -- the
+                # returned iterator is discarded, but the workers stay alive via
+                # train_dataloader's own persistent_workers bookkeeping, ready for
+                # train_epoch's real iteration later (every epoch, forever --
+                # train_dataloader itself is never rebuilt; NativePytorchDataModule's
+                # epoch_shuffle_seed is what lets FileReader.__iter__ reshuffle
+                # per-epoch on its own from here on, instead of reset() rebuilding a
+                # fresh DataLoader -- see its own docstring entry).
+                iter(train_dataloader)
         else:
             # Only tensor_par_group-rank-0 reads real data (see
             # UCF_VIT.training.process_batch's docstring); the rest of each
             # tensor-parallel group never touches train_dataloader/
             # data_module directly (process_batch only dereferences them on
             # tensor_par_group-rank-0), but both names must still be bound
-            # to *something* since train_epoch()/the per-epoch reset below
-            # reference them unconditionally for every rank.
+            # to *something* since train_epoch() references them
+            # unconditionally for every rank.
             data_module = None
             train_dataloader = None
 
@@ -222,13 +250,38 @@ def main():
             # whole world.
             train_sampler = torch.utils.data.distributed.DistributedSampler(train_data, shuffle=True, num_replicas=conf["parallelism"]["data_par_size"],rank=dist.get_rank(ddp_group))
 
-            # functools.partial (not a closure lambda) so this is picklable, which
-            # multiprocessing_context="spawn" requires -- see NativePytorchDataModule's
-            # multiprocessing_context docstring entry for why that matters.
-            train_dataloader = DataLoader(dataset = train_data, sampler=train_sampler, num_workers=conf["dataloader"]["num_workers"], pin_memory=conf["dataloader"]["pin_memory"], batch_size=conf["dataloader"]["batch_size"], drop_last=True, collate_fn=functools.partial(conf["dataloader"]["collate_fn"], adaptive_patching=conf["ap"]["do_ap"], return_label=conf["dataloader"]["return_label"]), multiprocessing_context=conf["dataloader"]["multiprocessing_context"])
+            # persistent_workers: True (whenever num_workers > 0) so this DataLoader's
+            # worker pool -- forked below, still before any CUDA context exists in
+            # this process -- is reused for the whole run rather than being
+            # re-forked every epoch. This map-style path has no per-epoch reset() of
+            # its own to worry about (it was never rebuilt between epochs).
+            train_dataloader = DataLoader(dataset = train_data, sampler=train_sampler, num_workers=conf["dataloader"]["num_workers"], persistent_workers=conf["dataloader"]["num_workers"] > 0, pin_memory=conf["dataloader"]["pin_memory"], batch_size=conf["dataloader"]["batch_size"], drop_last=True, collate_fn=functools.partial(conf["dataloader"]["collate_fn"], adaptive_patching=conf["ap"]["do_ap"], return_label=conf["dataloader"]["return_label"]))
+            if conf["dataloader"]["num_workers"] > 0:
+                iter(train_dataloader)  # forces the fork now -- see the iterative_dataloader branch's own comment above
         else:
             # Same reasoning as the iterative_dataloader branch above.
             train_dataloader = None
+
+#3. Bind this process to its GPU, then initialize model, optimizer, and scheduler
+##############################################################################################################
+    device = set_cuda_device(local_rank)
+    if conf["dataloader"]["type"] == "iterative_dataloader" and data_module is not None:
+        data_module.to(device)  # no-op movement (no real nn.Parameters/buffers) -- kept for parity with NativePytorchDataModule being an nn.Module
+
+    model, epoch_start, loss_list = get_model(conf, pretrained_conf, device, local_rank, fsdp_group, simple_ddp_group, tensor_par_group)
+
+    optimizer = configure_optimizer(model, conf["trainer"]["optimizer_type"], conf["optimizer"])
+    scheduler = configure_scheduler(optimizer, conf["trainer"]["scheduler_type"], conf["scheduler"])
+
+    if conf["trainer"]["resume_from_checkpoint"]:
+        optimizer, scheduler, loss_list, epoch_start = load_optimizer_scheduler_from_checkpoint(conf, optimizer, scheduler, data_seq_ort_group, device)
+
+    if conf["grad_scaler"]["use_grad_scaler"]:
+        grad_scaler = ShardedGradScaler(init_scale=conf["grad_scaler"]["init_scale"], growth_interval=conf["grad_scaler"]["growth_interval"])
+        min_scale = conf["grad_scaler"]["min_scale"]
+    else:
+        grad_scaler = None
+        min_scale = None
 
 #4. Training Loop
 ##############################################################################################################
@@ -259,13 +312,6 @@ def main():
         ddpm_scheduler = None
 
     for epoch in range(epoch_start,conf["trainer"]["max_epochs"]):
-        #Reset dataloader module every epoch to ensure all files get used
-        if epoch != epoch_start:
-            if conf["dataloader"]["type"] == "iterative_dataloader":
-                if dist.get_rank(tensor_par_group) == 0:
-                    data_module.reset()
-                    train_dataloader = data_module.train_dataloader()
-
         #tell the model that we are in train mode. Matters because we have the dropout
         model.train()
         epoch_loss = torch.tensor(0.0 , dtype=torch.float32, device=device)

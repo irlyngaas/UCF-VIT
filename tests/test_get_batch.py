@@ -3,15 +3,17 @@
 basic_ct-sap+tensor_par intermittently segfaulted on real Frontier runs (job
 5390076) -- a DataLoader worker (dataloader.num_workers > 0) forked after
 CUDA/NCCL was already initialized in the parent process, a documented hazard
-(see configs/basic_ct/sap/base_config.yaml's own num_workers comment and
-tests/README.md for the full story, including why multiprocessing_context:
-"spawn" isn't a safe blanket fix either). Fixed for that config with
-num_workers:0, but any other config combining num_workers>0 with a similar
-risky combination (tensor_par_size>1 + adaptive patching on 3D data) could
-still hit the same PyTorch RuntimeError -- get_batch now catches PyTorch's own
-"... exited unexpectedly" RuntimeError (the outer, catchable exception
-next(it_loader) actually raises -- confirmed against the installed torch's own
-dataloader.py source) and re-raises with a pointer to try num_workers:0.
+(see tests/README.md's "Fixed a real, intermittent basic_ct-sap+tensor_par
+segfault" and "Fixed the fork-after-CUDA-init segfault at its root" entries
+for the full story). Originally worked around with num_workers:0; the later
+entry fixed the actual root cause instead (train.py/val.py/test.py now build
+the DataLoader, and fork its worker pool, before CUDA is ever initialized),
+so num_workers:0 is no longer needed for this specific hazard. get_batch still
+catches PyTorch's own "... exited unexpectedly" RuntimeError (the outer,
+catchable exception next(it_loader) actually raises -- confirmed against the
+installed torch's own dataloader.py source) and re-raises with a pointer to
+check the DataLoader-before-CUDA-init ordering (or, as a last resort, try
+num_workers:0) for whatever crash still manages to hit it.
 
 Uses a fake it_loader (no real DataLoader/model/timm/monai/xformers needed --
 get_batch only ever calls next(it_loader) and reads conf) rather than

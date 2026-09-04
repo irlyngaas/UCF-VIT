@@ -194,13 +194,18 @@ def get_batch(conf, it_loader):
         # PyTorch's own DataLoader raises exactly this wording (dataloader.py's
         # _try_get_data) when a worker process dies without a normal Python
         # exception -- most commonly a segfault. Only fires when num_workers > 0.
-        # Root cause: get_model always initializes CUDA/NCCL before
-        # train_dataloader is ever constructed, so num_workers > 0 forks a worker
-        # after CUDA is already active in the parent -- a documented hazard,
-        # especially combined with tensor_par_size > 1 and ap.do_ap:True on 3D
-        # data (heavy per-sample CPU work in the worker). multiprocessing_context:
-        # "spawn" is not a safe blanket fix either -- it can crash differently on
-        # some clusters.
+        # Historically this codebase's own root cause: get_model initializing
+        # CUDA/NCCL before the DataLoader's workers were ever forked, especially
+        # combined with tensor_par_size > 1 and ap.do_ap:True on 3D data (heavy
+        # per-sample CPU work in the worker widening the race window). train.py/
+        # val.py/test.py now build the DataLoader (and, with persistent_workers,
+        # fork its worker pool once) before set_cuda_device ever runs -- see
+        # train.py's set_cuda_device docstring and tests/README.md's "Fixed the
+        # fork-after-CUDA-init segfault at its root" entry -- so this specific
+        # race shouldn't be reachable any more. If this still fires, it's worth
+        # checking whether that ordering was preserved (e.g. a custom script
+        # calling get_model before the DataLoader exists) before assuming it's a
+        # new, unrelated worker crash.
         if "exited unexpectedly" in str(e) and conf["dataloader"]["num_workers"] > 0:
             raise RuntimeError(
                 f"{e}\n\nThis usually means a DataLoader worker process crashed "
@@ -208,11 +213,14 @@ def get_batch(conf, it_loader):
                 "(dataloader.num_workers > 0) after CUDA/NCCL is already "
                 "initialized in the parent process, especially when combining "
                 "tensor_par_size > 1 with adaptive patching (ap.do_ap:True) on "
-                "3D data. Try setting dataloader.num_workers to 0 in your "
-                "config -- this avoids forking a worker process entirely (data "
-                "loading runs in the main process instead), at the cost of "
-                "losing dataloader/compute overlap. See "
-                "configs/basic_ct/sap/base_config.yaml for a worked example."
+                "3D data. train.py/val.py/test.py build the DataLoader before "
+                "CUDA is ever initialized specifically to avoid this -- if "
+                "you're using one of those entry points unmodified, this is "
+                "likely a different crash; if not, check that your script "
+                "builds the DataLoader before binding a CUDA device. Setting "
+                "dataloader.num_workers to 0 avoids forking a worker process "
+                "entirely (data loading runs in the main process instead), at "
+                "the cost of losing dataloader/compute overlap, as a last resort."
             ) from e
         raise
 

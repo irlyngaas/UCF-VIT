@@ -20,7 +20,7 @@ from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.utils.fused_attn import FusedAttn
 from UCF_VIT.ddpm.ddpm import DDPM_Scheduler
 
-from train import init_dist
+from train import init_dist, set_cuda_device
 
 
 #def main(device, local_rank):
@@ -48,7 +48,7 @@ def main():
 
     args = parser.parse_args()
 
-    device, local_rank = init_dist(args)
+    local_rank = init_dist(args)
     world_size = dist.get_world_size()
     world_rank = dist.get_rank()
 
@@ -73,12 +73,10 @@ def main():
     #Set up communication groups based on the parallelism settings chosen
     ddp_group, tensor_par_group, data_seq_ort_group, fsdp_group, simple_ddp_group = init_par_groups(world_rank = world_rank, data_par_size = conf["parallelism"]["data_par_size"], tensor_par_size = conf["parallelism"]["tensor_par_size"], fsdp_size = conf["parallelism"]["fsdp_size"], simple_ddp_size = conf["parallelism"]["simple_ddp_size"])
 
-#2. Load model from checkpoint
+#2. Initialize Dataloader
 ##############################################################################################################
-    model, epoch_start, loss_list = get_model(conf, {}, device, local_rank, fsdp_group, simple_ddp_group, tensor_par_group)
-
-#3. Initialize Dataloader
-##############################################################################################################
+    # Deliberately built before set_cuda_device() below establishes this process's
+    # first real CUDA context -- see train.py's set_cuda_device docstring for why.
     if test_conf["dataloader"]["type"] == "iterative_dataloader":
         if dist.get_rank(tensor_par_group) == 0:
             data_module = NativePytorchDataModule(dict_root_dirs=test_conf["data"]["dict_root_dirs"],
@@ -106,14 +104,19 @@ def main():
                 resize = test_conf["dataset_options"]["resize"],
                 num_classes = test_conf["model"]["kwargs"]["num_classes"] if test_conf["model"]["type"] in ["UNETR", "SAP"] else None,
                 ddp_group = ddp_group,
-                multiprocessing_context = test_conf["dataloader"]["multiprocessing_context"],
                 allow_file_reuse = test_conf["dataloader"]["allow_file_reuse"],
                 bucket_shuffle_seed = test_conf["dataloader"]["bucket_shuffle_seed"],
-            ).to(device)
+                epoch_shuffle_seed = test_conf["dataloader"]["epoch_shuffle_seed"],
+            )
 
             data_module.setup()
 
             eval_dataloader = data_module.train_dataloader()
+            if test_conf["dataloader"]["num_workers"] > 0:
+                # Forces the DataLoader's worker pool to fork right now, while this
+                # process still has no CUDA context at all -- see train.py's
+                # set_cuda_device docstring for why that matters.
+                iter(eval_dataloader)
         else:
             # Only tensor_par_group-rank-0 reads real data (see
             # UCF_VIT.training.process_batch's docstring); the rest of each
@@ -135,9 +138,19 @@ def main():
             # Same reasoning as train.py's own DistributedSampler construction.
             test_sampler = torch.utils.data.distributed.DistributedSampler(test_data, shuffle=False, num_replicas=test_conf["parallelism"]["data_par_size"],rank=dist.get_rank(ddp_group))
 
-            eval_dataloader = DataLoader(dataset = test_data, sampler=test_sampler, num_workers=test_conf["dataloader"]["num_workers"], pin_memory=test_conf["dataloader"]["pin_memory"], batch_size=test_conf["dataloader"]["batch_size"], drop_last=False, collate_fn=lambda batch: test_conf["dataloader"]["collate_fn"](batch, adaptive_patching=test_conf["ap"]["do_ap"], return_label=test_conf["dataloader"]["return_label"]), multiprocessing_context=test_conf["dataloader"]["multiprocessing_context"])
+            eval_dataloader = DataLoader(dataset = test_data, sampler=test_sampler, num_workers=test_conf["dataloader"]["num_workers"], persistent_workers=test_conf["dataloader"]["num_workers"] > 0, pin_memory=test_conf["dataloader"]["pin_memory"], batch_size=test_conf["dataloader"]["batch_size"], drop_last=False, collate_fn=lambda batch: test_conf["dataloader"]["collate_fn"](batch, adaptive_patching=test_conf["ap"]["do_ap"], return_label=test_conf["dataloader"]["return_label"]))
+            if test_conf["dataloader"]["num_workers"] > 0:
+                iter(eval_dataloader)  # forces the fork now -- see the iterative_dataloader branch's own comment above
         else:
             eval_dataloader = None
+
+#3. Bind this process to its GPU, then load the model from checkpoint
+##############################################################################################################
+    device = set_cuda_device(local_rank)
+    if test_conf["dataloader"]["type"] == "iterative_dataloader" and data_module is not None:
+        data_module.to(device)  # no-op movement (no real nn.Parameters/buffers) -- see train.py's own identical comment
+
+    model, epoch_start, loss_list = get_model(conf, {}, device, local_rank, fsdp_group, simple_ddp_group, tensor_par_group)
 
 #4. Test Pass
 ##############################################################################################################

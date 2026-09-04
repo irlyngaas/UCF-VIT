@@ -1,14 +1,14 @@
 #!/bin/bash
 #SBATCH -A lrn036
-#SBATCH -J test
+#SBATCH -J val
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:8
 #SBATCH --ntasks-per-node=8
 #SBATCH --cpus-per-task=7
 #SBATCH -t 00:15:00
 #SBATCH -p batch
-#SBATCH -o test-%j.out
-#SBATCH -e test-%j.out
+#SBATCH -o val-%j.out
+#SBATCH -e val-%j.out
 
 [ -z $JOBID ] && JOBID=$SLURM_JOB_ID
 [ -z $JOBSIZE ] && JOBSIZE=$SLURM_JOB_NUM_NODES
@@ -35,20 +35,23 @@ export OMP_NUM_THREADS=7
 export PYTHONPATH=$PWD:$PYTHONPATH
 
 # Generic across every dataset/model, unlike the per-[DATASET]/[MODEL]
-# training launch scripts (launch/basic_ct/*.sh etc.) -- test.py takes the
+# training launch scripts (launch/basic_ct/*.sh etc.) -- val.py takes the
 # same config as the training run being evaluated, so one script covers all
-# of them; just pass the config path in.
+# of them; just pass the config path in. Lives one directory down (launch/eval/),
+# matching the training launch scripts' own depth (launch/[DATASET]/), so the
+# ../../ relative path to configs/training_scripts is the same convention
+# either way.
 #
 # Usage:
-#   cd launch
-#   sbatch test.sh ../configs/basic_ct/unetr/base_config.yaml
+#   cd launch/eval
+#   sbatch val.sh ../../configs/basic_ct/unetr/base_config.yaml
 
 if [ -z "$1" ]; then
-    echo "Usage: sbatch test.sh <path/to/base_config.yaml>"
+    echo "Usage: sbatch val.sh <path/to/base_config.yaml>"
     exit 1
 fi
 
 CONFIG=$1
 
 time srun -n $((SLURM_JOB_NUM_NODES*8)) \
-python ../training_scripts/test.py "$CONFIG"
+python ../../training_scripts/val.py "$CONFIG"

@@ -18,7 +18,7 @@
 
 # ---------------------------- TRAINER -------------------------------------------
 trainer:
-  max_epochs: 40
+  max_epochs: 200
   data_type: "float32" #float 32 or bfloat16
   gpu_type: "amd" #amd or nvidia
   checkpoint_path: "../../checkpoint/unetr_token_selection_experiment/adaptive_area_weighted_alpha_5p0"
@@ -45,7 +45,7 @@ optimizer:
 # ---------------------------- SCHEDULER -----------------------------------------
 scheduler:
   type: "linear-warmup-cosine-annealing"
-  warmup_epochs: 2
+  warmup_epochs: 10
   warmup_start_lr: 1e-8
   eta_min: 1e-8
 
@@ -121,7 +121,7 @@ dataloader:
     'ct1': 100,
   }
   batch_size: 4 # UNETR exception: its skip-connection decoder (encoder1) runs a plain Conv3d directly on the full 256^3-resolution volume regardless of patch_size/embed_dim -- batch_size:32 OOM'd (~34GB for that one activation alone)
-  num_workers: 0 # 0, not 1 -- num_workers > 0 forks a DataLoader worker after CUDA/NCCL is already initialized (get_model runs before the DataLoader is built), a known-flaky fork-after-CUDA-init hazard (real segfault hit on job 5411961). See training.py's get_batch error message and configs/basic_ct/sap/base_config.yaml for the same precedent.
+  num_workers: 1 # job 5411961 hit a fork-after-CUDA-init segfault here; fixed at the root by building the DataLoader before CUDA is ever initialized (see tests/README.md's "Fixed the fork-after-CUDA-init segfault at its root" entry), not by disabling workers.
   pin_memory: False
   # Optional -- default 0.1/0.1 when omitted (see UCF_VIT.parse._resolve_dataset_splits).
   # Only used for dataset keys with no separate data.dict_val_root_dirs/dict_test_root_dirs

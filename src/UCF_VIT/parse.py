@@ -438,9 +438,23 @@ def parse_config(args, load_balance_offline=False):
 
     #TODO: Add checking on each argument, e.g. > 0
     fsdp_size = conf['parallelism']['fsdp_size']
-    simple_ddp_size = conf['parallelism']['simple_ddp_size']
-    data_par_size = fsdp_size * simple_ddp_size
     tensor_par_size = conf['parallelism']['tensor_par_size']
+    simple_ddp_size = conf['parallelism']['simple_ddp_size']
+    # "auto": fsdp_size/tensor_par_size are architecture choices, generally fixed
+    # regardless of how many nodes a given launch happens to use; simple_ddp_size
+    # is what's left over to fill the rest of world_size with data-parallel
+    # replicas. Opt in with the literal string "auto" so the same config works
+    # unmodified across different node counts instead of needing simple_ddp_size
+    # hand-edited to match every time. Requires a live process group (not
+    # available under load_balance_offline, e.g. utils/load_balance.py's offline
+    # precompute step) -- set an explicit integer there instead.
+    if simple_ddp_size == "auto":
+        assert not load_balance_offline, "parallelism.simple_ddp_size: \"auto\" requires a live distributed process group to read world_size from, which isn't available here (load_balance_offline=True) -- set an explicit integer instead for offline load-balancing computation."
+        world_size = dist.get_world_size()
+        denom = fsdp_size * tensor_par_size
+        assert world_size % denom == 0, f"parallelism.simple_ddp_size: \"auto\" requires world_size ({world_size}) to be evenly divisible by fsdp_size * tensor_par_size ({denom})"
+        simple_ddp_size = world_size // denom
+    data_par_size = fsdp_size * simple_ddp_size
     if not load_balance_offline:
         assert (data_par_size * tensor_par_size) == dist.get_world_size(), "DATA_PAR_SIZE * TENSOR_PAR_SIZE must equal world_size"
 
@@ -843,11 +857,6 @@ def parse_config(args, load_balance_offline=False):
         "dataset_module": dataset_module if dataloader_type == "dataloader" else None,
         "collate_fn": collate_fn if dataloader_type == "dataloader" else None,
         "return_label": return_label,
-        # Optional -- None (the default, if omitted from the config) leaves DataLoader's
-        # own default multiprocessing_context in place (fork on Linux). See
-        # NativePytorchDataModule's multiprocessing_context docstring entry for why a
-        # config would ever set this to "spawn".
-        "multiprocessing_context": conf['dataloader'].get('multiprocessing_context'),
         # Optional, default False. When a dataset key has fewer files than its
         # assigned DDP ranks/workers, training normally fails loudly (calculate_
         # load_balancing_on_the_fly's/FileReader's own asserts). True lets every
@@ -862,6 +871,13 @@ def parse_config(args, load_balance_offline=False):
         # improvement; `null` opts out -- see NativePytorchDataModule's own
         # docstring entry for the full rationale.
         "bucket_shuffle_seed": conf['dataloader'].get('bucket_shuffle_seed', 42),
+        # Seeds FileReader's own per-epoch file-order reshuffle (see its own
+        # epoch_shuffle_seed docstring entry) -- deterministic across every rank/
+        # worker sharing a dataset key is what keeps their disjoint-window sharding
+        # correct with no cross-process communication. Defaults to a fixed seed
+        # since some reshuffle every epoch is a strict improvement over none;
+        # `null` opts out (file order stays fixed for the whole run).
+        "epoch_shuffle_seed": conf['dataloader'].get('epoch_shuffle_seed', 42),
 
     }
 

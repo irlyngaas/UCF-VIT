@@ -577,3 +577,99 @@ def test_filereader_raises_on_zero_files_even_with_reuse_allowed(monkeypatch):
     )
     with pytest.raises(AssertionError, match="zero files at all"):
         list(reader)
+
+
+# ---------------------------------------------------------------------------
+# FileReader epoch_shuffle_seed -- moves the per-epoch reshuffle/replicate
+# that NativePytorchDataModule.setup()/reset() used to do (in the main
+# process, once per epoch) inside __iter__ itself, so a single persistent-
+# worker DataLoader can be reused for a whole run instead of being rebuilt
+# (and its workers re-forked) every epoch. See dataset.py's own docstring.
+# ---------------------------------------------------------------------------
+
+
+def test_filereader_epoch_shuffle_seed_none_leaves_file_list_unchanged_across_iterations(monkeypatch):
+    """Default (None) behavior must stay exactly as before: file_list used
+    as-is, unchanged across repeated __iter__ calls -- the contract every
+    other FileReader test in this file already relies on.
+    """
+    monkeypatch.setattr(FileReader, "read_process_file", lambda self, path: path)
+    monkeypatch.setattr("torch.utils.data.get_worker_info", lambda: _FakeWorkerInfo(num_workers=1, id=0))
+
+    file_list = [f"/fake/{i}.jpg" for i in range(10)]
+    reader = FileReader(
+        file_list, start_idx=0.0, end_idx=1.0, variables=("v0",), gx="1",
+        ddp_group=None, data_par_size=1, dataset="imagenet",
+    )
+    first = [path for path, variables in reader]
+    second = [path for path, variables in reader]
+    assert first == second == file_list
+
+
+def test_filereader_epoch_shuffle_seed_replicates_without_ballooning_across_epochs(monkeypatch):
+    """Regression test: _reshuffled_and_replicated_file_list must always
+    reshuffle from the stable master_file_list, not from the previous
+    epoch's already-replicated self.file_list -- otherwise each successive
+    __iter__ call would replicate keys_to_add times *again*, growing
+    unboundedly instead of staying at keys_to_add * len(master list) every
+    epoch.
+    """
+    monkeypatch.setattr(FileReader, "read_process_file", lambda self, path: path)
+    monkeypatch.setattr("torch.utils.data.get_worker_info", lambda: _FakeWorkerInfo(num_workers=1, id=0))
+
+    file_list = [f"/fake/{i}.jpg" for i in range(5)]
+    keys_to_add = 3
+    reader = FileReader(
+        file_list, start_idx=0.0, end_idx=1.0, variables=("v0",), gx="1",
+        ddp_group=None, data_par_size=1, dataset="imagenet", keys_to_add=keys_to_add,
+        epoch_shuffle_seed=42,
+    )
+    for epoch in range(4):
+        seen = [path for path, variables in reader]
+        assert len(seen) == keys_to_add * len(file_list)
+        # every replicated copy still only ever draws from the real file_list
+        assert set(seen) == set(file_list)
+
+
+def test_filereader_epoch_shuffle_seed_deterministic_across_separate_instances(monkeypatch):
+    """The actual correctness property this exists for: two separate
+    FileReader instances (standing in for two different ranks/workers, each
+    running in its own process with its own independent Python/numpy state)
+    constructed with the same epoch_shuffle_seed over the same master file
+    list must compute the *identical* shuffled+replicated order for a given
+    epoch, with no communication between them -- otherwise __iter__'s
+    disjoint-window sharding across ranks/workers would break.
+    """
+    monkeypatch.setattr(FileReader, "read_process_file", lambda self, path: path)
+    monkeypatch.setattr("torch.utils.data.get_worker_info", lambda: _FakeWorkerInfo(num_workers=1, id=0))
+
+    file_list = [f"/fake/{i}.jpg" for i in range(20)]
+
+    def make_reader():
+        return FileReader(
+            file_list, start_idx=0.0, end_idx=1.0, variables=("v0",), gx="1",
+            ddp_group=None, data_par_size=1, dataset="imagenet", epoch_shuffle_seed=7,
+        )
+
+    reader_a = make_reader()
+    reader_b = make_reader()
+
+    for epoch in range(3):
+        seen_a = [path for path, variables in reader_a]
+        seen_b = [path for path, variables in reader_b]
+        assert seen_a == seen_b
+
+
+def test_filereader_epoch_shuffle_seed_differs_across_epochs(monkeypatch):
+    monkeypatch.setattr(FileReader, "read_process_file", lambda self, path: path)
+    monkeypatch.setattr("torch.utils.data.get_worker_info", lambda: _FakeWorkerInfo(num_workers=1, id=0))
+
+    file_list = [f"/fake/{i}.jpg" for i in range(20)]
+    reader = FileReader(
+        file_list, start_idx=0.0, end_idx=1.0, variables=("v0",), gx="1",
+        ddp_group=None, data_par_size=1, dataset="imagenet", epoch_shuffle_seed=7,
+    )
+    epoch0 = [path for path, variables in reader]
+    epoch1 = [path for path, variables in reader]
+    assert epoch0 != epoch1  # different permutation -- not the same shuffle replayed
+    assert set(epoch0) == set(epoch1) == set(file_list)  # same underlying files either way

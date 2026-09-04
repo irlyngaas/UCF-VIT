@@ -101,7 +101,7 @@ def test_calculate_load_balancing_raises_when_zero_batches_per_rank(tmp_path):
     # images/rank for even one full batch (drop_last=True), so
     # batches_per_rank_epoch["ct1"] floors to 0. Without this assert, that
     # propagates into a bare ZeroDivisionError deep in
-    # NativePytorchDataModule._shuffle_and_replicate instead of a clear
+    # NativePytorchDataModule._compute_keys_to_add instead of a clear
     # message here -- the real failure mode that surfaced on Frontier when
     # dataloader.val_split_ratio/test_split_ratio's automatic split narrowed
     # an already-tight basic_ct allocation below one batch/rank.

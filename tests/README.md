@@ -2059,6 +2059,202 @@ shipped config, threads all 4 fields through when set, and collapses back
 to defaults when `save:False` even if the other fields are set to
 something else.
 
+### Fixed the fork-after-CUDA-init segfault at its root: persistent `DataLoader` workers, forked before any CUDA context exists
+
+Follow-up to "Fixed a real, intermittent `basic_ct-sap+tensor_par` segfault"
+above -- that fix (`num_workers:0`) sidestepped the hazard but gave up
+dataloader/compute overlap entirely, for every config that hit it (also
+applied to the 9 new `unetr_token_selection_experiment` configs after job
+5411961 hit the same crash). Asked whether the hazard itself could be
+avoided instead: fork the worker pool once, before this process's first
+CUDA context exists, and never fork again.
+
+Two real blockers, both in `NativePytorchDataModule` (`datamodule.py`):
+
+1. `train_dataloader()` hard-required `torch.distributed.is_initialized()`
+   already being `True` -- so even the first `DataLoader` couldn't be built
+   before `dist.init_process_group`. Turned out not to matter:
+   `dist.init_process_group('nccl', ...)` itself doesn't establish a CUDA
+   context (no `device_id` passed, so NCCL communicator creation stays lazy)
+   -- only the later `torch.cuda.set_device(local_rank)` call actually does.
+2. `train.py`'s epoch loop rebuilt the `DataLoader` from scratch every
+   epoch (`data_module.reset()` + `train_dataloader()` again, "to ensure
+   all files get used") -- `persistent_workers=True` only keeps a worker
+   pool alive *within one `DataLoader` object*, so a fresh object every
+   epoch re-forked fresh workers every epoch regardless, after CUDA was by
+   then long since initialized. Pre-forking epoch 0 safely would have left
+   every epoch after it exactly as exposed as before.
+
+Fixed both by moving the per-epoch file-order reshuffle *inside*
+`FileReader.__iter__` (`dataset.py`) itself, instead of the caller
+rebuilding a whole new pipeline between epochs:
+
+- New `FileReader.__init__` argument `epoch_shuffle_seed` (`None` by
+  default, preserving every existing test's exact contract of "`file_list`
+  used as-is"). When set, `__iter__` reshuffles+replicates
+  `self.master_file_list` fresh at the top of every call (via
+  `np.random.RandomState(epoch_shuffle_seed + self._epoch)`, `self._epoch`
+  incrementing each call) instead of receiving an already-shuffled list
+  from the caller.
+- Critically, this is *deterministic given the same seed and call count* --
+  every DDP rank/worker sharing a dataset key runs its own `FileReader`
+  instance in its own process, with no way to communicate a shuffle order
+  to each other once forked. Since `epoch_shuffle_seed` (from
+  `dataloader.epoch_shuffle_seed`, defaulting to 42, same convention as
+  `bucket_shuffle_seed`) is identical across all of them and every
+  process's `_epoch` counter advances in lockstep (one `__iter__` call per
+  epoch, everywhere), they independently reproduce the *identical*
+  permutation for a given epoch with zero cross-process communication --
+  exactly what keeps `__iter__`'s disjoint-window sharding across
+  ranks/workers correct.
+- `NativePytorchDataModule.setup()` no longer shuffles anything itself --
+  `set_iterative_dataloader` now passes `dict_lister_trains[k]` straight
+  through (unshuffled) plus `epoch_shuffle_seed`, and `_shuffle_and_replicate`
+  shrank to `_compute_keys_to_add` (just the replication-count math, no
+  shuffle). `reset()` is gone entirely -- nothing left for it to do.
+- `train_dataloader()` now sets `persistent_workers=self.num_workers > 0`.
+
+With the rebuild-every-epoch problem gone, `train.py`'s `main()` could
+actually reorder around the remaining real constraint. Split `init_dist`
+(rank/world-size bookkeeping + `dist.init_process_group`, no CUDA touched)
+from a new `set_cuda_device` (the actual `torch.cuda.set_device` call) and
+moved dataloader construction to run *between* them: `data_module.setup()`
++ `train_dataloader()` now happen right after `init_par_groups` (needs
+`dist.init_process_group`, not CUDA), followed by one bare `iter(train_dataloader)`
+call (discarding the returned iterator) whenever `num_workers > 0` --
+forces the worker pool to fork immediately, while this process has touched
+no CUDA at all yet, exactly the same way persistent-worker pools are
+meant to be triggered once and reused. Only *then* does `set_cuda_device`
+establish this process's first real CUDA context, followed by `get_model`
+and the rest of setup as before. The epoch loop's `reset()`+rebuild block
+is gone -- `train_dataloader` is now built exactly once per run and reused
+unchanged for every epoch. Applied the same `persistent_workers`+pre-fork
+treatment to the map-style `"dataloader"` (catsdogs) construction path too,
+for consistency, even though no shipped config exercises it.
+
+`val.py`/`test.py` also now thread `epoch_shuffle_seed` through their own
+`NativePytorchDataModule` construction (to preserve the pre-existing
+"shuffle once before reading" behavior for a single eval pass, which would
+otherwise have silently regressed to `None`/no-shuffle-at-all) -- their own
+CUDA-init ordering wasn't touched, since single-pass evaluation only ever
+forks once regardless.
+
+**Tier 1 coverage:** `tests/dataloaders/test_dataset.py` gained 4
+`epoch_shuffle_seed` tests on `FileReader` directly -- `None` leaves
+`file_list` byte-for-byte unchanged across repeated `__iter__` calls (the
+default-behavior contract every pre-existing `FileReader` test in the file
+already relies on); repeated calls replicate `keys_to_add` times from the
+stable master list without ballooning (the exact bug caught while writing
+this -- an earlier version read `self.file_list` instead of
+`self.master_file_list`, re-replicating an already-replicated list every
+epoch); two independently-constructed `FileReader` instances with the same
+seed produce byte-for-byte identical shuffled order (the actual
+cross-process correctness property this exists for); and successive epochs
+on the same instance produce genuinely different permutations (not the
+same shuffle replayed). `tests/dataloaders/test_datamodule_membership.py`
+gained tests for `train_dataloader()`'s `persistent_workers` following
+`num_workers`, `epoch_shuffle_seed` threading through to the `FileReader`
+`set_iterative_dataloader` builds, and `setup()` no longer shuffling
+`dict_lister_trains` order itself; its two `reset()`-calling tests were
+updated to drop the (now-nonexistent) call. `test_config_validation.py`
+gained `epoch_shuffle_seed` default/threading tests, matching
+`bucket_shuffle_seed`'s own convention.
+
+The actual runtime claim -- that this eliminates the fork-after-CUDA-init
+race rather than just reducing how often it's hit -- can only be verified
+for real on Frontier (no local CUDA/NCCL/Slurm environment to reproduce
+either the original hazard or its fix against); not yet confirmed there.
+
+### Follow-up: removed `multiprocessing_context` and every remaining `num_workers:0` workaround
+
+Once the fix above landed, both of the fork-after-CUDA-init hazard's old
+band-aids became redundant: `multiprocessing_context` (the `"spawn"` opt-in
+that traded the segfault for a worse Cray/Slurm launch crash, job 5394881,
+and was never actually used by any shipped config after that) and
+`num_workers:0` (`basic_ct/sap/base_config.yaml` and all 9
+`unetr_token_selection_experiment` configs, which lost dataloader/compute
+overlap as the price of avoiding the fork entirely). Removed the option
+entirely (`NativePytorchDataModule.__init__`/`train_dataloader()`,
+`parse.py`'s `dataloader_conf`, and both `DataLoader(...)` construction
+sites in `train.py`) rather than leaving it as unused dead infrastructure,
+and reverted every config back to `num_workers:1`.
+
+While reverting the two eval scripts, found and fixed a real breakage this
+session's own `train.py` reorder had silently introduced: `val.py`/`test.py`
+both still did `device, local_rank = init_dist(args)`, but `init_dist` had
+been changed (in the fork-after-CUDA-init fix above) to return only
+`local_rank`, with CUDA binding split out into the new `set_cuda_device`.
+Neither script has any local test coverage that actually calls `main()`
+(both need a real GPU/Slurm environment), so this shipped silently until
+caught while making this change. Fixed by applying the exact same reorder
+`train.py` already got: both scripts now build their `eval_dataloader`
+(and force its worker pool to fork, via a bare `iter(eval_dataloader)`,
+whenever `num_workers > 0`) *before* calling the new `set_cuda_device`,
+instead of after `get_model` as before -- so the two eval entry points get
+the same fork-after-CUDA-init protection `train.py` does, not just a fix
+for the immediate crash.
+
+`training.py`'s `get_batch` error-wrapping message (added alongside the
+original `num_workers:0` workaround) was updated to match: it no longer
+recommends `num_workers:0` as the primary fix, since the DataLoader-before-
+CUDA-init ordering should make the underlying race unreachable through
+`train.py`/`val.py`/`test.py` now -- it points at checking that ordering
+first, with `num_workers:0` demoted to a last-resort mention.
+
+**Tier 1 coverage:** removed the 2 `multiprocessing_context` tests from
+`test_config_validation.py` (nothing left to default/thread through).
+`test_get_batch.py`'s existing 3 tests (unaffected by the message wording
+change, since they only assert on stable substrings like `"exited
+unexpectedly"`/`"num_workers"`, not the removed `"Try setting
+dataloader.num_workers"` exact phrase) still pass. Full local suite: 254
+passed (down from 256, the 2 removed tests), 4 skipped, 0 failures.
+
+Like the fix above, whether removing `num_workers:0` actually holds up
+without the segfault returning can only be confirmed on real Frontier runs
+of the affected configs -- not yet done.
+
+### Follow-up: moved `launch/val.sh`/`launch/test.sh` to `launch/eval/`
+
+Raised while working in this area: the two generic eval launch scripts lived
+directly under `launch/`, one directory shallower than the per-dataset
+training launch scripts (`launch/[DATASET]/*.sh`), so their relative path to
+`configs/`/`training_scripts/` was `../` instead of the training scripts'
+`../../` -- an easy trap when copy-pasting a `sbatch` invocation between the
+two. Moved both (`git mv`) to a new `launch/eval/` directory, matching the
+training launch scripts' depth, and updated their internal `../` ->
+`../../` paths, usage comments, and the walkthrough in the top-level
+`README.md` to match.
+
+### Added `parallelism.simple_ddp_size: "auto"`
+
+Raised while working in this area: training runs often use more nodes than
+the `val.py`/`test.py` runs evaluating their checkpoints, but
+`simple_ddp_size` was always a fixed integer that has to exactly satisfy
+`fsdp_size * simple_ddp_size * tensor_par_size == world_size` -- switching
+node counts between a training launch and its eval launches meant
+hand-editing the config (or maintaining separate copies) every time, even
+though `fsdp_size`/`tensor_par_size` are normally architecture choices that
+don't change with node count at all.
+
+`parse.py`'s `PARALLELISM` section now accepts the literal string `"auto"`
+for `simple_ddp_size`: resolves to `dist.get_world_size() // (fsdp_size *
+tensor_par_size)` -- fsdp/tensor-parallel sizes stay fixed, simple_ddp_size
+fills whatever's left of the actual launch's world_size. Opt-in via the
+literal string (not a new default) so every existing config with a real
+integer keeps parsing identically. Two failure modes get clear, explicit
+assertions rather than a bare `ZeroDivisionError`/silently-wrong value:
+`world_size` not evenly divisible by `fsdp_size * tensor_par_size`, and
+`"auto"` used under `load_balance_offline=True` (`utils/load_balance.py`'s
+offline precompute path has no live process group to read `world_size`
+from at all).
+
+**Tier 1 coverage:** `test_config_validation.py` gained 5 tests --
+`"auto"` correctly divides out both `fsdp_size` and `tensor_par_size`
+(two separate tests, monkeypatching `torch.distributed.get_world_size`
+rather than needing a real multi-rank launch), the not-evenly-divisible
+case raises clearly, `load_balance_offline=True` raises clearly, and an
+explicit integer's behavior is unaffected by `"auto"`'s existence.
+
 ## Running the distributed (Tier 2) tests
 
 ```bash

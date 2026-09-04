@@ -991,7 +991,7 @@ We store the arguments for each individual run in a yaml file. This config file 
 
 2. Parallelism (only used in fsdp mode and load balancing script)
 - fsdp_size: Number of Fully Sharded Data Parallel ranks to use, for sharding model states
-- simple_ddp_size: Number of Data Parallel ranks to use, for distributing different data to ranks
+- simple_ddp_size: Number of Data Parallel ranks to use, for distributing different data to ranks. Set to the literal string `"auto"` to derive this from however many ranks the current launch actually has instead of a fixed number -- `simple_ddp_size = world_size / (fsdp_size * tensor_par_size)`. Useful since fsdp_size/tensor_par_size are usually architecture choices that stay fixed while the node count a given launch uses varies (e.g. a training run using more nodes than the val.py/test.py run evaluating its checkpoints) -- the same config then works unmodified either way instead of needing simple_ddp_size hand-edited to match every time. Requires world_size to be evenly divisible by `fsdp_size * tensor_par_size`, and a live distributed process group (not available to `utils/load_balance.py`'s offline precompute step -- use an explicit integer there).
 - tensor_par_size: Number of Tensor Parallel ranks to use, for distributing tensor across multiple ranks
 - seq_par_size: Number of Sequence Parallel ranks to use, for distributing input sequence across multiple ranks (NOT IMPLEMENTED YET)
 
@@ -1033,9 +1033,9 @@ We store the arguments for each individual run in a yaml file. This config file 
 - [OPTIONAL] is an optional keyword for launch scripts using the apptainer method for installing containers on Frontier or the docker method for installing containers for running on DGX machines
 
 9. Evaluate a checkpoint with `training_scripts/val.py`/`test.py`
-- Unlike the training launch scripts above, `launch/val.sh` and `launch/test.sh` are generic across every dataset/model -- pass the config path as an argument instead of hardcoding it per-launch-script:
-  - `cd launch && sbatch val.sh ../configs/basic_ct/unetr/base_config.yaml`
-  - `cd launch && sbatch test.sh ../configs/basic_ct/unetr/base_config.yaml`
+- Unlike the training launch scripts above, `launch/eval/val.sh` and `launch/eval/test.sh` are generic across every dataset/model -- pass the config path as an argument instead of hardcoding it per-launch-script. They live one directory down (`launch/eval/`), matching the training launch scripts' own depth (`launch/[DATASET]/`), so the config path argument uses the same `../../` convention either way:
+  - `cd launch/eval && sbatch val.sh ../../configs/basic_ct/unetr/base_config.yaml`
+  - `cd launch/eval && sbatch test.sh ../../configs/basic_ct/unetr/base_config.yaml`
 - Use the same config as the training run being evaluated (same `checkpoint_path`/`checkpoint_filename`) -- `val.py`/`test.py` force `trainer.resume_from_checkpoint: True` in code regardless of what the config says.
 
 

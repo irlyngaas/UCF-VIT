@@ -38,11 +38,18 @@ class FileReader(IterableDataset):
         dataset: str = "imagenet",
         resize: Optional[list] = None,
         allow_file_reuse: bool = False,
+        epoch_shuffle_seed: Optional[int] = None,
     ) -> None:
         """Initializes the reader over the `[start_idx, end_idx)` fraction of `file_list`.
 
         Args:
-            file_list: Full list of file paths for this dataset.
+            file_list: Full list of file paths for this dataset. If
+                `epoch_shuffle_seed` is None, this is used exactly as given
+                (the caller is assumed to have already shuffled/replicated it
+                as needed). If `epoch_shuffle_seed` is set, this is instead
+                treated as the *unshuffled* master list, and `__iter__`
+                itself reshuffles and replicates it fresh every call -- see
+                `epoch_shuffle_seed`.
             start_idx: Fraction (0.0-1.0) of `file_list` to start reading from.
             end_idx: Fraction (0.0-1.0) of `file_list` to stop reading at.
             variables: Variable/channel labels to attach to each yielded sample.
@@ -54,7 +61,9 @@ class FileReader(IterableDataset):
                 `torch.distributed` is not initialized.
             return_label: Whether to read and yield a label alongside the data.
             keys_to_add: Number of times to repeat iteration over the (sharded)
-                file list per epoch, used to balance dataset sizes.
+                file list per epoch, used to balance dataset sizes. Also the
+                number of times `epoch_shuffle_seed`'s internal reshuffle
+                independently re-permutes `file_list` per epoch, when set.
             dataset: Dataset name, e.g. "imagenet" or "basic_ct"; determines how
                 files are read in `read_process_file`.
             resize: `[height, width]` to resize images to, only used for
@@ -68,6 +77,24 @@ class FileReader(IterableDataset):
                 every shard gets at least one file instead, reused (duplicated,
                 round-robin) across shards as needed -- with a printed warning.
                 See `__iter__`'s own comment for the mechanism.
+            epoch_shuffle_seed: If None (default), `file_list` is used as-is,
+                unchanged across repeated `__iter__` calls (the caller is
+                responsible for reshuffling/replicating between epochs, e.g.
+                by constructing a fresh `FileReader`). If set, `__iter__`
+                instead reshuffles+replicates `file_list` itself, fresh, at
+                the start of every call, seeded with `epoch_shuffle_seed`
+                plus an internal per-instance call counter -- deterministic
+                given the same seed and call count, so every DDP rank/worker
+                sharing this dataset key (each running its own `FileReader`
+                instance, in its own process) computes the *identical*
+                shuffled order for a given epoch without needing to
+                communicate it, which is what keeps `__iter__`'s
+                disjoint-window sharding across ranks/workers correct. This
+                is what lets a single `DataLoader` (`persistent_workers:True`)
+                be reused for an entire run instead of being rebuilt (and its
+                workers re-forked) every epoch -- see
+                `NativePytorchDataModule`'s own docstring entry for why that
+                matters.
         """
         super().__init__()
         self.num_channels_available = len(variables)
@@ -75,6 +102,12 @@ class FileReader(IterableDataset):
         end_idx = int(end_idx * len(file_list))
         file_list = file_list[start_idx:end_idx]
         self.file_list = file_list
+        # Only actually read by _reshuffled_and_replicated_file_list -- the stable,
+        # un-replicated basis __iter__ rebuilds self.file_list from every epoch when
+        # epoch_shuffle_seed is set. Without this, the second epoch's reshuffle would
+        # read the *previous* epoch's already keys_to_add-times-replicated
+        # self.file_list instead, ballooning it further every epoch.
+        self.master_file_list = file_list
         self.data_par_size = data_par_size
         self.return_label = return_label
         self.variables = variables
@@ -83,6 +116,8 @@ class FileReader(IterableDataset):
         self.ddp_group = ddp_group
         self.dataset = dataset
         self.allow_file_reuse = allow_file_reuse
+        self.epoch_shuffle_seed = epoch_shuffle_seed
+        self._epoch = 0
 
         #Optional Inputs
         if self.dataset == "imagenet":
@@ -151,8 +186,29 @@ class FileReader(IterableDataset):
                 else:
                     return data
 
+    def _reshuffled_and_replicated_file_list(self):
+        """Builds this call's `keys_to_add`-times-replicated, freshly shuffled `file_list`.
+
+        Deterministic given `self.epoch_shuffle_seed` and `self._epoch` alone
+        (see `__init__`'s `epoch_shuffle_seed` docstring entry for why that
+        matters) -- every replicated copy is independently permuted, matching
+        the shuffle `NativePytorchDataModule._shuffle_and_replicate` used to
+        do once, in the main process, before construction.
+        """
+        rng = np.random.RandomState(self.epoch_shuffle_seed + self._epoch)
+        master = self.master_file_list
+        shuffled = rng.choice(master, size=len(master), replace=False).tolist()
+        for _ in range(self.keys_to_add - 1):
+            shuffled.extend(rng.choice(master, size=len(master), replace=False).tolist())
+        return shuffled
+
     def __iter__(self):
         """Yields preprocessed samples for this worker's shard of `self.file_list`.
+
+        If `self.epoch_shuffle_seed` is set, `self.file_list` is first
+        replaced with a freshly (deterministically) reshuffled+replicated
+        version for this epoch -- see `__init__`'s `epoch_shuffle_seed`
+        docstring entry.
 
         Determines this dataloader worker's contiguous shard of `self.file_list`
         based on the data-parallel rank (via `gx`/`ddp_group`) and the worker's
@@ -164,6 +220,10 @@ class FileReader(IterableDataset):
             `(data, label, self.variables)` if `self.return_label` is True,
             otherwise `(data, self.variables)`.
         """
+        if self.epoch_shuffle_seed is not None:
+            self.file_list = self._reshuffled_and_replicated_file_list()
+            self._epoch += 1
+
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is None:
             # No DataLoader multiprocessing workers (num_workers=0) -- stand in with a

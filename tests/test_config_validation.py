@@ -29,38 +29,6 @@ def test_shipped_config_parses(config_path):
     validate_config(config_path)
 
 
-def test_multiprocessing_context_defaults_to_none_when_omitted():
-    """Every shipped config leaves dataloader.multiprocessing_context unset --
-    DataLoader's own default (fork on Linux) stays in effect for all of them. (Tried
-    "spawn" for basic_ct/sap specifically, to work around a real fork-after-CUDA-init
-    segfault -- job 5390076 -- but that traded it for a different, faster,
-    whole-job-killing crash, job 5394881; basic_ct/sap uses num_workers:0 instead now.
-    See NativePytorchDataModule's multiprocessing_context docstring and
-    basic_ct/sap/base_config.yaml's own num_workers comment for the full story.)"""
-    conf = validate_config(SAP_CONFIG)
-    assert conf["dataloader"]["multiprocessing_context"] is None
-
-
-def test_multiprocessing_context_read_from_config_when_set():
-    """No shipped config currently sets this (see test_multiprocessing_context_defaults_
-    to_none_when_omitted for why) -- covers the parse.py plumbing itself via a synthetic
-    override, so it doesn't silently bit-rot if a future config does need it."""
-    with open(SAP_CONFIG) as f:
-        conf = yaml.load(f, Loader=yaml.FullLoader)
-    conf["dataloader"]["multiprocessing_context"] = "spawn"
-
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    os.close(fd)
-    try:
-        with open(path, "w") as f:
-            yaml.dump(conf, f)
-        args = argparse.Namespace(config=path, pretrained_config="")
-        parsed = parse_config(args, load_balance_offline=True)
-        assert parsed["dataloader"]["multiprocessing_context"] == "spawn"
-    finally:
-        os.remove(path)
-
-
 def test_resume_and_pretrained_both_true_raises_clearly():
     """Regression test: resume_from_checkpoint:True and use_pretrained_model:True
     together used to silently drop use_pretrained_model with no warning at all
@@ -103,6 +71,86 @@ def test_missing_interp_size_under_do_ap_raises_clearly():
         args = argparse.Namespace(config=path, pretrained_config="")
         with pytest.raises(SystemExit, match="interp_size"):
             parse_config(args, load_balance_offline=True)
+    finally:
+        os.remove(path)
+
+
+# ---------------------------------------------------------------------------
+# parallelism.simple_ddp_size: "auto" -- derives simple_ddp_size from world_size
+# (fsdp_size/tensor_par_size fixed by the model, simple_ddp_size fills the
+# rest) instead of needing hand-editing every time a run's node count changes.
+# ---------------------------------------------------------------------------
+
+
+def _config_with_parallelism(fsdp_size, simple_ddp_size, tensor_par_size):
+    with open(UNETR_CONFIG) as f:
+        conf = yaml.load(f, Loader=yaml.FullLoader)
+    conf["parallelism"] = {
+        "fsdp_size": fsdp_size,
+        "simple_ddp_size": simple_ddp_size,
+        "tensor_par_size": tensor_par_size,
+    }
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    os.close(fd)
+    with open(path, "w") as f:
+        yaml.dump(conf, f)
+    return path
+
+
+def test_simple_ddp_size_auto_derives_from_world_size(monkeypatch):
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda: 16)
+    path = _config_with_parallelism(fsdp_size=2, simple_ddp_size="auto", tensor_par_size=1)
+    try:
+        args = argparse.Namespace(config=path, pretrained_config="")
+        parsed = parse_config(args)
+        assert parsed["parallelism"]["simple_ddp_size"] == 8  # 16 / (2*1)
+        assert parsed["parallelism"]["data_par_size"] == 16  # fsdp_size * simple_ddp_size
+    finally:
+        os.remove(path)
+
+
+def test_simple_ddp_size_auto_accounts_for_tensor_par_size(monkeypatch):
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda: 16)
+    path = _config_with_parallelism(fsdp_size=1, simple_ddp_size="auto", tensor_par_size=2)
+    try:
+        args = argparse.Namespace(config=path, pretrained_config="")
+        parsed = parse_config(args)
+        assert parsed["parallelism"]["simple_ddp_size"] == 8  # 16 / (1*2)
+    finally:
+        os.remove(path)
+
+
+def test_simple_ddp_size_auto_raises_when_not_evenly_divisible(monkeypatch):
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda: 17)  # prime -- not divisible by 2
+    path = _config_with_parallelism(fsdp_size=2, simple_ddp_size="auto", tensor_par_size=1)
+    try:
+        args = argparse.Namespace(config=path, pretrained_config="")
+        with pytest.raises(AssertionError, match="evenly divisible"):
+            parse_config(args)
+    finally:
+        os.remove(path)
+
+
+def test_simple_ddp_size_auto_raises_under_load_balance_offline():
+    # utils/load_balance.py's offline precompute has no live process group to
+    # read world_size from -- "auto" must fail clearly there, not silently
+    # compute against the wrong (or no) world_size.
+    path = _config_with_parallelism(fsdp_size=1, simple_ddp_size="auto", tensor_par_size=1)
+    try:
+        args = argparse.Namespace(config=path, pretrained_config="")
+        with pytest.raises(AssertionError, match="load_balance_offline"):
+            parse_config(args, load_balance_offline=True)
+    finally:
+        os.remove(path)
+
+
+def test_simple_ddp_size_explicit_int_unaffected_by_auto_support(monkeypatch):
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda: 4)
+    path = _config_with_parallelism(fsdp_size=1, simple_ddp_size=4, tensor_par_size=1)
+    try:
+        args = argparse.Namespace(config=path, pretrained_config="")
+        parsed = parse_config(args)
+        assert parsed["parallelism"]["simple_ddp_size"] == 4
     finally:
         os.remove(path)
 
@@ -240,6 +288,37 @@ def test_token_capacity_warning_fires_for_point_but_not_area_weighted(capsys):
                 yaml.dump(conf, f)
             parse_config(args, load_balance_offline=True)
             assert "will never reach the reconstructed feature map" not in capsys.readouterr().out
+    finally:
+        os.remove(path)
+
+
+# ---------------------------------------------------------------------------
+# epoch_shuffle_seed -- seeds FileReader's own per-epoch reshuffle, see
+# UCF_VIT.dataloaders.dataset.FileReader's own docstring entry
+# ---------------------------------------------------------------------------
+
+
+def test_epoch_shuffle_seed_defaults_to_42_when_omitted():
+    # No shipped config sets this -- matches bucket_shuffle_seed's own default
+    # convention (a real seed by default, since some per-epoch reshuffle is a
+    # strict improvement over none).
+    parsed = validate_config(UNETR_CONFIG)
+    assert parsed["dataloader"]["epoch_shuffle_seed"] == 42
+
+
+def test_epoch_shuffle_seed_threads_through_when_set():
+    with open(UNETR_CONFIG) as f:
+        conf = yaml.load(f, Loader=yaml.FullLoader)
+    conf["dataloader"]["epoch_shuffle_seed"] = None  # opts out of reshuffling
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    os.close(fd)
+    try:
+        with open(path, "w") as f:
+            yaml.dump(conf, f)
+        args = argparse.Namespace(config=path, pretrained_config="")
+        parsed = parse_config(args, load_balance_offline=True)
+        assert parsed["dataloader"]["epoch_shuffle_seed"] is None
     finally:
         os.remove(path)
 

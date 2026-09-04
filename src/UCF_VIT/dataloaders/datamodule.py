@@ -152,7 +152,7 @@ class NativePytorchDataModule(torch.nn.Module):
         dataset_group_list (string, optional): How to split available GPUs amongst the available datasets, run "python utils/preprocess_load_balancing.py CONFIG_FILE NUM_GPUS" to obtain
         batches_per_rank_epoch (Dict, optional): Dict mapping each dataset key to the number of
             batches per rank per epoch (as returned by `calculate_load_balancing_on_the_fly`),
-            used in `setup`/`reset` to determine how many times each dataset's file listing
+            used in `setup` to determine how many times each dataset's file listing
             needs to be replicated to balance dataset sizes.
         div (int, optional): How many tiles to divide each image into
         tile_overlap (tuple[int,...], optional): Amount of tile overlapping to use in each dimension. Use 0 in each dimension for no overlapping
@@ -177,13 +177,6 @@ class NativePytorchDataModule(torch.nn.Module):
             `FileReader.read_process_file` swaps locally right before its `cv.resize` call);
             only used when `dataset` is "imagenet". If absent or has no "imagenet" entry,
             images are left at their native size.
-        multiprocessing_context (str, optional): `DataLoader`'s own `multiprocessing_context`
-            argument -- `None` (default) leaves PyTorch's default (`fork`) in place. Set to
-            `"spawn"` if `num_workers > 0` forks a worker after CUDA/NCCL is already
-            initialized in the parent (`get_model` runs before `train_dataloader`), which
-            can deadlock/segfault the worker -- see `configs/basic_ct/sap/base_config.yaml`.
-            Costs real per-worker startup latency (re-imports torch/timm/monai/xformers),
-            so it's opt-in, not a new default.
         allow_file_reuse (bool, optional): If False (default), a dataset key with fewer
             files than its assigned DDP ranks/workers fails loudly instead of silently
             training some ranks on no data. If True, every rank/worker gets at least one
@@ -196,6 +189,17 @@ class NativePytorchDataModule(torch.nn.Module):
             a narrow range of classes (skews BatchNorm stats, correlates gradients within a
             rank). Deterministic regardless of `data_par_size`/restarts. `None` disables
             shuffling (original contiguous ordering).
+        epoch_shuffle_seed (int, optional): Seeds each dataset key's per-epoch file-order
+            reshuffle (see `UCF_VIT.dataloaders.dataset.FileReader`'s own docstring entry
+            for the mechanism). `None` disables the internal reshuffle -- `FileReader`
+            then reads `dict_lister_trains[k]` in fixed, unchanging order every epoch.
+            Passing a real seed here (any config using `train_dataloader()`'s
+            `persistent_workers:True` effectively must) is what lets `train_dataloader()`
+            be built once and reused for an entire run: since `FileReader.__iter__`
+            itself now handles reshuffling, deterministically, every worker/rank
+            independently reproduces the identical order for a given epoch with no
+            cross-process communication needed -- no more rebuilding the `DataLoader`
+            (and re-forking its workers) between epochs the way `reset()` used to.
     """
 
     def __init__(
@@ -226,9 +230,9 @@ class NativePytorchDataModule(torch.nn.Module):
         ddp_group: Optional[dist.ProcessGroup] = None,
         num_classes: Optional[int] = None,
         resize: Optional[Dict] = None,
-        multiprocessing_context: Optional[str] = None,
         allow_file_reuse: bool = False,
         bucket_shuffle_seed: Optional[int] = None,
+        epoch_shuffle_seed: Optional[int] = None,
     ):
         """Initializes the data module and builds the per-dataset file listings.
 
@@ -255,9 +259,9 @@ class NativePytorchDataModule(torch.nn.Module):
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.pin_memory = pin_memory
-        self.multiprocessing_context = multiprocessing_context
         self.allow_file_reuse = allow_file_reuse
         self.bucket_shuffle_seed = bucket_shuffle_seed
+        self.epoch_shuffle_seed = epoch_shuffle_seed
         self.interp_size = interp_size
         self.tile_size = tile_size
         self.twoD = twoD
@@ -294,9 +298,8 @@ class NativePytorchDataModule(torch.nn.Module):
         self.dict_lister_trains = self.process_root_dirs()
 
         # Slices train/val/test membership once (sorted, deterministic) before
-        # setup()/reset()'s own per-epoch reshuffle (np.random.choice, unseeded --
-        # kept for training variety/per-rank sharding fairness) ever runs, so which
-        # files count as "train" vs held-out "val"/"test" doesn't drift across
+        # FileReader's own per-epoch reshuffle (see epoch_shuffle_seed) ever runs, so
+        # which files count as "train" vs held-out "val"/"test" doesn't drift across
         # restarts or epochs. Sorting also avoids relying on process_root_dirs's own
         # (unstable) listing order. set_iterative_dataloader passes a no-op
         # start_idx=0.0/end_idx=1.0 to FileReader since slicing happens here.
@@ -345,19 +348,21 @@ class NativePytorchDataModule(torch.nn.Module):
             dict_data_train: Dict of dataset-key -> iterable dataset to update in
                 place with the new pipeline for `k`.
             k: Dataset key to build the pipeline for.
-            lister_train: List of file paths for this dataset key (already
-                shuffled/replicated by the caller as needed).
-            keys_to_add: Number of times `lister_train` was replicated to balance
-                dataset sizes; passed through to `FileReader` as `keys_to_add`.
+            lister_train: List of file paths for this dataset key -- unshuffled;
+                `FileReader` handles its own per-epoch shuffle/replication
+                internally now (see `epoch_shuffle_seed`).
+            keys_to_add: Number of times `FileReader` replicates `lister_train`
+                per epoch to balance dataset sizes; passed through as its own
+                `keys_to_add`.
 
         Returns:
             `dict_data_train`, with `dict_data_train[k]` set to the new
             `ProcessChannels`-wrapped iterable dataset.
         """
         # start_idx/end_idx are a no-op [0.0, 1.0) here -- already applied once,
-        # deterministically, in __init__ (before setup()/reset()'s reshuffle could
-        # re-randomize membership; see __init__'s comment). FileReader still takes
-        # them as real parameters for its other direct callers/tests.
+        # deterministically, in __init__ (before FileReader's own per-epoch reshuffle
+        # could re-randomize membership; see __init__'s comment). FileReader still
+        # takes them as real parameters for its other direct callers/tests.
         start_idx = 0.0
         end_idx = 1.0
         if self.dataset == "imagenet":
@@ -387,6 +392,7 @@ class NativePytorchDataModule(torch.nn.Module):
                                 dataset=self.dataset,
                                 resize=resize,
                                 allow_file_reuse=self.allow_file_reuse,
+                                epoch_shuffle_seed=self.epoch_shuffle_seed,
                             ),
                         self.tile_size,
                         self.twoD,
@@ -424,6 +430,7 @@ class NativePytorchDataModule(torch.nn.Module):
                                 ddp_group = self.ddp_group,
                                 dataset=self.dataset,
                                 allow_file_reuse=self.allow_file_reuse,
+                                epoch_shuffle_seed=self.epoch_shuffle_seed,
                             ),
                         self.tile_size,
                         self.twoD,
@@ -451,11 +458,11 @@ class NativePytorchDataModule(torch.nn.Module):
         """Determines which single `dict_lister_trains`/`dict_data_train` key this rank owns.
 
         Uses the same `gx`-based `group_id` matching `train_dataloader` relies on --
-        factored out so `setup()`/`reset()` can shuffle and build only *this* rank's
-        own key's pipeline, instead of every key's, keeping per-epoch cost O(1) per
-        rank rather than O(number of keys) (O(`data_par_size`) for imagenet, since
-        it has up to `data_par_size` bucket keys -- O(`data_par_size`^2) cluster-wide
-        if every rank did this redundantly).
+        factored out so `setup()` can build only *this* rank's own key's pipeline,
+        instead of every key's, keeping setup cost O(1) per rank rather than
+        O(number of keys) (O(`data_par_size`) for imagenet, since it has up to
+        `data_par_size` bucket keys -- O(`data_par_size`^2) cluster-wide if every
+        rank did this redundantly).
 
         Returns:
             The single `self.dict_lister_trains` key this rank's DDP-rank
@@ -480,33 +487,23 @@ class NativePytorchDataModule(torch.nn.Module):
             if idx == group_id:
                 return k
 
-    def _shuffle_and_replicate(self, k):
-        """Shuffles this rank's own key's file listing and replicates it `keys_to_add` times.
-
-        Shared by `setup()`/`reset()` -- see their own docstrings for when/why
-        each calls this.
+    def _compute_keys_to_add(self, k):
+        """Computes how many times `FileReader` should replicate key `k`'s file listing per epoch.
 
         Args:
-            k: The dataset key to shuffle/replicate -- always `self._my_dataset_key()`'s
+            k: The dataset key to compute this for -- always `self._my_dataset_key()`'s
                 result in practice, but takes it as an argument rather than
-                recomputing it, since `setup()` also needs `k` for `self.batches_per_rank_epoch[k]`.
+                recomputing it, since `setup()` also needs `k` for other things.
 
         Returns:
-            A tuple `(lister_train, keys_to_add)`: the shuffled (and, if
-            `keys_to_add > 1`, replicated -- each repetition independently
-            shuffled) file list, and how many times it was replicated.
+            `1` for imagenet (no replication -- see `set_iterative_dataloader`'s
+            imagenet branch), otherwise `ceil(self.max_balance / self.batches_per_rank_epoch[k])`
+            so a smaller joint dataset's effective epoch length still matches the
+            largest one's.
         """
-        lister_train = self.dict_lister_trains[k]
         if self.dataset == "imagenet":
-            keys_to_add = 1
-        else:
-            keys_to_add = int(np.ceil(self.max_balance/self.batches_per_rank_epoch[k]))
-        _lister_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
-        if keys_to_add > 1:
-            for i in range(keys_to_add-1):
-                _balance_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
-                _lister_train.extend(_balance_train)
-        return _lister_train, keys_to_add
+            return 1
+        return int(np.ceil(self.max_balance/self.batches_per_rank_epoch[k]))
 
     def setup(self):
         """Builds the iterable training dataset for this rank's own dataset key, if not already built.
@@ -514,11 +511,16 @@ class NativePytorchDataModule(torch.nn.Module):
         Computes `self.max_balance`, the largest `batches_per_rank_epoch` across
         every joint dataset (not just this rank's own -- a smaller joint
         dataset's `keys_to_add` replication needs to know the largest one's
-        epoch length to match it), then replicates and shuffles *only this
-        rank's own dataset key's* file listing (`keys_to_add` times) and
-        builds its pipeline via `set_iterative_dataloader`. No-op if
+        epoch length to match it), then builds *only this rank's own dataset
+        key's* pipeline via `set_iterative_dataloader`. No-op if
         `self.dict_data_train` is already set. See `_my_dataset_key`'s own
         docstring for why every other key is skipped entirely.
+
+        Per-epoch file-order reshuffling is no longer done here -- when
+        `self.epoch_shuffle_seed` is set, `FileReader.__iter__` (built by
+        `set_iterative_dataloader` below) handles that itself, fresh, every
+        epoch, so the same `dict_data_train`/`train_dataloader()` built here
+        can be reused for an entire run instead of being rebuilt every epoch.
         """
         # load datasets only if they're not loaded already
         if not self.dict_data_train:
@@ -535,40 +537,34 @@ class NativePytorchDataModule(torch.nn.Module):
                           self.max_balance = self.batches_per_rank_epoch[k]
 
             k = self._my_dataset_key()
-            lister_train, keys_to_add = self._shuffle_and_replicate(k)
-            self.dict_data_train = self.set_iterative_dataloader({}, k, lister_train, keys_to_add)
-
-    def reset(self):
-        """Rebuilds this rank's own dataset-key pipeline with a freshly shuffled file order.
-
-        Called between epochs to randomize file order and reintroduce data that may
-        have been missed in prior epochs (files get dropped when a dataset's file
-        count isn't evenly divisible by the number of GPUs splitting it up). See
-        `_my_dataset_key`'s own docstring for why every other key is skipped
-        entirely.
-        """
-        k = self._my_dataset_key()
-        lister_train, keys_to_add = self._shuffle_and_replicate(k)
-        self.dict_data_train = self.set_iterative_dataloader({}, k, lister_train, keys_to_add)
+            keys_to_add = self._compute_keys_to_add(k)
+            self.dict_data_train = self.set_iterative_dataloader({}, k, self.dict_lister_trains[k], keys_to_add)
 
     def train_dataloader(self):
         """Builds the `DataLoader` for the dataset assigned to this rank's data-parallel group.
 
-        `setup()`/`reset()` already built `self.dict_data_train` for only this
-        rank's own dataset key (see `_my_dataset_key`), so this just wraps
-        that single pipeline in a `DataLoader` using `collate_fn`.
+        `setup()` already built `self.dict_data_train` for only this rank's own
+        dataset key (see `_my_dataset_key`), so this just wraps that single
+        pipeline in a `DataLoader` using `collate_fn`.
+
+        `persistent_workers` is set whenever `self.num_workers > 0`: combined
+        with `self.epoch_shuffle_seed` (see its own docstring entry) handling
+        per-epoch reshuffling internally, the `DataLoader` returned here is
+        meant to be built once and reused for an entire run -- its worker
+        pool then only ever forks once, rather than being torn down and
+        re-forked every epoch.
 
         Returns:
             A `torch.utils.data.DataLoader` over this rank's assigned dataset.
 
         Raises:
             NotImplementedError: If `torch.distributed` is not initialized, or
-                if `setup()`/`reset()` haven't been called yet.
+                if `setup()` hasn't been called yet.
         """
         if not torch.distributed.is_initialized():
             raise NotImplementedError("Only support distributed training")
         if not self.dict_data_train:
-            raise NotImplementedError("dict_data_train is empty -- call setup() (or reset()) first")
+            raise NotImplementedError("dict_data_train is empty -- call setup() first")
 
         k = next(iter(self.dict_data_train))
         data_train = self.dict_data_train[k]
@@ -579,11 +575,8 @@ class NativePytorchDataModule(torch.nn.Module):
             batch_size=self.batch_size,
             drop_last=True,
             num_workers=self.num_workers,
+            persistent_workers=self.num_workers > 0,
             pin_memory=self.pin_memory,
-            # A plain function + functools.partial (rather than a closure lambda) so this
-            # is picklable, which multiprocessing_context="spawn" requires -- see the
-            # multiprocessing_context docstring entry above for why that matters.
             collate_fn=functools.partial(collate_fn, return_label=self.return_label, adaptive_patching=self.adaptive_patching, separate_channels=self.separate_channels, dataset=self.dataset, num_labels=num_labels, return_qdt=self.return_qdt, dict_key=k),
-            multiprocessing_context=self.multiprocessing_context,
         )
 

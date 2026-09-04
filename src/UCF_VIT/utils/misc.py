@@ -876,7 +876,7 @@ def calculate_load_balancing_on_the_fly(conf, VERBOSE=False):
     # at least 1 full *batch* (drop_last=True means fewer than batch_size images
     # yields zero batches, not a smaller one). Without this check that silently
     # propagates into a bare ZeroDivisionError deep in NativePytorchDataModule.
-    # _shuffle_and_replicate instead of a clear message here. Real way to hit
+    # _compute_keys_to_add instead of a clear message here. Real way to hit
     # this: the automatic train/val/test split (val_split_ratio/test_split_ratio)
     # can push an already-tight allocation below one batch/rank even though it
     # had enough images before the split.
