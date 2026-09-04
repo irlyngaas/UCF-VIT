@@ -2255,6 +2255,43 @@ rather than needing a real multi-rank launch), the not-evenly-divisible
 case raises clearly, `load_balance_offline=True` raises clearly, and an
 explicit integer's behavior is unaffected by `"auto"`'s existence.
 
+#### Follow-up: `"auto"` gated on the wrong condition -- caught by actually using it
+
+Switched all 9 `unetr_token_selection_experiment` configs to
+`simple_ddp_size: "auto"` and immediately broke `test_shipped_config_parses`
+for every one of them. Root cause: `"auto"`'s guard asserted `not
+load_balance_offline`, on the assumption that `load_balance_offline=True`
+meant "no live process group exists." False -- `utils/validate_config.py`
+(which both `test_shipped_config_parses` and the standalone
+`validate_config.py` CLI tool call) always calls `init_single_process_dist()`
+first, so it *does* have a live (single-process, world_size=1)
+`torch.distributed` group by the time `parse_config(..., load_balance_offline=True)`
+runs. `load_balance_offline` only means "skip the world_size *consistency*
+assert further down" -- a genuinely different thing from "is there a group
+to read `world_size` from at all," which only `utils/load_balance.py`'s
+standalone precompute script actually lacks (it never initializes one).
+
+Fixed by gating on the real precondition, `dist.is_initialized()`, instead
+of `load_balance_offline`. Under `validate_config`'s single-process group,
+`"auto"` now resolves against `world_size=1` and parses successfully (same
+as any other config, since the later consistency assert is still skipped
+under `load_balance_offline=True` regardless) -- it doesn't need to match
+the real training launch's world_size to be valid syntax, same as every
+already-shipped config with an explicit `simple_ddp_size` integer that
+doesn't happen to equal 1 either.
+
+**Tier 1 coverage:** replaced the old
+`test_simple_ddp_size_auto_raises_under_load_balance_offline` (which could
+no longer actually trigger the failure it claimed to, now that the guard
+changed) with `test_simple_ddp_size_auto_raises_with_no_live_process_group`
+(monkeypatches `torch.distributed.is_initialized` to `False` -- the one
+real Frontier caller with no live group at all, `utils/load_balance.py`) and
+`test_simple_ddp_size_auto_works_under_load_balance_offline_with_live_group`
+(the `validate_config.py` case: `load_balance_offline=True` *and* a live
+group -- must resolve, not raise). Full local suite: 260 passed, 4 skipped,
+0 failures, including `test_shipped_config_parses` for all 9
+`unetr_token_selection_experiment` configs now using `"auto"`.
+
 ## Running the distributed (Tier 2) tests
 
 ```bash

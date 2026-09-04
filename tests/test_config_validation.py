@@ -131,15 +131,35 @@ def test_simple_ddp_size_auto_raises_when_not_evenly_divisible(monkeypatch):
         os.remove(path)
 
 
-def test_simple_ddp_size_auto_raises_under_load_balance_offline():
+def test_simple_ddp_size_auto_raises_with_no_live_process_group(monkeypatch):
     # utils/load_balance.py's offline precompute has no live process group to
     # read world_size from -- "auto" must fail clearly there, not silently
-    # compute against the wrong (or no) world_size.
+    # compute against the wrong (or no) world_size. Gated on
+    # dist.is_initialized() itself, not load_balance_offline -- validate_config.py
+    # also passes load_balance_offline=True but does have a live (single-process)
+    # group by then, so that flag alone can't be the signal.
+    monkeypatch.setattr("torch.distributed.is_initialized", lambda: False)
     path = _config_with_parallelism(fsdp_size=1, simple_ddp_size="auto", tensor_par_size=1)
     try:
         args = argparse.Namespace(config=path, pretrained_config="")
-        with pytest.raises(AssertionError, match="load_balance_offline"):
+        with pytest.raises(AssertionError, match="process group.*none is initialized"):
             parse_config(args, load_balance_offline=True)
+    finally:
+        os.remove(path)
+
+
+def test_simple_ddp_size_auto_works_under_load_balance_offline_with_live_group(monkeypatch):
+    # The validate_config.py case: load_balance_offline=True *and* a live
+    # (single-process) group already initialized -- "auto" must resolve fine
+    # here (against that group's own world_size), matching every shipped
+    # unetr_token_selection_experiment config now using "auto" with
+    # test_shipped_config_parses's load_balance_offline=True validation.
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda: 1)
+    path = _config_with_parallelism(fsdp_size=1, simple_ddp_size="auto", tensor_par_size=1)
+    try:
+        args = argparse.Namespace(config=path, pretrained_config="")
+        parsed = parse_config(args, load_balance_offline=True)
+        assert parsed["parallelism"]["simple_ddp_size"] == 1
     finally:
         os.remove(path)
 

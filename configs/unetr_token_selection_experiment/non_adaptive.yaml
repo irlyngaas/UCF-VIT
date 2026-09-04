@@ -28,7 +28,7 @@ trainer:
 # ---------------------------- PARALLELISM ---------------------------------------
 parallelism:
   fsdp_size: 1
-  simple_ddp_size: 16
+  simple_ddp_size: "auto" # derives from world_size at launch time (world_size / (fsdp_size * tensor_par_size)) -- see README.md's Parallelism section
   tensor_par_size: 1
 
 # ---------------------------- OPTIMIZER -----------------------------------------

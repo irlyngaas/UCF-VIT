@@ -445,11 +445,14 @@ def parse_config(args, load_balance_offline=False):
     # is what's left over to fill the rest of world_size with data-parallel
     # replicas. Opt in with the literal string "auto" so the same config works
     # unmodified across different node counts instead of needing simple_ddp_size
-    # hand-edited to match every time. Requires a live process group (not
-    # available under load_balance_offline, e.g. utils/load_balance.py's offline
-    # precompute step) -- set an explicit integer there instead.
+    # hand-edited to match every time. Requires a live process group to read
+    # world_size from -- gated on dist.is_initialized() itself (not
+    # load_balance_offline, which just skips the *consistency* assert below and
+    # is also set by callers, like validate_config.py, that do have a live
+    # single-process group). utils/load_balance.py's offline precompute is the
+    # real no-group case -- set an explicit integer there instead.
     if simple_ddp_size == "auto":
-        assert not load_balance_offline, "parallelism.simple_ddp_size: \"auto\" requires a live distributed process group to read world_size from, which isn't available here (load_balance_offline=True) -- set an explicit integer instead for offline load-balancing computation."
+        assert dist.is_initialized(), "parallelism.simple_ddp_size: \"auto\" requires a live distributed process group to read world_size from, and none is initialized here -- set an explicit integer instead (e.g. for utils/load_balance.py's offline precompute step)."
         world_size = dist.get_world_size()
         denom = fsdp_size * tensor_par_size
         assert world_size % denom == 0, f"parallelism.simple_ddp_size: \"auto\" requires world_size ({world_size}) to be evenly divisible by fsdp_size * tensor_par_size ({denom})"
