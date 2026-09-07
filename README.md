@@ -1,6 +1,7 @@
 ## Table of Contents
 - [UCF-VIT](#ucf-vit)
 - [Install](#install)
+- [Running 2D diffusion on Frontier](#running-2d-diffusion-on-frontier)
 - [Innovations](#Innovations)
 - [Model Architectures](#model-architectures)
 1. [Vision Transformer](#vision-transformer-vit)
@@ -69,6 +70,151 @@ ln -s $CRAY_MPICH_DIR/lib/libfmpich.so libmpicxx.so
 ```
 
 Various example scripts for launching jobs are in the launch folder. Those identified with `_apptainer` in the filename are for running with the Apptainer container
+
+## Running 2D diffusion on Frontier
+
+The current Frontier workflow for 2D diffusion uses these files:
+
+- `launch/xct/submit_diffusion_fsdp_Frontier_loop.sh`: submits the first job.
+- `launch/xct/diffusion_fsdp_Frontier.sh`: runs inside each Slurm allocation and submits graceful continuations.
+- `dev_scripts/train_diffusion_fsdp_wFixedFID_2D_singMod.py`: training entry point. Despite the historical `singMod` filename, modality selection comes from the YAML config.
+- `configs/xct/diffusion/base_config_dgx_2D.yaml`: single-modality XCT example.
+- `configs/xct/diffusion/base_config_dgx_2D_Multimodal.yaml`: multimodal XCT and neutron CT example.
+
+Run submission commands from the repository root. This is important because Slurm executes a spool copy of the batch script; resolving paths relative to `${BASH_SOURCE[0]}` inside an allocation can incorrectly produce paths under `/var/spool`.
+
+```bash
+cd /ccs/home/3az/UCF-VIT
+```
+
+### Start a fresh run
+
+The submission wrapper accepts the node count and config path. For the current 8-node multimodal run:
+
+```bash
+bash launch/xct/submit_diffusion_fsdp_Frontier_loop.sh \
+    8 \
+    configs/xct/diffusion/base_config_dgx_2D_Multimodal.yaml
+```
+
+The initial job always exports `RESUME_FROM_CHECKPOINT=False`. Each Frontier node runs eight Slurm tasks, with one task per GPU, so an 8-node job has a world size of 64.
+
+For node-local 8-way FSDP sharding, use the separate FSDP8 config and training entry point. The third submission-wrapper argument selects the training script; omitting it preserves the legacy script as the default.
+
+```bash
+bash launch/xct/submit_diffusion_fsdp_Frontier_loop.sh \
+    8 \
+    configs/xct/diffusion/base_config_frontier_2D_Multimodal_FSDP8.yaml \
+    dev_scripts/train_diffusion_fsdp_wFixedFID_2D_FSDP.py
+```
+
+On 8 nodes this resolves to `fsdp_size=8`, `simple_ddp_size=8`, and `HYBRID_SHARD`: parameters are sharded across the eight GPUs within a node and replicated across nodes. The FSDP script saves CPU-offloaded sharded model and optimizer state in one atomic checkpoint file per global rank. Its checkpoint format is intentionally separate from the legacy `NO_SHARD` script; do not resume a legacy optimizer checkpoint with the FSDP script.
+
+The recommended config settings are:
+
+```yaml
+parallelism:
+  simple_ddp_size: "auto"
+
+trainer:
+  auto_checkpoint_path: True
+  checkpoint_root: /path/to/checkpoint/root
+  checkpoint_path: null
+  inference_path: null
+  resume_from_checkpoint: False
+```
+
+With `simple_ddp_size: "auto"`, training calculates:
+
+```text
+simple_ddp_size = world_size / (fsdp_size * tensor_par_size * seq_par_size)
+```
+
+With automatic checkpoint paths enabled, the run directory records the effective resource and model settings. For example:
+
+```text
+N8_G64_DDP64_FSDP1_TP1_lr0.005_PS8_BS128_ED1024_float32/
+```
+
+Slurm stdout and stderr are combined in the run's `logs/` directory rather than written in the repository:
+
+```text
+<checkpoint_root>/<run_name>/logs/diffusion_fsdp-<job_id>.out
+```
+
+### Automatic checkpoint continuation
+
+The batch allocation is one hour by default. The launcher sets a training deadline ten minutes before the Slurm limit. When that deadline is reached, every rank leaves the training loop together, writes a restart checkpoint, and exits cleanly. Representative checkpoint files use the name:
+
+```text
+<checkpoint_filename>_latest_rank_<rank>.ckpt
+```
+
+The launcher detects the continuation marker and submits another job with:
+
+```text
+AUTO_RESUBMIT=1
+RESUME_FROM_CHECKPOINT=True
+```
+
+A partial epoch is replayed after restart, which avoids silently skipping batches. The continuation inherits the node count, config, and log directory.
+
+Automatic resubmission happens only after a clean wall-time checkpoint. A Python, GPU, RCCL/NCCL, or Slurm task failure stops the chain so a persistent error does not create an infinite sequence of failing jobs.
+
+The timing can be overridden at submission time. The checkpoint buffer must be smaller than the requested wall time:
+
+```bash
+export JOB_WALLTIME_SECONDS=3600
+export CHECKPOINT_BUFFER_SECONDS=600
+```
+
+If these values are changed, keep the `#SBATCH -t` limit in `diffusion_fsdp_Frontier.sh` consistent with `JOB_WALLTIME_SECONDS`.
+
+### Resume manually after a failed allocation
+
+First verify that the latest checkpoint exists and that another copy of the run is not active:
+
+```bash
+squeue -u "$USER" -n diffusion_fsdp
+ls -lh <run_directory>/<checkpoint_filename>_latest_rank_*.ckpt
+```
+
+Then submit the batch launcher with resume enabled. `LOG_DIR` must be exported so later automatic continuations keep writing to the same location:
+
+```bash
+CONFIG_FILE=/ccs/home/3az/UCF-VIT/configs/xct/diffusion/base_config_dgx_2D_Multimodal.yaml
+RUN_DIR=<resolved_checkpoint_run_directory>
+LOG_DIR="${RUN_DIR}/logs"
+mkdir -p "$LOG_DIR"
+
+sbatch \
+    --nodes=8 \
+    --output="${LOG_DIR}/%x-%j.out" \
+    --error="${LOG_DIR}/%x-%j.out" \
+    --export="ALL,AUTO_RESUBMIT=1,RESUME_FROM_CHECKPOINT=True,LOG_DIR=${LOG_DIR}" \
+    launch/xct/diffusion_fsdp_Frontier.sh \
+    "$CONFIG_FILE"
+```
+
+The environment override selects `<checkpoint_filename>_latest` for loading; it does not require changing `resume_from_checkpoint` in the YAML.
+
+### Monitor or stop a run
+
+```bash
+# Active and pending diffusion jobs
+squeue -u "$USER" -n diffusion_fsdp
+
+# Accounting information for a job and its steps
+sacct -j <job_id> --format=JobID,State,ExitCode,Elapsed,NodeList
+
+# Follow the current log
+tail -f <run_directory>/logs/diffusion_fsdp-<job_id>.out
+
+# Stop a run. A canceled job does not automatically submit a continuation.
+scancel <job_id>
+```
+
+For distributed failures, find the first traceback or collective timeout rather than relying on the final `srun` termination messages. If all ranks except one time out in the same collective, the missing rank is usually the process to investigate first.
 
 ## NVIDIA DGX
 To run on NVIDIA DGX systems we rely on Pytorch Docker containers maintained by NVIDIA. The following instructions give commands to build a docker container with our codebase.

@@ -2,8 +2,6 @@ import os
 import torch
 import matplotlib.pyplot as plt
 import numpy as np
-import sys
-sys.path.append(os.path.expanduser('~/git/UCF-VIT/src'))
 # from torcheval.metrics import FrechetInceptionDistance
 from UCF_VIT.ddpm.ddpm import DDPM_Scheduler
 from UCF_VIT.utils.misc import  unpatchify
@@ -14,11 +12,20 @@ import math
 def plotLoss(lossVec, save_path='./'):
     loss_array = np.array([x.cpu().item() if isinstance(x, torch.Tensor) else x for x in lossVec])
 
+    # Do not let a diagnostic plot hide the original numerical failure.
+    finite_loss = loss_array[np.isfinite(loss_array)]
+    if finite_loss.size == 0:
+        return
+
     fig, ax = plt.subplots(1, 1, facecolor='w')
     ax.plot(loss_array, '-k', label='train')
     ax.set_yscale('log')
     plt.legend()
-    ax.set_ylim([min(loss_array), 1])
+    positive_loss = finite_loss[finite_loss > 0]
+    if positive_loss.size:
+        lower = positive_loss.min()
+        upper = max(finite_loss.max(), lower * 1.01)
+        ax.set_ylim([lower, upper])
     if save_path.__contains__("rank"):
         plt.title("rank_" + save_path.split("rank")[1].split(".png")[0])
     fig.savefig(save_path, format='png', dpi=150)
@@ -3688,5 +3695,3 @@ def plotPerformanceImgs(
 # min,max,mean for Fuller_p6_round_sph_sph_p70Vf_dm_p15_pm_p15_r_p15_UC60_SimulVol_Pair_8.npy are: 0.0,1.0,0.994354248046875
 # min,max,mean for Fuller_p6_round_sph_sph_p70Vf_dm_p15_pm_p15_r_p15_UC60_SimulVol_Pair_9.npy are: 0.0989999994635582,0.28999999165534973,0.2857721149921417
 # min,max,mean for Fuller_p6_round_sph_sph_p70Vf_dm_p15_pm_p15_r_p15_UC60_SimulVol_Pair_9.npy are: 0.0,1.0,0.9951171875
-
-

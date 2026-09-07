@@ -324,7 +324,16 @@ class NativePytorchDataModule(torch.nn.Module):
                     if num_data_roots > self.data_par_size-1:
                         break
         elif self.dataset == "xct":
-            dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, ""))) for k, root_dir in self.dict_root_dirs.items() }
+            # XCT roots can also contain metadata (for example global_stats.json).
+            # Passing those files to np.load fails nondeterministically after the
+            # per-epoch shuffle, so only expose NumPy volumes to FileReader.
+            dict_lister_trains = {
+                k: [
+                    path for path in dp.iter.FileLister(os.path.join(root_dir, ""))
+                    if str(path).lower().endswith(".npy")
+                ]
+                for k, root_dir in self.dict_root_dirs.items()
+            }
         else:
             dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in self.dict_root_dirs.items() }
         return dict_lister_trains
@@ -514,4 +523,3 @@ class NativePytorchDataModule(torch.nn.Module):
             pin_memory=self.pin_memory,
             collate_fn=lambda batch: collate_fn(batch, return_label=self.return_label, single_channel=self.single_channel, adaptive_patching = self.adaptive_patching, separate_channels=self.separate_channels, dataset=self.dataset, num_classes=self.num_classes, num_labels=num_labels, return_qdt=self.return_qdt, dict_key=k),
         )
-

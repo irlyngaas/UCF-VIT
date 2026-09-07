@@ -18,7 +18,12 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import (
    size_based_auto_wrap_policy, wrap, transformer_auto_wrap_policy,
 )
-from torch.distributed.fsdp import MixedPrecision
+from torch.distributed.fsdp import (
+    MixedPrecision,
+    ShardedOptimStateDictConfig,
+    ShardedStateDictConfig,
+    StateDictType,
+)
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
    checkpoint_wrapper,
    CheckpointImpl,
@@ -83,47 +88,71 @@ def clip_and_require_finite_gradients(model, max_grad_norm, epoch, batch):
     return grad_norm
 
 
+def configure_sharded_checkpointing(model):
+    """Use CPU-offloaded, per-rank FSDP shards for model and optimizer state."""
+    FSDP.set_state_dict_type(
+        model,
+        StateDictType.SHARDED_STATE_DICT,
+        ShardedStateDictConfig(offload_to_cpu=True),
+        ShardedOptimStateDictConfig(offload_to_cpu=True),
+    )
+
+
+def collect_sharded_training_state(model, optimizer, scheduler):
+    """Collect this rank's model/optimizer shard; every rank must call this."""
+    return (
+        model.state_dict(),
+        FSDP.optim_state_dict(model, optimizer),
+        scheduler.state_dict(),
+    )
+
+
+def save_sharded_checkpoint(
+    checkpoint_path,
+    checkpoint_stem,
+    epoch,
+    next_epoch,
+    model_state,
+    optimizer_state,
+    scheduler_state,
+    loss_list,
+):
+    """Atomically save this global rank's checkpoint shard."""
+    world_rank = dist.get_rank()
+    checkpoint_file = os.path.join(
+        checkpoint_path, f"{checkpoint_stem}_rank_{world_rank}.ckpt"
+    )
+    temporary_file = (
+        f"{checkpoint_file}.tmp-{os.environ.get('SLURM_JOB_ID', 'local')}"
+    )
+    torch.save(
+        {
+            'epoch': epoch,
+            'next_epoch': next_epoch,
+            'model_state_dict': model_state,
+            'optimizer_state_dict': optimizer_state,
+            'scheduler_state_dict': scheduler_state,
+            'loss_list': loss_list,
+        },
+        temporary_file,
+    )
+    os.replace(temporary_file, checkpoint_file)
+    return checkpoint_file
+
+
 def main(device):
 #1. Load arguments from config file and setup parallelization
 ##############################################################################################################
 
-    print("in main()","sys.argv[1] ",sys.argv[1],flush=True) 
-    
+    print("in main()","sys.argv[1] ",sys.argv[1],flush=True)
+
     # Use torch.distributed + torchrun env, not SLURM
     world_rank = dist.get_rank()
     world_size = dist.get_world_size()
     # LOCAL_RANK is set by torchrun; needed later for FSDP(device_id=...)
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
-    # Emit flushed, per-rank breadcrumbs around each potentially blocking
-    # training phase.  TRACE_RANK_SYNC makes an "after" marker trustworthy on
-    # CUDA/ROCm, where kernels otherwise execute asynchronously.  The Frontier
-    # launcher enables both switches for long-running jobs.
-    trace_rank_phases = os.environ.get("TRACE_RANK_PHASES", "0").lower() in (
-        "1", "true", "yes"
-    )
-    trace_rank_sync = os.environ.get("TRACE_RANK_SYNC", "0").lower() in (
-        "1", "true", "yes"
-    )
 
-    def rank_phase(phase, epoch, batch, synchronize=False):
-        if not trace_rank_phases:
-            return
-        if synchronize and trace_rank_sync and torch.cuda.is_available():
-            torch.cuda.synchronize(device)
-        print(
-            "[rank-phase]"
-            f" time={time.time():.6f}"
-            f" host={os.uname().nodename}"
-            f" rank={world_rank}"
-            f" local_rank={local_rank}"
-            f" epoch={epoch}"
-            f" batch={batch}"
-            f" phase={phase}",
-            flush=True,
-        )
-
-    
     # world_size = int(os.environ['SLURM_NTASKS'])
     # world_rank = dist.get_rank()
 
@@ -134,7 +163,7 @@ def main(device):
 
     conf = yaml.load(open(config_path,'r'),Loader=yaml.FullLoader)
 
-    if world_rank==0: 
+    if world_rank==0:
         print(conf,flush=True)
 
     max_epochs = conf['trainer']['max_epochs']
@@ -144,7 +173,7 @@ def main(device):
     gpu_type = conf['trainer']['gpu_type']
 
     checkpoint_path = conf['trainer'].get('checkpoint_path')
-  
+
     checkpoint_filename = conf['trainer']['checkpoint_filename']
 
     checkpoint_filename_for_loading = conf['trainer']['checkpoint_filename_for_loading']
@@ -167,7 +196,7 @@ def main(device):
     seq_par_size = conf['parallelism']['seq_par_size']
 
     cpu_offload_flag = conf['parallelism']['cpu_offloading']
- 
+
     lr = float(conf['model']['lr'])
 
     beta_1 = float(conf['model']['beta_1'])
@@ -191,13 +220,13 @@ def main(device):
     tile_size = conf['model']['net']['init_args']['tile_size']
 
     patch_size = conf['model']['net']['init_args']['patch_size']
- 
+
     emb_dim = conf['model']['net']['init_args']['embed_dim']
 
     depth = conf['model']['net']['init_args']['depth']
 
     num_heads = conf['model']['net']['init_args']['num_heads']
-    
+
     decoder_embed_dim = conf['model']['net']['init_args']['decoder_embed_dim']
 
     decoder_depth = conf['model']['net']['init_args']['decoder_depth']
@@ -210,7 +239,7 @@ def main(device):
 
     drop_path = conf['model']['net']['init_args']['drop_path']
 
-    linear_decoder = conf['model']['net']['init_args']['linear_decoder'] 
+    linear_decoder = conf['model']['net']['init_args']['linear_decoder']
 
     twoD = conf['model']['net']['init_args']['twoD']
 
@@ -283,6 +312,12 @@ def main(device):
     else:
         simple_ddp_size = int(simple_ddp_size)
 
+    if fsdp_size <= 1:
+        raise ValueError(
+            "This entry point requires parallelism.fsdp_size > 1. "
+            "Use the legacy singMod script for NO_SHARD training."
+        )
+
     if conf['trainer'].get('auto_checkpoint_path', False):
         checkpoint_root = conf['trainer']['checkpoint_root']
         num_nodes = int(os.environ.get('SLURM_JOB_NUM_NODES', 1))
@@ -318,7 +353,7 @@ def main(device):
         tile_size_z = None
     else:
         tile_size_z = tile_size[2]
-    
+
     assert (tile_size_x%patch_size)==0, "tile_size_x % patch_size must be 0"
     assert (tile_size_y%patch_size)==0, "tile_size_y % patch_size must be 0"
     if dataset != "imagenet":
@@ -382,7 +417,7 @@ def main(device):
         depth=depth,
         num_heads=num_heads,
         decoder_depth=decoder_depth,
-        decoder_embed_dim=decoder_embed_dim, 
+        decoder_embed_dim=decoder_embed_dim,
         decoder_num_heads=decoder_num_heads,
         mlp_ratio=mlp_ratio,
         drop_path_rate=drop_path,
@@ -405,7 +440,7 @@ def main(device):
     if not resume_from_checkpoint: #train from scratch
         epoch_start = 0
         loss_list = []
-        if world_rank==0:       
+        if world_rank==0:
             print("resume from checkpoint was set to False. Pretrain from scratch.",flush=True)
 
         if world_rank==0:
@@ -444,25 +479,20 @@ def main(device):
            #map_location = 'cuda:'+str(device)
            model.load_state_dict(torch.load(checkpoint_path+'/initial_'+str(0)+'.pth',map_location=map_location),strict=False)
 
-    else:  
-        if world_rank< tensor_par_size:
-            if os.path.exists(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(world_rank)+".ckpt"):
-                print("resume from checkpoint was set to True. Checkpoint path found.",flush=True)
-
-                print("rank",dist.get_rank(),"src_rank",world_rank,flush=True)
-
-                #map_location = 'cuda:'+str(device)
-                map_location = 'cpu'
-
-                checkpoint = torch.load(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(world_rank)+".ckpt",map_location=map_location)
-                model.load_state_dict(checkpoint['model_state_dict'])
-                epoch_start = checkpoint.get('next_epoch', checkpoint['epoch'] + 1)
-                del checkpoint
-
-            else:
-                print("resume from checkpoint was set to True. But the checkpoint path does not exist.",flush=True)
-
-                sys.exit("checkpoint path does not exist")
+    else:
+        # Sharded checkpoints are loaded after FSDP wrapping. Every global rank
+        # owns a distinct model/optimizer shard and must have a checkpoint file.
+        epoch_start = 0
+        loss_list = []
+        checkpoint_file = os.path.join(
+            checkpoint_path,
+            f"{checkpoint_filename_for_loading}_rank_{world_rank}.ckpt",
+        )
+        if not os.path.exists(checkpoint_file):
+            raise FileNotFoundError(
+                f"Missing FSDP checkpoint shard for rank {world_rank}: "
+                f"{checkpoint_file}"
+            )
 
     dist.barrier()
 
@@ -510,12 +540,25 @@ def main(device):
     #add hybrid sharded FSDP
     if fsdp_size > 1 and simple_ddp_size > 1:
         model = FSDP(model, device_id=local_rank, process_group= (fsdp_group,simple_ddp_group), sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.HYBRID_SHARD, auto_wrap_policy = my_auto_wrap_policy, mixed_precision=bfloatPolicy, forward_prefetch=True, limit_all_gathers = False )
+        sharding_strategy_name = "HYBRID_SHARD"
     #add fully sharded FSDP
     elif fsdp_size > 1 and simple_ddp_size == 1:
         model = FSDP(model, device_id=local_rank, process_group= fsdp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.FULL_SHARD, auto_wrap_policy = my_auto_wrap_policy, mixed_precision=bfloatPolicy, forward_prefetch=True, limit_all_gathers = False )
+        sharding_strategy_name = "FULL_SHARD"
     #add unsharded DDP
     else:
         model = FSDP(model, device_id=local_rank, process_group= simple_ddp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.NO_SHARD, auto_wrap_policy = my_auto_wrap_policy, mixed_precision=bfloatPolicy, forward_prefetch=True, limit_all_gathers = False )
+        sharding_strategy_name = "NO_SHARD"
+
+    if world_rank == 0:
+        print(
+            f"FSDP strategy: {sharding_strategy_name}; "
+            f"shard group size: {dist.get_world_size(fsdp_group)}; "
+            f"replica group size: {dist.get_world_size(simple_ddp_group)}",
+            flush=True,
+        )
+
+    configure_sharded_checkpointing(model)
 
     check_fn = lambda submodule: isinstance(submodule, Block)
     apply_activation_checkpointing(
@@ -526,20 +569,33 @@ def main(device):
     scheduler = configure_scheduler(optimizer,warmup_steps,max_steps,warmup_start_lr,eta_min)
 
     if resume_from_checkpoint:
+        checkpoint_file = os.path.join(
+            checkpoint_path,
+            f"{checkpoint_filename_for_loading}_rank_{world_rank}.ckpt",
+        )
+        checkpoint = torch.load(
+            checkpoint_file, map_location='cpu', weights_only=False
+        )
 
-        print("optimizer resume from checkpoint was set to True",flush=True)
-
-        src_rank = world_rank - tensor_par_size * dist.get_rank(group=data_seq_ort_group)
-
-        #map_location = 'cuda:'+str(device)
-        map_location = 'cpu'
-
-        checkpoint = torch.load(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(src_rank)+".ckpt",map_location=map_location)
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        # All ranks participate in loading their model shard. FSDP converts
+        # the portable sharded optimizer state back to this rank's flattened
+        # optimizer representation before AdamW consumes it.
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer_state = FSDP.optim_state_dict_to_load(
+            model, optimizer, checkpoint['optimizer_state_dict']
+        )
+        optimizer.load_state_dict(optimizer_state)
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         loss_list = checkpoint['loss_list']
         epoch_start = checkpoint.get('next_epoch', checkpoint['epoch'] + 1)
-        del checkpoint
+        del checkpoint, optimizer_state
+
+        if world_rank == 0:
+            print(
+                f"Resumed sharded model and optimizer from {checkpoint_file}; "
+                f"starting epoch {epoch_start}",
+                flush=True,
+            )
 
     if use_grad_scaler:
         scaler = ShardedGradScaler(init_scale=8192, growth_interval=100)
@@ -600,7 +656,7 @@ def main(device):
     fid_scores = []
     fid_epochs = []
     fid_eval_period = 10
-    
+
     best_loss = float("inf")
     best_epoch = -1
     epochs_without_improvement = 0
@@ -610,8 +666,8 @@ def main(device):
     save_period = 1 # this allows for us ensuring the data is plotted and saved correctly, and then we cahnge it to 50 or some other number for less frequent saving!
     save_period_main = 50
     decay_factor = 0.9
-    patience_inc_rate = 1.25 
-        
+    patience_inc_rate = 1.25
+
     best_model_state = None
     best_optimizer_state = None
     best_scheduler_state = None
@@ -639,12 +695,9 @@ def main(device):
         with torch.autograd.set_detect_anomaly(False):
             while counter < iterations_per_epoch:
                 counter = counter + 1
-                rank_phase("batch_start", epoch, counter)
                 if tensor_par_size > 1:
                     if dist.get_rank(tensor_par_group) == 0:
-                        rank_phase("before_data_fetch", epoch, counter)
                         data, variables, dict_key = next(it_loader)
-                        rank_phase("after_data_fetch", epoch, counter)
                         data = data.to(precision_dt)
                         data = data.to(device)
                         if dataset != "imagenet":
@@ -662,7 +715,7 @@ def main(device):
                     else:
                         if dataset != "imagenet":
                             dict_key_len = torch.tensor(0).to(device)
-                        else: 
+                        else:
                             dict_key = "imagenet"
 
                     if dataset != "imagenet":
@@ -689,9 +742,7 @@ def main(device):
                     dist.broadcast(e, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
 
                 else: #Avoid unnecesary broadcasts if not using tensor parallelism
-                    rank_phase("before_data_fetch", epoch, counter)
                     data, variables, _ = next(it_loader)
-                    rank_phase("after_data_fetch", epoch, counter)
                     data = data.to(precision_dt)
                     data = data.to(device)
                     t = torch.randint(0,num_time_steps,(batch_size,))
@@ -701,24 +752,19 @@ def main(device):
                     else:
                         a = ddpm_scheduler.alpha[t].view(batch_size,1,1,1,1).to(precision_dt).to(device)
                     data = (torch.sqrt(a)*data) + (torch.sqrt(1-a)*e)
-                rank_phase("after_data_prepare", epoch, counter, synchronize=True)
-                rank_phase("before_forward", epoch, counter)
                 loss = training_step(data, variables, t, e, model, patch_size, twoD, loss_fn)
-                rank_phase("after_forward", epoch, counter, synchronize=True)
 
                 require_finite_loss(loss, epoch, counter, device)
 
                 epoch_loss += loss.detach()
-    
+
                 if world_rank == 0 and (
                     counter == 1 or counter % log_every_n_steps == 0
                 ):
                     print("epoch: ",epoch,"batch_idx",counter,"world_rank",world_rank,"it_loss ",loss,flush=True)
-    
-                rank_phase("before_backward", epoch, counter)
+
                 if use_grad_scaler:
                     scaler.scale(loss).backward()
-                    rank_phase("after_backward", epoch, counter, synchronize=True)
                     scaler.unscale_(optimizer)
                     clip_and_require_finite_gradients(
                         model, max_grad_norm, epoch, counter
@@ -729,16 +775,13 @@ def main(device):
                         scaler._scale = torch.tensor(min_scale).to(scaler._scale)
                 else:
                     loss.backward()
-                    rank_phase("after_backward", epoch, counter, synchronize=True)
                     clip_and_require_finite_gradients(
                         model, max_grad_norm, epoch, counter
                     )
                     optimizer.step()
-                rank_phase("after_optimizer", epoch, counter, synchronize=True)
 
                 scheduler.step()
                 optimizer.zero_grad()
-                rank_phase("batch_complete", epoch, counter)
 
                 # Check periodically on every rank so all processes leave the
                 # training loop together with enough time to write a restart.
@@ -746,23 +789,16 @@ def main(device):
                     stop_tensor = torch.tensor(
                         int(time.time() >= deadline_epoch), device=device
                     )
-                    rank_phase("before_deadline_all_reduce", epoch, counter)
                     dist.all_reduce(stop_tensor, op=dist.ReduceOp.MAX)
-                    rank_phase(
-                        "after_deadline_all_reduce", epoch, counter,
-                        synchronize=True,
-                    )
                     if stop_tensor.item():
                         walltime_stop_requested = True
                         break
-        epoch_loss /= max(counter, 1)
-        # Every tensor-parallel rank represents the same data sample, while
-        # data-parallel ranks see different samples. Averaging over the full
-        # world weights every data replica equally (the TP duplication cancels)
-        # and gives every rank the same metric for logging and best-model logic.
+        # Use one globally averaged value for logging, LR decisions, and all
+        # state-dict collectives. Rank-local decisions can deadlock FSDP when
+        # only a subset of a shard group enters model.state_dict().
         dist.all_reduce(epoch_loss, op=dist.ReduceOp.SUM)
-        epoch_loss /= world_size
-        loss_list.append(epoch_loss)
+        epoch_loss /= world_size * max(counter, 1)
+        loss_list.append(epoch_loss.detach().cpu())
 
         # Also check at the epoch boundary in case it did not land on a
         # multiple of ten batches.
@@ -770,60 +806,38 @@ def main(device):
             stop_tensor = torch.tensor(
                 int(time.time() >= deadline_epoch), device=device
             )
-            rank_phase("before_epoch_deadline_all_reduce", epoch, counter)
             dist.all_reduce(stop_tensor, op=dist.ReduceOp.MAX)
-            rank_phase(
-                "after_epoch_deadline_all_reduce", epoch, counter,
-                synchronize=True,
-            )
             walltime_stop_requested = bool(stop_tensor.item())
 
         if walltime_stop_requested:
-            # state_dict() can involve collectives under FSDP, so every rank
-            # must participate even though only the representative ranks write.
-            rank_phase("before_restart_model_state", epoch, counter)
-            restart_model_state = model.state_dict()
-            rank_phase(
-                "after_restart_model_state", epoch, counter,
-                synchronize=True,
+            # Every rank collects and writes its own CPU-offloaded shard. A
+            # partial epoch is replayed after restart.
+            restart_states = collect_sharded_training_state(
+                model, optimizer, scheduler
             )
-            rank_phase("before_restart_optimizer_state", epoch, counter)
-            restart_optimizer_state = optimizer.state_dict()
-            rank_phase(
-                "after_restart_optimizer_state", epoch, counter,
-                synchronize=True,
+            checkpoint_file = save_sharded_checkpoint(
+                checkpoint_path,
+                f"{checkpoint_filename}_latest",
+                epoch,
+                epoch,
+                *restart_states,
+                # This epoch is replayed, so do not retain its partial loss as
+                # if it were a completed epoch in the history.
+                loss_list[:-1],
             )
-            restart_scheduler_state = scheduler.state_dict()
-
-            if world_rank < tensor_par_size:
-                checkpoint_file = os.path.join(
-                    checkpoint_path,
-                    f"{checkpoint_filename}_latest_rank_{world_rank}.ckpt",
-                )
-                temporary_file = f"{checkpoint_file}.tmp-{os.environ.get('SLURM_JOB_ID', 'local')}"
-                torch.save({
-                    'epoch': epoch,
-                    # A partial epoch is replayed after restart. This avoids
-                    # silently skipping data processed after the prior epoch.
-                    'next_epoch': epoch,
-                    'model_state_dict': restart_model_state,
-                    'optimizer_state_dict': restart_optimizer_state,
-                    'scheduler_state_dict': restart_scheduler_state,
-                    'loss_list': loss_list,
-                }, temporary_file)
-                os.replace(temporary_file, checkpoint_file)
+            if world_rank == 0:
                 print(
-                    f"Saved walltime restart checkpoint: {checkpoint_file}",
+                    f"Saved walltime restart checkpoint shards; rank 0: "
+                    f"{checkpoint_file}",
                     flush=True,
                 )
+            del restart_states
 
-            rank_phase("before_restart_barrier", epoch, counter)
             dist.barrier()
-            rank_phase("after_restart_barrier", epoch, counter)
             if world_rank == 0:
                 print("Walltime checkpoint complete; requesting continuation.", flush=True)
             return True
-        
+
         # if epoch % fid_eval_period == 0 and world_rank == 0:
         #     model.eval()
         #     for var in default_vars:
@@ -836,7 +850,7 @@ def main(device):
         #         log_and_plot_fid(fid, epoch, fid_scores, fid_epochs, inference_path)
         #     else:
         #         print(f"FID computation failed at epoch {epoch}")
-        
+
         if world_rank==0:
             print("epoch: ",epoch," epoch_loss ",epoch_loss, flush=True)
             if epoch % 100 == 0:
@@ -885,7 +899,7 @@ def main(device):
             )
 
         dist.barrier()
-            
+
         # Track best model independently
         if epoch_loss.item() < best_loss:
             best_loss = epoch_loss.item()
@@ -893,21 +907,25 @@ def main(device):
             epochs_without_improvement = 0
 
             if save_checkpoints:
-                best_model_state = copy.deepcopy(model.state_dict())
-                best_optimizer_state = copy.deepcopy(optimizer.state_dict())
-                best_scheduler_state = copy.deepcopy(scheduler.state_dict())
+                best_states = collect_sharded_training_state(
+                    model, optimizer, scheduler
+                )
+                best_model_state = copy.deepcopy(best_states[0])
+                best_optimizer_state = copy.deepcopy(best_states[1])
+                best_scheduler_state = copy.deepcopy(best_states[2])
+                del best_states
         else:
             epochs_without_improvement += 1
 
             # Reduce LR if no improvement for `patience` epochs
             if epochs_without_improvement >= patience:
-                
+
                 # model.load_state_dict(best_model_state)
                 # optimizer.load_state_dict(best_optimizer_state)
                 # scheduler.load_state_dict(best_scheduler_state)
                 # if world_rank == 0:
                 #     print(f"[Epoch {epoch}] Reloading best model from epoch {best_epoch} after LR decay.")
-                    
+
                 lr_decay_count += 1
                 for i, param_group in enumerate(optimizer.param_groups):
                     if world_rank == 0:
@@ -924,26 +942,27 @@ def main(device):
                 epochs_without_improvement = 0
 
         dist.barrier()
-        
-        # Save the best model periodically
-        if save_checkpoints and epoch > 0 and epoch % save_period == 0 and world_rank < tensor_par_size:
-            torch.save({
-                'epoch': best_epoch,
-                'model_state_dict': best_model_state,
-                'optimizer_state_dict': best_optimizer_state,
-                'scheduler_state_dict': best_scheduler_state,
-                'loss_list': loss_list,
-            }, f"{checkpoint_path}/{checkpoint_filename}_BEST_{epoch}_rank_{world_rank}.ckpt")
 
-            model.load_state_dict(best_model_state)
-
-            for var in default_vars:
-                model.eval()
-                sample_images(model, var, device, tile_size, precision_dt, patch_size,
-                            epoch=epoch, num_samples=5, twoD=twoD, save_path=inference_path,
-                            num_time_steps=num_time_steps)
-                model.train()
-            if save_period<save_period_main:
+        # Cached best states are already CPU-offloaded and sharded. Every
+        # rank writes its own shard; training continues from the current
+        # model/optimizer instead of inconsistently restoring only rank 0.
+        if save_checkpoints and epoch > 0 and epoch % save_period == 0:
+            save_sharded_checkpoint(
+                checkpoint_path,
+                f"{checkpoint_filename}_BEST_{epoch}",
+                best_epoch,
+                best_epoch + 1,
+                best_model_state,
+                best_optimizer_state,
+                best_scheduler_state,
+                loss_list,
+            )
+            if world_rank == 0:
+                print(
+                    f"Saved sharded best checkpoint from epoch {best_epoch}",
+                    flush=True,
+                )
+            if save_period < save_period_main:
                 save_period = save_period_main
 
 
@@ -953,26 +972,19 @@ def main(device):
     if world_rank == 0:
         print(f"Training completed. Best loss: {best_loss:.6f} at epoch {best_epoch}")
 
-    if save_checkpoints and best_model_state is not None and world_rank < tensor_par_size:
-        torch.save({
-            'epoch': best_epoch,
-            'model_state_dict': best_model_state,
-            'optimizer_state_dict': best_optimizer_state,
-            'scheduler_state_dict': best_scheduler_state,
-            'loss_list': loss_list,
-        }, checkpoint_path+"/"+checkpoint_filename+"_FINALBEST_"+str(best_epoch)+"_rank_"+str(world_rank)+".ckpt".format(best_epoch)) 
-
-        model.load_state_dict(best_model_state)
-
-        for var in default_vars:
-            model.eval()
-            sample_images(model, var, device, tile_size, precision_dt, patch_size,
-                                epoch=best_epoch, num_samples=10, twoD=twoD, save_path=inference_path,
-                                num_time_steps=num_time_steps)
-            model.train()
-            # save_intermediate_data(model, var, device, tile_size, precision_dt, patch_size,
-            #                     epoch=best_epoch, num_samples=2, twoD=twoD, save_path=inference_path,
-            #                     num_time_steps=num_time_steps)
+    if save_checkpoints and best_model_state is not None:
+        save_sharded_checkpoint(
+            checkpoint_path,
+            f"{checkpoint_filename}_FINALBEST_{best_epoch}",
+            best_epoch,
+            best_epoch + 1,
+            best_model_state,
+            best_optimizer_state,
+            best_scheduler_state,
+            loss_list,
+        )
+        if world_rank == 0:
+            print("Saved final sharded best checkpoint", flush=True)
 
     return False
 
@@ -1060,7 +1072,7 @@ if __name__ == "__main__":
 # #    initialize_process()
 
 #     print("Using dist.init_process_group. world_size ",world_size,flush=True)
-    
+
 #     main(device)
 
 #     dist.destroy_process_group()

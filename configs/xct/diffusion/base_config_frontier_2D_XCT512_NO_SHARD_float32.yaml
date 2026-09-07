@@ -10,21 +10,25 @@ parallelism:
 
 # ---------------------------- TRAINER -------------------------------------------
 trainer:
-  max_epochs: 20000
-  data_type: "float32" #"bfloat16" #
+  max_epochs: 5
+  data_type: "float32"
+  reduce_data_type: "float32"
   gpu_type: "amd"
+  log_every_n_steps: 25
+  enable_performance_plots: False
+  save_checkpoints: False
   auto_checkpoint_path: True
   checkpoint_root: "/lustre/orion/world-shared/gen006/AmirZ/Checkpoints_Frontier_FY26/NeutronCT_Concrete_512x512x512_Standardized/Pat2000_Dec0.9" #256x256x256_227Volumes_Standardized/Pat2000_Dec0.9
   checkpoint_path: null
-  checkpoint_filename: "XCT_Conc_Norm_base" # "XCT_Conc_base_Synth" # "Breaker_AM_base" # "XCT_half_concrete_base" #  
-  checkpoint_filename_for_loading: "XCT_Conc_Norm_base_0" # "XCT_Conc_base_Synth_0" #  "Breaker_AM_base_0" #  "XCT_half_concrete_base_0" #  xct_concrete_base_[EPOCH]
+  checkpoint_filename: "XCT512_NO_SHARD_float32"
+  checkpoint_filename_for_loading: "XCT512_NO_SHARD_float32_0"
   inference_path: null
   resume_from_checkpoint: False
 
 
 # ---------------------------- MODEL -------------------------------------------
 model:
-  lr: 0.005
+  lr: 0.001
   beta_1: 0.9
   beta_2: 0.95
   weight_decay: 1e-5
@@ -34,11 +38,13 @@ model:
   eta_min: 1e-8
   loss_fn: "MSE"
   use_grad_scaler: False #True
+  max_grad_norm: 1.0
+  fused_attn: "DEFAULT"
 
   net:
     init_args:
       default_vars: [
-        "xct", 
+        "xct",
       ]
       tile_size: [256, 256, 256] #[32,32,32] #
       patch_size: 8 #8 # 1
@@ -51,7 +57,7 @@ model:
       mlp_ratio: 6
       mlp_ratio_decoder: 4
       drop_path: 0.1
-      drop_rate: 0.0  # 0.05 # 
+      drop_rate: 0.0  # 0.05 #
       linear_decoder: True
       twoD: True
       use_varemb: False
@@ -70,7 +76,7 @@ data:
     'xct1': 0,
   }
   dict_end_idx: {
-    'xct1': 1,
+    'xct1': 0.25, #1
   }
   dict_buffer_sizes: {
     'xct1': 400,
@@ -80,10 +86,10 @@ data:
   }
   dict_in_variables: {
     'xct1': [
-     "xct", 
+     "xct",
     ],
   }
-  batch_size: 32
+  batch_size: 64
   num_workers: 1
   pin_memory: False
   single_channel: False

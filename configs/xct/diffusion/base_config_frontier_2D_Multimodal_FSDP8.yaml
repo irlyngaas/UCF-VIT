@@ -1,6 +1,12 @@
+# Frontier multimodal configuration for node-local 8-way FSDP sharding.
+# On 8 nodes (64 GPUs), simple_ddp_size:auto resolves to 8 and selects
+# HYBRID_SHARD: shard within each node and replicate across nodes.
+# Use only with train_diffusion_fsdp_wFixedFID_2D_FSDP.py; its checkpoint
+# format is intentionally different from the legacy NO_SHARD script.
+
 # ---------------------------- PARALLELISM -------------------------------------
 parallelism:
-  fsdp_size: 1
+  fsdp_size: 8
   # "auto" derives this dimension from the Slurm world size after accounting
   # for FSDP, tensor-parallel, and sequence-parallel dimensions.
   simple_ddp_size: "auto"
@@ -14,10 +20,10 @@ trainer:
   data_type: "float32" #"bfloat16" #
   gpu_type: "amd"
   auto_checkpoint_path: True
-  checkpoint_root: "/lustre/orion/world-shared/gen006/AmirZ/Checkpoints_Frontier_FY26/NeutronCT_Concrete_512x512x512_Standardized/Pat2000_Dec0.9" #256x256x256_227Volumes_Standardized/Pat2000_Dec0.9
+  checkpoint_root: "/lustre/orion/world-shared/gen006/AmirZ/Checkpoints_Frontier_FY26/NeutronCT_XRayCT_Standardized/Pat2000_Dec0.9"
   checkpoint_path: null
-  checkpoint_filename: "XCT_Conc_Norm_base" # "XCT_Conc_base_Synth" # "Breaker_AM_base" # "XCT_half_concrete_base" #  
-  checkpoint_filename_for_loading: "XCT_Conc_Norm_base_0" # "XCT_Conc_base_Synth_0" #  "Breaker_AM_base_0" #  "XCT_half_concrete_base_0" #  xct_concrete_base_[EPOCH]
+  checkpoint_filename: "XCT_NCT_Conc_Norm_FSDP8" # "XCT_Conc_base_Synth" # "Breaker_AM_base" # "XCT_half_concrete_base" #
+  checkpoint_filename_for_loading: "XCT_NCT_Conc_Norm_FSDP8_0" # "XCT_Conc_base_Synth_0" #  "Breaker_AM_base_0" #  "XCT_half_concrete_base_0" #  xct_concrete_base_[EPOCH]
   inference_path: null
   resume_from_checkpoint: False
 
@@ -38,7 +44,8 @@ model:
   net:
     init_args:
       default_vars: [
-        "xct", 
+        "xct",
+        "nct",
       ]
       tile_size: [256, 256, 256] #[32,32,32] #
       patch_size: 8 #8 # 1
@@ -51,7 +58,7 @@ model:
       mlp_ratio: 6
       mlp_ratio_decoder: 4
       drop_path: 0.1
-      drop_rate: 0.0  # 0.05 # 
+      drop_rate: 0.0  # 0.05 #
       linear_decoder: True
       twoD: True
       use_varemb: False
@@ -64,26 +71,34 @@ model:
 data:
   dataset: "xct"
   dict_root_dirs: {
-    'xct1': "/lustre/orion/world-shared/gen006/AmirZ/NeutronCT_Concrete_512x512x512_Standardized",
+    'xct1': "/lustre/orion/world-shared/gen006/AmirZ/XCT_Concrete_256x256_Standardized",
+    'nct1': "/lustre/orion/world-shared/gen006/AmirZ/NeutronCT_Concrete_256x256x256_Standardized",
     }
   dict_start_idx: {
     'xct1': 0,
+    'nct1': 0,
   }
   dict_end_idx: {
-    'xct1': 1,
+    'xct1': 0.1,
+    'nct1': 1,
   }
   dict_buffer_sizes: {
     'xct1': 400,
+    'nct1': 400,
   }
   num_channels_used: {
     'xct1': 1,
+    'nct1': 1,
   }
   dict_in_variables: {
     'xct1': [
-     "xct", 
+     "xct",
+    ],
+    'nct1': [
+     "nct",
     ],
   }
-  batch_size: 32
+  batch_size: 128
   num_workers: 1
   pin_memory: False
   single_channel: False
@@ -95,5 +110,6 @@ load_balancing:
   auto_load_balancing: True
   batches_per_rank_epoch: {
   'xct1': 600,
+  'nct1': 1200,
   }
-  dataset_group_list: '16' #'1:3:75:1:8:4' # '2:1' # '16' # 75:
+  dataset_group_list: '2:1' #'1:3:75:1:8:4' # '2:1' # '16' # 75:

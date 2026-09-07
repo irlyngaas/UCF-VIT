@@ -303,7 +303,15 @@ def process_root_dirs(dataset, dict_root_dirs, data_par_size):
                 if num_data_roots > num_total_ddp_ranks-1:
                     break
     elif dataset == "xct":
-        dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, ""))) for k, root_dir in dict_root_dirs.items() }
+        # Keep load-balancing counts consistent with the actual XCT dataloader
+        # and ignore JSON/other metadata stored beside the NumPy volumes.
+        dict_lister_trains = {
+            k: [
+                path for path in dp.iter.FileLister(os.path.join(root_dir, ""))
+                if str(path).lower().endswith(".npy")
+            ]
+            for k, root_dir in dict_root_dirs.items()
+        }
     else:
         dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in dict_root_dirs.items() }
     return dict_lister_trains
@@ -595,6 +603,5 @@ def calculate_load_balancing_on_the_fly(yaml_file, data_par_size, batch_size, VE
 
 def is_power_of_two(n):
     return (n != 0) and (n & (n-1) == 0)
-
 
 

@@ -122,11 +122,27 @@ class Mlp(nn.Module):
         self.tensor_par_size = tensor_par_size
         self.tensor_par_group = tensor_par_group
 
+        if hidden_features % self.tensor_par_size != 0:
+            raise ValueError(
+                f"hidden_features ({hidden_features}) must be divisible by "
+                f"tensor_par_size ({self.tensor_par_size})"
+            )
+
         self.fc1 = linear_layer(in_features, hidden_features // self.tensor_par_size, bias=bias[0])
         self.act = act_layer()
         self.drop1 = nn.Dropout(drop_probs[0])
         self.norm = norm_layer(hidden_features) if norm_layer is not None else nn.Identity()
         self.fc2 = linear_layer(hidden_features // self.tensor_par_size, out_features, bias=bias[1])
+        # PyTorch initializes from the local fan-in. A row-parallel shard has
+        # 1/TP of the full fan-in, so compensate before summing TP outputs.
+        if self.tensor_par_size > 1:
+            with torch.no_grad():
+                self.fc2.weight.div_(self.tensor_par_size ** 0.5)
+        # A zero output bias is identical on every TP replica and is added once
+        # after the reduction. Use the same initialization for TP1 as well so
+        # independently initialized TP1/TPN models have equivalent statistics.
+        if self.fc2.bias is not None:
+            nn.init.zeros_(self.fc2.bias)
         self.drop2 = nn.Dropout(drop_probs[1])
 
     def forward(self, x):
@@ -137,11 +153,32 @@ class Mlp(nn.Module):
         x = self.act(x)
         x = self.drop1(x)
         x = self.norm(x)
-        x = self.fc2(x)
-        x = self.drop2(x)
-
         if self.tensor_par_size > 1:
+            # Only the weight contribution is partial. Reduce it first, then
+            # add the replicated bias once and apply dropout to the complete
+            # output. Applying either before the reduction changes TP1 math.
+            if isinstance(self.fc2, nn.Linear):
+                x = F.linear(x, self.fc2.weight, bias=None)
+            else:
+                x = F.conv2d(
+                    x,
+                    self.fc2.weight,
+                    bias=None,
+                    stride=self.fc2.stride,
+                    padding=self.fc2.padding,
+                    dilation=self.fc2.dilation,
+                    groups=self.fc2.groups,
+                )
             x = F_AllReduce_B_Identity(x, op=dist.ReduceOp.SUM, group=self.tensor_par_group)
+            if self.fc2.bias is not None:
+                if isinstance(self.fc2, nn.Linear):
+                    x = x + self.fc2.bias
+                else:
+                    x = x + self.fc2.bias[None, :, None, None]
+        else:
+            x = self.fc2(x)
+
+        x = self.drop2(x)
 
         return x
 
@@ -168,11 +205,24 @@ class Attention(nn.Module):
         self.tensor_par_size = tensor_par_size
         self.tensor_par_group = tensor_par_group
 
+        if self.num_heads % self.tensor_par_size != 0:
+            raise ValueError(
+                f"num_heads ({self.num_heads}) must be divisible by "
+                f"tensor_par_size ({self.tensor_par_size})"
+            )
+
         self.qkv = nn.Linear(dim, dim * 3 // self.tensor_par_size, bias=qkv_bias)
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim // self.tensor_par_size, dim)
+        if self.tensor_par_size > 1:
+            with torch.no_grad():
+                self.proj.weight.div_(self.tensor_par_size ** 0.5)
+        # proj is row parallel, so its replicated bias is initialized equally
+        # and added once after the partial outputs have been summed.
+        if self.proj.bias is not None:
+            nn.init.zeros_(self.proj.bias)
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -212,12 +262,17 @@ class Attention(nn.Module):
             x = x.transpose(1,2)
 
         x = x.reshape(B, N, C // self.tensor_par_size)
-        x = self.proj(x)
-        x = self.proj_drop(x)
 
         if self.tensor_par_size > 1:
-            dist.all_reduce(x, op=dist.ReduceOp.SUM, group=self.tensor_par_group)
-        
+            x = F.linear(x, self.proj.weight, bias=None)
+            x = F_AllReduce_B_Identity(x, op=dist.ReduceOp.SUM, group=self.tensor_par_group)
+            if self.proj.bias is not None:
+                x = x + self.proj.bias
+        else:
+            x = self.proj(x)
+
+        x = self.proj_drop(x)
+
         return x
 
 class Block(nn.Module):
@@ -269,8 +324,11 @@ class Block(nn.Module):
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
         self.temporalEmbeddings = SinusoidalEmbeddings(time_steps=1000, embed_dim=dim)
-        self.timeEmbeddingMap = EmbeddingDenseLayer(dim, dim, 0.1) # dropout_prob
-        self.condEmbeddingMap = EmbeddingDenseLayer(dim, dim, 0.1) # dropout_prob
+        # Use the configured projection dropout instead of an independent,
+        # hard-coded probability. In particular, proj_drop=0 makes TP
+        # equivalence tests deterministic across model-parallel ranks.
+        self.timeEmbeddingMap = EmbeddingDenseLayer(dim, dim, proj_drop)
+        self.condEmbeddingMap = EmbeddingDenseLayer(dim, dim, proj_drop)
 
 
     def forward(self, x: torch.Tensor, t, c) -> torch.Tensor:
