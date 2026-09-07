@@ -13,7 +13,13 @@
 #   # Use 2 nodes and a different config.
 #   ./submit_diffusion_fsdp_Frontier_loop.sh 2 /path/to/config.yaml
 #
-#   ./submit_diffusion_fsdp_Frontier_loop.sh [nodes] [config_file] [training_script]
+#   # Resume from a named checkpoint while rebasing its restored LR.
+#   ./submit_diffusion_fsdp_Frontier_loop.sh 32 config.yaml train.py \
+#       XCT_NCT_Conc_Norm_base_BEST_8 0.001 1
+#
+#   ./submit_diffusion_fsdp_Frontier_loop.sh \
+#       [nodes] [config_file] [training_script] \
+#       [resume_checkpoint_name] [resume_lr] [recovery_attempt]
 
 # Stop immediately if this submission script has an error.
 set -euo pipefail
@@ -23,6 +29,9 @@ set -euo pipefail
 NODES="${1:-2}"
 CONFIG_FILE="${2:-}"
 TRAINING_SCRIPT="${3:-}"
+RESUME_CHECKPOINT_NAME="${4:-}"
+RESUME_LR="${5:-}"
+RECOVERY_ATTEMPT="${6:-0}"
 
 # --- Locate the batch launcher and default config ----------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,6 +53,11 @@ fi
 
 if [[ ! -f "$TRAINING_SCRIPT" ]]; then
     echo "Training script not found: $TRAINING_SCRIPT" >&2
+    exit 2
+fi
+
+if [[ ! "$RECOVERY_ATTEMPT" =~ ^[0-9]+$ ]]; then
+    echo "Recovery attempt must be a non-negative integer: $RECOVERY_ATTEMPT" >&2
     exit 2
 fi
 
@@ -96,17 +110,38 @@ LOG_DIR="${CHECKPOINT_ROOT}/${RUN_NAME}/logs"
 mkdir -p "$LOG_DIR"
 export LOG_DIR
 
+RESUME_FROM_CHECKPOINT=False
+if [[ -n "$RESUME_CHECKPOINT_NAME" ]]; then
+    RESUME_FROM_CHECKPOINT=True
+    if [[ -z "$RESUME_LR" ]]; then
+        echo "A resume LR is required with a resume checkpoint name" >&2
+        exit 2
+    fi
+    for ((rank = 0; rank < TENSOR_PAR_SIZE; rank++)); do
+        CHECKPOINT_FILE="${CHECKPOINT_ROOT}/${RUN_NAME}/${RESUME_CHECKPOINT_NAME}_rank_${rank}.ckpt"
+        if [[ ! -f "$CHECKPOINT_FILE" ]]; then
+            echo "Resume checkpoint not found: $CHECKPOINT_FILE" >&2
+            exit 2
+        fi
+    done
+fi
+
 # --- Submit the first job -----------------------------------------------------
-# The first job starts from scratch. The batch launcher changes the effective
-# resume setting to True when it submits every later continuation.
-echo "Submitting initial ${NODES}-node job with automatic continuation enabled."
+# By default the first job starts from scratch. Optional checkpoint arguments
+# support an explicit recovery launch; later retries are automatic.
+echo "Submitting ${NODES}-node job with automatic continuation enabled."
 echo "Config: ${CONFIG_FILE}"
 echo "Training script: ${TRAINING_SCRIPT}"
 echo "Logs: ${LOG_DIR}"
+if [[ "$RESUME_FROM_CHECKPOINT" == True ]]; then
+    echo "Resume checkpoint: ${RESUME_CHECKPOINT_NAME}"
+    echo "Rebased learning rate: ${RESUME_LR}"
+    echo "Recovery attempt: ${RECOVERY_ATTEMPT}"
+fi
 sbatch \
     --nodes="$NODES" \
     --job-name="$JOB_NAME" \
     --output="${LOG_DIR}/%x-%j.out" \
     --error="${LOG_DIR}/%x-%j.out" \
-    --export=ALL,AUTO_RESUBMIT=1,RESUME_FROM_CHECKPOINT=False \
+    --export=ALL,AUTO_RESUBMIT=1,RESUME_FROM_CHECKPOINT="$RESUME_FROM_CHECKPOINT",RESUME_CHECKPOINT_NAME="$RESUME_CHECKPOINT_NAME",RESUME_LR="$RESUME_LR",RECOVERY_ATTEMPT="$RECOVERY_ATTEMPT" \
     "$LAUNCHER" "$CONFIG_FILE"

@@ -50,7 +50,7 @@ def training_step(data, variables, t, e, net: DiffusionVIT, patch_size, twoD, lo
 
 
 def require_finite_loss(loss, epoch, batch, device):
-    """Stop every rank together as soon as any rank produces NaN/Inf."""
+    """Return False on every rank if any rank produces a NaN/Inf loss."""
     all_finite = torch.isfinite(loss.detach()).to(device=device, dtype=torch.int32)
     dist.all_reduce(all_finite, op=dist.ReduceOp.MIN)
     if not all_finite.item():
@@ -59,13 +59,12 @@ def require_finite_loss(loss, epoch, batch, device):
                 f"Non-finite loss detected at epoch={epoch}, batch={batch}",
                 flush=True,
             )
-        raise FloatingPointError(
-            f"Non-finite loss detected at epoch={epoch}, batch={batch}"
-        )
+        return False
+    return True
 
 
 def clip_and_require_finite_gradients(model, max_grad_norm, epoch, batch):
-    """Clip through FSDP and fail collectively on a non-finite total norm."""
+    """Clip through FSDP and report gradient finiteness collectively."""
     clip_limit = max_grad_norm if max_grad_norm is not None else float("inf")
     grad_norm = model.clip_grad_norm_(clip_limit)
     all_finite = torch.isfinite(grad_norm.detach()).to(dtype=torch.int32)
@@ -77,10 +76,56 @@ def clip_and_require_finite_gradients(model, max_grad_norm, epoch, batch):
                 f"{grad_norm.item()}",
                 flush=True,
             )
-        raise FloatingPointError(
-            f"Non-finite gradient norm at epoch={epoch}, batch={batch}"
-        )
-    return grad_norm
+        return False, grad_norm
+    return True, grad_norm
+
+
+def rebase_optimizer_and_scheduler_lr(optimizer, scheduler, resume_lr):
+    """Rebase a restored optimizer and its scheduler to a lower peak LR."""
+    resume_lr = float(resume_lr)
+    if resume_lr <= 0:
+        raise ValueError(f"RESUME_LR must be positive, got {resume_lr}")
+
+    scheduler.base_lrs = [resume_lr] * len(optimizer.param_groups)
+    if hasattr(scheduler, '_get_closed_form_lr'):
+        current_lrs = scheduler._get_closed_form_lr()
+    else:
+        current_lrs = [resume_lr] * len(optimizer.param_groups)
+
+    for param_group, current_lr in zip(optimizer.param_groups, current_lrs):
+        param_group['lr'] = current_lr
+        param_group['initial_lr'] = resume_lr
+    scheduler._last_lr = current_lrs
+    return current_lrs
+
+
+def latest_complete_best_checkpoint(checkpoint_path, checkpoint_filename,
+                                    tensor_par_size):
+    """Find the newest numbered BEST checkpoint present for every TP rank."""
+    pattern = os.path.join(
+        checkpoint_path,
+        f"{checkpoint_filename}_BEST_*_rank_0.ckpt",
+    )
+    candidates = []
+    prefix = f"{checkpoint_filename}_BEST_"
+    suffix = "_rank_0.ckpt"
+    for path in glob.glob(pattern):
+        basename = os.path.basename(path)
+        epoch_text = basename[len(prefix):-len(suffix)]
+        if epoch_text.isdigit():
+            candidates.append((int(epoch_text), epoch_text))
+
+    for _, epoch_text in sorted(candidates, reverse=True):
+        checkpoint_name = f"{checkpoint_filename}_BEST_{epoch_text}"
+        if all(
+            os.path.exists(os.path.join(
+                checkpoint_path,
+                f"{checkpoint_name}_rank_{rank}.ckpt",
+            ))
+            for rank in range(tensor_par_size)
+        ):
+            return checkpoint_name
+    return None
 
 
 def main(device):
@@ -156,7 +201,26 @@ def main(device):
     if resume_override is not None:
         resume_from_checkpoint = resume_override.lower() in ('1', 'true', 'yes')
         if resume_from_checkpoint:
-            checkpoint_filename_for_loading = f"{checkpoint_filename}_latest"
+            checkpoint_filename_for_loading = (
+                os.environ.get('RESUME_CHECKPOINT_NAME')
+                or f"{checkpoint_filename}_latest"
+            )
+
+    recovery_conf = conf.get('numerical_recovery', {})
+    numerical_recovery_enabled = recovery_conf.get('enabled', False)
+    recovery_lr_decay_factor = float(
+        recovery_conf.get('lr_decay_factor', 0.5)
+    )
+    recovery_min_lr = float(recovery_conf.get('min_lr', 1e-8))
+    recovery_max_retries = int(recovery_conf.get('max_retries', 3))
+    recovery_attempt = int(os.environ.get('RECOVERY_ATTEMPT', '0'))
+
+    if not 0.0 < recovery_lr_decay_factor < 1.0:
+        raise ValueError("numerical_recovery.lr_decay_factor must be in (0, 1)")
+    if recovery_min_lr <= 0.0:
+        raise ValueError("numerical_recovery.min_lr must be positive")
+    if recovery_max_retries < 0:
+        raise ValueError("numerical_recovery.max_retries cannot be negative")
 
     fsdp_size = conf['parallelism']['fsdp_size']
 
@@ -541,6 +605,20 @@ def main(device):
         epoch_start = checkpoint.get('next_epoch', checkpoint['epoch'] + 1)
         del checkpoint
 
+        resume_lr_override = os.environ.get('RESUME_LR')
+        if resume_lr_override:
+            previous_lrs = [group['lr'] for group in optimizer.param_groups]
+            rebased_lrs = rebase_optimizer_and_scheduler_lr(
+                optimizer, scheduler, float(resume_lr_override)
+            )
+            if world_rank == 0:
+                print(
+                    "Rebased restored optimizer/scheduler learning rates "
+                    f"from {previous_lrs} to base={resume_lr_override}, "
+                    f"current={rebased_lrs}",
+                    flush=True,
+                )
+
     if use_grad_scaler:
         scaler = ShardedGradScaler(init_scale=8192, growth_interval=100)
         min_scale= 128
@@ -616,6 +694,93 @@ def main(device):
     best_optimizer_state = None
     best_scheduler_state = None
     deadline_epoch = int(os.environ.get('TRAINING_DEADLINE_EPOCH', '0'))
+
+    def prepare_numerical_recovery(failure_kind, epoch, batch):
+        """Save/select a safe best checkpoint and request a lower-LR retry."""
+        if not numerical_recovery_enabled:
+            raise FloatingPointError(
+                f"Non-finite {failure_kind} at epoch={epoch}, batch={batch}"
+            )
+        if recovery_attempt >= recovery_max_retries:
+            raise FloatingPointError(
+                f"Non-finite {failure_kind} at epoch={epoch}, batch={batch}; "
+                f"recovery retry limit {recovery_max_retries} reached"
+            )
+
+        checkpoint_name = None
+        local_best_available = torch.tensor(
+            int(best_model_state is not None),
+            dtype=torch.int32,
+            device=device,
+        )
+        dist.all_reduce(local_best_available, op=dist.ReduceOp.MIN)
+
+        if local_best_available.item():
+            checkpoint_name = f"{checkpoint_filename}_RECOVERY"
+            if world_rank < tensor_par_size:
+                checkpoint_file = os.path.join(
+                    checkpoint_path,
+                    f"{checkpoint_name}_rank_{world_rank}.ckpt",
+                )
+                temporary_file = (
+                    f"{checkpoint_file}.tmp-"
+                    f"{os.environ.get('SLURM_JOB_ID', 'local')}"
+                )
+                torch.save({
+                    'epoch': best_epoch,
+                    'model_state_dict': best_model_state,
+                    'optimizer_state_dict': best_optimizer_state,
+                    'scheduler_state_dict': best_scheduler_state,
+                    'loss_list': loss_list,
+                }, temporary_file)
+                os.replace(temporary_file, checkpoint_file)
+            dist.barrier()
+        else:
+            checkpoint_holder = [None]
+            if world_rank == 0:
+                checkpoint_holder[0] = latest_complete_best_checkpoint(
+                    checkpoint_path,
+                    checkpoint_filename,
+                    tensor_par_size,
+                )
+            dist.broadcast_object_list(checkpoint_holder, src=0)
+            checkpoint_name = checkpoint_holder[0]
+
+        if not checkpoint_name:
+            raise FloatingPointError(
+                f"Non-finite {failure_kind} at epoch={epoch}, batch={batch}; "
+                "no complete best checkpoint is available for recovery"
+            )
+
+        current_lr = max(group['lr'] for group in optimizer.param_groups)
+        recovery_lr = max(
+            current_lr * recovery_lr_decay_factor,
+            recovery_min_lr,
+        )
+        if recovery_lr >= current_lr:
+            raise FloatingPointError(
+                f"Cannot reduce learning rate below {current_lr}; "
+                f"configured minimum is {recovery_min_lr}"
+            )
+
+        request = {
+            'kind': 'numerical_recovery',
+            'failure_kind': failure_kind,
+            'epoch': epoch,
+            'batch': batch,
+            'checkpoint_name': checkpoint_name,
+            'resume_lr': recovery_lr,
+            'recovery_attempt': recovery_attempt + 1,
+        }
+        if world_rank == 0:
+            print(
+                "Requesting numerical recovery: "
+                f"checkpoint={checkpoint_name}, lr={current_lr:.8g}->"
+                f"{recovery_lr:.8g}, attempt={recovery_attempt + 1}/"
+                f"{recovery_max_retries}",
+                flush=True,
+            )
+        return request
 
     for epoch in range(epoch_start,max_epochs):
         #Reset dataloader module every epoch to ensure all files get used
@@ -706,7 +871,11 @@ def main(device):
                 loss = training_step(data, variables, t, e, model, patch_size, twoD, loss_fn)
                 rank_phase("after_forward", epoch, counter, synchronize=True)
 
-                require_finite_loss(loss, epoch, counter, device)
+                if not require_finite_loss(loss, epoch, counter, device):
+                    optimizer.zero_grad(set_to_none=True)
+                    return prepare_numerical_recovery(
+                        'loss', epoch, counter
+                    )
 
                 epoch_loss += loss.detach()
     
@@ -720,9 +889,14 @@ def main(device):
                     scaler.scale(loss).backward()
                     rank_phase("after_backward", epoch, counter, synchronize=True)
                     scaler.unscale_(optimizer)
-                    clip_and_require_finite_gradients(
+                    gradients_finite, _ = clip_and_require_finite_gradients(
                         model, max_grad_norm, epoch, counter
                     )
+                    if not gradients_finite:
+                        optimizer.zero_grad(set_to_none=True)
+                        return prepare_numerical_recovery(
+                            'gradient norm', epoch, counter
+                        )
                     scaler.step(optimizer)
                     scaler.update()
                     if scaler._scale < min_scale:
@@ -730,9 +904,14 @@ def main(device):
                 else:
                     loss.backward()
                     rank_phase("after_backward", epoch, counter, synchronize=True)
-                    clip_and_require_finite_gradients(
+                    gradients_finite, _ = clip_and_require_finite_gradients(
                         model, max_grad_norm, epoch, counter
                     )
+                    if not gradients_finite:
+                        optimizer.zero_grad(set_to_none=True)
+                        return prepare_numerical_recovery(
+                            'gradient norm', epoch, counter
+                        )
                     optimizer.step()
                 rank_phase("after_optimizer", epoch, counter, synchronize=True)
 
@@ -1021,9 +1200,9 @@ if __name__ == "__main__":
     print("Using dist.init_process_group. world_size", world_size, flush=True)
 
     # Your main training function
-    continuation_requested = main(device)
+    run_result = main(device)
 
-    if continuation_requested:
+    if run_result is True:
         continuation_marker = os.environ.get('CONTINUATION_MARKER')
         if not continuation_marker:
             raise RuntimeError(
@@ -1033,6 +1212,22 @@ if __name__ == "__main__":
             with open(continuation_marker, 'w') as marker_file:
                 marker_file.write('resume\n')
             print(f"Created continuation marker: {continuation_marker}", flush=True)
+        dist.barrier()
+
+    elif isinstance(run_result, dict) and run_result.get('kind') == 'numerical_recovery':
+        recovery_marker = os.environ.get('RECOVERY_MARKER')
+        if not recovery_marker:
+            raise RuntimeError(
+                "RECOVERY_MARKER must be set for numerical recovery"
+            )
+        if world_rank == 0:
+            with open(recovery_marker, 'w') as marker_file:
+                marker_file.write(
+                    f"{run_result['checkpoint_name']}\n"
+                    f"{run_result['resume_lr']:.17g}\n"
+                    f"{run_result['recovery_attempt']}\n"
+                )
+            print(f"Created numerical recovery marker: {recovery_marker}", flush=True)
         dist.barrier()
 
     dist.destroy_process_group()

@@ -66,6 +66,10 @@ mkdir -p "$MIOPEN_USER_DB_PATH"
 # Python creates this small file after saving its walltime checkpoint. The
 # shell checks for it after srun exits to decide whether another job is needed.
 export CONTINUATION_MARKER="${REPO_ROOT}/.diffusion_fsdp-continuation-${JOB_ID}"
+# A separate marker requests rollback to a best checkpoint after a collective
+# NaN/Inf detection. Its three lines are checkpoint name, reduced LR, and
+# recovery-attempt number.
+export RECOVERY_MARKER="${REPO_ROOT}/.diffusion_fsdp-recovery-${JOB_ID}"
 
 # --- Configure distributed training -----------------------------------------
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
@@ -124,6 +128,39 @@ TRAINING_STATUS=$?
 set -e
 
 # --- Decide whether to submit another one-hour job ---------------------------
+# Numerical recovery is handled before ordinary walltime continuation. Python
+# exits cleanly only after it has selected or atomically saved a safe best
+# checkpoint and written all retry parameters to the recovery marker.
+if (( TRAINING_STATUS == 0 )) && [[ -f "$RECOVERY_MARKER" ]]; then
+    mapfile -t RECOVERY_VALUES < "$RECOVERY_MARKER"
+    rm -f "$RECOVERY_MARKER"
+    RECOVERY_CHECKPOINT="${RECOVERY_VALUES[0]:-}"
+    RECOVERY_LR="${RECOVERY_VALUES[1]:-}"
+    NEXT_RECOVERY_ATTEMPT="${RECOVERY_VALUES[2]:-}"
+    if [[ -z "$RECOVERY_CHECKPOINT" || -z "$RECOVERY_LR" ||
+          ! "$NEXT_RECOVERY_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Invalid numerical recovery marker contents" >&2
+        exit 1
+    fi
+    if [[ "${AUTO_RESUBMIT:-0}" == "1" ]]; then
+        BATCH_SCRIPT="${REPO_ROOT}/launch/xct/diffusion_fsdp_Frontier.sh"
+        echo "Submitting numerical rollback attempt ${NEXT_RECOVERY_ATTEMPT}"
+        echo "Checkpoint: ${RECOVERY_CHECKPOINT}"
+        echo "Rebased learning rate: ${RECOVERY_LR}"
+        sbatch \
+            --nodes="$NODE_COUNT" \
+            --job-name="${JOB_NAME:-diffusion_fsdp}" \
+            --output="${LOG_DIR}/%x-%j.out" \
+            --error="${LOG_DIR}/%x-%j.out" \
+            --export=ALL,AUTO_RESUBMIT=1,RESUME_FROM_CHECKPOINT=True,RESUME_CHECKPOINT_NAME="$RECOVERY_CHECKPOINT",RESUME_LR="$RECOVERY_LR",RECOVERY_ATTEMPT="$NEXT_RECOVERY_ATTEMPT" \
+            "$BATCH_SCRIPT" "$CONFIG_FILE"
+        exit 0
+    fi
+
+    echo "A numerical rollback was prepared; AUTO_RESUBMIT is disabled."
+    exit 0
+fi
+
 # A continuation is submitted only when:
 #   1. training exited cleanly, and
 #   2. Python saved a checkpoint and created the marker file.
@@ -138,7 +175,7 @@ if (( TRAINING_STATUS == 0 )) && [[ -f "$CONTINUATION_MARKER" ]]; then
             --job-name="${JOB_NAME:-diffusion_fsdp}" \
             --output="${LOG_DIR}/%x-%j.out" \
             --error="${LOG_DIR}/%x-%j.out" \
-            --export=ALL,AUTO_RESUBMIT=1,RESUME_FROM_CHECKPOINT=True \
+            --export=ALL,AUTO_RESUBMIT=1,RESUME_FROM_CHECKPOINT=True,RESUME_CHECKPOINT_NAME= \
             "$BATCH_SCRIPT" "$CONFIG_FILE"
         exit 0
     fi

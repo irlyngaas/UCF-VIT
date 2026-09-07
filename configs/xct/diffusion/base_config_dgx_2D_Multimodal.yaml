@@ -96,3 +96,12 @@ load_balancing:
     xct1: 224
     nct1: 224
   dataset_group_list: "128:128"
+
+# If any rank encounters a non-finite loss or gradient, all ranks stop the
+# current attempt together. The launcher rolls back to the best completed
+# checkpoint, rebases both optimizer and scheduler, and resubmits automatically.
+numerical_recovery:
+  enabled: True
+  lr_decay_factor: 0.2
+  min_lr: 1e-5
+  max_retries: 3
