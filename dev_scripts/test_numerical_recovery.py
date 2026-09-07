@@ -8,6 +8,7 @@ import torch
 from train_diffusion_fsdp_wFixedFID_2D_singMod import (
     latest_complete_best_checkpoint,
     rebase_optimizer_and_scheduler_lr,
+    update_loss_degradation_streak,
 )
 from UCF_VIT.utils.misc import configure_scheduler
 
@@ -59,6 +60,38 @@ class NumericalRecoveryTest(unittest.TestCase):
             )
 
         self.assertEqual(selected, 'model_BEST_8')
+
+    def test_finite_loss_degradation_requires_consecutive_epochs(self):
+        streak, should_recover = update_loss_degradation_streak(
+            current_loss=0.13,
+            best_loss=0.06,
+            factor=2.0,
+            streak=0,
+            patience=2,
+        )
+        self.assertEqual(streak, 1)
+        self.assertFalse(should_recover)
+
+        streak, should_recover = update_loss_degradation_streak(
+            current_loss=0.47,
+            best_loss=0.06,
+            factor=2.0,
+            streak=streak,
+            patience=2,
+        )
+        self.assertEqual(streak, 2)
+        self.assertTrue(should_recover)
+
+    def test_healthy_loss_resets_degradation_streak(self):
+        streak, should_recover = update_loss_degradation_streak(
+            current_loss=0.07,
+            best_loss=0.06,
+            factor=2.0,
+            streak=1,
+            patience=2,
+        )
+        self.assertEqual(streak, 0)
+        self.assertFalse(should_recover)
 
 
 if __name__ == '__main__':

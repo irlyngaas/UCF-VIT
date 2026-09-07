@@ -105,3 +105,7 @@ numerical_recovery:
   lr_decay_factor: 0.2
   min_lr: 1e-5
   max_retries: 3
+  # Roll back when two consecutive completed epochs exceed twice the best
+  # persisted loss, even if all values remain finite.
+  loss_degradation_factor: 2.0
+  loss_degradation_patience: 2

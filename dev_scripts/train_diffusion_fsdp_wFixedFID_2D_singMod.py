@@ -128,6 +128,17 @@ def latest_complete_best_checkpoint(checkpoint_path, checkpoint_filename,
     return None
 
 
+def update_loss_degradation_streak(current_loss, best_loss, factor, streak,
+                                   patience):
+    """Track consecutive finite epochs whose loss is far above the best."""
+    current_loss = float(current_loss)
+    best_loss = float(best_loss)
+    if not np.isfinite(best_loss) or current_loss <= best_loss * factor:
+        return 0, False
+    streak += 1
+    return streak, streak >= patience
+
+
 def main(device):
 #1. Load arguments from config file and setup parallelization
 ##############################################################################################################
@@ -213,6 +224,12 @@ def main(device):
     )
     recovery_min_lr = float(recovery_conf.get('min_lr', 1e-8))
     recovery_max_retries = int(recovery_conf.get('max_retries', 3))
+    recovery_loss_degradation_factor = float(
+        recovery_conf.get('loss_degradation_factor', 2.0)
+    )
+    recovery_loss_degradation_patience = int(
+        recovery_conf.get('loss_degradation_patience', 2)
+    )
     recovery_attempt = int(os.environ.get('RECOVERY_ATTEMPT', '0'))
 
     if not 0.0 < recovery_lr_decay_factor < 1.0:
@@ -221,6 +238,14 @@ def main(device):
         raise ValueError("numerical_recovery.min_lr must be positive")
     if recovery_max_retries < 0:
         raise ValueError("numerical_recovery.max_retries cannot be negative")
+    if recovery_loss_degradation_factor <= 1.0:
+        raise ValueError(
+            "numerical_recovery.loss_degradation_factor must be > 1"
+        )
+    if recovery_loss_degradation_patience < 1:
+        raise ValueError(
+            "numerical_recovery.loss_degradation_patience must be positive"
+        )
 
     fsdp_size = conf['parallelism']['fsdp_size']
 
@@ -589,6 +614,10 @@ def main(device):
     optimizer = configure_optimizer(model,lr,beta_1,beta_2,weight_decay)
     scheduler = configure_scheduler(optimizer,warmup_steps,max_steps,warmup_start_lr,eta_min)
 
+    resume_best_loss = None
+    resume_best_epoch = -1
+    resume_loaded_best_state = False
+
     if resume_from_checkpoint:
 
         print("optimizer resume from checkpoint was set to True",flush=True)
@@ -603,6 +632,23 @@ def main(device):
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         loss_list = checkpoint['loss_list']
         epoch_start = checkpoint.get('next_epoch', checkpoint['epoch'] + 1)
+        resume_best_epoch = checkpoint.get('best_epoch', checkpoint['epoch'])
+        resume_best_loss = checkpoint.get('best_loss')
+        resume_loaded_best_state = checkpoint.get(
+            'is_best_state',
+            '_BEST_' in checkpoint_filename_for_loading
+            or checkpoint_filename_for_loading.endswith('_RECOVERY'),
+        )
+        if resume_best_loss is None:
+            finite_losses = [
+                float(value.item() if torch.is_tensor(value) else value)
+                for value in loss_list
+                if np.isfinite(float(
+                    value.item() if torch.is_tensor(value) else value
+                ))
+            ]
+            if finite_losses:
+                resume_best_loss = min(finite_losses)
         del checkpoint
 
         resume_lr_override = os.environ.get('RESUME_LR')
@@ -679,8 +725,12 @@ def main(device):
     fid_epochs = []
     fid_eval_period = 10
     
-    best_loss = float("inf")
-    best_epoch = -1
+    best_loss = (
+        float(resume_best_loss)
+        if resume_best_loss is not None and resume_loaded_best_state
+        else float("inf")
+    )
+    best_epoch = resume_best_epoch if resume_loaded_best_state else -1
     epochs_without_improvement = 0
     max_patience = 50000
     patience = 2000
@@ -690,9 +740,25 @@ def main(device):
     decay_factor = 0.9
     patience_inc_rate = 1.25 
         
-    best_model_state = None
-    best_optimizer_state = None
-    best_scheduler_state = None
+    best_model_state = (
+        copy.deepcopy(model.state_dict())
+        if resume_loaded_best_state and save_checkpoints else None
+    )
+    best_optimizer_state = (
+        copy.deepcopy(optimizer.state_dict())
+        if resume_loaded_best_state and save_checkpoints else None
+    )
+    best_scheduler_state = (
+        copy.deepcopy(scheduler.state_dict())
+        if resume_loaded_best_state and save_checkpoints else None
+    )
+    degradation_streak = 0
+    if world_rank == 0 and resume_loaded_best_state:
+        print(
+            f"Restored persistent best state: epoch={best_epoch}, "
+            f"loss={best_loss:.6g}",
+            flush=True,
+        )
     deadline_epoch = int(os.environ.get('TRAINING_DEADLINE_EPOCH', '0'))
 
     def prepare_numerical_recovery(failure_kind, epoch, batch):
@@ -728,10 +794,14 @@ def main(device):
                 )
                 torch.save({
                     'epoch': best_epoch,
+                    'next_epoch': best_epoch + 1,
                     'model_state_dict': best_model_state,
                     'optimizer_state_dict': best_optimizer_state,
                     'scheduler_state_dict': best_scheduler_state,
                     'loss_list': loss_list,
+                    'best_epoch': best_epoch,
+                    'best_loss': best_loss,
+                    'is_best_state': True,
                 }, temporary_file)
                 os.replace(temporary_file, checkpoint_file)
             dist.barrier()
@@ -958,21 +1028,38 @@ def main(device):
             walltime_stop_requested = bool(stop_tensor.item())
 
         if walltime_stop_requested:
-            # state_dict() can involve collectives under FSDP, so every rank
-            # must participate even though only the representative ranks write.
-            rank_phase("before_restart_model_state", epoch, counter)
-            restart_model_state = model.state_dict()
-            rank_phase(
-                "after_restart_model_state", epoch, counter,
-                synchronize=True,
-            )
-            rank_phase("before_restart_optimizer_state", epoch, counter)
-            restart_optimizer_state = optimizer.state_dict()
-            rank_phase(
-                "after_restart_optimizer_state", epoch, counter,
-                synchronize=True,
-            )
-            restart_scheduler_state = scheduler.state_dict()
+            # Continue from the best completed state, not a potentially
+            # degrading partial epoch. This also carries the best state across
+            # one-hour Slurm allocations without doubling checkpoint size.
+            if best_model_state is not None:
+                restart_epoch = best_epoch
+                restart_next_epoch = best_epoch + 1
+                restart_model_state = best_model_state
+                restart_optimizer_state = best_optimizer_state
+                restart_scheduler_state = best_scheduler_state
+                restart_best_loss = best_loss
+                restart_is_best_state = True
+            else:
+                # A first allocation can theoretically reach its deadline
+                # before completing an epoch. Preserve the old replay behavior
+                # in that exceptional case.
+                rank_phase("before_restart_model_state", epoch, counter)
+                restart_model_state = model.state_dict()
+                rank_phase(
+                    "after_restart_model_state", epoch, counter,
+                    synchronize=True,
+                )
+                rank_phase("before_restart_optimizer_state", epoch, counter)
+                restart_optimizer_state = optimizer.state_dict()
+                rank_phase(
+                    "after_restart_optimizer_state", epoch, counter,
+                    synchronize=True,
+                )
+                restart_scheduler_state = scheduler.state_dict()
+                restart_epoch = epoch
+                restart_next_epoch = epoch
+                restart_best_loss = None
+                restart_is_best_state = False
 
             if world_rank < tensor_par_size:
                 checkpoint_file = os.path.join(
@@ -981,14 +1068,15 @@ def main(device):
                 )
                 temporary_file = f"{checkpoint_file}.tmp-{os.environ.get('SLURM_JOB_ID', 'local')}"
                 torch.save({
-                    'epoch': epoch,
-                    # A partial epoch is replayed after restart. This avoids
-                    # silently skipping data processed after the prior epoch.
-                    'next_epoch': epoch,
+                    'epoch': restart_epoch,
+                    'next_epoch': restart_next_epoch,
                     'model_state_dict': restart_model_state,
                     'optimizer_state_dict': restart_optimizer_state,
                     'scheduler_state_dict': restart_scheduler_state,
                     'loss_list': loss_list,
+                    'best_epoch': best_epoch,
+                    'best_loss': restart_best_loss,
+                    'is_best_state': restart_is_best_state,
                 }, temporary_file)
                 os.replace(temporary_file, checkpoint_file)
                 print(
@@ -1002,6 +1090,32 @@ def main(device):
             if world_rank == 0:
                 print("Walltime checkpoint complete; requesting continuation.", flush=True)
             return True
+
+        if numerical_recovery_enabled and best_model_state is not None:
+            degradation_streak, loss_has_diverged = (
+                update_loss_degradation_streak(
+                    epoch_loss.item(),
+                    best_loss,
+                    recovery_loss_degradation_factor,
+                    degradation_streak,
+                    recovery_loss_degradation_patience,
+                )
+            )
+            if degradation_streak and world_rank == 0:
+                print(
+                    "Finite loss degradation detected: "
+                    f"epoch={epoch}, loss={epoch_loss.item():.6g}, "
+                    f"best={best_loss:.6g}, "
+                    f"threshold={best_loss * recovery_loss_degradation_factor:.6g}, "
+                    f"streak={degradation_streak}/"
+                    f"{recovery_loss_degradation_patience}",
+                    flush=True,
+                )
+            if loss_has_diverged:
+                optimizer.zero_grad(set_to_none=True)
+                return prepare_numerical_recovery(
+                    'finite loss degradation', epoch, counter
+                )
         
         # if epoch % fid_eval_period == 0 and world_rank == 0:
         #     model.eval()
@@ -1108,10 +1222,14 @@ def main(device):
         if save_checkpoints and epoch > 0 and epoch % save_period == 0 and world_rank < tensor_par_size:
             torch.save({
                 'epoch': best_epoch,
+                'next_epoch': best_epoch + 1,
                 'model_state_dict': best_model_state,
                 'optimizer_state_dict': best_optimizer_state,
                 'scheduler_state_dict': best_scheduler_state,
                 'loss_list': loss_list,
+                'best_epoch': best_epoch,
+                'best_loss': best_loss,
+                'is_best_state': True,
             }, f"{checkpoint_path}/{checkpoint_filename}_BEST_{epoch}_rank_{world_rank}.ckpt")
 
             model.load_state_dict(best_model_state)
@@ -1135,10 +1253,14 @@ def main(device):
     if save_checkpoints and best_model_state is not None and world_rank < tensor_par_size:
         torch.save({
             'epoch': best_epoch,
+            'next_epoch': best_epoch + 1,
             'model_state_dict': best_model_state,
             'optimizer_state_dict': best_optimizer_state,
             'scheduler_state_dict': best_scheduler_state,
             'loss_list': loss_list,
+            'best_epoch': best_epoch,
+            'best_loss': best_loss,
+            'is_best_state': True,
         }, checkpoint_path+"/"+checkpoint_filename+"_FINALBEST_"+str(best_epoch)+"_rank_"+str(world_rank)+".ckpt".format(best_epoch)) 
 
         model.load_state_dict(best_model_state)
