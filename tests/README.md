@@ -402,9 +402,45 @@ together without error), the new test collects one parametrized instance
 by default and the full sweep matrix when `--speed-buffer-sizes`/
 `--speed-num-workers` are given, and skips cleanly (via `dist_info`'s own
 srun check) with no real SLURM launch present -- confirmed the rest of the
-local suite is unaffected. Not yet run for real on Frontier -- that's the
-next real empirical step for the `basic_ct/sap` `buffer_size` question this
-whole investigation started from.
+local suite is unaffected.
+
+#### Real run (job 5445830) found a page-cache artifact biasing sweep comparisons
+
+First real run of the multi-rank test, `--speed-buffer-sizes 16,32,64,100`
+against `basic_ct/sap`: `buffer_size=16` (first in the sweep) took ~540s
+per rank; `32`/`64`/`100` all dropped to ~110-125s per rank, uniformly
+across every one of the 8 real ranks. Diagnosed by hand, not a real
+`buffer_size` effect -- if buffer-fill time genuinely dominated, a
+*smaller* buffer should reach its first batch *faster*, not 5x slower, so
+the direction of the effect was itself the tell.
+
+Root cause: `_narrowed_generic_config_path`'s `min_files` only depends on
+`max(buffer_size, batch_size * NUM_BATCHES_TO_PULL)`, and for
+`basic_ct/sap` (`batch_size=32`, `NUM_BATCHES_TO_PULL=4`) the
+`batch_size * NUM_BATCHES_TO_PULL` term (128) dominates every swept
+`buffer_size` (16/32/64/100, all ≤ 128) -- so `min_files`, and therefore
+`compute_narrow_dict_idx`'s returned window width, comes out identical for
+all four. Combined with `dict_start_idx` always being `0.0`, every sweep
+point narrowed to the *exact same real files*. Only the first one pays
+real cold Lustre I/O (metadata + OST reads); every later point reads the
+identical files back out of page cache, which has nothing to do with
+`buffer_size` at all.
+
+Fixed with a new `_sweep_offset_frac` (duplicated in both the
+single-process and multi-rank files, same convention as
+`_time_batches_lenient`): computes this parametrized test's position within
+the full `--speed-buffer-sizes` × `--speed-num-workers` sweep and turns it
+into a `[0, 1)` starting fraction, so `_narrowed_generic_config_path` gives
+each sweep point a disjoint slice of the real file list instead of always
+starting at `0.0` (clamped so `start + width` never exceeds `1.0` -- falls
+back to overlapping only when the narrowed window is already close to the
+whole dataset, which is unavoidable either way). With a single default run
+(no sweep values given), `total_slots == 1` and the offset is always `0.0`
+-- unchanged from before. Verified locally: the offset/window math produces
+four cleanly disjoint `[start, end)` ranges for the real
+`--speed-buffer-sizes 16,32,64,100` case, and the full local suite is
+unaffected. Not yet re-run for real on Frontier to confirm the sweep now
+gives comparable, non-cache-biased numbers.
 
 **Tier 1 coverage:** none of this is unit-testable for the same reason as
 above -- verified locally instead (compiles, full local suite still 263

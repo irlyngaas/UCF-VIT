@@ -309,7 +309,48 @@ def test_real_decode_throughput_catsdogs_classification(num_workers):
     _report("catsdogs/classification", num_workers, elapsed, NUM_BATCHES_TO_PULL, conf["dataloader"]["batch_size"])
 
 
-def _narrowed_generic_config_path(base_config_path, num_workers, buffer_size, tag):
+def _sweep_offset_frac(request, base_config_path, buffer_size, num_workers):
+    """Returns this parametrized test's position (as a [0, 1) fraction) within
+    the full --speed-buffer-sizes x --speed-num-workers sweep, so
+    `_narrowed_generic_config_path` can give each sweep point a disjoint
+    slice of real files instead of every point narrowing to the identical
+    `dict_start_idx=0.0` window.
+
+    Without this, a real Frontier run (job 5445830, against `basic_ct/sap`)
+    showed the actual bug directly: `min_files` here only depends on
+    `buffer_size`/`batch_size`/`NUM_BATCHES_TO_PULL`, and for that config
+    `batch_size * NUM_BATCHES_TO_PULL` (128) dominated every swept
+    `buffer_size` (16/32/64/100), so every sweep point narrowed to the exact
+    same real files. Only the first one to run paid real cold Lustre I/O;
+    every later one silently read the identical files back out of page
+    cache -- `buffer_size=16` (first in the sweep) took ~540s/rank,
+    `buffer_size=32/64/100` (same files, already warm) all dropped to
+    ~110-125s/rank, with no actual correlation to `buffer_size` itself (a
+    smaller buffer should reach its first batch *faster*, not 5x slower, if
+    the timing were really measuring buffer-fill cost).
+    """
+    with open(base_config_path) as f:
+        raw = yaml.load(f, Loader=yaml.FullLoader)
+
+    raw_bs = request.config.getoption("--speed-buffer-sizes")
+    if raw_bs:
+        buffer_sizes = [int(v.strip()) for v in raw_bs.split(",") if v.strip()]
+    else:
+        dict_buffer_sizes = raw["dataloader"].get("dict_buffer_sizes") or {}
+        buffer_sizes = [next(iter(dict_buffer_sizes.values()))] if dict_buffer_sizes else [buffer_size]
+
+    raw_nw = request.config.getoption("--speed-num-workers")
+    if raw_nw:
+        num_workers_values = [int(v.strip()) for v in raw_nw.split(",") if v.strip()]
+    else:
+        num_workers_values = [raw["dataloader"]["num_workers"]]
+
+    slot_index = buffer_sizes.index(buffer_size) * len(num_workers_values) + num_workers_values.index(num_workers)
+    total_slots = len(buffer_sizes) * len(num_workers_values)
+    return slot_index / total_slots
+
+
+def _narrowed_generic_config_path(base_config_path, num_workers, buffer_size, tag, start_offset_frac=0.0):
     """Same idea as `_narrowed_config_path`, but for an arbitrary
     `iterative_dataloader`-type config instead of one of the three fixed
     ones above -- `min_files` is derived from the config's own
@@ -320,6 +361,13 @@ def _narrowed_generic_config_path(base_config_path, num_workers, buffer_size, ta
     shard and `ShuffleIterableDataset` would never reach its steady-state
     swap-and-yield behavior for *any* of them, hiding the exact effect this
     is meant to measure (see this module's own docstring).
+
+    `start_offset_frac` (see `_sweep_offset_frac`) shifts the narrowed
+    window's start within the real file list instead of always starting at
+    0.0, so different sweep points read disjoint real files -- clamped so
+    `start + width` never exceeds 1.0 (falls back to overlapping only when
+    the narrowed window is already close to the whole dataset, which is
+    unavoidable either way).
 
     Returns:
         `(config_path, real_buffer_size)` -- `real_buffer_size` is what was
@@ -354,8 +402,14 @@ def _narrowed_generic_config_path(base_config_path, num_workers, buffer_size, ta
     except NoRealDataFoundError as e:
         pytest.skip(str(e))
 
-    conf["dataloader"]["dict_start_idx"] = {k: 0.0 for k in narrow_end_idx}
-    conf["dataloader"]["dict_end_idx"] = narrow_end_idx
+    dict_start_idx = {}
+    dict_end_idx = {}
+    for k, width in narrow_end_idx.items():
+        start = min(start_offset_frac, max(0.0, 1.0 - width))
+        dict_start_idx[k] = start
+        dict_end_idx[k] = min(1.0, start + width)
+    conf["dataloader"]["dict_start_idx"] = dict_start_idx
+    conf["dataloader"]["dict_end_idx"] = dict_end_idx
     conf["dataloader"]["num_workers"] = num_workers
     conf["dataloader"]["dict_buffer_sizes"] = {k: real_buffer_size for k in conf["dataloader"]["dict_buffer_sizes"]}
 
@@ -403,8 +457,10 @@ def test_real_decode_throughput_config(request, speed_buffer_size, speed_num_wor
         pytest.skip("no --speed-config given -- see this test's own docstring for usage")
 
     label = os.path.splitext(os.path.basename(speed_config))[0]
+    start_offset_frac = _sweep_offset_frac(request, speed_config, speed_buffer_size, speed_num_workers)
     config_path, real_buffer_size = _narrowed_generic_config_path(
         speed_config, speed_num_workers, speed_buffer_size, f"{label}-{speed_num_workers}-{speed_buffer_size}",
+        start_offset_frac=start_offset_frac,
     )
     conf, data_module = _build_data_module(config_path)
     loader = data_module.train_dataloader()

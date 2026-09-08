@@ -73,13 +73,48 @@ pytestmark = pytest.mark.dataloader_speed
 NUM_BATCHES_TO_PULL = 4
 
 
-def _narrowed_generic_config_path(base_config_path, num_workers, buffer_size, world_rank, tag):
+def _sweep_offset_frac(request, base_config_path, buffer_size, num_workers):
+    """Same idea (and same reasoning) as tests/dataloaders/
+    test_dataset_speed_real_data.py's identical helper -- duplicated rather
+    than imported across sibling test-module files, matching this repo's
+    convention. See that file's own docstring for the real Frontier example
+    (job 5445830) that motivated this: every sweep point narrowing to the
+    same `dict_start_idx=0.0` window let later sweep points silently read
+    the exact same real files a previous point had already warmed into page
+    cache, making them look ~5x faster for reasons unrelated to
+    `buffer_size`/`num_workers` themselves.
+    """
+    with open(base_config_path) as f:
+        raw = yaml.load(f, Loader=yaml.FullLoader)
+
+    raw_bs = request.config.getoption("--speed-buffer-sizes")
+    if raw_bs:
+        buffer_sizes = [int(v.strip()) for v in raw_bs.split(",") if v.strip()]
+    else:
+        dict_buffer_sizes = raw["dataloader"].get("dict_buffer_sizes") or {}
+        buffer_sizes = [next(iter(dict_buffer_sizes.values()))] if dict_buffer_sizes else [buffer_size]
+
+    raw_nw = request.config.getoption("--speed-num-workers")
+    if raw_nw:
+        num_workers_values = [int(v.strip()) for v in raw_nw.split(",") if v.strip()]
+    else:
+        num_workers_values = [raw["dataloader"]["num_workers"]]
+
+    slot_index = buffer_sizes.index(buffer_size) * len(num_workers_values) + num_workers_values.index(num_workers)
+    total_slots = len(buffer_sizes) * len(num_workers_values)
+    return slot_index / total_slots
+
+
+def _narrowed_generic_config_path(base_config_path, num_workers, buffer_size, world_rank, tag, start_offset_frac=0.0):
     """Same idea as tests/dataloaders/test_dataset_speed_real_data.py's
     `_narrowed_generic_config_path`, but sized for this file's real
     `data_par_size` real ranks (no single-simulated-rank factor needed --
     every rank here really is its own real rank). Per-rank tag (via
     `world_rank`) avoids concurrent ranks racing the same scratch file, same
     as `test_dataloader_real_pipeline.py`'s own narrowing helpers.
+    `start_offset_frac` (see `_sweep_offset_frac`) staggers which real files
+    this sweep point narrows to -- same reasoning as the single-process
+    version's identical parameter.
 
     Returns:
         `(config_path, real_buffer_size)`.
@@ -111,8 +146,14 @@ def _narrowed_generic_config_path(base_config_path, num_workers, buffer_size, wo
     except NoRealDataFoundError as e:
         pytest.skip(str(e))
 
-    conf["dataloader"]["dict_start_idx"] = {k: 0.0 for k in narrow_end_idx}
-    conf["dataloader"]["dict_end_idx"] = narrow_end_idx
+    dict_start_idx = {}
+    dict_end_idx = {}
+    for k, width in narrow_end_idx.items():
+        start = min(start_offset_frac, max(0.0, 1.0 - width))
+        dict_start_idx[k] = start
+        dict_end_idx[k] = min(1.0, start + width)
+    conf["dataloader"]["dict_start_idx"] = dict_start_idx
+    conf["dataloader"]["dict_end_idx"] = dict_end_idx
     conf["dataloader"]["num_workers"] = num_workers
     conf["dataloader"]["dict_buffer_sizes"] = {k: real_buffer_size for k in conf["dataloader"]["dict_buffer_sizes"]}
 
@@ -210,9 +251,10 @@ def test_real_decode_throughput_config_distributed(dist_info, request, speed_buf
         pytest.skip("no --speed-config given -- see this test's own docstring for usage")
 
     label = os.path.splitext(os.path.basename(speed_config))[0]
+    start_offset_frac = _sweep_offset_frac(request, speed_config, speed_buffer_size, speed_num_workers)
     config_path, real_buffer_size = _narrowed_generic_config_path(
         speed_config, speed_num_workers, speed_buffer_size, dist_info["world_rank"],
-        f"{label}-{speed_num_workers}-{speed_buffer_size}",
+        f"{label}-{speed_num_workers}-{speed_buffer_size}", start_offset_frac=start_offset_frac,
     )
     conf, data_module = _build_data_module(config_path)
     loader = data_module.train_dataloader()
