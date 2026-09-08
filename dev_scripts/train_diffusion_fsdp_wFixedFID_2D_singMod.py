@@ -101,7 +101,17 @@ def rebase_optimizer_and_scheduler_lr(optimizer, scheduler, resume_lr):
 
 def latest_complete_best_checkpoint(checkpoint_path, checkpoint_filename,
                                     tensor_par_size):
-    """Find the newest numbered BEST checkpoint present for every TP rank."""
+    """Find a stable or numbered BEST checkpoint present for every TP rank."""
+    stable_name = f"{checkpoint_filename}_BEST"
+    if all(
+        os.path.exists(os.path.join(
+            checkpoint_path,
+            f"{stable_name}_rank_{rank}.ckpt",
+        ))
+        for rank in range(tensor_par_size)
+    ):
+        return stable_name
+
     pattern = os.path.join(
         checkpoint_path,
         f"{checkpoint_filename}_BEST_*_rank_0.ckpt",
@@ -126,6 +136,48 @@ def latest_complete_best_checkpoint(checkpoint_path, checkpoint_filename,
         ):
             return checkpoint_name
     return None
+
+
+def continuation_epoch_fields(epoch, epoch_completed):
+    """Return restart metadata for a routine wall-time checkpoint.
+
+    A deadline can arrive in the middle of an epoch. In that case the current
+    model/optimizer state is retained and the interrupted epoch is replayed.
+    If the epoch completed, the next allocation starts at the following one.
+    Crucially, neither case rewinds the logical position to ``best_epoch``.
+    """
+    epoch = int(epoch)
+    return {
+        'epoch': epoch,
+        'next_epoch': epoch + 1 if epoch_completed else epoch,
+    }
+
+
+def completed_epoch_improves_best(epoch_completed, current_loss, best_loss):
+    """Only allow a fully completed epoch to replace the best checkpoint."""
+    return bool(epoch_completed) and float(current_loss) < float(best_loss)
+
+
+def modality_metric_spec(dict_root_dirs, dict_in_variables, dataset):
+    """Build metric labels for any number of configured datasets/modalities."""
+    if dataset == "imagenet":
+        return [('imagenet', 'imagenet')]
+
+    result = []
+    for dataset_key in dict_root_dirs:
+        variables = dict_in_variables.get(dataset_key, [])
+        if isinstance(variables, str):
+            variables = [variables]
+        variable_label = '+'.join(map(str, variables)) or 'unknown'
+        result.append((str(dataset_key), variable_label))
+    return result
+
+
+def normalize_dataset_key(dataset_key):
+    """Normalize collate/broadcast dataset identifiers to a metric key."""
+    if isinstance(dataset_key, (list, tuple)):
+        return ''.join(map(str, dataset_key))
+    return str(dataset_key)
 
 
 def update_loss_degradation_streak(current_loss, best_loss, factor, streak,
@@ -348,6 +400,14 @@ def main(device):
     num_channels_used = conf['data']['num_channels_used']
 
     dict_in_variables = conf['data']['dict_in_variables']
+    modality_metrics = modality_metric_spec(
+        dict_root_dirs, dict_in_variables, dataset
+    )
+    modality_metric_keys = [key for key, _ in modality_metrics]
+    modality_metric_labels = dict(modality_metrics)
+    modality_metric_indices = {
+        key: index for index, key in enumerate(modality_metric_keys)
+    }
 
     batch_size = conf['data']['batch_size']
 
@@ -494,6 +554,9 @@ def main(device):
     if not resume_from_checkpoint: #train from scratch
         epoch_start = 0
         loss_list = []
+        modality_loss_history = {
+            key: [] for key in modality_metric_keys
+        }
         if world_rank==0:       
             print("resume from checkpoint was set to False. Pretrain from scratch.",flush=True)
 
@@ -631,6 +694,11 @@ def main(device):
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         loss_list = checkpoint['loss_list']
+        saved_modality_history = checkpoint.get('modality_loss_history', {})
+        modality_loss_history = {
+            key: list(saved_modality_history.get(key, []))
+            for key in modality_metric_keys
+        }
         epoch_start = checkpoint.get('next_epoch', checkpoint['epoch'] + 1)
         resume_best_epoch = checkpoint.get('best_epoch', checkpoint['epoch'])
         resume_best_loss = checkpoint.get('best_loss')
@@ -639,6 +707,15 @@ def main(device):
             '_BEST_' in checkpoint_filename_for_loading
             or checkpoint_filename_for_loading.endswith('_RECOVERY'),
         )
+        if world_rank == 0:
+            print(
+                "Restored checkpoint: "
+                f"type={checkpoint.get('checkpoint_type', 'legacy')}, "
+                f"stored_epoch={checkpoint['epoch']}, "
+                f"next_epoch={epoch_start}, "
+                f"best_epoch={resume_best_epoch}",
+                flush=True,
+            )
         if resume_best_loss is None:
             finite_losses = [
                 float(value.item() if torch.is_tensor(value) else value)
@@ -725,12 +802,15 @@ def main(device):
     fid_epochs = []
     fid_eval_period = 10
     
+    # A routine latest checkpoint is not itself the best state, but it still
+    # carries the persistent best metric metadata. Preserve that comparison
+    # baseline while continuing from the latest model/optimizer state.
     best_loss = (
         float(resume_best_loss)
-        if resume_best_loss is not None and resume_loaded_best_state
+        if resume_best_loss is not None
         else float("inf")
     )
-    best_epoch = resume_best_epoch if resume_loaded_best_state else -1
+    best_epoch = resume_best_epoch if resume_best_loss is not None else -1
     epochs_without_improvement = 0
     max_patience = 50000
     patience = 2000
@@ -799,9 +879,11 @@ def main(device):
                     'optimizer_state_dict': best_optimizer_state,
                     'scheduler_state_dict': best_scheduler_state,
                     'loss_list': loss_list,
+                    'modality_loss_history': modality_loss_history,
                     'best_epoch': best_epoch,
                     'best_loss': best_loss,
                     'is_best_state': True,
+                    'checkpoint_type': 'recovery_best',
                 }, temporary_file)
                 os.replace(temporary_file, checkpoint_file)
             dist.barrier()
@@ -863,6 +945,12 @@ def main(device):
         model.train()
         loss = 0.0
         epoch_loss = torch.tensor(0.0 , dtype=torch.float32, device=device)
+        modality_loss_sums = torch.zeros(
+            len(modality_metric_keys), dtype=torch.float64, device=device
+        )
+        modality_loss_counts = torch.zeros(
+            len(modality_metric_keys), dtype=torch.int64, device=device
+        )
         if world_rank==0:
             print("Starting epoch ",epoch,flush=True)
 
@@ -883,7 +971,7 @@ def main(device):
                         data = data.to(precision_dt)
                         data = data.to(device)
                         if dataset != "imagenet":
-                            dict_key_len = torch.tensor(len(dict_key)).to(device)
+                            dict_key_holder = [normalize_dataset_key(dict_key)]
                         else:
                             dict_key = "imagenet"
                         t = torch.randint(0,num_time_steps,(batch_size,))
@@ -896,18 +984,18 @@ def main(device):
                         data = (torch.sqrt(a)*data) + (torch.sqrt(1-a)*e)
                     else:
                         if dataset != "imagenet":
-                            dict_key_len = torch.tensor(0).to(device)
+                            dict_key_holder = [None]
                         else: 
                             dict_key = "imagenet"
 
                     if dataset != "imagenet":
-                        dist.broadcast(dict_key_len, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group = tensor_par_group)
-                        if dist.get_rank(tensor_par_group) != 0:
-                            dict_key = [None] * dict_key_len.item()
-                        dist.broadcast_object_list(dict_key, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
-
-                        if dist.get_rank(tensor_par_group) != 0:
-                            dict_key = ''.join(dict_key)
+                        dist.broadcast_object_list(
+                            dict_key_holder,
+                            src=(dist.get_rank() // tensor_par_size
+                                 * tensor_par_size),
+                            group=tensor_par_group,
+                        )
+                        dict_key = dict_key_holder[0]
 
                     if dist.get_rank(tensor_par_group) != 0:
                         if twoD:
@@ -925,7 +1013,7 @@ def main(device):
 
                 else: #Avoid unnecesary broadcasts if not using tensor parallelism
                     rank_phase("before_data_fetch", epoch, counter)
-                    data, variables, _ = next(it_loader)
+                    data, variables, dict_key = next(it_loader)
                     rank_phase("after_data_fetch", epoch, counter)
                     data = data.to(precision_dt)
                     data = data.to(device)
@@ -948,6 +1036,15 @@ def main(device):
                     )
 
                 epoch_loss += loss.detach()
+                metric_key = normalize_dataset_key(dict_key)
+                metric_index = modality_metric_indices.get(metric_key)
+                if metric_index is None:
+                    raise KeyError(
+                        f"Dataloader returned unknown dataset key {metric_key!r}; "
+                        f"configured keys are {modality_metric_keys}"
+                    )
+                modality_loss_sums[metric_index] += loss.detach().double()
+                modality_loss_counts[metric_index] += 1
     
                 if world_rank == 0 and (
                     counter == 1 or counter % log_every_n_steps == 0
@@ -1004,6 +1101,7 @@ def main(device):
                     if stop_tensor.item():
                         walltime_stop_requested = True
                         break
+        epoch_completed = counter >= iterations_per_epoch
         epoch_loss /= max(counter, 1)
         # Every tensor-parallel rank represents the same data sample, while
         # data-parallel ranks see different samples. Averaging over the full
@@ -1011,7 +1109,74 @@ def main(device):
         # and gives every rank the same metric for logging and best-model logic.
         dist.all_reduce(epoch_loss, op=dist.ReduceOp.SUM)
         epoch_loss /= world_size
-        loss_list.append(epoch_loss)
+        dist.all_reduce(modality_loss_sums, op=dist.ReduceOp.SUM)
+        dist.all_reduce(modality_loss_counts, op=dist.ReduceOp.SUM)
+
+        epoch_modality_losses = {}
+        for metric_index, metric_key in enumerate(modality_metric_keys):
+            count = modality_loss_counts[metric_index].item()
+            if count:
+                epoch_modality_losses[metric_key] = (
+                    modality_loss_sums[metric_index].item() / count
+                )
+
+        if epoch_completed:
+            loss_list.append(epoch_loss)
+            for metric_key, metric_loss in epoch_modality_losses.items():
+                modality_loss_history[metric_key].append(metric_loss)
+
+        if world_rank == 0:
+            readable_modality_losses = {
+                f"{key}[{modality_metric_labels[key]}]": value
+                for key, value in epoch_modality_losses.items()
+            }
+            completion_label = "complete" if epoch_completed else "partial"
+            print(
+                f"epoch: {epoch} modality_losses ({completion_label}) "
+                f"{readable_modality_losses}",
+                flush=True,
+            )
+
+        # Persist a newly improved completed epoch before handling a wall-time
+        # exit. Otherwise a deadline that lands exactly at the epoch boundary
+        # would advance the latest checkpoint while silently losing the new
+        # best state. Partial epochs are never eligible.
+        epoch_improved = completed_epoch_improves_best(
+            epoch_completed, epoch_loss.item(), best_loss
+        )
+        if epoch_improved:
+            best_loss = epoch_loss.item()
+            best_epoch = epoch
+            epochs_without_improvement = 0
+
+            if save_checkpoints:
+                best_model_state = copy.deepcopy(model.state_dict())
+                best_optimizer_state = copy.deepcopy(optimizer.state_dict())
+                best_scheduler_state = copy.deepcopy(scheduler.state_dict())
+                if world_rank < tensor_par_size:
+                    best_checkpoint_file = os.path.join(
+                        checkpoint_path,
+                        f"{checkpoint_filename}_BEST_rank_{world_rank}.ckpt",
+                    )
+                    best_temporary_file = (
+                        f"{best_checkpoint_file}.tmp-"
+                        f"{os.environ.get('SLURM_JOB_ID', 'local')}"
+                    )
+                    torch.save({
+                        'epoch': best_epoch,
+                        'next_epoch': best_epoch + 1,
+                        'model_state_dict': best_model_state,
+                        'optimizer_state_dict': best_optimizer_state,
+                        'scheduler_state_dict': best_scheduler_state,
+                        'loss_list': loss_list,
+                        'modality_loss_history': modality_loss_history,
+                        'best_epoch': best_epoch,
+                        'best_loss': best_loss,
+                        'is_best_state': True,
+                        'checkpoint_type': 'best',
+                    }, best_temporary_file)
+                    os.replace(best_temporary_file, best_checkpoint_file)
+            dist.barrier()
 
         # Also check at the epoch boundary in case it did not land on a
         # multiple of ten batches.
@@ -1028,38 +1193,26 @@ def main(device):
             walltime_stop_requested = bool(stop_tensor.item())
 
         if walltime_stop_requested:
-            # Continue from the best completed state, not a potentially
-            # degrading partial epoch. This also carries the best state across
-            # one-hour Slurm allocations without doubling checkpoint size.
-            if best_model_state is not None:
-                restart_epoch = best_epoch
-                restart_next_epoch = best_epoch + 1
-                restart_model_state = best_model_state
-                restart_optimizer_state = best_optimizer_state
-                restart_scheduler_state = best_scheduler_state
-                restart_best_loss = best_loss
-                restart_is_best_state = True
-            else:
-                # A first allocation can theoretically reach its deadline
-                # before completing an epoch. Preserve the old replay behavior
-                # in that exceptional case.
-                rank_phase("before_restart_model_state", epoch, counter)
-                restart_model_state = model.state_dict()
-                rank_phase(
-                    "after_restart_model_state", epoch, counter,
-                    synchronize=True,
-                )
-                rank_phase("before_restart_optimizer_state", epoch, counter)
-                restart_optimizer_state = optimizer.state_dict()
-                rank_phase(
-                    "after_restart_optimizer_state", epoch, counter,
-                    synchronize=True,
-                )
-                restart_scheduler_state = scheduler.state_dict()
-                restart_epoch = epoch
-                restart_next_epoch = epoch
-                restart_best_loss = None
-                restart_is_best_state = False
+            # Routine wall-time continuation must retain the latest mutually
+            # consistent model, optimizer, and scheduler states. The separate
+            # BEST checkpoint remains available for explicit numerical
+            # recovery, but must not rewind every ordinary continuation.
+            rank_phase("before_restart_model_state", epoch, counter)
+            restart_model_state = model.state_dict()
+            rank_phase(
+                "after_restart_model_state", epoch, counter,
+                synchronize=True,
+            )
+            rank_phase("before_restart_optimizer_state", epoch, counter)
+            restart_optimizer_state = optimizer.state_dict()
+            rank_phase(
+                "after_restart_optimizer_state", epoch, counter,
+                synchronize=True,
+            )
+            restart_scheduler_state = scheduler.state_dict()
+            restart_position = continuation_epoch_fields(
+                epoch, epoch_completed
+            )
 
             if world_rank < tensor_par_size:
                 checkpoint_file = os.path.join(
@@ -1068,15 +1221,16 @@ def main(device):
                 )
                 temporary_file = f"{checkpoint_file}.tmp-{os.environ.get('SLURM_JOB_ID', 'local')}"
                 torch.save({
-                    'epoch': restart_epoch,
-                    'next_epoch': restart_next_epoch,
+                    **restart_position,
                     'model_state_dict': restart_model_state,
                     'optimizer_state_dict': restart_optimizer_state,
                     'scheduler_state_dict': restart_scheduler_state,
                     'loss_list': loss_list,
+                    'modality_loss_history': modality_loss_history,
                     'best_epoch': best_epoch,
-                    'best_loss': restart_best_loss,
-                    'is_best_state': restart_is_best_state,
+                    'best_loss': best_loss,
+                    'is_best_state': False,
+                    'checkpoint_type': 'latest',
                 }, temporary_file)
                 os.replace(temporary_file, checkpoint_file)
                 print(
@@ -1091,7 +1245,7 @@ def main(device):
                 print("Walltime checkpoint complete; requesting continuation.", flush=True)
             return True
 
-        if numerical_recovery_enabled and best_model_state is not None:
+        if numerical_recovery_enabled and np.isfinite(best_loss):
             degradation_streak, loss_has_diverged = (
                 update_loss_degradation_streak(
                     epoch_loss.item(),
@@ -1179,17 +1333,7 @@ def main(device):
 
         dist.barrier()
             
-        # Track best model independently
-        if epoch_loss.item() < best_loss:
-            best_loss = epoch_loss.item()
-            best_epoch = epoch
-            epochs_without_improvement = 0
-
-            if save_checkpoints:
-                best_model_state = copy.deepcopy(model.state_dict())
-                best_optimizer_state = copy.deepcopy(optimizer.state_dict())
-                best_scheduler_state = copy.deepcopy(scheduler.state_dict())
-        else:
+        if not epoch_improved:
             epochs_without_improvement += 1
 
             # Reduce LR if no improvement for `patience` epochs
@@ -1219,7 +1363,9 @@ def main(device):
         dist.barrier()
         
         # Save the best model periodically
-        if save_checkpoints and epoch > 0 and epoch % save_period == 0 and world_rank < tensor_par_size:
+        if (save_checkpoints and best_model_state is not None and epoch > 0
+                and epoch % save_period == 0
+                and world_rank < tensor_par_size):
             torch.save({
                 'epoch': best_epoch,
                 'next_epoch': best_epoch + 1,
@@ -1227,13 +1373,16 @@ def main(device):
                 'optimizer_state_dict': best_optimizer_state,
                 'scheduler_state_dict': best_scheduler_state,
                 'loss_list': loss_list,
+                'modality_loss_history': modality_loss_history,
                 'best_epoch': best_epoch,
                 'best_loss': best_loss,
                 'is_best_state': True,
+                'checkpoint_type': 'best',
             }, f"{checkpoint_path}/{checkpoint_filename}_BEST_{epoch}_rank_{world_rank}.ckpt")
 
-            model.load_state_dict(best_model_state)
-
+            # Sampling uses the current training state. Do not replace only the
+            # model weights with an older best state while leaving optimizer
+            # and scheduler states untouched.
             for var in default_vars:
                 model.eval()
                 sample_images(model, var, device, tile_size, precision_dt, patch_size,
@@ -1258,9 +1407,11 @@ def main(device):
             'optimizer_state_dict': best_optimizer_state,
             'scheduler_state_dict': best_scheduler_state,
             'loss_list': loss_list,
+            'modality_loss_history': modality_loss_history,
             'best_epoch': best_epoch,
             'best_loss': best_loss,
             'is_best_state': True,
+            'checkpoint_type': 'final_best',
         }, checkpoint_path+"/"+checkpoint_filename+"_FINALBEST_"+str(best_epoch)+"_rank_"+str(world_rank)+".ckpt".format(best_epoch)) 
 
         model.load_state_dict(best_model_state)

@@ -6,7 +6,11 @@ from pathlib import Path
 import torch
 
 from train_diffusion_fsdp_wFixedFID_2D_singMod import (
+    completed_epoch_improves_best,
+    continuation_epoch_fields,
     latest_complete_best_checkpoint,
+    modality_metric_spec,
+    normalize_dataset_key,
     rebase_optimizer_and_scheduler_lr,
     update_loss_degradation_streak,
 )
@@ -14,6 +18,40 @@ from UCF_VIT.utils.misc import configure_scheduler
 
 
 class NumericalRecoveryTest(unittest.TestCase):
+    def test_partial_walltime_checkpoint_replays_only_interrupted_epoch(self):
+        self.assertEqual(
+            continuation_epoch_fields(epoch=26, epoch_completed=False),
+            {'epoch': 26, 'next_epoch': 26},
+        )
+
+    def test_completed_walltime_checkpoint_advances_one_epoch(self):
+        self.assertEqual(
+            continuation_epoch_fields(epoch=26, epoch_completed=True),
+            {'epoch': 26, 'next_epoch': 27},
+        )
+
+    def test_only_completed_epoch_can_replace_best_checkpoint(self):
+        self.assertTrue(completed_epoch_improves_best(True, 0.04, 0.05))
+        self.assertFalse(completed_epoch_improves_best(False, 0.04, 0.05))
+        self.assertFalse(completed_epoch_improves_best(True, 0.06, 0.05))
+
+    def test_modality_metrics_follow_arbitrary_configuration(self):
+        spec = modality_metric_spec(
+            {'xray_source': '/x', 'neutron_source': '/n', 'mri_source': '/m'},
+            {
+                'xray_source': ['xct'],
+                'neutron_source': ['nct'],
+                'mri_source': ['t1', 't2'],
+            },
+            dataset='xct',
+        )
+        self.assertEqual(spec, [
+            ('xray_source', 'xct'),
+            ('neutron_source', 'nct'),
+            ('mri_source', 't1+t2'),
+        ])
+        self.assertEqual(normalize_dataset_key(['mri', '_source']), 'mri_source')
+
     def test_rebases_optimizer_and_scheduler(self):
         parameters = [torch.nn.Parameter(torch.ones(1)) for _ in range(2)]
         optimizer = torch.optim.AdamW([
@@ -60,6 +98,25 @@ class NumericalRecoveryTest(unittest.TestCase):
             )
 
         self.assertEqual(selected, 'model_BEST_8')
+
+    def test_prefers_stable_best_checkpoint_complete_across_tp_ranks(self):
+        with tempfile.TemporaryDirectory() as checkpoint_path:
+            for rank in (0, 1):
+                Path(os.path.join(
+                    checkpoint_path,
+                    f'model_BEST_rank_{rank}.ckpt',
+                )).touch()
+            for rank in (0, 1):
+                Path(os.path.join(
+                    checkpoint_path,
+                    f'model_BEST_12_rank_{rank}.ckpt',
+                )).touch()
+
+            selected = latest_complete_best_checkpoint(
+                checkpoint_path, 'model', tensor_par_size=2
+            )
+
+        self.assertEqual(selected, 'model_BEST')
 
     def test_finite_loss_degradation_requires_consecutive_epochs(self):
         streak, should_recover = update_loss_degradation_streak(
