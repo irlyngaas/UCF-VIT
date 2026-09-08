@@ -3,6 +3,7 @@ import os
 import pytest
 import torch
 import torch.distributed as dist
+import yaml
 
 
 def _slurm_launch_available():
@@ -43,3 +44,50 @@ def dist_info():
 
     dist.barrier()
     dist.destroy_process_group()
+
+
+def _config_default(config, option, key):
+    """Same idea as tests/dataloaders/conftest.py's identical helper --
+    duplicated rather than imported (conftest.py files aren't meant to import
+    each other across sibling directories) for
+    test_dataloader_speed_real_pipeline.py's speed_buffer_size/
+    speed_num_workers fixtures. --speed-config/etc. options themselves are
+    registered once, in the shared tests/conftest.py (see its own
+    pytest_addoption docstring for why they can't live in either directory's
+    own conftest.py).
+    """
+    speed_config = config.getoption("--speed-config")
+    if not speed_config:
+        return None
+    with open(speed_config) as f:
+        raw = yaml.load(f, Loader=yaml.FullLoader)
+    if key == "num_workers":
+        return raw["dataloader"]["num_workers"]
+    dict_buffer_sizes = raw["dataloader"].get("dict_buffer_sizes")
+    if not dict_buffer_sizes:
+        return None  # "dataloader"-type config (catsdogs) -- no buffer_size concept
+    return next(iter(dict_buffer_sizes.values()))
+
+
+def pytest_generate_tests(metafunc):
+    """Same idea as tests/dataloaders/conftest.py's identical hook -- see its
+    own docstring. Duplicated (not shared) since it only needs to apply to
+    this directory's own test_dataloader_speed_real_pipeline.py.
+    """
+    if "speed_buffer_size" in metafunc.fixturenames:
+        raw = metafunc.config.getoption("--speed-buffer-sizes")
+        if raw:
+            values = [int(v.strip()) for v in raw.split(",") if v.strip()]
+        else:
+            default = _config_default(metafunc.config, "speed_buffer_size", "buffer_size")
+            values = [default]
+        metafunc.parametrize("speed_buffer_size", values)
+
+    if "speed_num_workers" in metafunc.fixturenames:
+        raw = metafunc.config.getoption("--speed-num-workers")
+        if raw:
+            values = [int(v.strip()) for v in raw.split(",") if v.strip()]
+        else:
+            default = _config_default(metafunc.config, "speed_num_workers", "num_workers")
+            values = [default]
+        metafunc.parametrize("speed_num_workers", values)

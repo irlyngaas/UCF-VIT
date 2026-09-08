@@ -56,50 +56,6 @@ def _ensure_single_process_distributed():
         yield
 
 
-def pytest_addoption(parser):
-    """CLI options for test_dataset_speed_real_data.py's generic, config-driven test.
-
-    Kept in this directory's own conftest.py (not the top-level tests/conftest.py)
-    since they're only meaningful for tests/dataloaders/'s dataloader_speed-marked
-    tests. See test_real_decode_throughput_config's own docstring for usage.
-    """
-    parser.addoption(
-        "--speed-config",
-        action="store",
-        default=None,
-        help=(
-            "Path to a real config YAML to run test_real_decode_throughput_config "
-            "against (e.g. ../../configs/basic_ct/sap/base_config.yaml). Only that "
-            "one config runs -- deliberately not a sweep over every shipped config, "
-            "since real decode timing is expensive. Skipped entirely if omitted."
-        ),
-    )
-    parser.addoption(
-        "--speed-buffer-sizes",
-        action="store",
-        default="",
-        help=(
-            "Comma-separated dict_buffer_sizes values to sweep against "
-            "--speed-config's own dataset key (e.g. '16,32,64,100'). Only meaningful "
-            "for dataloader.type:\"iterative_dataloader\" configs (ShuffleIterableDataset's "
-            "buffer_size) -- ignored (single no-op run) for \"dataloader\"-type configs "
-            "(catsdogs), which have no buffer_size concept at all. Defaults to just "
-            "--speed-config's own shipped value if omitted."
-        ),
-    )
-    parser.addoption(
-        "--speed-num-workers",
-        action="store",
-        default="",
-        help=(
-            "Comma-separated num_workers values to sweep against --speed-config "
-            "(e.g. '0,1,4'). Defaults to just --speed-config's own shipped value if "
-            "omitted, so the default cost is one run, not the full "
-            "NUM_WORKERS_VALUES matrix -- pass this explicitly to also sweep it."
-        ),
-    )
-
-
 def _config_default(config, option, key):
     """Reads a single int default out of --speed-config's own raw YAML, for
     whichever of --speed-buffer-sizes/--speed-num-workers wasn't given

@@ -37,3 +37,53 @@ def _single_process_distributed():
         dist.destroy_process_group()
     else:
         yield
+
+
+def pytest_addoption(parser):
+    """CLI options shared by tests/dataloaders/test_dataset_speed_real_data.py's
+    single-process test_real_decode_throughput_config and tests/distributed/
+    test_dataloader_speed_real_pipeline.py's real multi-rank counterpart.
+
+    Kept here (a shared ancestor of both) rather than in either directory's
+    own conftest.py: pytest loads every conftest.py under `testpaths` (see
+    pyproject.toml -- testpaths = ["tests"]) for a bare `pytest` invocation,
+    so registering the same --speed-config/etc. options in two sibling
+    conftest.py files would crash argparse with a duplicate-option error the
+    moment both tests/dataloaders/ and tests/distributed/ are collected
+    together, not just when either speed test actually runs.
+    """
+    parser.addoption(
+        "--speed-config",
+        action="store",
+        default=None,
+        help=(
+            "Path to a real config YAML to run test_real_decode_throughput_config "
+            "against (e.g. ../../configs/basic_ct/sap/base_config.yaml). Only that "
+            "one config runs -- deliberately not a sweep over every shipped config, "
+            "since real decode timing is expensive. Skipped entirely if omitted."
+        ),
+    )
+    parser.addoption(
+        "--speed-buffer-sizes",
+        action="store",
+        default="",
+        help=(
+            "Comma-separated dict_buffer_sizes values to sweep against "
+            "--speed-config's own dataset key (e.g. '16,32,64,100'). Only meaningful "
+            "for dataloader.type:\"iterative_dataloader\" configs (ShuffleIterableDataset's "
+            "buffer_size) -- ignored (single no-op run) for \"dataloader\"-type configs "
+            "(catsdogs), which have no buffer_size concept at all. Defaults to just "
+            "--speed-config's own shipped value if omitted."
+        ),
+    )
+    parser.addoption(
+        "--speed-num-workers",
+        action="store",
+        default="",
+        help=(
+            "Comma-separated num_workers values to sweep against --speed-config "
+            "(e.g. '0,1,4'). Defaults to just --speed-config's own shipped value if "
+            "omitted, so the default cost is one run, not the full "
+            "NUM_WORKERS_VALUES matrix -- pass this explicitly to also sweep it."
+        ),
+    )

@@ -36,5 +36,17 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 
 # tests/distributed/ needs an actual multi-process launch (unlike the rest of
 # tests/, which run fine as a single local process) -- see tests/README.md.
+#
+# "$@" forwards this script's own sbatch arguments straight to pytest, same
+# as launch/tests/run_dataloader_speed.sh -- with no extra arguments this
+# still runs the normal Tier 2 distributed suite exactly as before (the
+# dataloader_speed marker is excluded by default, see addopts in
+# pyproject.toml). To run the real multi-rank decode-throughput measurement
+# in test_dataloader_speed_real_pipeline.py against one specific config
+# instead, pass:
+#   sbatch run_distributed_tests.sh -m dataloader_speed \
+#     -k test_real_decode_throughput_config_distributed \
+#     --speed-config ../../configs/basic_ct/sap/base_config.yaml \
+#     --speed-buffer-sizes 16,32,64,100
 time srun -n $((SLURM_JOB_NUM_NODES*8)) \
-python -m pytest ../../tests/distributed/ -v
+python -m pytest ../../tests/distributed/ -v "$@"

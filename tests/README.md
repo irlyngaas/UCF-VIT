@@ -343,6 +343,69 @@ batch specifically -- a more precise metric for a `ShuffleIterableDataset`
 buffer-fill question anyway, since the stall happens before the first
 sample is ever yielded, independent of how many batches follow after that.
 
+#### Real multi-rank version: `tests/distributed/test_dataloader_speed_real_pipeline.py`
+
+After three real-Frontier-run failures in a row on the single-process
+version above -- all fixed, but all in scaffolding *this test itself*
+introduced (the SLURM-launch heuristic, the ambient `MASTER_ADDR`, the
+simulated-1/8th-rank narrowing math), none of them actually caused by
+`gloo` vs. `NCCL` -- the user asked directly whether the single-process
+approach was simply the wrong tool, since the whole point is measuring
+performance "in an environment similar to where I'm doing testing." It
+was: `gloo`/single-process can validly measure raw decode cost in
+isolation, but it gives one process a whole node's cores to itself, while
+real SAP training runs `data_par_size` ranks' worth of `num_workers`
+subprocesses on the same node's cores *simultaneously* -- a real CPU-
+contention gap the single-process number can't show, on top of not using
+the real launch mechanics at all.
+
+Added a real multi-rank counterpart instead of continuing to patch the
+single-process version: `test_real_decode_throughput_config_distributed`,
+reusing `tests/distributed/conftest.py`'s already-proven `dist_info`
+fixture (real `srun`, real NCCL, confirmed passing on a real Frontier run
+elsewhere in this suite) and the exact real-pipeline construction
+`test_dataloader_real_pipeline.py` uses (`parse_config` with **no**
+`load_balance_offline` -- this rank's real world size must equal the
+config's real `data_par_size * tensor_par_size`, exactly as production
+enforces). Every real rank narrows/builds/times its own real shard
+concurrently, synchronized by a `dist.barrier()` right before the timed
+region so every rank's clock starts together; results are gathered onto
+rank 0 via `dist.all_gather_object` and printed as a per-rank breakdown
+plus an aggregate (total real samples across every rank ÷ the *slowest*
+rank's elapsed time) -- that aggregate, not any single rank's number, is
+what approximates real steady-state per-node throughput under contention.
+
+The `--speed-config`/`--speed-buffer-sizes`/`--speed-num-workers` CLI
+options themselves moved up to the top-level `tests/conftest.py` (a shared
+ancestor of both `tests/dataloaders/` and `tests/distributed/`) rather than
+being duplicated in a second directory-level `conftest.py` -- `testpaths =
+["tests"]` in `pyproject.toml` means a bare `pytest` invocation collects
+both directories together, and registering the same `argparse` option
+twice would crash collection outright, not just this one test. Each
+directory keeps its own (duplicated, not shared) `pytest_generate_tests`/
+`_config_default`, since those are directory-scoped hooks with no
+conflict risk. Run via `run_distributed_tests.sh`'s own `"$@"` forwarding
+(added alongside this, matching `run_dataloader_speed.sh`'s existing
+pattern):
+
+```bash
+sbatch run_distributed_tests.sh -m dataloader_speed \
+  -k test_real_decode_throughput_config_distributed \
+  --speed-config ../../configs/basic_ct/sap/base_config.yaml \
+  --speed-buffer-sizes 16,32,64,100
+```
+
+**Tier 1 coverage:** same as the single-process version -- verified
+locally that both `conftest.py` changes don't reintroduce an `argparse`
+conflict (`pytest --collect-only tests/` collects both directories
+together without error), the new test collects one parametrized instance
+by default and the full sweep matrix when `--speed-buffer-sizes`/
+`--speed-num-workers` are given, and skips cleanly (via `dist_info`'s own
+srun check) with no real SLURM launch present -- confirmed the rest of the
+local suite is unaffected. Not yet run for real on Frontier -- that's the
+next real empirical step for the `basic_ct/sap` `buffer_size` question this
+whole investigation started from.
+
 **Tier 1 coverage:** none of this is unit-testable for the same reason as
 above -- verified locally instead (compiles, full local suite still 263
 passed/4 skipped/0 failures, `dataloader_speed`-marked tests still run/skip
