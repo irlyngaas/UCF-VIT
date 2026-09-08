@@ -300,6 +300,57 @@ passed, 4 skipped, 0 failures). The actual empirical question (is
 a real Frontier run with `--speed-config` pointed at `basic_ct/sap`'s
 config — not yet done.
 
+#### Follow-up: two real Frontier failures, one infra, one a real data ceiling
+
+First real run (job 5421658) never got past dataloader construction at
+all: `NativePytorchDataModule._my_dataset_key()` raised `NotImplementedError`
+("Only support distributed training"). `tests/conftest.py`'s autouse
+single-process `torch.distributed` fixture steps aside whenever
+`SLURM_PROCID`/`SLURM_NTASKS`/`SLURM_LOCALID` are all set, assuming that
+means real multi-rank `tests/distributed/` tests are running -- but
+`run_dataloader_speed.sh` submits via a real `sbatch` job too, just without
+`srun`, and this Frontier cluster populates those same variables for a bare
+`sbatch` script regardless. Fixed with a new, always-on single-process init
+fixture scoped to `tests/dataloaders/` itself (independent of that
+heuristic -- safe since nothing here is ever real multi-rank, and
+conftest.py fixtures don't cross into sibling directories).
+
+Second run (job 5421778) got further but hit a real gloo error resolving
+`MASTER_ADDR` ("Address family not supported by protocol") -- the ambient
+shell environment already had `MASTER_ADDR` set to a hostname
+(`localhost.localdomain`) whose DNS/NSS resolution trips an IPv6 mismatch
+on this cluster; the fixture's `os.environ.setdefault(...)` left it alone
+since it was already set. Fixed by forcing a numeric loopback literal and a
+freshly-bound port unconditionally, instead of deferring to whatever's
+already in the environment -- this process group has nothing to do with
+whatever that ambient `MASTER_ADDR` was for.
+
+Third run (job 5421875, after both fixes) finally reached real decode
+work, but every single swept `buffer_size` failed identically:
+`_time_batches`'s hard `assert len(batches) == num_batches` only ever
+pulled 2 of the requested 4 batches. Confirmed by hand this is a real data
+ceiling, not a bug in `_narrowed_generic_config_path`'s `min_files` math:
+852 real `basic_ct` files -> ~681 training (default 0.8/0.1/0.1 split) ->
+÷8 (`basic_ct/sap`'s real `simple_ddp_size`) ≈ 85 files for one simulated
+1/8th-shard rank -> ÷32 (`batch_size`) = exactly 2 batches, regardless of
+`buffer_size` -- independently reproducing the same ~85-file/2-batch math
+this whole investigation started from. Fixed with a new
+`_time_batches_lenient` (used only by `test_real_decode_throughput_config`,
+not the three fixed tests -- their `*_MIN_FILES` targets are already known
+to fit) that requires only >= 1 batch instead of an exact count, reports
+however many were actually available, and additionally times the *first*
+batch specifically -- a more precise metric for a `ShuffleIterableDataset`
+buffer-fill question anyway, since the stall happens before the first
+sample is ever yielded, independent of how many batches follow after that.
+
+**Tier 1 coverage:** none of this is unit-testable for the same reason as
+above -- verified locally instead (compiles, full local suite still 263
+passed/4 skipped/0 failures, `dataloader_speed`-marked tests still run/skip
+correctly with no double-init conflicts between the two `tests/dataloaders/
+conftest.py` fixtures). A fourth real Frontier run, with all three fixes in
+place, is what's actually needed to get the real empirical numbers this was
+all for -- not yet done.
+
 `tests/dataloaders/test_pin_memory_speed.py` measures whether
 `dataloader.pin_memory:True` (every shipped config currently has this
 `False`) is actually worth turning on — raised while looking at whether

@@ -234,6 +234,40 @@ def _time_batches(loader, num_batches):
     return elapsed
 
 
+def _time_batches_lenient(loader, max_batches):
+    """Like `_time_batches`, but for `test_real_decode_throughput_config`
+    specifically: an arbitrary `--speed-config`'s real `data_par_size` can
+    genuinely have too little real data for one simulated 1/8th-shard rank
+    to ever produce `max_batches` at its real `batch_size` -- e.g. a real
+    Frontier run against `basic_ct/sap` (`data_par_size:8`, `batch_size:32`)
+    hit exactly this: 852 real files -> ~681 training -> ~85/rank -> exactly
+    2 batches, not 4, *regardless* of `buffer_size` (job 5421875). That's a
+    real ceiling of the data itself, not a narrowing bug -- `_time_batches`'s
+    hard `assert len(batches) == num_batches` would fail identically for
+    every `buffer_size` swept, telling you nothing about `buffer_size`
+    specifically. Requires only >= 1 batch (still fails clearly if the
+    config/narrowing is broken enough to yield nothing at all), and also
+    times the first batch alone -- the more precise metric for a
+    `ShuffleIterableDataset` buffer-fill question in the first place, since
+    the stall happens before the *first* sample is ever yielded, not
+    something aggregate multi-batch timing isolates cleanly.
+
+    Returns:
+        `(elapsed_total, batches_pulled, time_to_first_batch)`.
+    """
+    it = iter(loader)
+    start = time.perf_counter()
+    try:
+        first = next(it)
+    except StopIteration:
+        pytest.fail("pulled 0 batches -- no real narrowed data available at all (see --speed-config's own real data)")
+    time_to_first_batch = time.perf_counter() - start
+
+    batches = [first] + list(itertools.islice(it, max_batches - 1))
+    elapsed_total = time.perf_counter() - start
+    return elapsed_total, len(batches), time_to_first_batch
+
+
 def _report(dataset_label, num_workers, elapsed, num_batches, batch_size, extra=""):
     samples = num_batches * batch_size
     rate = samples / elapsed if elapsed > 0 else float("inf")
@@ -352,6 +386,17 @@ def test_real_decode_throughput_config(request, speed_buffer_size, speed_num_wor
     Only supports dataloader.type:"iterative_dataloader" configs (asserted
     in _narrowed_generic_config_path) -- "dataloader"-type configs (catsdogs)
     have no buffer_size/ShuffleIterableDataset in the pipeline to sweep.
+
+    Uses _time_batches_lenient, not _time_batches -- unlike the three fixed
+    configs above (whose *_MIN_FILES targets are known to fit comfortably in
+    their real data), an arbitrary --speed-config's real data_par_size can
+    leave too little real data for one simulated 1/8th-shard rank to ever
+    produce NUM_BATCHES_TO_PULL batches, regardless of buffer_size (see that
+    helper's own docstring for the real example this hit). Reports whatever
+    batch count was actually available, plus time_to_first_batch
+    specifically -- the metric that actually isolates a buffer_size-related
+    stall, since ShuffleIterableDataset can't yield anything before its
+    buffer fills, independent of how many batches follow after that.
     """
     speed_config = request.config.getoption("--speed-config")
     if not speed_config:
@@ -363,8 +408,12 @@ def test_real_decode_throughput_config(request, speed_buffer_size, speed_num_wor
     )
     conf, data_module = _build_data_module(config_path)
     loader = data_module.train_dataloader()
-    elapsed = _time_batches(loader, NUM_BATCHES_TO_PULL)
+    elapsed, batches_pulled, time_to_first_batch = _time_batches_lenient(loader, NUM_BATCHES_TO_PULL)
     _report(
-        label, speed_num_workers, elapsed, NUM_BATCHES_TO_PULL, conf["dataloader"]["batch_size"],
-        extra=f", buffer_size={real_buffer_size}",
+        label, speed_num_workers, elapsed, batches_pulled, conf["dataloader"]["batch_size"],
+        extra=(
+            f", buffer_size={real_buffer_size}, time_to_first_batch={time_to_first_batch:.3f}s"
+            + (f" (only {batches_pulled}/{NUM_BATCHES_TO_PULL} batches available from real data)"
+               if batches_pulled < NUM_BATCHES_TO_PULL else "")
+        ),
     )
