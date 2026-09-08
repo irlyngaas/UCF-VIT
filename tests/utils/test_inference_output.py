@@ -17,7 +17,7 @@ def test_save_inference_batch_writes_expected_files(tmp_path):
     save_inference_batch(str(tmp_path), batch, output, batch_idx=3, rank=1)
 
     for sample in (0, 1):
-        for suffix in ("input", "label", "pred"):
+        for suffix in ("input", "label", "pred_label"):
             assert os.path.exists(tmp_path / f"rank1_batch3_sample{sample}_{suffix}.nii.gz")
 
 
@@ -31,7 +31,7 @@ def test_save_inference_batch_pred_matches_argmax(tmp_path):
 
     save_inference_batch(str(tmp_path), batch, output, batch_idx=0, rank=0)
 
-    pred = np.array(nib.load(str(tmp_path / "rank0_batch0_sample0_pred.nii.gz")).dataobj)
+    pred = np.array(nib.load(str(tmp_path / "rank0_batch0_sample0_pred_label.nii.gz")).dataobj)
     assert np.all(pred == 2)
 
 

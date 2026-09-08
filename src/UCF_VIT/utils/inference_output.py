@@ -39,7 +39,11 @@ def save_inference_batch(output_dir, batch, output, batch_idx, rank):
         prefix = os.path.join(output_dir, f"rank{rank}_batch{batch_idx}_sample{i}")
         _write_nifti(data[i], f"{prefix}_input.nii.gz")
         _write_nifti(label[i], f"{prefix}_label.nii.gz")
-        _write_nifti(pred[i], f"{prefix}_pred.nii.gz")
+        # "_label" suffix (not just "_pred") so viewers that auto-detect
+        # Scalar Volume vs. Labelmap by filename (e.g. 3D Slicer's "Add
+        # Data") treat this the same as the ground truth instead of loading
+        # it as a continuous grayscale volume.
+        _write_nifti(pred[i], f"{prefix}_pred_label.nii.gz")
 
 
 def _write_nifti(array, path):

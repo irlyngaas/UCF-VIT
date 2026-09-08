@@ -2227,7 +2227,7 @@ that doesn't mention it keeps parsing exactly as before.
 
 New `UCF_VIT.utils.inference_output.save_inference_batch` writes one
 batch's `data`/`label`/argmax(`output`) volumes as NIfTI files
-(`rank{r}_batch{b}_sample{i}_{input,label,pred}.nii.gz`) with an identity
+(`rank{r}_batch{b}_sample{i}_{input,label,pred_label}.nii.gz`) with an identity
 affine -- `dataset.py`'s `basic_ct` loader already discards each file's
 real affine on load (keeps only `.dataobj`), so there's no real affine
 available to preserve on the way back out. Wired into `eval_epoch`'s
@@ -2249,6 +2249,23 @@ tests: `inference_output` defaults to fully off when omitted from a real
 shipped config, threads all 4 fields through when set, and collapses back
 to defaults when `save:False` even if the other fields are set to
 something else.
+
+#### Follow-up: renamed `_pred.nii.gz` to `_pred_label.nii.gz` for viewer auto-detection
+
+Real usage (visually comparing `non_adaptive_200epoch` inference dumps in
+3D Slicer) surfaced that Slicer's "Add Data" import auto-detects Scalar
+Volume vs. Labelmap by filename convention, not by the NIfTI header's
+actual datatype -- `_label.nii.gz` got picked up as a Labelmap (discrete
+per-class colors) while `_pred.nii.gz` didn't, defaulting to a continuous
+grayscale Scalar Volume, even though both files are written with identical
+`int16` headers (`_write_nifti` never wrote float data for either; this was
+purely a Slicer-side import heuristic, confirmed by inspecting both files'
+on-disk headers directly -- byte-for-byte identical `datatype`/`scl_slope`/
+`scl_inter`/`cal_min`/`cal_max`). Renamed the prediction file to
+`_pred_label.nii.gz` so it matches the same filename convention as the
+ground truth and gets auto-detected the same way, with no manual
+"convert/reformat" step needed in the viewer. `tests/utils/
+test_inference_output.py` updated to match the new filename.
 
 ### Fixed the fork-after-CUDA-init segfault at its root: persistent `DataLoader` workers, forked before any CUDA context exists
 
