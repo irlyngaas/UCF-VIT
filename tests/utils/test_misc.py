@@ -14,12 +14,14 @@ from UCF_VIT.utils.misc import (
     detect_img_size,
     detect_num_channels,
     find_repo_root,
+    get_test_data,
     is_power_of_two,
     patchify,
     process_root_dirs,
     shard_attention_state_dict,
     shard_mlp_state_dict,
     slice_file_list,
+    stitch_data,
     unpatchify,
 )
 
@@ -653,6 +655,72 @@ def test_find_repo_root_finds_the_actual_repo_root():
     # A file only the real repo root's own src/ layout would have.
     assert os.path.isfile(os.path.join(root, "src", "UCF_VIT", "utils", "misc.py"))
     assert os.path.isdir(os.path.join(root, "training_scripts"))
+
+
+def _write_sst_memmap(path, raw_shape, fill):
+    mm = np.memmap(path, dtype=np.float32, mode='w+', shape=raw_shape)
+    mm[:] = fill(raw_shape)
+    mm.flush()
+
+
+def test_get_test_data_and_stitch_data_round_trip_no_overlap(tmp_path):
+    """get_test_data (real full-volume inference tiling) + stitch_data
+    (reassembly) must round-trip exactly when tiles don't overlap -- direct
+    correctness test for both, using known, distinct per-variable content
+    (so a wrong variable/axis mix-up shows up as a value mismatch, not just
+    a shape mismatch).
+    """
+    nz, ny, nx = 4, 4, 8
+    raw_shape = (nz, ny, nx + 2)
+    root = str(tmp_path)
+
+    true_r = np.arange(np.prod(raw_shape), dtype=np.float32).reshape(raw_shape)
+    true_p = true_r + 1000.0
+    _write_sst_memmap(os.path.join(root, "r_1.0"), raw_shape, lambda s: true_r)
+    _write_sst_memmap(os.path.join(root, "p_1.0"), raw_shape, lambda s: true_p)
+
+    data, seg = get_test_data(
+        root, "1.0", vars_input=["r"], vars_output=["p"],
+        tile_size_z=4, tile_size_y=4, tile_size_x=4,
+        nz=nz, ny=ny, nx=nx, nzskip=1, nyskip=1, nxskip=1, overlap=0.0,
+    )
+    assert data.shape == (2, 1, 4, 4, 4)  # 2 non-overlapping tiles along x (8/4)
+    assert seg.shape == (2, 1, 4, 4, 4)
+
+    reconstructed_r = stitch_data(data, nz, ny, nx, tile_size_z=4, tile_size_y=4, tile_size_x=4, nzskip=1, nyskip=1, nxskip=1, overlap=0.0)
+    reconstructed_p = stitch_data(seg, nz, ny, nx, tile_size_z=4, tile_size_y=4, tile_size_x=4, nzskip=1, nyskip=1, nxskip=1, overlap=0.0)
+
+    # true_* is (Z, Y, X) on disk (with +2 x-axis padding, trimmed here);
+    # get_test_data/stitch_data both operate in (X, Y, Z) order.
+    expected_r = true_r[:, :, :nx].transpose(2, 1, 0)
+    expected_p = true_p[:, :, :nx].transpose(2, 1, 0)
+    np.testing.assert_array_equal(reconstructed_r[..., 0], expected_r)
+    np.testing.assert_array_equal(reconstructed_p[..., 0], expected_p)
+
+
+def test_stitch_data_averages_overlapping_tiles(tmp_path):
+    """A constant field must reconstruct to the same constant everywhere,
+    including in regions covered by more than one overlapping tile (the
+    real thing overlap>0 exists to smooth over) -- a wrong overlap-region
+    average would show up as a non-constant reconstruction.
+    """
+    nz, ny, nx = 4, 4, 8
+    raw_shape = (nz, ny, nx + 2)
+    root = str(tmp_path)
+
+    _write_sst_memmap(os.path.join(root, "r_1.0"), raw_shape, lambda s: np.full(s, 7.0, dtype=np.float32))
+    _write_sst_memmap(os.path.join(root, "p_1.0"), raw_shape, lambda s: np.full(s, 7.0, dtype=np.float32))
+
+    data, _ = get_test_data(
+        root, "1.0", vars_input=["r"], vars_output=["p"],
+        tile_size_z=4, tile_size_y=4, tile_size_x=4,
+        nz=nz, ny=ny, nx=nx, nzskip=1, nyskip=1, nxskip=1, overlap=0.5,
+    )
+    assert data.shape[0] > 2  # overlap=0.5 must produce more (overlapping) tiles than the no-overlap case
+
+    reconstructed = stitch_data(data, nz, ny, nx, tile_size_z=4, tile_size_y=4, tile_size_x=4, nzskip=1, nyskip=1, nxskip=1, overlap=0.5)
+
+    np.testing.assert_allclose(reconstructed, 7.0)
 
 
 def test_find_repo_root_independent_of_cwd():

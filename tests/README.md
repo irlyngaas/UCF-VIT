@@ -4408,3 +4408,61 @@ real batch successfully -- the direct regression test for the bug above.
 `test_config_validation.py`'s existing glob-based test picked up the new
 `configs/sst/mae/base_config.yaml` automatically. Confirmed the full local
 suite is unaffected.
+
+#### Follow-up: ported the sst-relevant auxiliary dev tools that were still cleanly portable
+
+From the old SST branch's dev tools -- ported what has zero coupling to
+anything the architecture/config-schema refactor changed:
+
+- `src/UCF_VIT/utils/plotting.py` (new): `plot_learning_curve`,
+  `get_1Dgrid`, `plot_contour_box` -- plain `numpy`/`matplotlib`
+  functions, no model/dataloader imports at all, so nothing to actually
+  port beyond a straight copy (light cleanup: dropped dead commented-out
+  alternate lines, added real docstrings).
+- `UCF_VIT.utils.misc.get_test_data`/`stitch_data` (new): real
+  full-volume "sst" inference tiling + overlap-averaged reassembly --
+  unlike the training pipeline's `FileReader`/`TileDataIter` (real
+  training/eval samples, not necessarily an exhaustive covering),
+  these extract *every* tile covering one entire real timestamp and
+  stitch per-tile predictions back into one dense volume, for genuine
+  scientific evaluation/visualization of a checkpoint's real predictions.
+  Also memmap-based, same on-disk layout and same `+2` x-axis padding
+  handling as `FileReader.read_process_file`'s `"sst"` branch (every
+  tile offset is bounded by the true `nx`, so the padding is never read
+  here either, same reasoning). Fixed one real, if minor, bug while
+  porting: `stitch_data`'s final `np.divide` had no `out=`, leaving
+  uninitialized memory (not zero) in any region no tile ever covers --
+  harmless in practice (the tile grid always covers the domain
+  edge-to-edge by construction) but worth not shipping regardless.
+
+**Not ported -- genuinely new capabilities, not mechanical ports, not
+attempted here:**
+- `dev_scripts/find_model_size.py` -- the old version was ~300 lines of
+  old-architecture (`fsdp.arch`) FSDP/training boilerplate just to
+  construct a model and print its size; a lean replacement using this
+  codebase's current `parse_config`/`get_model` would be maybe 20 lines,
+  but wasn't built this pass.
+- `utils/visualize_adaptive.py`'s old SST branch usage was still 2D-only
+  (quadtree) -- unchanged from what's already shipped here. Extending it
+  to "sst" (3D, octree) needs a real new feature (`FixedOctTree` has no
+  `draw()` method at all -- `Patchify`'s 2D quadtree visualization relies
+  entirely on `FixedQuadTree.draw()`), not a port.
+- A driver script actually combining `get_test_data`/`stitch_data`/
+  `plotting.py` end-to-end (load a real checkpoint, run real full-volume
+  inference, reassemble, plot) -- the old branch's
+  `dev_scripts/inference_sap_simple.py`/`inference_pred_fsdp.py`
+  equivalent, translated to this codebase's current `test.py`/`val.py`
+  conventions. The pieces it would call are now all ported and tested;
+  wiring them together into one script is a real, separate follow-up.
+
+**Tier 1 coverage:** `tests/utils/test_misc.py` gained
+`test_get_test_data_and_stitch_data_round_trip_no_overlap` (real memmap
+files with known, distinct per-variable content -- extracts tiles, stitches
+them back, and confirms an exact match against the true domain, catching
+any axis/variable mix-up as a value mismatch) and
+`test_stitch_data_averages_overlapping_tiles` (a constant field must
+reconstruct to the same constant even where multiple overlapping tiles
+land, the actual behavior `overlap > 0` exists for). No test added for
+`plotting.py` -- pure `matplotlib` rendering helpers with no return-value
+logic to assert against, consistent with how this repo doesn't test other
+purely-visual helpers either. Confirmed the full local suite is unaffected.

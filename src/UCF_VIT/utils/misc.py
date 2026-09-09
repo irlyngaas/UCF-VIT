@@ -1085,3 +1085,154 @@ def calculate_tile_bounds(tile_idx, div, tile_size, overlap_start, overlap_end):
         start -= overlap_start
         end += overlap_end
     return start, end
+
+def get_test_data(data_dir, timestamp, vars_input, vars_output, tile_size_z, tile_size_y, tile_size_x, nz, ny, nx, nzskip, nyskip, nxskip, overlap=0.0):
+    """Extracts every (optionally overlapping) tile covering one full "sst" timestamp, for real full-volume inference.
+
+    Unlike the training pipeline's `FileReader`/`TileDataIter` (which sample
+    real tiles for training/eval, not necessarily an exhaustive, gap-free
+    covering of the whole domain), this is for running a trained model over
+    an *entire* real snapshot and reassembling the result (see
+    `stitch_data`) -- e.g. for genuine scientific evaluation/visualization
+    of a checkpoint's real predictions, not a training-time sample.
+
+    Reads directly from real per-variable memmap files (same on-disk layout
+    as `FileReader.read_process_file`'s `"sst"` branch: one flat
+    `"<variable>_<timestamp>"` file per variable, shape `(nz, ny, nx+2)` --
+    the `+2` x-axis ghost-cell padding is never read here either, since
+    every tile's x-offset is bounded by the *true* `nx`, same reasoning as
+    `FileReader`'s own trim).
+
+    Args:
+        data_dir: Directory containing this timestamp's real per-variable files.
+        timestamp: Timestamp string identifying this snapshot (the
+            `"<timestamp>"` in each file's `"<variable>_<timestamp>"` name).
+        vars_input: Input variable names (e.g. `["r", "u", "v", "w"]`).
+        vars_output: Target variable names (e.g. `["p"]`).
+        tile_size_z, tile_size_y, tile_size_x: Size of each extracted tile.
+        nz, ny, nx: True full domain size (not including the `+2` x-axis padding).
+        nzskip, nyskip, nxskip: Unused here -- kept only for interface symmetry with `stitch_data`.
+        overlap: Fraction (in `[0, 1)`) of each tile's extent to overlap
+            with its neighbors along every axis. `0.0` (default) tiles the
+            domain edge-to-edge with no overlap.
+
+    Returns:
+        A tuple `(data, seg)`: `data`, shape `(num_tiles, len(vars_input),
+        tile_size_x, tile_size_y, tile_size_z)`, every input tile,
+        channel-first, axis order `(X, Y, Z)` (matching `FileReader`'s own
+        convention); `seg`, the same shape/order for `vars_output`.
+
+    Raises:
+        ValueError: If `overlap` is not in `[0, 1]`.
+    """
+    if overlap < 0 or overlap > 1:
+        raise ValueError(f"Overlap of windows for inference should be in [0,1]. Current value = {overlap}")
+
+    nzsl, nysl, nxsl = tile_size_z, tile_size_y, tile_size_x
+
+    nz_step = max(int(nzsl * (1 - overlap)), 1)
+    ny_step = max(int(nysl * (1 - overlap)), 1)
+    nx_step = max(int(nxsl * (1 - overlap)), 1)
+
+    # Corner offsets covering the full domain edge-to-edge: evenly spaced by
+    # the step size, plus one final offset flush against the far edge if the
+    # even spacing would otherwise leave a gap uncovered at the end.
+    nzoffsets = np.arange(0, nz - nzsl + 1, nz_step)
+    if nzoffsets[-1] + nzsl < nz:
+        nzoffsets = np.append(nzoffsets, nz - nzsl)
+    nyoffsets = np.arange(0, ny - nysl + 1, ny_step)
+    if nyoffsets[-1] + nysl < ny:
+        nyoffsets = np.append(nyoffsets, ny - nysl)
+    nxoffsets = np.arange(0, nx - nxsl + 1, nx_step)
+    if nxoffsets[-1] + nxsl < nx:
+        nxoffsets = np.append(nxoffsets, nx - nxsl)
+
+    batch_size = len(nzoffsets) * len(nyoffsets) * len(nxoffsets)
+    data = np.zeros((batch_size, len(vars_input), tile_size_x, tile_size_y, tile_size_z), dtype=np.float32)
+    seg = np.zeros((batch_size, len(vars_output), tile_size_x, tile_size_y, tile_size_z), dtype=np.float32)
+
+    input_data_maps = {var: np.memmap(f"{data_dir}/{var}_{timestamp}", dtype=np.float32, mode='r', shape=(nz, ny, nx + 2)) for var in vars_input}
+    output_data_maps = {var: np.memmap(f"{data_dir}/{var}_{timestamp}", dtype=np.float32, mode='r', shape=(nz, ny, nx + 2)) for var in vars_output}
+
+    j = 0
+    for nzoffset in nzoffsets:
+        for nyoffset in nyoffsets:
+            for nxoffset in nxoffsets:
+                data[j] = np.stack([
+                    input_data_maps[var][nzoffset:nzoffset + nzsl, nyoffset:nyoffset + nysl, nxoffset:nxoffset + nxsl].copy().transpose(2, 1, 0)
+                    for var in vars_input
+                ], axis=0)
+                seg[j] = np.stack([
+                    output_data_maps[var][nzoffset:nzoffset + nzsl, nyoffset:nyoffset + nysl, nxoffset:nxoffset + nxsl].copy().transpose(2, 1, 0)
+                    for var in vars_output
+                ], axis=0)
+                j += 1
+
+    for var in vars_input + vars_output:
+        if var in input_data_maps:
+            input_data_maps[var]._mmap.close()
+        if var in output_data_maps:
+            output_data_maps[var]._mmap.close()
+
+    return data, seg
+
+def stitch_data(output, nz, ny, nx, tile_size_z, tile_size_y, tile_size_x, nzskip, nyskip, nxskip, overlap=0.5):
+    """Reassembles `get_test_data`'s per-tile model predictions back into one full dense volume.
+
+    Overlapping tiles (`overlap > 0`) are averaged in the regions they
+    share -- must be called with the exact same `tile_size_*`/`nzskip`/
+    `nyskip`/`nxskip`/`overlap`/domain-size arguments `get_test_data` was
+    called with, so the tile grid (and thus which output entries land in
+    which region) lines up identically.
+
+    Args:
+        output: Model predictions for every tile from `get_test_data`,
+            shape `(num_tiles, num_vars, tile_size_x, tile_size_y, tile_size_z)`.
+        nz, ny, nx: True full domain size (not including the `+2` x-axis padding).
+        tile_size_z, tile_size_y, tile_size_x: Size of each tile (matching `get_test_data`'s own).
+        nzskip, nyskip, nxskip: Stride (in grid points) to place each tile's
+            values at in the reassembled volume -- `1` for a dense
+            (gap-free) reconstruction.
+        overlap: Fraction (in `[0, 1)`) of tile overlap used by `get_test_data`.
+
+    Returns:
+        The reassembled dense volume, shape `(nx, ny, nz, num_vars)`
+        (`X, Y, Z` order, matching `get_test_data`'s own tile axis
+        convention) -- overlapping regions averaged, non-overlapping
+        regions exactly the corresponding tile's own prediction.
+    """
+    nzsl, nysl, nxsl = tile_size_z, tile_size_y, tile_size_x
+
+    nz_step = max(int(nzsl * (1 - overlap)), 1)
+    ny_step = max(int(nysl * (1 - overlap)), 1)
+    nx_step = max(int(nxsl * (1 - overlap)), 1)
+
+    nzoffsets = np.arange(0, nz - nzsl + 1, nz_step)
+    if nzoffsets[-1] + nzsl < nz:
+        nzoffsets = np.append(nzoffsets, nz - nzsl)
+    nyoffsets = np.arange(0, ny - nysl + 1, ny_step)
+    if nyoffsets[-1] + nysl < ny:
+        nyoffsets = np.append(nyoffsets, ny - nysl)
+    nxoffsets = np.arange(0, nx - nxsl + 1, nx_step)
+    if nxoffsets[-1] + nxsl < nx:
+        nxoffsets = np.append(nxoffsets, nx - nxsl)
+
+    num_vars = output.shape[1]
+    data = np.zeros((nx, ny, nz, num_vars), dtype=np.float32)
+    data_count = np.zeros((nx, ny, nz, num_vars), dtype=np.float32)
+
+    j = 0
+    for nzoffset in nzoffsets:
+        for nyoffset in nyoffsets:
+            for nxoffset in nxoffsets:
+                for var in range(num_vars):
+                    sub_cube = output[j, var, :]
+                    data[nxoffset:nxoffset + (nxsl * nxskip):nxskip,
+                         nyoffset:nyoffset + (nysl * nyskip):nyskip,
+                         nzoffset:nzoffset + (nzsl * nzskip):nzskip, var] += sub_cube
+                    data_count[nxoffset:nxoffset + (nxsl * nxskip):nxskip,
+                               nyoffset:nyoffset + (nysl * nyskip):nyskip,
+                               nzoffset:nzoffset + (nzsl * nzskip):nzskip, var] += 1
+                j += 1
+
+    return np.divide(data, data_count, out=np.zeros_like(data), where=data_count > 0)
