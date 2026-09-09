@@ -638,20 +638,31 @@ def parse_config(args, load_balance_offline=False):
     #TODO: Add checking on each argument, e.g. > 0
 
     dataset = conf['data']['dataset']
-    assert dataset in ["imagenet", "catsdogs", "basic_ct"], "This training script only supports the following datasets: imagenet, catsdogs, basic_ct"
+    assert dataset in ["imagenet", "catsdogs", "basic_ct", "sst"], "This training script only supports the following datasets: imagenet, catsdogs, basic_ct, sst"
 
     #img_size is always the real/native size of the data. If omitted,
     #auto-detect it by reading one real file (see detect_img_size's own
     #docstring). Resizing to a *different* size than native is a separate,
     #optional step -- see resize_conf below -- not what img_size means.
-    try:
-        img_size = conf['data']['img_size']
-    except KeyError:
-        if dist.get_rank() == 0:
-            print("img_size is not set, auto-detecting from the real data files under dict_root_dirs...")
-        img_size = detect_img_size(dataset, conf['data']['dict_root_dirs'])
-        if dist.get_rank() == 0:
-            print(f"Detected img_size: {img_size}")
+    if dataset == "sst":
+        # No cheap header to auto-detect img_size from (raw flat binary
+        # files, no metadata) -- required explicitly rather than attempting
+        # detect_img_size (which assumes an imagesTr/ listing convention
+        # this dataset doesn't use at all). Also doubles as the per-chunk
+        # size -- see UCF_VIT.utils.misc.process_root_dirs's own docstring.
+        try:
+            img_size = conf['data']['img_size']
+        except KeyError:
+            sys.exit("data.img_size is required for dataset:\"sst\" (no auto-detection is possible)")
+    else:
+        try:
+            img_size = conf['data']['img_size']
+        except KeyError:
+            if dist.get_rank() == 0:
+                print("img_size is not set, auto-detecting from the real data files under dict_root_dirs...")
+            img_size = detect_img_size(dataset, conf['data']['dict_root_dirs'])
+            if dist.get_rank() == 0:
+                print(f"Detected img_size: {img_size}")
 
     assert len(img_size) == 2 or len(img_size) == 3, "Img_size needs to be 2D or 3D"
     if len(img_size) == 2:
@@ -732,14 +743,22 @@ def parse_config(args, load_balance_offline=False):
     #If omitted, auto-detect it by reading one real file per dataset key
     #(see detect_num_channels's own docstring for per-dataset-type behavior
     #and why basic_ct raises rather than guessing for multi-channel files).
-    try:
-        num_channels = conf['data']['num_channels']
-    except KeyError:
-        if dist.get_rank() == 0:
-            print("num_channels is not set, auto-detecting from the real data files under dict_root_dirs...")
-        num_channels = detect_num_channels(dataset, conf['data']['dict_root_dirs'])
-        if dist.get_rank() == 0:
-            print(f"Detected num_channels: {num_channels}")
+    if dataset == "sst":
+        # No cheap header to auto-detect from either -- see img_size's
+        # identical treatment above.
+        try:
+            num_channels = conf['data']['num_channels']
+        except KeyError:
+            sys.exit("data.num_channels is required for dataset:\"sst\" (no auto-detection is possible)")
+    else:
+        try:
+            num_channels = conf['data']['num_channels']
+        except KeyError:
+            if dist.get_rank() == 0:
+                print("num_channels is not set, auto-detecting from the real data files under dict_root_dirs...")
+            num_channels = detect_num_channels(dataset, conf['data']['dict_root_dirs'])
+            if dist.get_rank() == 0:
+                print(f"Detected num_channels: {num_channels}")
 
     for i,k in enumerate(num_channels):
         if i == 0:
@@ -751,9 +770,15 @@ def parse_config(args, load_balance_offline=False):
     in_chans = num_chan
         
     #Create default dict_in_variables if it doesn't exist that assumes the channels are the same across different datasets
+    #"sst" is required, not defaulted: dict_in_variables' entries there aren't
+    #just informational labels, read_process_file uses them as real filename
+    #prefixes ("<variable>_<timestamp>") -- the generic numeric-placeholder
+    #default below would silently point at files that don't exist.
+    if dataset == "sst" and 'dict_in_variables' not in conf['data']:
+        sys.exit("data.dict_in_variables is required for dataset:\"sst\" -- its entries are real filename prefixes, not just labels")
     try:
         dict_in_variables = conf['data']['dict_in_variables']
-        #Check if number of variables is valid 
+        #Check if number of variables is valid
         for i,k in enumerate(conf['data']['dict_in_variables']):
             assert len(conf['data']['dict_in_variables'][k]) == num_channels[k], "dict_in_variables must have the same amount as the num_channels"
     except KeyError:
@@ -772,6 +797,20 @@ def parse_config(args, load_balance_offline=False):
             default_vars = conf['data']['dict_in_variables'][k]
         else:
             default_vars = list(set(default_vars + conf['data']['dict_in_variables'][k]))
+
+    #dict_out_variables: regression-target variable names per dataset key --
+    #only meaningful for "sst" (every other dataset's label comes from a
+    #fixed location relative to the input, e.g. basic_ct's sibling
+    #labelsTr/, rather than a separate named variable). Required, not
+    #defaulted, when dataset:"sst" and this model type actually returns a
+    #label (VIT/SAP/UNETR) -- no sensible default target variable exists.
+    if dataset == "sst" and model_conf["type"] in ["VIT", "SAP", "UNETR"]:
+        try:
+            dict_out_variables = conf['data']['dict_out_variables']
+        except KeyError:
+            sys.exit("data.dict_out_variables is required for dataset:\"sst\" with a model type that returns a label")
+    else:
+        dict_out_variables = conf['data'].get('dict_out_variables')
 
     #If using adaptive patching check if fixed length is compatible with tile_size
     if ap_conf['do_ap']:
@@ -834,6 +873,7 @@ def parse_config(args, load_balance_offline=False):
         "dict_test_root_dirs": resolved_test_root_dirs,
         "num_channels": num_channels,
         "dict_in_variables": dict_in_variables,
+        "dict_out_variables": dict_out_variables,
         "in_chans": in_chans,
     }
 
@@ -849,6 +889,9 @@ def parse_config(args, load_balance_offline=False):
 
         elif data_conf['dataset'] in ["basic_ct"]:
             assert model_conf['type'] in ["SAP", "UNETR"], "This dataset can only be used for segmentation"
+
+        elif data_conf['dataset'] in ["sst"]:
+            assert model_conf['type'] in ["UNETR"], "This dataset can only be used for regression (UNETR with model.loss_fn:\"MSE\")"
 
     dataloader_type = conf['dataloader']['type']
     assert dataloader_type in ["dataloader", "iterative_dataloader"], "dataloader type not valid"
@@ -907,6 +950,11 @@ def parse_config(args, load_balance_offline=False):
     #TODO: Move this to its own function
     dataset_options_conf = {
         "resize": resize_conf,
+        # "sst" only -- per dataset key, the true full on-disk domain size
+        # (see process_root_dirs's own docstring). Omitted/empty means every
+        # key has exactly 1 chunk (full_domain_size == img_size), matching
+        # every shipped "sst" config today.
+        "full_domain_size": conf.get('dataset_options', {}).get('full_domain_size', {}) or {},
     }
 
 # ---------------------------- INFERENCE OUTPUT -----------------------------------

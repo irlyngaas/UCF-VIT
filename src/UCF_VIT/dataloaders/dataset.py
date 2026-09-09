@@ -39,6 +39,9 @@ class FileReader(IterableDataset):
         resize: Optional[list] = None,
         allow_file_reuse: bool = False,
         epoch_shuffle_seed: Optional[int] = None,
+        variables_out: Optional[list] = None,
+        chunk_size: Optional[list] = None,
+        full_domain_size: Optional[list] = None,
     ) -> None:
         """Initializes the reader over the `[start_idx, end_idx)` fraction of `file_list`.
 
@@ -95,6 +98,20 @@ class FileReader(IterableDataset):
                 workers re-forked) every epoch -- see
                 `NativePytorchDataModule`'s own docstring entry for why that
                 matters.
+            variables_out: Regression-target variable names, e.g. `["p"]`.
+                Only used (and required, when `return_label`) for "sst" --
+                every other dataset's label comes from a fixed location
+                relative to the input file (e.g. basic_ct's sibling
+                "labelsTr" directory) rather than a separate named variable.
+            chunk_size: This dataset key's per-sample/per-chunk size `[nz,
+                ny, nx]` -- matches `data.img_size` exactly (see
+                `UCF_VIT.utils.misc.process_root_dirs`'s own docstring for
+                why "sst" repurposes img_size as the chunk size). Only used
+                for "sst".
+            full_domain_size: This dataset key's true full on-disk domain
+                size `[nz, ny, nx]` -- what one raw per-variable file
+                actually spans, before any chunk splitting. Only used for
+                "sst"; `chunk_size` itself when omitted (1 chunk).
         """
         super().__init__()
         self.num_channels_available = len(variables)
@@ -122,6 +139,10 @@ class FileReader(IterableDataset):
         #Optional Inputs
         if self.dataset == "imagenet":
             self.resize = resize
+        if self.dataset == "sst":
+            self.variables_out = variables_out
+            self.chunk_size = chunk_size
+            self.full_domain_size = full_domain_size or chunk_size
 
     def read_process_file(self, path):
         """Reads and preprocesses a single data file according to `self.dataset`.
@@ -185,6 +206,49 @@ class FileReader(IterableDataset):
                     return data, label
                 else:
                     return data
+
+        elif self.dataset == "sst":
+            # "path" is a synthetic "<root_dir>/<timestamp>" identifier (see
+            # process_root_dirs's own docstring), optionally suffixed with
+            # "__chunk<z>_<y>_<x>" when this dataset key is split into more
+            # than one chunk per raw file.
+            raw_path, _, chunk_suffix = path.partition("__chunk")
+            chunk_idx = [int(v) for v in chunk_suffix.split("_")] if chunk_suffix else [0, 0, 0]
+
+            root_path = Path(raw_path)
+            parent = root_path.parent
+            stem = root_path.name
+            nz_full, ny_full, nx_full = self.full_domain_size
+            nz, ny, nx = self.chunk_size
+            z0, y0, x0 = chunk_idx[0] * nz, chunk_idx[1] * ny, chunk_idx[2] * nx
+
+            def _read_channel(var):
+                channel_path = os.path.join(parent, f"{var}_{stem}")
+                # +2 on the x axis: a fixed, real characteristic of this CFD
+                # data's on-disk layout (ghost cells), not a tunable config
+                # value. Confirmed: the real domain is the *first* nx_full
+                # columns -- the trailing 2 are simply never read (every
+                # chunk/tile bound is computed from nx_full, so they're
+                # unreachable by construction, not explicitly trimmed here
+                # for any other reason than clarity/safety).
+                full = np.memmap(channel_path, dtype=np.float32, mode='r', shape=(nz_full, ny_full, nx_full + 2))[:, :, :nx_full]
+                chunk = full[z0:z0 + nz, y0:y0 + ny, x0:x0 + nx]
+                # (nz, ny, nx) -> (nx, ny, nz): matches every other dataset's
+                # channel-first-then-(X, Y, Z) convention (TileDataIter's own
+                # slicing, and everything downstream of it, assumes this),
+                # not the memmap's own on-disk (Z, Y, X) shape. A view, not a
+                # copy -- still lazy, no real read happens until a later
+                # caller (TileDataIter's own tile slice) actually materializes
+                # a (small) piece of it.
+                return chunk.transpose(2, 1, 0)
+
+            data_list = [_read_channel(var) for var in self.variables]
+
+            if self.return_label:
+                label_list = [_read_channel(var) for var in self.variables_out]
+                return data_list, label_list
+            else:
+                return data_list
 
     def _reshuffled_and_replicated_file_list(self):
         """Builds this call's `keys_to_add`-times-replicated, freshly shuffled `file_list`.
@@ -333,6 +397,27 @@ class TileDataIter(IterableDataset):
 
         self.classification = classification
 
+    @staticmethod
+    def _slice_tile(data, x_bounds, y_bounds, z_bounds):
+        """Slices one `(start, end)`-bounded tile out of `data` along its 3
+        spatial axes, returning a real, materialized (not lazy)
+        channel-first ndarray -- only used by the 3D (non-`twoD`) branches
+        below, the only ones "sst" (the one dataset that can pass a list
+        here) ever reaches; `data` is a single already-stacked channel-first
+        ndarray for every other dataset.
+
+        `data` is either that single ndarray, or (only for "sst" -- see
+        `FileReader.read_process_file`'s own docstring) a list of per-channel
+        memmap views. In the list case, only the tile actually being cut is
+        ever read from disk: `np.asarray` is what forces the read, and it
+        only ever sees this one small tile's worth, never the whole
+        (potentially many-GB) volume `FileReader` handed off.
+        """
+        sx, sy, sz = slice(*x_bounds), slice(*y_bounds), slice(*z_bounds)
+        if isinstance(data, list):
+            return np.stack([np.asarray(channel[sx, sy, sz]) for channel in data], axis=0)
+        return data[:, sx, sy, sz]
+
     def __iter__(self):
         """Yields one tile at a time from every sample produced by `self.dataset`.
 
@@ -371,13 +456,13 @@ class TileDataIter(IterableDataset):
                         for x_idx in range(self.div):
                             for y_idx in range(self.div):
                                 for z_idx in range(self.div):
-                                    start_x, end_x = calculate_tile_bounds(x_idx, self.div, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
-                                    start_y, end_y = calculate_tile_bounds(y_idx, self.div, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
-                                    start_z, end_z = calculate_tile_bounds(z_idx, self.div, self.tile_size_no_overlap[2], self.start_overlap[2], self.end_overlap[2])
+                                    x_bounds = calculate_tile_bounds(x_idx, self.div, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
+                                    y_bounds = calculate_tile_bounds(y_idx, self.div, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
+                                    z_bounds = calculate_tile_bounds(z_idx, self.div, self.tile_size_no_overlap[2], self.start_overlap[2], self.end_overlap[2])
                                     if self.classification:
-                                        yield data[:, start_x:end_x, start_y:end_y, start_z:end_z], label, variables
+                                        yield self._slice_tile(data, x_bounds, y_bounds, z_bounds), label, variables
                                     else:
-                                        yield data[:, start_x:end_x, start_y:end_y, start_z:end_z], label[start_x:end_x, start_y:end_y, start_z:end_z], variables
+                                        yield self._slice_tile(data, x_bounds, y_bounds, z_bounds), self._slice_tile(label, x_bounds, y_bounds, z_bounds), variables
 
             else:
                 for (data,variables) in self.dataset:
@@ -399,10 +484,10 @@ class TileDataIter(IterableDataset):
                         for x_idx in range(self.div):
                             for y_idx in range(self.div):
                                 for z_idx in range(self.div):
-                                    start_x, end_x = calculate_tile_bounds(x_idx, self.div, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
-                                    start_y, end_y = calculate_tile_bounds(y_idx, self.div, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
-                                    start_z, end_z = calculate_tile_bounds(z_idx, self.div, self.tile_size_no_overlap[2], self.start_overlap[2], self.end_overlap[2])
-                                    yield data[:, start_x:end_x, start_y:end_y, start_z:end_z], variables
+                                    x_bounds = calculate_tile_bounds(x_idx, self.div, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
+                                    y_bounds = calculate_tile_bounds(y_idx, self.div, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
+                                    z_bounds = calculate_tile_bounds(z_idx, self.div, self.tile_size_no_overlap[2], self.start_overlap[2], self.end_overlap[2])
+                                    yield self._slice_tile(data, x_bounds, y_bounds, z_bounds), variables
 
         else: #Data is 2D -- imagenet only in practice (the only
               #iterative_dataloader dataset with a 2D img_size); catsdogs

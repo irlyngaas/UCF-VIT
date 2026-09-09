@@ -385,13 +385,14 @@ def shard_attention_state_dict(full_state_dict, num_heads, tensor_par_size, tp_r
     return sharded
 
 
-def process_root_dirs(dataset, dict_root_dirs, data_par_size=None):
-    """Builds per-dataset-key lists of image file paths.
+def process_root_dirs(dataset, dict_root_dirs, data_par_size=None, img_size=None, full_domain_size=None):
+    """Builds per-dataset-key lists of file paths (or, for "sst", synthetic
+    per-sample identifiers -- see below).
 
     For "imagenet", lists every image under each root directory (grouped by
     class, in deterministic sorted-class/sorted-image order), one entry per key
-    in `dict_root_dirs`. For other datasets, lists all files under each root
-    directory's "imagesTr" subfolder, same shape.
+    in `dict_root_dirs`. For "sst", see below. For other datasets, lists all
+    files under each root directory's "imagesTr" subfolder, same shape.
 
     Deliberately *not* bucketed by rank count here -- that would make *which
     files count as train/val/test* depend on `data_par_size` (a real problem on
@@ -403,14 +404,57 @@ def process_root_dirs(dataset, dict_root_dirs, data_par_size=None):
     deterministic) output -- so split membership never depends on rank count,
     only how it's divided across ranks does.
 
+    "sst" data is laid out as one flat binary file per variable per timestamp,
+    all sharing the same root directory, named "<variable>_<timestamp>" (e.g.
+    "r_29.960000", "p_29.960000") -- not one self-contained file per sample the
+    way "imagesTr" is. A "sample" here is therefore a synthetic identifier,
+    "<root_dir>/<timestamp>", that `UCF_VIT.dataloaders.dataset.FileReader.
+    read_process_file` expands into each variable's real file by re-attaching
+    its own "<variable>_" prefix -- built by listing every real file under
+    `root_dir`, skipping the "global" file (auxiliary/metadata, not a real
+    variable snapshot), and deduplicating on everything after the first "_"
+    (the timestamp), since every variable's file for a given timestamp shares
+    it.
+
+    Additionally, each raw file can be further split into independent
+    "chunks" -- for scaling a run across far more DDP ranks than there are
+    real timestamps, by turning each timestamp into `num_chunks_z *
+    num_chunks_y * num_chunks_x` independent, separately-shardable dataset
+    entries instead of one. `img_size` (the per-sample/per-chunk size,
+    matching its usual meaning everywhere else in this codebase -- what
+    `FileReader` yields, before `tiling.div` tiles it further for model
+    input) and `full_domain_size` (the true, full on-disk extent of one raw
+    file, `[nz, ny, nx]`) together determine `num_chunks[i] = full_domain_size
+    [k][i] // img_size[i]`; only used, and only required, for "sst". When
+    every axis divides evenly to 1 chunk (matching every shipped "sst" config
+    today, which sets no `full_domain_size` narrower than `img_size` at all),
+    entries are plain "<root_dir>/<timestamp>" strings, identical to the
+    single-chunk case -- otherwise each entry gets a
+    "__chunk<z>_<y>_<x>" suffix identifying which chunk of that timestamp it
+    is. Kept as a suffixed *string*, not a richer structure (e.g. a tuple),
+    specifically so every existing generic list operation elsewhere
+    (`sorted`, slicing, `bucket_file_list`, and -- most importantly --
+    `FileReader`'s own `epoch_shuffle_seed` reshuffle, which round-trips
+    entries through `numpy.random.RandomState.choice` and needs a clean 1-D
+    array of hashable-as-opaque-strings) keeps working completely unchanged;
+    `read_process_file` is the only place that ever parses the suffix back
+    out.
+
     Args:
         dataset: Dataset name, e.g. "imagenet" or another supported dataset key.
         data_par_size: Unused -- kept only so existing callers passing it
             positionally don't need updating.
+        img_size: Per-sample/per-chunk size `[nz, ny, nx]`. Only used (and
+            required) for "sst".
+        full_domain_size: Dict mapping each `dict_root_dirs` key to that
+            key's true full on-disk domain size `[nz, ny, nx]`. Only used
+            for "sst"; a key missing from this dict (or the dict being
+            entirely absent) defaults to `img_size` itself for that key --
+            i.e. 1 chunk, matching every shipped "sst" config today.
 
     Returns:
         Dict mapping each `dict_root_dirs` key to its (sorted) list of file
-        paths.
+        paths (or, for "sst", synthetic per-sample/per-chunk identifiers).
     """
     if dataset == "imagenet":
         dict_lister_trains = {}
@@ -421,6 +465,35 @@ def process_root_dirs(dataset, dict_root_dirs, data_par_size=None):
                 cls_dir = os.path.join(root_dir, cls_name)
                 img_list.extend(sorted(glob.glob(os.path.join(cls_dir, "*.JPEG"))))
             dict_lister_trains[k] = img_list
+    elif dataset == "sst":
+        full_domain_size = full_domain_size or {}
+        dict_lister_trains = {}
+        for k, root_dir in dict_root_dirs.items():
+            timestamps = sorted({
+                fname.partition("_")[2]
+                for fname in os.listdir(root_dir)
+                if fname != "global" and "_" in fname
+            })
+
+            this_full_size = full_domain_size.get(k, img_size)
+            num_chunks = [this_full_size[i] // img_size[i] for i in range(3)]
+            assert all(this_full_size[i] % img_size[i] == 0 for i in range(3)), (
+                f"dataset_options.full_domain_size for '{k}' ({this_full_size}) must divide "
+                f"evenly by data.img_size ({img_size}) in every dimension -- got remainder "
+                f"{[this_full_size[i] % img_size[i] for i in range(3)]}."
+            )
+
+            if num_chunks == [1, 1, 1]:
+                entries = [os.path.join(root_dir, t) for t in timestamps]
+            else:
+                entries = [
+                    os.path.join(root_dir, t) + f"__chunk{zz}_{yy}_{xx}"
+                    for zz in range(num_chunks[0])
+                    for yy in range(num_chunks[1])
+                    for xx in range(num_chunks[2])
+                    for t in timestamps
+                ]
+            dict_lister_trains[k] = entries
     else:
         dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in dict_root_dirs.items() }
     return dict_lister_trains
@@ -710,7 +783,8 @@ def calculate_load_balancing_on_the_fly(conf, VERBOSE=False):
     else:
         resize = None
 
-    dict_lister_trains = process_root_dirs(dataset, dict_root_dirs)
+    full_domain_size = conf['dataset_options'].get('full_domain_size') if dataset == "sst" else None
+    dict_lister_trains = process_root_dirs(dataset, dict_root_dirs, img_size=img_size, full_domain_size=full_domain_size)
 
     # For imagenet, dict_start_idx/dict_end_idx's ratio slice (on a sorted,
     # deterministic order) must happen *before* any rank-count-dependent bucketing,

@@ -116,6 +116,13 @@ def collate_fn(batch, return_label, adaptive_patching, separate_channels, datase
             inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
             if dataset == "imagenet":
                 label = torch.stack([torch.tensor(batch[i][1]) for i in range(len(batch))])
+            elif dataset == "sst":
+                # Already channel-first (stacked over dict_out_variables in
+                # FileReader.read_process_file/TileDataIter._slice_tile),
+                # unlike basic_ct's raw (no channel dim) class-index label --
+                # no expand_dims needed here even when there's only one
+                # output variable.
+                label = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
             else:
                 if num_labels == 1:
                     label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
@@ -200,6 +207,18 @@ class NativePytorchDataModule(torch.nn.Module):
             independently reproduces the identical order for a given epoch with no
             cross-process communication needed -- no more rebuilding the `DataLoader`
             (and re-forking its workers) between epochs the way `reset()` used to.
+        dict_out_variables (Dict, optional): "sst" only -- regression-target variable
+            names per dataset key, e.g. `{"P1F4R32": ["p"]}`. Required (and only
+            meaningful) when `dataset` is "sst" and `return_label` is True.
+        img_size (list, optional): "sst" only -- this dataset's per-sample/per-chunk
+            size `[nz, ny, nx]` (see `UCF_VIT.utils.misc.process_root_dirs`'s own
+            docstring for why "sst" repurposes img_size as the chunk size, not the
+            true full on-disk domain size).
+        full_domain_size (Dict, optional): "sst" only -- per dataset key, the true
+            full on-disk domain size `[nz, ny, nx]` of one raw file, if different
+            from `img_size` (i.e. more than 1 chunk per file). A key missing from
+            this dict (or the dict being entirely absent) means 1 chunk for that
+            key.
     """
 
     def __init__(
@@ -233,6 +252,9 @@ class NativePytorchDataModule(torch.nn.Module):
         allow_file_reuse: bool = False,
         bucket_shuffle_seed: Optional[int] = None,
         epoch_shuffle_seed: Optional[int] = None,
+        dict_out_variables: Optional[Dict] = None,
+        img_size: Optional[list] = None,
+        full_domain_size: Optional[Dict] = None,
     ):
         """Initializes the data module and builds the per-dataset file listings.
 
@@ -285,6 +307,13 @@ class NativePytorchDataModule(torch.nn.Module):
 
         if self.dataset == "imagenet":
             self.resize = resize
+
+        if self.dataset == "sst":
+            assert dict_out_variables is not None and img_size is not None, \
+                "dict_out_variables and img_size are required when dataset is \"sst\""
+            self.dict_out_variables = dict_out_variables
+            self.img_size = img_size
+            self.full_domain_size = full_domain_size or {}
 
         in_variables = {}
         for k, list_out in dict_in_variables.items():
@@ -339,6 +368,10 @@ class NativePytorchDataModule(torch.nn.Module):
             Dict mapping each `self.dict_root_dirs` key to its (sorted) list of
             file paths.
         """
+        if self.dataset == "sst":
+            return process_root_dirs_shared(
+                self.dataset, self.dict_root_dirs, img_size=self.img_size, full_domain_size=self.full_domain_size,
+            )
         return process_root_dirs_shared(self.dataset, self.dict_root_dirs)
 
     def set_iterative_dataloader(self, dict_data_train, k, lister_train, keys_to_add):
@@ -375,6 +408,14 @@ class NativePytorchDataModule(torch.nn.Module):
             variables = self.dict_in_variables[k]
             num_channels_used = self.num_channels_used[k]
         return_label = self.return_label
+        if self.dataset == "sst":
+            variables_out = self.dict_out_variables[k] if return_label else None
+            chunk_size = self.img_size
+            full_domain_size = self.full_domain_size.get(k, self.img_size)
+        else:
+            variables_out = None
+            chunk_size = None
+            full_domain_size = None
         if self.dataset == "imagenet":
             dict_data_train[k] = ProcessChannels(
                 ShuffleIterableDataset(
@@ -431,6 +472,9 @@ class NativePytorchDataModule(torch.nn.Module):
                                 dataset=self.dataset,
                                 allow_file_reuse=self.allow_file_reuse,
                                 epoch_shuffle_seed=self.epoch_shuffle_seed,
+                                variables_out=variables_out,
+                                chunk_size=chunk_size,
+                                full_domain_size=full_domain_size,
                             ),
                         self.tile_size,
                         self.twoD,

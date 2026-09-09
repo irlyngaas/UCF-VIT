@@ -204,3 +204,63 @@ def test_forward_step_mae_nativeresmaskmse_do_ap_matches_native_resolution_patch
     # would blow up the loss if it leaked in.
     assert loss.item() == pytest.approx(0.0, abs=1e-6)
     assert model.calls[0] is SEQ_DO_AP
+
+
+# ---------------------------------------------------------------------------
+# UNETR: classification (default, DiceCELoss) vs. regression (loss_fn:"MSE")
+# ---------------------------------------------------------------------------
+
+
+class _FakeUNETRModel:
+    """Stub standing in for a real UNETR model -- forward_step only ever
+    calls `.forward(data, variables)` (non-do_ap), so this records what it
+    was called with and returns a fixed output, no real model needed.
+    """
+
+    def __init__(self, output):
+        self._output = output
+        self.calls = []
+
+    def forward(self, data, variables):
+        self.calls.append(data)
+        return self._output
+
+
+def _unetr_conf(loss_fn):
+    return {"model": {"type": "UNETR", "loss_fn": loss_fn}, "ap": {"do_ap": False}}
+
+
+def test_forward_step_unetr_mse_regression_uses_plain_mse_not_dicece():
+    # num_classes:1 -- a real class-index one-hot/softmax (DiceCELoss) would
+    # be shape/semantically wrong here; forward_step must skip it entirely.
+    output = torch.tensor([[[[1.0, 2.0], [3.0, 5.0]]]])  # (B=1, C=1, H=2, W=2)
+    label = torch.tensor([[[[1.0, 2.0], [3.0, 3.0]]]])  # off by 2 at one voxel
+    model = _FakeUNETRModel(output)
+    batch = {"data": torch.zeros(1, 4, 2, 2), "variables": ["r", "u", "v", "w"], "label": label}
+
+    loss, returned_output = forward_step(_unetr_conf("MSE"), batch, model)
+
+    expected = torch.nn.functional.mse_loss(output, label)
+    assert loss.item() == pytest.approx(expected.item())
+    assert loss.item() == pytest.approx(1.0)  # mean((2)**2) over 4 elements = 4/4
+    assert returned_output is output
+    assert model.calls[0] is batch["data"]
+
+
+def test_forward_step_unetr_default_still_uses_dicece_classification():
+    # Regression test: adding the "MSE" branch must not change existing
+    # classification configs' behavior (loss_fn omitted/None is by far the
+    # common case -- every shipped basic_ct/unetr config today).
+    output = torch.zeros(1, 3, 2, 2)
+    output[:, 2] = 10.0  # class 2 wins argmax everywhere
+    label = torch.full((1, 1, 2, 2), 2, dtype=torch.long)
+    model = _FakeUNETRModel(output)
+    batch = {"data": torch.zeros(1, 1, 2, 2), "variables": ["ct1"], "label": label}
+
+    loss, returned_output = forward_step(_unetr_conf(None), batch, model)
+
+    from monai.losses import DiceCELoss
+    criterion = DiceCELoss(to_onehot_y=True, softmax=True, squared_pred=True, smooth_nr=0.0, smooth_dr=1e-6)
+    expected = criterion(output, label)
+    assert loss.item() == pytest.approx(expected.item())
+    assert returned_output is output

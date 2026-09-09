@@ -4126,3 +4126,139 @@ checkpointed schedule exactly as before (regression check that the existing
 path is unchanged). `test_config_validation.py` gained a test confirming
 `reset_scheduler_on_resume:True` without `resume_from_checkpoint:True` fails
 clearly instead of being silently ignored.
+
+## Added a fourth dataset: "sst" (CFD regression, UNETR + `model.loss_fn:"MSE"`)
+
+Ported from the old `SST` branch, which had diverged 51 commits before a
+major refactor (`fsdp`/`simple` split -> unified `model/`; the whole config
+schema changed shape) -- not a mergeable diff, so this is a from-scratch
+re-implementation guided by the old branch's actual on-disk data format and
+task, not a code port. Repurposes `UNETR` for real-valued regression
+(predicting pressure `p` from velocity/density `r`/`u`/`v`/`w`) instead of
+its usual classification/segmentation task, via two new, purely additive
+pieces: a new dataset type ("sst") in the data-loading layer, and a new
+`model.loss_fn:"MSE"` option for `UNETR` in the training layer. Every
+existing dataset/config is unaffected -- confirmed by the full local suite
+staying green throughout (no existing test's behavior changed).
+
+**Data format:** one flat `np.memmap` binary file per variable per
+timestamp (e.g. `r_29.960000`, `p_29.960000`), all in one directory per
+dataset key -- not one self-contained file per sample the way
+`basic_ct`/`imagenet` are. `UCF_VIT.utils.misc.process_root_dirs` gained an
+`"sst"` branch that lists real files, skips the auxiliary `"global"` file,
+and dedupes on everything after each file's first `"_"` (the timestamp,
+shared across every variable's file for one snapshot) to build synthetic
+`"<root_dir>/<timestamp>"` sample identifiers; `FileReader.read_process_file`
+expands each back into per-variable file paths by re-attaching the
+variable's own prefix.
+
+**Chunk splitting, kept from the old branch on request** (not present in
+any config shipped so far, but a deliberate, explicit capability): real
+volumes (e.g. 512x512x256, 4 input channels) are too large to fully
+materialize before tiling, so `data.img_size` is repurposed as the
+per-sample/per-*chunk* size for `"sst"` specifically (not the true
+on-disk extent), and a new `dataset_options.full_domain_size` holds that
+true extent -- `num_chunks[i] = full_domain_size[i] // img_size[i]`. When
+`num_chunks == [1,1,1]` (every case so far), sample identifiers are
+unchanged plain `"<root_dir>/<timestamp>"` strings; otherwise each chunk
+gets a `"__chunk<z>_<y>_<x>"` suffix, keeping every entry a *string* (not
+e.g. a tuple) specifically so `FileReader`'s existing `epoch_shuffle_seed`
+reshuffle -- which round-trips entries through
+`numpy.random.RandomState.choice`, needing a clean 1-D array -- and every
+other generic list operation (`sorted`, slicing, `bucket_file_list`) keep
+working completely unchanged; `read_process_file` is the only place that
+ever parses the suffix back out. This also turns out to be the natural way
+to reconcile a non-cubic real domain (512x512x256) with `tiling.div`'s
+single shared divisor across all 3 axes -- see the new
+`configs/sst/unetr/base_config.yaml`'s own header comment for a real
+worked example (a 256^3 chunk size divides cleanly by `div:4` into 64^3
+tiles, where the raw 512x512x256 domain doesn't).
+
+**Memory safety:** `FileReader.read_process_file`'s `"sst"` branch returns
+a *list* of per-channel `np.memmap` views, not a stacked ndarray (unlike
+every other dataset) -- stacking would force-materialize the whole,
+potentially many-GB chunk immediately. `TileDataIter` gained a new
+`_slice_tile` static method, used by its 3D (non-`twoD`) branches (the only
+ones `"sst"` -- always 3D, never `twoD` -- ever reaches), that transparently
+handles both cases: a single already-stacked ndarray (every other dataset,
+byte-identical behavior to before) or a list of memmap views (`"sst"`
+only), in which case only the one small tile actually being cut is ever
+read from disk (`np.stack`/`np.asarray` is what forces the read, and it
+only ever sees that one tile).
+
+**A real, caught-before-running bug:** the raw files have a fixed `+2`
+padding on the x axis (confirmed with the user: real ghost cells, not a
+tunable value) that the tiling grid never reaches (every chunk/tile bound
+is computed from the true, unpadded `nx`) -- initially implemented as a
+symmetric `[..., 1:-1]` trim under an explicit, flagged assumption; the
+user corrected this before any real run happened -- it's actually a
+trailing-only `[..., :nx]` trim, no offset at all. Fixed in
+`FileReader.read_process_file` and the corresponding test's reference
+slice before either was ever exercised against real data.
+
+**`training.py`:** `forward_step`'s `UNETR` branch now checks
+`conf["model"]["loss_fn"] == "MSE"` and, if so, uses plain `nn.MSELoss()`
+against `batch["label"]` directly instead of `DiceCELoss`'s
+one-hot/softmax classification machinery (meaningless -- and shape-
+incompatible -- for a `num_classes:1` continuous target). `train_epoch`/
+`eval_epoch`'s accuracy reporting gained the same dispatch: `AsDiscrete`/
+`DiceMetric` are classification-only (`argmax` over `num_classes:1` is
+trivially always index 0), so regression reports plain MSE instead, the
+same quantity the loss itself is. Every existing `UNETR` config has
+`loss_fn` omitted (defaults to `None`, unchanged), so this is purely
+additive.
+
+**`UCF_VIT.utils.inference_output.save_inference_batch`** (the `test.py`/
+`val.py` NIfTI-dump feature) previously always `argmax`'d the model output
+-- meaningless for `num_classes:1` regression (always index 0). Now
+dispatches on `output.shape[1] == 1` (a real segmentation task never has
+exactly 1 class): classification keeps the existing argmax-to-int16 path
+and `_pred_label.nii.gz` filename (the `"_label"` suffix exists specifically
+so viewers like Slicer auto-load it as a discrete Labelmap); regression
+saves the raw continuous prediction as float32, named plain `_pred.nii.gz`
+(no `"_label"` suffix -- a continuous field should render as an ordinary
+Scalar Volume, not get a categorical Labelmap color table applied to it).
+
+**Known, deliberately out-of-scope gaps, not attempted here:**
+- Adaptive patching (`ap.do_ap:True`) -- the old branch's config used it,
+  but `Patchify_3D`'s edge-detection (Canny) is tuned around image-like
+  data, not raw CFD float fields with arbitrary value ranges, and hasn't
+  been checked against this data at all. `configs/sst/unetr/base_config.yaml`
+  is deliberately non-adaptive as a first, lower-risk pass -- a real,
+  separate follow-up if wanted.
+- `save_inference_batch` only ever dumps `batch["data"][:, 0]` (the first
+  input channel) -- fine for every existing single-channel dataset, but
+  `"sst"` has 4 real input channels (r/u/v/w); only the first is currently
+  visualized.
+- `nx_skip`/`ny_skip`/`nz_skip` (present, but never implemented -- the old
+  branch's own `#TODO: Fix Logic...` -- in the branch this was ported from)
+  were dropped entirely rather than carried over as more dead config surface.
+- The old branch's `dev_scripts/train_pred_fsdp.py`-style two-phase
+  MAE-pretrain-then-finetune workflow, and the `SAP`-model config
+  (`configs/sst/sap/base_config3D.yaml` in the old branch) -- deferred;
+  the user is undecided on whether the `SAP` path is wanted at all.
+
+**Tier 1 coverage:** new `tests/dataloaders/test_sst.py` -- `process_root_dirs`'s
+timestamp enumeration/dedup/`"global"`-skip and chunk expansion (including
+an uneven-division rejection test), `FileReader.read_process_file`'s actual
+memmap slicing against real on-disk files with known, distinct values per
+variable (catches offset/transpose bugs as a value mismatch, not just a
+shape mismatch) for both the single- and multi-chunk cases, a cross-check
+that `TileDataIter`'s list-of-memmaps path produces byte-identical tiles to
+the equivalent already-stacked-ndarray path, and one full end-to-end test
+building real memmap files on disk and running them all the way through
+`NativePytorchDataModule.setup`/`train_dataloader`/`collate_fn` with real
+chunk-splitting engaged (2 timestamps x 2 chunks = 4 independent samples),
+checking real, distinguishable per-chunk content survives the whole
+pipeline. `tests/test_forward_step.py` and `tests/utils/
+test_inference_output.py` each gained regression-mode tests alongside
+existing classification-mode ones (confirming the existing, unchanged
+default path still dispatches correctly). `test_config_validation.py`'s
+existing glob-based `test_shipped_config_parses` picked up the new
+`configs/sst/unetr/base_config.yaml` automatically.
+
+Not yet run against real Frontier data -- `dict_root_dirs` points at a real
+path from the old branch's own config
+(`/lustre/orion/stf006/world-shared/muraligm/CFD135/data_iso/super_res/
+binary_data/P1F4R32_nx512ny512nz256_6vars`); needs a real run to confirm
+end to end, especially the `+2`-padding fix.

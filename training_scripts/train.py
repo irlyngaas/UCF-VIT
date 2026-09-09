@@ -193,6 +193,9 @@ def main():
                 allow_file_reuse = conf["dataloader"]["allow_file_reuse"],
                 bucket_shuffle_seed = conf["dataloader"]["bucket_shuffle_seed"],
                 epoch_shuffle_seed = conf["dataloader"]["epoch_shuffle_seed"],
+                dict_out_variables = conf["data"]["dict_out_variables"],
+                img_size = conf["data"]["img_size"],
+                full_domain_size = conf["dataset_options"]["full_domain_size"],
             )
 
             data_module.setup()

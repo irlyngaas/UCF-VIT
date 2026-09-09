@@ -81,7 +81,12 @@ def forward_step(conf, batch, model):
     Dispatches to architecture-specific forward/loss logic based on
     `conf["model"]["type"]` (VIT classification cross-entropy, SAP/UNETR
     segmentation Dice(+CE) loss, MAE/DiffusionVIT reconstruction MSE loss).
-    MAE additionally supports `conf["model"]["loss_fn"] == "maskMSE"`
+    UNETR additionally supports `conf["model"]["loss_fn"] == "MSE"`, for
+    repurposing the same architecture for real-valued regression instead of
+    classification (e.g. "sst"'s pred task -- `model.num_classes:1`, no real
+    classes to Dice/one-hot at all) -- plain `nn.MSELoss()` against
+    `batch["label"]` directly, skipping DiceCELoss's one-hot/softmax
+    machinery entirely. MAE additionally supports `conf["model"]["loss_fn"] == "maskMSE"`
     (`masked_mse`, `UCF_VIT.utils.metrics`): reconstruction MSE computed only
     over the masked (encoder-hidden) patches, the standard MAE-paper loss,
     instead of `"MSE"`'s plain `nn.MSELoss()` over every patch (masked and
@@ -169,9 +174,15 @@ def forward_step(conf, batch, model):
 
         else:
             output = model.forward(batch["data"], batch["variables"])
-            
 
-        criterion = DiceCELoss(to_onehot_y=True, softmax=True, squared_pred=True, smooth_nr=0.0, smooth_dr=1e-6)
+        if conf["model"]["loss_fn"] == "MSE":
+            # Regression (e.g. "sst"'s pred task: num_classes:1, a real
+            # continuous target) -- DiceCELoss's to_onehot_y/softmax are
+            # classification-only machinery, meaningless (and shape-
+            # incompatible: no class dim to one-hot) here.
+            criterion = nn.MSELoss()
+        else:
+            criterion = DiceCELoss(to_onehot_y=True, softmax=True, squared_pred=True, smooth_nr=0.0, smooth_dr=1e-6)
         loss = criterion(output, batch["label"])
 
         return loss, output
@@ -660,15 +671,21 @@ def train_epoch(conf, model, train_dataloader, epoch, iterations_per_epoch, opti
             epoch_accuracy += acc.detach()
 
         elif conf["model"]["type"] == "UNETR":
-            post_label = AsDiscrete(to_onehot=conf["model"]["kwargs"]["num_classes"])
-            post_pred = AsDiscrete(argmax=True, to_onehot=conf["model"]["kwargs"]["num_classes"])
-            dice_acc = DiceMetric(include_background=False, reduction=MetricReduction.MEAN, get_not_nans=True)
+            if conf["model"]["loss_fn"] == "MSE":
+                # Regression -- AsDiscrete/DiceMetric are classification-only
+                # (argmax over num_classes:1 is trivially always 0); report
+                # plain MSE instead, the same quantity the loss itself is.
+                acc = nn.functional.mse_loss(output, batch["label"])
+            else:
+                post_label = AsDiscrete(to_onehot=conf["model"]["kwargs"]["num_classes"])
+                post_pred = AsDiscrete(argmax=True, to_onehot=conf["model"]["kwargs"]["num_classes"])
+                dice_acc = DiceMetric(include_background=False, reduction=MetricReduction.MEAN, get_not_nans=True)
 
-            train_labels_list = decollate_batch(batch["label"])
-            train_labels_convert = [post_label(train_label_tensor) for train_label_tensor in train_labels_list]
-            train_outputs_list = decollate_batch(output)
-            train_output_convert = [post_pred(train_pred_tensor) for train_pred_tensor in train_outputs_list]
-            acc = dice_acc(y_pred=train_output_convert, y=train_labels_convert)
+                train_labels_list = decollate_batch(batch["label"])
+                train_labels_convert = [post_label(train_label_tensor) for train_label_tensor in train_labels_list]
+                train_outputs_list = decollate_batch(output)
+                train_output_convert = [post_pred(train_pred_tensor) for train_pred_tensor in train_outputs_list]
+                acc = dice_acc(y_pred=train_output_convert, y=train_labels_convert)
 
 
         if dist.get_rank() == 0:
@@ -762,15 +779,19 @@ def eval_epoch(conf, model, eval_dataloader, epoch, iterations_per_epoch, device
                 epoch_accuracy += acc.detach()
 
             elif conf["model"]["type"] == "UNETR":
-                post_label = AsDiscrete(to_onehot=conf["model"]["kwargs"]["num_classes"])
-                post_pred = AsDiscrete(argmax=True, to_onehot=conf["model"]["kwargs"]["num_classes"])
-                dice_acc = DiceMetric(include_background=False, reduction=MetricReduction.MEAN, get_not_nans=True)
+                if conf["model"]["loss_fn"] == "MSE":
+                    # Regression -- see train_epoch's identical branch for why.
+                    acc = nn.functional.mse_loss(output, batch["label"])
+                else:
+                    post_label = AsDiscrete(to_onehot=conf["model"]["kwargs"]["num_classes"])
+                    post_pred = AsDiscrete(argmax=True, to_onehot=conf["model"]["kwargs"]["num_classes"])
+                    dice_acc = DiceMetric(include_background=False, reduction=MetricReduction.MEAN, get_not_nans=True)
 
-                eval_labels_list = decollate_batch(batch["label"])
-                eval_labels_convert = [post_label(eval_label_tensor) for eval_label_tensor in eval_labels_list]
-                eval_outputs_list = decollate_batch(output)
-                eval_output_convert = [post_pred(eval_pred_tensor) for eval_pred_tensor in eval_outputs_list]
-                acc = dice_acc(y_pred=eval_output_convert, y=eval_labels_convert)
+                    eval_labels_list = decollate_batch(batch["label"])
+                    eval_labels_convert = [post_label(eval_label_tensor) for eval_label_tensor in eval_labels_list]
+                    eval_outputs_list = decollate_batch(output)
+                    eval_output_convert = [post_pred(eval_pred_tensor) for eval_pred_tensor in eval_outputs_list]
+                    acc = dice_acc(y_pred=eval_output_convert, y=eval_labels_convert)
 
                 if conf["inference_output"]["save"] and (conf["inference_output"]["all_batches"] or counter <= conf["inference_output"]["num_batches"]):
                     save_inference_batch(conf["inference_output"]["output_dir"], batch, output, counter, dist.get_rank())
