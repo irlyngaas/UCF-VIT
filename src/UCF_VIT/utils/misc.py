@@ -411,10 +411,8 @@ def process_root_dirs(dataset, dict_root_dirs, data_par_size=None, img_size=None
     "<root_dir>/<timestamp>", that `UCF_VIT.dataloaders.dataset.FileReader.
     read_process_file` expands into each variable's real file by re-attaching
     its own "<variable>_" prefix -- built by listing every real file under
-    `root_dir`, skipping the "global" file (auxiliary/metadata, not a real
-    variable snapshot), and deduplicating on everything after the first "_"
-    (the timestamp), since every variable's file for a given timestamp shares
-    it.
+    `root_dir` and deduplicating on everything after the first "_" (the
+    timestamp), since every variable's file for a given timestamp shares it.
 
     Additionally, each raw file can be further split into independent
     "chunks" -- for scaling a run across far more DDP ranks than there are
@@ -472,7 +470,7 @@ def process_root_dirs(dataset, dict_root_dirs, data_par_size=None, img_size=None
             timestamps = sorted({
                 fname.partition("_")[2]
                 for fname in os.listdir(root_dir)
-                if fname != "global" and "_" in fname
+                if "_" in fname
             })
 
             this_full_size = full_domain_size.get(k, img_size)

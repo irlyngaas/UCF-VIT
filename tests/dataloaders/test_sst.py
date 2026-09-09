@@ -36,10 +36,15 @@ def _touch_variable_files(root_dir, variables, timestamps):
     for t in timestamps:
         for var in variables:
             open(os.path.join(root_dir, f"{var}_{t}"), "w").close()
-    open(os.path.join(root_dir, "global"), "w").close()
+    # A stray file with no "_" at all (confirmed with the user: real "sst"
+    # directories don't actually contain one -- there's no separate
+    # metadata/"global" file to special-case) -- process_root_dirs's own
+    # `"_" in fname` guard should still just ignore it rather than crash
+    # trying to parse it as "<var>_<timestamp>".
+    open(os.path.join(root_dir, "readme"), "w").close()
 
 
-def test_process_root_dirs_sst_single_chunk_dedupes_variables_and_skips_global(tmp_path):
+def test_process_root_dirs_sst_single_chunk_dedupes_variables_and_ignores_files_without_underscore(tmp_path):
     root_dir = str(tmp_path)
     _touch_variable_files(root_dir, variables=["r", "u", "v", "w"], timestamps=["1.0", "2.0"])
 
