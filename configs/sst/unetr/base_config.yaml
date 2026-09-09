@@ -120,7 +120,7 @@ data:
   twoD: False
   patch_size: 8 # Only used when do_ap:False (standard patching) -- tile_size (64) / patch_size (8) = 8 tokens per axis, 8^3 = 512 total, matching ap.fixed_length above.
   dict_root_dirs: {
-    'P1F4R32': '/lustre/orion/world-shared/stf006/muraligm/CFD135/data_iso/max_ent/binary_data/P1F4R32',
+    'P1F4R32': '/lustre/orion/world-shared/stf006/muraligm/CFD135/data_iso/max_ent/binary_data/P1F4R32_training/raw_data/',
   }
   num_channels: {
     'P1F4R32': 4,
