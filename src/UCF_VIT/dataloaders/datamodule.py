@@ -309,8 +309,15 @@ class NativePytorchDataModule(torch.nn.Module):
             self.resize = resize
 
         if self.dataset == "sst":
-            assert dict_out_variables is not None and img_size is not None, \
-                "dict_out_variables and img_size are required when dataset is \"sst\""
+            assert img_size is not None, "img_size is required when dataset is \"sst\""
+            # dict_out_variables is only actually needed when this run reads
+            # a label at all (e.g. UNETR regression) -- MAE pretraining on
+            # "sst" has return_label:False (no dataset-specific label
+            # concept it needs at all, same as MAE against any other
+            # dataset) and never reaches read_process_file's variables_out
+            # path, so it's fine left unset there.
+            if return_label:
+                assert dict_out_variables is not None, "dict_out_variables is required when dataset is \"sst\" and return_label is True"
             self.dict_out_variables = dict_out_variables
             self.img_size = img_size
             self.full_domain_size = full_domain_size or {}

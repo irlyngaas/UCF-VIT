@@ -4364,3 +4364,47 @@ concrete failure-mode reproduction described above). `test_config_
 validation.py`'s existing glob-based test picked up the new
 `configs/sst/unetr/adaptive_config.yaml` automatically. Confirmed the full
 local suite is unaffected.
+
+#### Follow-up: MAE pretrain -> UNETR finetune, and a real bug it found first
+
+New `configs/sst/mae/base_config.yaml` -- MAE pretraining on "sst"'s input
+fields (unsupervised; `decoder_embed_dim:576`/`decoder_depth:8`/
+`decoder_num_heads:16`/`decoder_mlp_ratio:4`/`mask_ratio:0.75` translated
+directly from the old SST branch's own MAE-phase config values). Phase 2
+(`configs/sst/unetr/base_config.yaml`) already had `trainer.
+use_pretrained_model`/`pretrained_checkpoint_filename` fields (every
+shipped config does, off by default) -- just needed a comment explaining
+the real steps (flip `use_pretrained_model:True`, point
+`pretrained_checkpoint_filename` at a real MAE epoch, launch with
+`--pretrained_config ../../configs/sst/mae/base_config.yaml`), not a new
+config file, since `NativePytorchDataModule`/`get_model`'s existing
+pretrained-loading mechanism (encoder-only state-dict transplant, already
+exercised for `basic_ct` earlier this session) turned out to be already
+dataset-agnostic -- no "sst"-specific code needed for the transplant
+itself.
+
+Writing a real MAE+"sst" config surfaced a real bug first, before ever
+running it: `NativePytorchDataModule.__init__`'s `"sst"` branch
+unconditionally asserted `dict_out_variables is not None` -- fine for
+`UNETR` regression (`return_label:True`, genuinely needs it), but MAE
+pretraining has `return_label:False` (unsupervised, same as MAE against
+any other dataset -- never reads `dict_out_variables`/`"p"` at all) and
+would have failed that assert on every MAE+"sst" config, including this
+new one. Fixed to only require it when `return_label` is actually `True`,
+matching `parse.py`'s own already-conditional requirement exactly.
+
+`launch/sst/mae.sh` added (mirrors `unetr.sh`, not yet run against real
+data); `launch/sst/unetr.sh` now forwards `"$@"` to `train.py` so
+`--pretrained_config` can be appended for the finetune run once a real MAE
+checkpoint exists.
+
+**Tier 1 coverage:** new `test_native_pytorch_data_module_sst_mae_
+pretraining_needs_no_dict_out_variables` in `tests/dataloaders/test_sst.py`
+-- builds a real `NativePytorchDataModule` with `return_label:False` and
+`dict_out_variables:None` (deliberately no `"p"` file on disk at all, so
+the test would fail loudly with `FileNotFoundError` if `return_label`'s
+path were ever mistakenly reached), confirming it constructs and pulls a
+real batch successfully -- the direct regression test for the bug above.
+`test_config_validation.py`'s existing glob-based test picked up the new
+`configs/sst/mae/base_config.yaml` automatically. Confirmed the full local
+suite is unaffected.

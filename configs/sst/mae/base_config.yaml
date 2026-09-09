@@ -1,0 +1,149 @@
+# MAE pretraining on the "sst" CFD dataset's input fields (r, u, v, w) --
+# unsupervised (dataloader.return_label is always False for MAE, regardless
+# of dataset, so this never touches data.dict_out_variables/"p" at all).
+# Phase 1 of a two-phase pretrain-then-finetune workflow -- phase 2 is
+# configs/sst/unetr/base_config.yaml's UNETR regression model, warm-started
+# from this MAE's encoder via trainer.use_pretrained_model (see that file's
+# own comment for exact steps). Not yet run against real Frontier data.
+#
+# decoder_embed_dim:576/decoder_depth:8/decoder_num_heads:16/
+# decoder_mlp_ratio:4/mask_ratio:0.75 are translated directly from the old
+# SST branch's own MAE-phase config values (576 satisfies this codebase's
+# own decoder_embed_dim constraints -- divisible by 3 for
+# get_3d_sincos_pos_embed under twoD:False, and by decoder_num_heads).
+#
+# See configs/sst/unetr/base_config.yaml's own header comment for the "sst"
+# data-layout/chunking writeup (chunk_size==img_size==256^3,
+# full_domain_size 256x512x512, tiling.div:4 -> tile_size 64^3) -- same
+# setup here, same real data.
+
+# ---------------------------- TRAINER -------------------------------------------
+trainer:
+  max_epochs: 100
+  data_type: "float32" #float 32 or bfloat16
+  gpu_type: "amd" #amd or nvidia
+  checkpoint_path: "checkpoint/sst/mae/base"
+  resume_from_checkpoint: False
+  checkpoint_filename: "epoch_0"
+  use_pretrained_model: False
+  pretrained_checkpoint_filename: ""
+  save_frequency: 2
+
+# ---------------------------- PARALLELISM ---------------------------------------
+parallelism:
+  fsdp_size: 1
+  simple_ddp_size: "auto" # derives from world_size at launch time (world_size / (fsdp_size * tensor_par_size)) -- see README.md's Parallelism section. Adjust fsdp_size/tensor_par_size for your real allocation size before running at scale.
+  tensor_par_size: 1
+
+# ---------------------------- OPTIMIZER -----------------------------------------
+optimizer:
+  type: "AdamW"
+  lr: 0.0001
+  beta_1: 0.9
+  beta_2: 0.95
+  weight_decay: 1e-5
+
+# ---------------------------- SCHEDULER -----------------------------------------
+scheduler:
+  type: "linear-warmup-cosine-annealing"
+  warmup_epochs: 4
+  warmup_start_lr: 1e-8
+  eta_min: 1e-8
+
+# ---------------------------- GRAD SCALER ---------------------------------------
+grad_scaler:
+  use_grad_scaler: False
+  init_scale: 8192
+  min_scale: 128
+  growth_interval: 100
+
+# ---------------------------- MODEL ---------------------------------------------
+model:
+  type: "MAE"
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  mlp_ratio: 4
+  drop_path: 0.0
+  drop_rate: 0.0
+  use_channel_aggregation: False
+
+  loss_fn: "MSE" #"MSE" (every patch, masked and visible) or "maskMSE" (only the masked/encoder-hidden patches -- the standard MAE-paper loss).
+  mask_ratio: 0.75
+  linear_decoder: False
+  decoder_embed_dim: 576
+  decoder_depth: 8
+  decoder_num_heads: 16
+  decoder_mlp_ratio: 4
+
+# ---------------------------- TILING --------------------------------------------
+tiling:
+  do_tiling: True
+  div: 4 # data.img_size (256) / div -> tile_size 64 in every dimension.
+  tile_overlap: 0
+  use_all_data: False
+
+# ---------------------------- AP ------------------------------------------------
+
+ap:
+  do_ap: False
+  fixed_length: 512
+  separate_channels: False
+  use_adaptive_pos_emb: True
+  interp_size: 32 # Only used when do_ap:True; not used by this baseline (do_ap:False) -- shown here so it's easy to find if you turn adaptive patching on. Matches configs/sst/unetr/adaptive_config.yaml's own ap block if you do.
+
+# ---------------------------- DATA ----------------------------------------------
+data:
+  dataset: "sst"
+  # [nz, ny, nx] -- doubles as the per-sample/per-chunk size for "sst", not
+  # the true full on-disk domain (that's dataset_options.full_domain_size
+  # below) -- see UCF_VIT.utils.misc.process_root_dirs's own docstring.
+  # Required explicitly for "sst" (no cheap header to auto-detect from).
+  img_size: [256, 256, 256]
+  twoD: False
+  patch_size: 8 # Only used when do_ap:False (standard patching).
+  dict_root_dirs: {
+    'P1F4R32': '/lustre/orion/world-shared/stf006/muraligm/CFD135/data_iso/max_ent/binary_data/P1F4R32_training/raw_data/',
+  }
+  num_channels: {
+    'P1F4R32': 4,
+  } # r, u, v, w -- required explicitly for "sst" (no cheap header to auto-detect from)
+  dict_in_variables: {
+    'P1F4R32': [
+     "r",
+     "u",
+     "v",
+     "w",
+    ],
+  } # Required for "sst" -- these are real filename prefixes ("<variable>_<timestamp>"), not just labels.
+  # No dict_out_variables -- MAE is unsupervised (dataloader.return_label is
+  # always False for this model type), never reads "p" at all.
+
+# ---------------------------- DATALOADER ----------------------------------------
+dataloader:
+  type: "iterative_dataloader"
+  dict_start_idx: {
+    'P1F4R32': 0,
+  }
+  dict_end_idx: {
+    'P1F4R32': 1,
+  }
+  dict_buffer_sizes: {
+    'P1F4R32': 100,
+  }
+  batch_size: 2
+  num_workers: 1
+  pin_memory: False
+  # Optional -- default 0.1/0.1 when omitted (see UCF_VIT.parse._resolve_dataset_splits).
+  val_split_ratio: 0.1
+  test_split_ratio: 0.1
+
+# ---------------------------- DATASET SPECIFIC OPTIONS -------------------------------------------
+dataset_options:
+  # "sst" only -- the true full on-disk domain size [nz, ny, nx] of one raw
+  # file, bigger than data.img_size above (the per-chunk size) in the y/x
+  # dimensions -- see configs/sst/unetr/base_config.yaml's own header
+  # comment and UCF_VIT.utils.misc.process_root_dirs's docstring for why.
+  full_domain_size: {
+    'P1F4R32': [256, 512, 512],
+  }

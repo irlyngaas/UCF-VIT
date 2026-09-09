@@ -34,6 +34,15 @@ trainer:
   checkpoint_path: "checkpoint/sst/unetr/base"
   resume_from_checkpoint: False
   checkpoint_filename: "epoch_0"
+  # To finetune from a configs/sst/mae/base_config.yaml pretraining run
+  # instead of training from scratch: set use_pretrained_model:True,
+  # pretrained_checkpoint_filename to the real MAE checkpoint epoch you
+  # want (e.g. "epoch_10"), and launch with
+  # "--pretrained_config ../../configs/sst/mae/base_config.yaml" added to
+  # the training_scripts/train.py invocation (see launch/sst/unetr.sh's own
+  # comment). Only the shared encoder gets transplanted -- UNETR's own
+  # decoder/heads always start fresh regardless (see UCF_VIT.model.utils.
+  # extract_encoder_state_dict).
   use_pretrained_model: False
   pretrained_checkpoint_filename: ""
   save_frequency: 2

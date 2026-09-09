@@ -273,3 +273,45 @@ def test_native_pytorch_data_module_sst_end_to_end_with_chunking(tmp_path):
             assert len(r_val) == 1 and len(u_val) == 1 and len(p_val) == 1
             assert (u_val - r_val).item() == pytest.approx(10.0)
             assert (p_val - r_val).item() == pytest.approx(20.0)
+
+
+def test_native_pytorch_data_module_sst_mae_pretraining_needs_no_dict_out_variables(tmp_path):
+    """MAE pretraining on "sst" has return_label:False (unsupervised, same
+    as MAE against any other dataset) and never reads dict_out_variables/"p"
+    at all -- must not require it, unlike UNETR regression (return_label:
+    True). Regression test for exactly this: NativePytorchDataModule's own
+    "sst" branch used to assert dict_out_variables is not None
+    unconditionally, which would have broken every MAE+"sst" config.
+    """
+    root_dir = str(tmp_path)
+    for var in ("r", "u"):
+        _write_memmap(os.path.join(root_dir, f"{var}_1.0"), (2, 4, 6), lambda s: np.zeros(s, dtype=np.float32))
+    # Deliberately no "p_1.0" at all -- would raise FileNotFoundError if
+    # read_process_file's return_label path were ever mistakenly reached.
+
+    data_module = NativePytorchDataModule(
+        dict_root_dirs={"P1F4R32": root_dir},
+        dict_start_idx={"P1F4R32": 0.0},
+        dict_end_idx={"P1F4R32": 1.0},
+        dict_buffer_sizes={"P1F4R32": 10},
+        dict_in_variables={"P1F4R32": ["r", "u"]},
+        num_channels_used={"P1F4R32": 2},
+        batch_size=1,
+        num_workers=0,
+        tile_size=(4, 4, 2),
+        twoD=False,
+        return_label=False,  # MAE
+        batches_per_rank_epoch={"P1F4R32": 1},
+        div=1,
+        tile_overlap=(0, 0, 0),
+        data_par_size=1,
+        dataset="sst",
+        dict_out_variables=None,  # the point of this test
+        img_size=[2, 4, 4],
+    )
+    data_module.setup()
+    batches = list(data_module.train_dataloader())
+
+    assert len(batches) == 1
+    inp, variables, dict_key = batches[0]
+    assert inp.shape == (1, 2, 4, 4, 2)
