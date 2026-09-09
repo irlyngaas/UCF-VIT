@@ -18,12 +18,13 @@
 
 # ---------------------------- TRAINER -------------------------------------------
 trainer:
-  max_epochs: 200
+  max_epochs: 1000
   data_type: "float32" #float 32 or bfloat16
   gpu_type: "amd" #amd or nvidia
   checkpoint_path: "checkpoint/unetr_token_selection_experiment/adaptive_cross_attention"
-  resume_from_checkpoint: False
-  checkpoint_filename: "epoch_0"
+  resume_from_checkpoint: True
+  checkpoint_filename: "epoch_182" # verify this is actually the last checkpoint saved on disk before changing
+  reset_scheduler_on_resume: True # fresh warmup+cosine-decay schedule sized to the new max_epochs, instead of the checkpointed 200-epoch schedule (already decayed near eta_min) -- see tests/README.md
   use_pretrained_model: False
   pretrained_checkpoint_filename: ""
   save_frequency: 2
