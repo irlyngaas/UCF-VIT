@@ -4076,3 +4076,53 @@ against in `parse.py` directly, not just in the affected configs);
 the constraints 2D adaptive patching requires. If this test starts failing
 again after a config or `parse.py` change, that's a real regression, not a
 flaky test.
+
+## Added `trainer.reset_scheduler_on_resume` for continuing training past its original `max_epochs`
+
+Motivated by a real run (`unetr_token_selection_experiment/adaptive_cross_attention.yaml`,
+174-183 real epochs on Frontier, jobs 5421840/5445353): `trainer.max_epochs:
+200` was just a first guess at how long training might need, and inference
+quality at that point suggested it wasn't enough -- the fix under
+consideration is to keep training much longer (e.g. up to 1000 epochs), not
+to treat 200 as a real budget that was reached.
+
+Before this, `resume_from_checkpoint:True` always called
+`scheduler.load_state_dict(checkpoint['scheduler_state_dict'])`
+unconditionally in `load_optimizer_scheduler_from_checkpoint` (`training.py`)
+-- which restores the checkpointed schedule's own `max_epochs` (200) along
+with everything else, so simply bumping `trainer.max_epochs` in the config
+and resuming would silently keep the *old* schedule shape: the LR stays
+pinned wherever the old, already-mostly-decayed-to-`eta_min` cosine schedule
+left it, never running a real schedule over the new, larger budget.
+
+New `trainer.reset_scheduler_on_resume` (default `False`, only meaningful
+alongside `resume_from_checkpoint:True` -- rejected explicitly in
+`parse_config` otherwise, same "reject the nonsensical combination" pattern
+as the existing `resume_from_checkpoint`+`use_pretrained_model` check).
+When `True`, `load_optimizer_scheduler_from_checkpoint` skips loading the
+checkpointed scheduler state and instead rebuilds one fresh via
+`configure_scheduler`, using `conf["scheduler"]` (whose `max_epochs` is
+always derived from `trainer.max_epochs` -- see `parse_config`) --
+attached to the optimizer *after* `optimizer.load_state_dict` has already
+restored its (near-`eta_min`) state, since `_LRScheduler.__init__` applies
+its own epoch-0 LR to the optimizer's param groups as the very last step of
+construction. Building fresh in that order is what makes the new schedule
+actually take effect, with no need to reach into the scheduler's private
+internals. Model weights and optimizer momentum are still restored from the
+checkpoint as normal -- only the LR schedule resets.
+
+To use: bump `trainer.max_epochs` to the new target and set
+`trainer.reset_scheduler_on_resume: True` alongside the existing
+`resume_from_checkpoint: True`/`checkpoint_filename` pointing at the
+checkpoint to continue from.
+
+**Tier 1 coverage:** new `tests/test_load_optimizer_scheduler_from_checkpoint.py`
+-- builds a real optimizer/scheduler pair, steps it most of the way through
+a 200-epoch schedule (LR decayed near `eta_min`), checkpoints it, then
+confirms `reset_scheduler_on_resume:True` resumes at the checkpointed epoch
+but with a fresh scheduler (new `max_epochs`, LR back at `warmup_start_lr`),
+while `reset_scheduler_on_resume:False` (the default) still restores the
+checkpointed schedule exactly as before (regression check that the existing
+path is unchanged). `test_config_validation.py` gained a test confirming
+`reset_scheduler_on_resume:True` without `resume_from_checkpoint:True` fails
+clearly instead of being silently ignored.

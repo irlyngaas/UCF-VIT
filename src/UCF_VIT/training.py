@@ -4,7 +4,7 @@ import torch.nn as nn
 import einops
 import torch.distributed as dist
 
-from UCF_VIT.utils.misc import patchify, unpatchify
+from UCF_VIT.utils.misc import configure_scheduler, patchify, unpatchify
 from monai.losses import DiceCELoss
 from monai.utils.enums import MetricReduction
 from monai.metrics import DiceMetric
@@ -19,7 +19,9 @@ def load_optimizer_scheduler_from_checkpoint(conf, optimizer, scheduler, data_se
     Args:
         conf: Parsed training configuration dict (as returned by `parse_config`).
         optimizer: Optimizer instance to load state into, in place.
-        scheduler: LR scheduler instance to load state into, in place.
+        scheduler: LR scheduler instance to load state into, in place -- unless
+            `conf["trainer"]["reset_scheduler_on_resume"]`, in which case this
+            instance is discarded and a fresh one takes its place (see below).
         data_seq_ort_group: Process group used to locate this rank's corresponding
             checkpoint file (the checkpoint from the equivalent tensor-parallel rank
             within this rank's data-parallel replica).
@@ -41,7 +43,27 @@ def load_optimizer_scheduler_from_checkpoint(conf, optimizer, scheduler, data_se
 
     checkpoint = torch.load(conf["trainer"]["checkpoint_path"]+"/"+conf["trainer"]["checkpoint_filename"]+"_rank_"+str(src_rank)+".ckpt",map_location=map_location)
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+    if conf["trainer"]["reset_scheduler_on_resume"]:
+        # For continuing a run past its original trainer.max_epochs (e.g. 200
+        # turned out not to be enough, bump it to 1000 and keep training) --
+        # the checkpointed schedule was shaped for the OLD max_epochs and is
+        # already most of the way through its cosine decay, so loading it
+        # back would just keep the LR pinned near eta_min instead of running
+        # a real schedule over the new, larger budget. Rebuilding fresh
+        # (rather than mutating `scheduler` in place) relies on
+        # configure_scheduler's LR scheduler classes applying their own
+        # epoch-0 LR to `optimizer`'s param_groups as the last step of
+        # construction -- doing that *after* optimizer.load_state_dict above
+        # (which restores the OLD near-eta_min lr into param_groups) is what
+        # actually overrides it, with no need to touch the scheduler's
+        # internals directly. conf["scheduler"]["max_epochs"] is always
+        # derived from conf["trainer"]["max_epochs"] (see parse_config), so
+        # this naturally sizes itself to whatever max_epochs this run was
+        # actually launched with.
+        scheduler = configure_scheduler(optimizer, conf["trainer"]["scheduler_type"], conf["scheduler"])
+    else:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
     loss_list = checkpoint['loss_list']
     epoch_start = checkpoint['epoch'] + 1

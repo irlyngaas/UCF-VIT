@@ -54,6 +54,27 @@ def test_resume_and_pretrained_both_true_raises_clearly():
         os.remove(path)
 
 
+def test_reset_scheduler_on_resume_without_resume_raises_clearly():
+    """reset_scheduler_on_resume:True only means something alongside
+    resume_from_checkpoint:True (see load_optimizer_scheduler_from_checkpoint
+    in training.py) -- rejected explicitly rather than silently ignored when
+    resume_from_checkpoint is left at its default False."""
+    with open(SAP_CONFIG) as f:
+        conf = yaml.load(f, Loader=yaml.FullLoader)
+    conf["trainer"]["reset_scheduler_on_resume"] = True
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    os.close(fd)
+    try:
+        with open(path, "w") as f:
+            yaml.dump(conf, f)
+        args = argparse.Namespace(config=path, pretrained_config="")
+        with pytest.raises(SystemExit, match="reset_scheduler_on_resume:True requires trainer.resume_from_checkpoint:True"):
+            parse_config(args, load_balance_offline=True)
+    finally:
+        os.remove(path)
+
+
 def test_missing_interp_size_under_do_ap_raises_clearly():
     """Regression test for interp_size's requiredness: do_ap:True with no
     ap.interp_size set must fail with a clear, actionable error (not a bare

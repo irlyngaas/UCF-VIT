@@ -403,6 +403,17 @@ def parse_config(args, load_balance_offline=False):
     if resume_from_checkpoint and conf['trainer'].get('use_pretrained_model', False):
         sys.exit("trainer.resume_from_checkpoint and trainer.use_pretrained_model cannot both be True -- resume_from_checkpoint continues an existing training run from its own checkpoint, use_pretrained_model starts a new run initialized from a different model's weights. Set only one of them to True.")
 
+    # reset_scheduler_on_resume: for continuing a run past its original
+    # trainer.max_epochs (bump max_epochs to a larger value and keep training,
+    # under a fresh schedule sized to the new budget, instead of the checkpointed
+    # schedule -- already mostly decayed toward eta_min -- picking back up where
+    # it left off). Only meaningful alongside resume_from_checkpoint:True; .get
+    # (not a bare index) so every existing config that's never heard of this
+    # field keeps parsing exactly as before.
+    reset_scheduler_on_resume = conf['trainer'].get('reset_scheduler_on_resume', False)
+    if reset_scheduler_on_resume and not resume_from_checkpoint:
+        sys.exit("trainer.reset_scheduler_on_resume:True requires trainer.resume_from_checkpoint:True -- there's no checkpointed schedule to reset when not resuming from one.")
+
     try:
         optimizer_type = conf["optimizer"]["type"]
         assert optimizer_type.lower() in ['sgd', 'adam', 'adamw'], "Optimizer type not supported. Choose optimizer type from the following choices: sgd, adam, adamw"
@@ -432,6 +443,7 @@ def parse_config(args, load_balance_offline=False):
         "checkpoint_path": os.path.join(find_repo_root(), conf['trainer']['checkpoint_path']),
         "checkpoint_filename": conf['trainer']['checkpoint_filename'],
         "resume_from_checkpoint": resume_from_checkpoint,
+        "reset_scheduler_on_resume": reset_scheduler_on_resume,
         "use_pretrained_model": conf['trainer']['use_pretrained_model'] if not resume_from_checkpoint else False,
         "pretrained_checkpoint_filename": conf['trainer'].get('pretrained_checkpoint_filename', ""),
         "save_frequency": save_frequency,
