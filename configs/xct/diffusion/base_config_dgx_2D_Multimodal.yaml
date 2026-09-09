@@ -15,6 +15,14 @@ trainer:
   gpu_type: "amd"
   log_every_n_steps: 25
   enable_performance_plots: False
+  # Refresh loss plots every completed epoch. Save a current-state milestone
+  # every 50 epochs. Generate qualitative previews after the first completed
+  # epoch in each allocation and every 50 epochs.
+  loss_plot_period: 1
+  checkpoint_period: 50
+  generation_period: 50
+  generate_on_allocation_start: True
+  preview_seed: 1234
   save_checkpoints: True
   auto_checkpoint_path: True
   checkpoint_root: "/lustre/orion/world-shared/gen006/AmirZ/Checkpoints_Frontier_FY26/NeutronCT_XRayCT_512x512x512_Standardized/Pat2000_Dec0.9"
@@ -105,7 +113,10 @@ numerical_recovery:
   lr_decay_factor: 0.2
   min_lr: 1e-5
   max_retries: 3
-  # Roll back when two consecutive completed epochs exceed twice the best
-  # persisted loss, even if all values remain finite.
-  loss_degradation_factor: 2.0
-  loss_degradation_patience: 2
+  # Use smoothed relative regression so differently scaled modalities receive
+  # equal protection. A deliberate best-state recovery resets these monitors.
+  ema_alpha: 0.3
+  loss_degradation_factor: 1.10
+  loss_degradation_patience: 3
+  modality_degradation_factor: 1.20
+  modality_degradation_patience: 3

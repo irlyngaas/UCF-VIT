@@ -12,6 +12,9 @@ from train_diffusion_fsdp_wFixedFID_2D_singMod import (
     modality_metric_spec,
     normalize_dataset_key,
     rebase_optimizer_and_scheduler_lr,
+    should_generate_preview,
+    should_save_periodic_checkpoint,
+    update_ema_degradation,
     update_loss_degradation_streak,
 )
 from UCF_VIT.utils.misc import configure_scheduler
@@ -34,6 +37,39 @@ class NumericalRecoveryTest(unittest.TestCase):
         self.assertTrue(completed_epoch_improves_best(True, 0.04, 0.05))
         self.assertFalse(completed_epoch_improves_best(False, 0.04, 0.05))
         self.assertFalse(completed_epoch_improves_best(True, 0.06, 0.05))
+
+    def test_preview_runs_at_allocation_start_and_global_period(self):
+        self.assertTrue(should_generate_preview(35, 35, True, 50))
+        self.assertTrue(should_generate_preview(50, 44, True, 50))
+        self.assertFalse(should_generate_preview(44, 44, False, 50))
+        self.assertFalse(should_generate_preview(36, 35, True, 50))
+
+    def test_periodic_checkpoint_requires_completed_period_epoch(self):
+        self.assertTrue(should_save_periodic_checkpoint(50, True, 50))
+        self.assertFalse(should_save_periodic_checkpoint(50, False, 50))
+        self.assertFalse(should_save_periodic_checkpoint(49, True, 50))
+
+    def test_ema_degradation_requires_sustained_relative_regression(self):
+        ema = None
+        best = float('inf')
+        streak = 0
+        triggered = False
+        for loss in (1.0, 1.3, 1.3, 1.3):
+            ema, best, streak, triggered = update_ema_degradation(
+                loss, ema, best, alpha=1.0, factor=1.2,
+                streak=streak, patience=3,
+            )
+        self.assertEqual(best, 1.0)
+        self.assertEqual(streak, 3)
+        self.assertTrue(triggered)
+
+    def test_ema_degradation_resets_when_loss_recovers(self):
+        ema, best, streak, triggered = update_ema_degradation(
+            1.05, 1.3, 1.0, alpha=1.0, factor=1.2,
+            streak=2, patience=3,
+        )
+        self.assertEqual((ema, best, streak), (1.05, 1.0, 0))
+        self.assertFalse(triggered)
 
     def test_modality_metrics_follow_arbitrary_configuration(self):
         spec = modality_metric_spec(

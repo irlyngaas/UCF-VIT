@@ -8,28 +8,62 @@ from UCF_VIT.utils.misc import  unpatchify
 from einops import rearrange
 import torch.distributed as dist
 import math
+import re
 ## plots
-def plotLoss(lossVec, save_path='./'):
-    loss_array = np.array([x.cpu().item() if isinstance(x, torch.Tensor) else x for x in lossVec])
+def plotLoss(lossVec, save_path='./', epochs=None, yscale='linear'):
+    """Plot finite epoch losses with sensible bounds for short histories."""
+    loss_array = np.asarray([
+        x.detach().cpu().item() if isinstance(x, torch.Tensor) else float(x)
+        for x in lossVec
+    ], dtype=float)
+    epoch_array = (
+        np.arange(loss_array.size, dtype=int)
+        if epochs is None
+        else np.asarray(epochs)
+    )
+    if epoch_array.size != loss_array.size:
+        raise ValueError("epochs and lossVec must have the same length")
 
     # Do not let a diagnostic plot hide the original numerical failure.
-    finite_loss = loss_array[np.isfinite(loss_array)]
-    if finite_loss.size == 0:
+    finite_mask = np.isfinite(loss_array)
+    if not finite_mask.any():
         return
+    finite_epochs = epoch_array[finite_mask]
+    finite_loss = loss_array[finite_mask]
 
-    fig, ax = plt.subplots(1, 1, facecolor='w')
-    ax.plot(loss_array, '-k', label='train')
-    ax.set_yscale('log')
-    plt.legend()
-    positive_loss = finite_loss[finite_loss > 0]
-    if positive_loss.size:
-        lower = positive_loss.min()
-        upper = max(finite_loss.max(), lower * 1.01)
-        ax.set_ylim([lower, upper])
-    if save_path.__contains__("rank"):
-        plt.title("rank_" + save_path.split("rank")[1].split(".png")[0])
-    fig.savefig(save_path, format='png', dpi=150)
+    fig, ax = plt.subplots(1, 1, figsize=(8, 5), facecolor='w')
+    ax.plot(finite_epochs, finite_loss, '-o', color='black', markersize=3,
+            linewidth=1.4, label='global train loss')
+    best_index = int(np.argmin(finite_loss))
+    ax.scatter([finite_epochs[best_index]], [finite_loss[best_index]],
+               color='tab:green', marker='*', s=90, zorder=3, label='best')
+    if yscale == 'log' and np.all(finite_loss > 0):
+        ax.set_yscale('log')
+    elif yscale != 'linear':
+        raise ValueError("yscale must be 'linear' or 'log'")
+
+    # Matplotlib's default single-point bounds produce misleading scientific
+    # tick labels and can make the only marker appear absent.
+    if finite_loss.size == 1:
+        y_value = finite_loss[0]
+        y_padding = max(abs(y_value) * 0.1, 1e-6)
+        ax.set_ylim(y_value - y_padding, y_value + y_padding)
+        ax.set_xlim(finite_epochs[0] - 0.5, finite_epochs[0] + 0.5)
+
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('MSE loss')
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+    rank_match = re.search(r'rank[_-]?(\d+)', os.path.basename(save_path))
+    ax.set_title(
+        f'Global training loss (rank {rank_match.group(1)} copy)'
+        if rank_match else 'Global training loss'
+    )
+    fig.tight_layout()
+    temporary_path = f"{save_path}.tmp.png"
+    fig.savefig(temporary_path, format='png', dpi=150)
     plt.close(fig)
+    os.replace(temporary_path, save_path)
 
 
 
@@ -125,23 +159,36 @@ def plot_3D_array_center_slices(arrays,filename='3D_center_slices.png'):
 
 
 
-def sample_images(model, var, device, res, precision_dt, patch_size, epoch=0, num_samples=10, twoD=False, save_path='figures', num_time_steps=1000):
+def sample_images(model, var, device, res, precision_dt, patch_size, epoch=0,
+                  num_samples=10, twoD=False, save_path='figures',
+                  num_time_steps=1000, seed=None, filename_tag=None):
 
     scheduler = DDPM_Scheduler(num_time_steps=num_time_steps)
     times = [0, 15, 50, 100, 200, 300, 400, 550, 700, 999]
+    generator = None
+    if seed is not None:
+        generator = torch.Generator(device='cpu')
+        generator.manual_seed(int(seed))
 
     images = []
     if not twoD:
-        z = torch.randn(num_samples, 1, res[0], res[1], res[2])
+        z = torch.randn(
+            num_samples, 1, res[0], res[1], res[2], generator=generator
+        )
     else:
-        z = torch.randn(num_samples, 1, res[1], res[2])
+        z = torch.randn(num_samples, 1, res[1], res[2], generator=generator)
 
     with torch.no_grad():
         for t in reversed(range(1, num_time_steps)):
             if not twoD:
-                e = torch.randn(num_samples, 1, res[0], res[1], res[2])
+                e = torch.randn(
+                    num_samples, 1, res[0], res[1], res[2],
+                    generator=generator,
+                )
             else:
-                e = torch.randn(num_samples, 1, res[1], res[2])
+                e = torch.randn(
+                    num_samples, 1, res[1], res[2], generator=generator
+                )
 
             t = [t]
             temp = (scheduler.beta[t]/( (torch.sqrt(1-scheduler.alpha[t]))*(torch.sqrt(1-scheduler.beta[t]))))
@@ -166,14 +213,19 @@ def sample_images(model, var, device, res, precision_dt, patch_size, epoch=0, nu
     # images = np.array(images)
     # images = images.astype('float32')
 
+    tag_suffix = ''
+    if filename_tag:
+        safe_tag = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(filename_tag))
+        tag_suffix = f'_{safe_tag}'
+
     if not twoD:
-        plot_3D_array_center_slices_up(images, filename=os.path.join(save_path, '3D_GEN_centerSlice_%s_%i_%i_%i_%irank%i.png' %(var, epoch, res[0], res[1], res[2], dist.get_rank())))
+        plot_3D_array_center_slices_up(images, filename=os.path.join(save_path, '3D_GEN_centerSlice_%s_%i_%i_%i_%irank%i%s.png' %(var, epoch, res[0], res[1], res[2], dist.get_rank(), tag_suffix)))
         # # plot_3D_array_center_slices(images, filename=os.path.join(save_path, '3D_gen_centerSlice_%s_%i_%i_%i_%irank%i.png' %(var, epoch, res[0], res[1], res[2], dist.get_rank())))
         # images = np.array(images)
         # images = images.astype('float32')
         # np.savez(os.path.join(save_path,'Output_gen_%s_%i_%i_%i_%irank%i.npz' %(var, epoch, res[0], res[1], res[2], dist.get_rank())),images)
     else:
-        plot_2D_array_slices(images, filename=os.path.join(save_path, '2D_gen_%s_%i_%i_%i_rank%i.png' %(var, epoch, res[1], res[2], dist.get_rank())))
+        plot_2D_array_slices(images, filename=os.path.join(save_path, '2D_gen_%s_%i_%i_%i_rank%i%s.png' %(var, epoch, res[1], res[2], dist.get_rank(), tag_suffix)))
         # np.savez(os.path.join(save_path,'Output_gen_%s_%i_%i_%i_rank%i.npz' %(var, epoch, res[1], res[2], dist.get_rank())),images)
 
 # ## correct sample images (supposedly!)

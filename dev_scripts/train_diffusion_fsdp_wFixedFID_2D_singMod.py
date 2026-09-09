@@ -158,6 +158,22 @@ def completed_epoch_improves_best(epoch_completed, current_loss, best_loss):
     return bool(epoch_completed) and float(current_loss) < float(best_loss)
 
 
+def should_generate_preview(epoch, epoch_start, epoch_completed, period,
+                            generate_on_allocation_start=True):
+    """Choose previews independently of checkpoint/best-state availability."""
+    if not epoch_completed or epoch <= 0:
+        return False
+    first_preview_epoch = epoch_start if epoch_start > 0 else 1
+    return (
+        generate_on_allocation_start and epoch == first_preview_epoch
+    ) or epoch % period == 0
+
+
+def should_save_periodic_checkpoint(epoch, epoch_completed, period):
+    """Select completed current-state milestone epochs."""
+    return bool(epoch_completed) and epoch > 0 and epoch % period == 0
+
+
 def modality_metric_spec(dict_root_dirs, dict_in_variables, dataset):
     """Build metric labels for any number of configured datasets/modalities."""
     if dataset == "imagenet":
@@ -189,6 +205,25 @@ def update_loss_degradation_streak(current_loss, best_loss, factor, streak,
         return 0, False
     streak += 1
     return streak, streak >= patience
+
+
+def update_ema_degradation(current_loss, ema_loss, best_ema_loss, alpha,
+                           factor, streak, patience):
+    """Update an EMA and detect sustained relative regression from its best."""
+    current_loss = float(current_loss)
+    ema_loss = (
+        current_loss
+        if ema_loss is None or not np.isfinite(ema_loss)
+        else alpha * current_loss + (1.0 - alpha) * float(ema_loss)
+    )
+    best_ema_loss = float(best_ema_loss)
+    if not np.isfinite(best_ema_loss) or ema_loss < best_ema_loss:
+        best_ema_loss = ema_loss
+    if ema_loss <= best_ema_loss * factor:
+        streak = 0
+    else:
+        streak += 1
+    return ema_loss, best_ema_loss, streak, streak >= patience
 
 
 def main(device):
@@ -282,6 +317,13 @@ def main(device):
     recovery_loss_degradation_patience = int(
         recovery_conf.get('loss_degradation_patience', 2)
     )
+    recovery_ema_alpha = float(recovery_conf.get('ema_alpha', 0.3))
+    recovery_modality_degradation_factor = float(
+        recovery_conf.get('modality_degradation_factor', 1.2)
+    )
+    recovery_modality_degradation_patience = int(
+        recovery_conf.get('modality_degradation_patience', 3)
+    )
     recovery_attempt = int(os.environ.get('RECOVERY_ATTEMPT', '0'))
 
     if not 0.0 < recovery_lr_decay_factor < 1.0:
@@ -297,6 +339,16 @@ def main(device):
     if recovery_loss_degradation_patience < 1:
         raise ValueError(
             "numerical_recovery.loss_degradation_patience must be positive"
+        )
+    if not 0.0 < recovery_ema_alpha <= 1.0:
+        raise ValueError("numerical_recovery.ema_alpha must be in (0, 1]")
+    if recovery_modality_degradation_factor <= 1.0:
+        raise ValueError(
+            "numerical_recovery.modality_degradation_factor must be > 1"
+        )
+    if recovery_modality_degradation_patience < 1:
+        raise ValueError(
+            "numerical_recovery.modality_degradation_patience must be positive"
         )
 
     fsdp_size = conf['parallelism']['fsdp_size']
@@ -384,6 +436,20 @@ def main(device):
         conf['trainer'].get('enable_performance_plots', True)
     )
     save_checkpoints = bool(conf['trainer'].get('save_checkpoints', True))
+    loss_plot_period = max(
+        1, int(conf['trainer'].get('loss_plot_period', 1))
+    )
+    generation_period = max(
+        1, int(conf['trainer'].get('generation_period', 50))
+    )
+    checkpoint_period = max(
+        1, int(conf['trainer'].get('checkpoint_period', 50))
+    )
+    generate_on_allocation_start = bool(
+        conf['trainer'].get('generate_on_allocation_start', True)
+    )
+    preview_seed = int(conf['trainer'].get('preview_seed', 1234))
+    preview_job_tag = f"job{os.environ.get('SLURM_JOB_ID', 'local')}"
 
     dataset = conf['data']['dataset']
     assert dataset in ["basic_ct", "imagenet", "xct"], "This training script only supports basic_ct, imagenet, or xct datasets"
@@ -680,6 +746,7 @@ def main(device):
     resume_best_loss = None
     resume_best_epoch = -1
     resume_loaded_best_state = False
+    resume_monitor_state = {}
 
     if resume_from_checkpoint:
 
@@ -707,6 +774,7 @@ def main(device):
             '_BEST_' in checkpoint_filename_for_loading
             or checkpoint_filename_for_loading.endswith('_RECOVERY'),
         )
+        resume_monitor_state = checkpoint.get('loss_monitor_state', {})
         if world_rank == 0:
             print(
                 "Restored checkpoint: "
@@ -815,8 +883,6 @@ def main(device):
     max_patience = 50000
     patience = 2000
     lr_decay_count = 0
-    save_period = 1 # this allows for us ensuring the data is plotted and saved correctly, and then we cahnge it to 50 or some other number for less frequent saving!
-    save_period_main = 50
     decay_factor = 0.9
     patience_inc_rate = 1.25 
         
@@ -832,7 +898,46 @@ def main(device):
         copy.deepcopy(scheduler.state_dict())
         if resume_loaded_best_state and save_checkpoints else None
     )
-    degradation_streak = 0
+    # A deliberate best-state recovery starts a fresh monitoring phase. An
+    # ordinary latest-state continuation carries its EMA and streaks forward.
+    if resume_loaded_best_state:
+        resume_monitor_state = {}
+    overall_loss_ema = resume_monitor_state.get('overall_ema')
+    overall_best_ema = float(
+        resume_monitor_state.get('overall_best_ema', best_loss)
+    )
+    overall_degradation_streak = int(
+        resume_monitor_state.get('overall_streak', 0)
+    )
+    modality_loss_emas = {
+        key: resume_monitor_state.get('modality_ema', {}).get(key)
+        for key in modality_metric_keys
+    }
+    modality_best_emas = {
+        key: float(
+            resume_monitor_state.get('modality_best_ema', {}).get(
+                key, float('inf')
+            )
+        )
+        for key in modality_metric_keys
+    }
+    modality_degradation_streaks = {
+        key: int(
+            resume_monitor_state.get('modality_streak', {}).get(key, 0)
+        )
+        for key in modality_metric_keys
+    }
+
+    def loss_monitor_state_dict():
+        return {
+            'overall_ema': overall_loss_ema,
+            'overall_best_ema': overall_best_ema,
+            'overall_streak': overall_degradation_streak,
+            'modality_ema': dict(modality_loss_emas),
+            'modality_best_ema': dict(modality_best_emas),
+            'modality_streak': dict(modality_degradation_streaks),
+        }
+
     if world_rank == 0 and resume_loaded_best_state:
         print(
             f"Restored persistent best state: epoch={best_epoch}, "
@@ -880,6 +985,7 @@ def main(device):
                     'scheduler_state_dict': best_scheduler_state,
                     'loss_list': loss_list,
                     'modality_loss_history': modality_loss_history,
+                    'loss_monitor_state': loss_monitor_state_dict(),
                     'best_epoch': best_epoch,
                     'best_loss': best_loss,
                     'is_best_state': True,
@@ -1137,6 +1243,68 @@ def main(device):
                 flush=True,
             )
 
+        loss_degradation_reasons = []
+        if epoch_completed and numerical_recovery_enabled:
+            (
+                overall_loss_ema,
+                overall_best_ema,
+                overall_degradation_streak,
+                overall_has_degraded,
+            ) = update_ema_degradation(
+                epoch_loss.item(),
+                overall_loss_ema,
+                overall_best_ema,
+                recovery_ema_alpha,
+                recovery_loss_degradation_factor,
+                overall_degradation_streak,
+                recovery_loss_degradation_patience,
+            )
+            if overall_has_degraded:
+                loss_degradation_reasons.append('smoothed overall loss')
+
+            for metric_key, metric_loss in epoch_modality_losses.items():
+                (
+                    modality_loss_emas[metric_key],
+                    modality_best_emas[metric_key],
+                    modality_degradation_streaks[metric_key],
+                    modality_has_degraded,
+                ) = update_ema_degradation(
+                    metric_loss,
+                    modality_loss_emas[metric_key],
+                    modality_best_emas[metric_key],
+                    recovery_ema_alpha,
+                    recovery_modality_degradation_factor,
+                    modality_degradation_streaks[metric_key],
+                    recovery_modality_degradation_patience,
+                )
+                if modality_has_degraded:
+                    loss_degradation_reasons.append(
+                        f"smoothed modality loss {metric_key}"
+                    )
+
+            if world_rank == 0:
+                modality_monitor = {
+                    f"{key}[{modality_metric_labels[key]}]": {
+                        'ema': modality_loss_emas[key],
+                        'best_ema': modality_best_emas[key],
+                        'ratio': (
+                            modality_loss_emas[key]
+                            / modality_best_emas[key]
+                        ),
+                        'streak': modality_degradation_streaks[key],
+                    }
+                    for key in epoch_modality_losses
+                }
+                print(
+                    "loss_monitor: "
+                    f"overall_ema={overall_loss_ema:.6g}, "
+                    f"overall_best_ema={overall_best_ema:.6g}, "
+                    f"overall_ratio={overall_loss_ema / overall_best_ema:.4f}, "
+                    f"overall_streak={overall_degradation_streak}, "
+                    f"modalities={modality_monitor}",
+                    flush=True,
+                )
+
         # Persist a newly improved completed epoch before handling a wall-time
         # exit. Otherwise a deadline that lands exactly at the epoch boundary
         # would advance the latest checkpoint while silently losing the new
@@ -1170,6 +1338,7 @@ def main(device):
                         'scheduler_state_dict': best_scheduler_state,
                         'loss_list': loss_list,
                         'modality_loss_history': modality_loss_history,
+                        'loss_monitor_state': loss_monitor_state_dict(),
                         'best_epoch': best_epoch,
                         'best_loss': best_loss,
                         'is_best_state': True,
@@ -1227,6 +1396,7 @@ def main(device):
                     'scheduler_state_dict': restart_scheduler_state,
                     'loss_list': loss_list,
                     'modality_loss_history': modality_loss_history,
+                    'loss_monitor_state': loss_monitor_state_dict(),
                     'best_epoch': best_epoch,
                     'best_loss': best_loss,
                     'is_best_state': False,
@@ -1245,31 +1415,11 @@ def main(device):
                 print("Walltime checkpoint complete; requesting continuation.", flush=True)
             return True
 
-        if numerical_recovery_enabled and np.isfinite(best_loss):
-            degradation_streak, loss_has_diverged = (
-                update_loss_degradation_streak(
-                    epoch_loss.item(),
-                    best_loss,
-                    recovery_loss_degradation_factor,
-                    degradation_streak,
-                    recovery_loss_degradation_patience,
-                )
+        if loss_degradation_reasons:
+            optimizer.zero_grad(set_to_none=True)
+            return prepare_numerical_recovery(
+                ' and '.join(loss_degradation_reasons), epoch, counter
             )
-            if degradation_streak and world_rank == 0:
-                print(
-                    "Finite loss degradation detected: "
-                    f"epoch={epoch}, loss={epoch_loss.item():.6g}, "
-                    f"best={best_loss:.6g}, "
-                    f"threshold={best_loss * recovery_loss_degradation_factor:.6g}, "
-                    f"streak={degradation_streak}/"
-                    f"{recovery_loss_degradation_patience}",
-                    flush=True,
-                )
-            if loss_has_diverged:
-                optimizer.zero_grad(set_to_none=True)
-                return prepare_numerical_recovery(
-                    'finite loss degradation', epoch, counter
-                )
         
         # if epoch % fid_eval_period == 0 and world_rank == 0:
         #     model.eval()
@@ -1286,12 +1436,26 @@ def main(device):
         
         if world_rank==0:
             print("epoch: ",epoch," epoch_loss ",epoch_loss, flush=True)
-            if epoch % 100 == 0:
-                plotLoss(loss_list, save_path=os.path.join(checkpoint_path, f'loss_N{simple_ddp_size//8}_BS{batch_size}_PS{patch_size}_ED{emb_dim}_rank0.png'))
+            if epoch_completed and epoch % loss_plot_period == 0:
+                plotLoss(
+                    loss_list,
+                    save_path=os.path.join(
+                        checkpoint_path,
+                        f'loss_N{simple_ddp_size//8}_BS{batch_size}_PS'
+                        f'{patch_size}_ED{emb_dim}_rank0.png',
+                    ),
+                )
         if world_rank==1:
-            if epoch % 100 == 0:
+            if epoch_completed and epoch % loss_plot_period == 0:
                 print("epoch: ",epoch," epoch_loss ",epoch_loss, flush=True)
-                plotLoss(loss_list, save_path=os.path.join(checkpoint_path, f'loss_N{simple_ddp_size//8}_BS{batch_size}_PS{patch_size}_ED{emb_dim}_rank1.png'))
+                plotLoss(
+                    loss_list,
+                    save_path=os.path.join(
+                        checkpoint_path,
+                        f'loss_N{simple_ddp_size//8}_BS{batch_size}_PS'
+                        f'{patch_size}_ED{emb_dim}_rank1.png',
+                    ),
+                )
 
         if enable_performance_plots and ((epoch==1) or (epoch % 50 == 0)) and (dist.get_rank(tensor_par_group) == 0):
             # grab a small batch from the current loader (only this rank has it)
@@ -1361,36 +1525,68 @@ def main(device):
                 epochs_without_improvement = 0
 
         dist.barrier()
-        
-        # Save the best model periodically
-        if (save_checkpoints and best_model_state is not None and epoch > 0
-                and epoch % save_period == 0
-                and world_rank < tensor_par_size):
-            torch.save({
-                'epoch': best_epoch,
-                'next_epoch': best_epoch + 1,
-                'model_state_dict': best_model_state,
-                'optimizer_state_dict': best_optimizer_state,
-                'scheduler_state_dict': best_scheduler_state,
-                'loss_list': loss_list,
-                'modality_loss_history': modality_loss_history,
-                'best_epoch': best_epoch,
-                'best_loss': best_loss,
-                'is_best_state': True,
-                'checkpoint_type': 'best',
-            }, f"{checkpoint_path}/{checkpoint_filename}_BEST_{epoch}_rank_{world_rank}.ckpt")
 
-            # Sampling uses the current training state. Do not replace only the
-            # model weights with an older best state while leaving optimizer
-            # and scheduler states untouched.
+        periodic_checkpoint_due = should_save_periodic_checkpoint(
+            epoch, epoch_completed, checkpoint_period
+        )
+        if periodic_checkpoint_due:
+            # Unlike BEST checkpoints, this milestone is the mutually
+            # consistent current training state at the named epoch.
+            periodic_model_state = model.state_dict()
+            periodic_optimizer_state = optimizer.state_dict()
+            periodic_scheduler_state = scheduler.state_dict()
+            if world_rank < tensor_par_size:
+                periodic_checkpoint_file = os.path.join(
+                    checkpoint_path,
+                    f"{checkpoint_filename}_EPOCH_{epoch}_rank_"
+                    f"{world_rank}.ckpt",
+                )
+                periodic_temporary_file = (
+                    f"{periodic_checkpoint_file}.tmp-"
+                    f"{os.environ.get('SLURM_JOB_ID', 'local')}"
+                )
+                torch.save({
+                    'epoch': epoch,
+                    'next_epoch': epoch + 1,
+                    'model_state_dict': periodic_model_state,
+                    'optimizer_state_dict': periodic_optimizer_state,
+                    'scheduler_state_dict': periodic_scheduler_state,
+                    'loss_list': loss_list,
+                    'modality_loss_history': modality_loss_history,
+                    'loss_monitor_state': loss_monitor_state_dict(),
+                    'best_epoch': best_epoch,
+                    'best_loss': best_loss,
+                    'is_best_state': False,
+                    'checkpoint_type': 'periodic',
+                }, periodic_temporary_file)
+                os.replace(
+                    periodic_temporary_file, periodic_checkpoint_file
+                )
+                print(
+                    "Saved periodic current-state checkpoint: "
+                    f"{periodic_checkpoint_file}",
+                    flush=True,
+                )
+            dist.barrier()
+
+        generation_due = should_generate_preview(
+            epoch,
+            epoch_start,
+            epoch_completed,
+            generation_period,
+            generate_on_allocation_start,
+        )
+        if generation_due and world_rank < tensor_par_size:
+            # Always sample the current training state. Do not replace its
+            # weights with an older best state or couple previews to best-state
+            # availability.
             for var in default_vars:
                 model.eval()
                 sample_images(model, var, device, tile_size, precision_dt, patch_size,
                             epoch=epoch, num_samples=5, twoD=twoD, save_path=inference_path,
-                            num_time_steps=num_time_steps)
+                            num_time_steps=num_time_steps, seed=preview_seed,
+                            filename_tag=f"{preview_job_tag}_preview")
                 model.train()
-            if save_period<save_period_main:
-                save_period = save_period_main
 
 
         dist.barrier()
@@ -1408,6 +1604,7 @@ def main(device):
             'scheduler_state_dict': best_scheduler_state,
             'loss_list': loss_list,
             'modality_loss_history': modality_loss_history,
+            'loss_monitor_state': loss_monitor_state_dict(),
             'best_epoch': best_epoch,
             'best_loss': best_loss,
             'is_best_state': True,
@@ -1420,7 +1617,8 @@ def main(device):
             model.eval()
             sample_images(model, var, device, tile_size, precision_dt, patch_size,
                                 epoch=best_epoch, num_samples=10, twoD=twoD, save_path=inference_path,
-                                num_time_steps=num_time_steps)
+                                num_time_steps=num_time_steps, seed=preview_seed,
+                                filename_tag=f"{preview_job_tag}_finalbest")
             model.train()
             # save_intermediate_data(model, var, device, tile_size, precision_dt, patch_size,
             #                     epoch=best_epoch, num_samples=2, twoD=twoD, save_path=inference_path,
