@@ -4301,3 +4301,66 @@ tests" section above) work for `--speed-config
 (or the speed tests, pointed at the sst config) actually run on Frontier.
 Confirmed locally: collects and skips cleanly (no real `srun` launch
 present), and the rest of the local suite is unaffected.
+
+#### Follow-up: real Frontier confirmation, then adaptive patching
+
+`configs/sst/unetr/base_config.yaml` ran cleanly against real Frontier
+data (job 5455196, non-adaptive) -- real 8-rank init, "Train from
+scratch.", no errors/NaN anywhere, 4 full epochs completed before hitting
+the (deliberately short, first-attempt) time limit, `epoch_loss` trending
+sharply down (12.59 -> 11.85 -> 5.36 -> 1.86). `it_loss`/`it_acc` print
+identically on every batch, exactly as designed -- regression's "accuracy"
+is the same plain MSE the loss itself is (see `train_epoch`'s `UNETR`
+branch). Confirmed both the memmap `+2`-padding trim and the `MSE`
+regression path work correctly against real data, not just synthetic
+files.
+
+With the non-adaptive path confirmed, added adaptive patching
+(`configs/sst/unetr/adaptive_config.yaml`) as its own follow-up, not
+folded into `base_config.yaml` -- this needed a real fix, not just
+flipping `ap.do_ap:True`. `Patchify_3D`'s `SimpleITK.CannyEdgeDetection`
+call uses *absolute* hysteresis thresholds (`canny_thresholds`, default
+`(0.05, 0.15)`) tuned for roughly `[0,1]`-scaled data -- true for
+`basic_ct` only because it's min-max normalized once at file-read time
+(`FileReader.read_process_file`'s own `(data-data.min())/(data.max()-
+data.min())`); `"sst"`'s raw CFD fields (density/velocity/pressure) are in
+arbitrary physical units with no such normalization anywhere in their
+pipeline. Plugging those straight into the existing thresholds would
+silently either miss real features (raw gradient magnitude far below the
+absolute threshold) or flag everything (far above it), depending on the
+field's real scale -- not a hypothetical: `test_patchify_3d_sst_detects_
+edge_too_small_for_raw_scale` (below) reproduces the miss case directly
+with a real step of magnitude `0.001`, ~50x smaller than
+`canny_thresholds`' own lower bound.
+
+Fixed by normalizing *only* the array fed into `CannyEdgeDetection` for
+`dataset:"sst"` specifically (per channel, locally, inside `Patchify_3D.
+forward`) -- the real patch content (`octree.serialize`, what the model
+actually trains against) still gets the real, un-normalized `img`
+unchanged, so training still happens on real physical values, only the
+edge-detection *input* is rescaled. Scoped strictly to `"sst"` -- every
+other dataset's edge-detection input is completely untouched (`Patchify_3D`'s
+`dataset` parameter was previously "kept for interface compatibility"
+only, never actually branched on).
+
+`adaptive_config.yaml`'s `ap.fixed_length:729`/`ap.interp_size:8` are
+translated from the old SST branch's config (`fixed_length:729`,
+`patch_size:8` -- that codebase had no separate `interp_size` concept,
+`patch_size` served both roles); `729 == 9^3` exactly, so UNETR's
+reconstructed canvas (`sqrt_len=9`) loses zero adaptive tokens (doesn't
+trigger `parse.py`'s own "UNETR's decoder bottleneck..." warning). Not yet
+run against real Frontier data.
+
+**Tier 1 coverage:** `tests/dataloaders/test_transform.py` gained three
+tests: `test_patchify_3d_sst_normalizes_only_edge_detection_input_not_real_
+patch_content` (the core equivalence property -- `dataset:"sst"` on raw,
+arbitrary-scale data must produce the *exact same* edge map a manually
+pre-normalized `[0,1]` volume gets on the default path, while the real
+patch content stays at real physical values, not the normalized proxy),
+`test_patchify_3d_non_sst_dataset_unaffected` (regression check that
+`basic_ct`'s own edge-detection input is untouched), and
+`test_patchify_3d_sst_detects_edge_too_small_for_raw_scale` (the direct,
+concrete failure-mode reproduction described above). `test_config_
+validation.py`'s existing glob-based test picked up the new
+`configs/sst/unetr/adaptive_config.yaml` automatically. Confirmed the full
+local suite is unaffected.

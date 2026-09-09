@@ -4,34 +4,36 @@
 # DiceCELoss path -- see UCF_VIT.training.forward_step's own model.loss_fn
 # dispatch.
 #
-# Deliberately non-adaptive (ap.do_ap:False) -- confirmed working against
-# real Frontier data first (job 5455196) before adding the adaptive-
-# patching follow-up in adaptive_config.yaml (Patchify_3D's Canny edge
-# detection needed a real fix for "sst"'s arbitrary-range CFD floats, not
-# just flipping ap.do_ap -- see that file's own header comment).
+# Adaptive-patching (ap.do_ap:True) follow-up to base_config.yaml (which
+# stays non-adaptive, confirmed working against real Frontier data first).
+# Required a real fix, not just flipping the flag: Patchify_3D's Canny edge
+# detection uses absolute hysteresis thresholds tuned for ~[0,1]-scaled
+# data (true for basic_ct only because it's min-max normalized once at
+# file-read time) -- "sst"'s raw CFD fields are in arbitrary physical
+# units, so Patchify_3D now normalizes *only* its edge-detection input for
+# dataset:"sst" (per channel, locally), leaving the real patch content
+# (what the model actually sees/trains against) at real physical values.
+# See Patchify_3D's own docstring.
 #
-# "sst" data is one flat np.memmap binary file per variable per timestamp
-# (not one self-contained file per sample), too large to tile after fully
-# loading (512x512x256, 4 input channels) -- see UCF_VIT.utils.misc.
-# process_root_dirs's own docstring for the full "sst" data-layout writeup.
-# dataset_options.full_domain_size ([256, 512, 512], the true on-disk
-# extent) is bigger than data.img_size ([256, 256, 256] below, doubling as
-# the per-chunk size) in the y/x dimensions, splitting each real timestamp
-# into 1*2*2 = 4 independent, separately-shardable chunks -- both so real
-# 512x512 volumes don't have to be tiled directly (each chunk stays a real
-# on-disk memmap slice, sliced further into tiles the normal way once
-# loaded), and to line up tiling.div with a cube (256^3), since tiling.div
-# applies the same divisor to every axis and 512/256 aren't both evenly
-# divisible into 64-sized tiles by one shared div. Composes to the same
-# real per-token tile_size the old config used: img_size (256) / div (4) =
-# 64 in every dimension.
+# fixed_length:729 (=9^3, satisfying the octree "7n+1" constraint) and
+# interp_size:8 are translated from the old SST branch's config
+# (fixed_length:729, patch_size:8 -- that codebase had no separate
+# interp_size concept, patch_size served both roles) -- 9^3 == fixed_length
+# exactly, so UNETR's reconstructed canvas (sqrt_len=9) loses zero adaptive
+# tokens (see parse.py's own "UNETR's decoder bottleneck..." warning, which
+# this doesn't trigger).
+#
+# See base_config.yaml's own header comment for the "sst" data-layout/
+# chunking writeup (chunk_size==img_size==256^3, full_domain_size
+# 256x512x512, tiling.div:4 -> tile_size 64^3) -- unchanged here, adaptive
+# patching is independent of that.
 
 # ---------------------------- TRAINER -------------------------------------------
 trainer:
   max_epochs: 600
   data_type: "float32" #float 32 or bfloat16
   gpu_type: "amd" #amd or nvidia
-  checkpoint_path: "checkpoint/sst/unetr/base"
+  checkpoint_path: "checkpoint/sst/unetr/adaptive"
   resume_from_checkpoint: False
   checkpoint_filename: "epoch_0"
   use_pretrained_model: False
@@ -55,13 +57,8 @@ optimizer:
 # ---------------------------- SCHEDULER -----------------------------------------
 scheduler:
   type: "linear-warmup-cosine-annealing"
-  # The old SST-branch config specified its schedule in optimizer *steps*
-  # (warmup_steps:1000, max_steps:20000), not epochs -- this codebase's
-  # scheduler is epoch-based (trainer.max_epochs above), and there's no
-  # exact unit conversion without knowing real batches/epoch for this run,
-  # so warmup_epochs here is a reasonable starting guess (matching other
-  # shipped UNETR configs), not a faithful translation -- tune once you
-  # have a real batches/epoch figure.
+  # See base_config.yaml's identical comment -- a starting guess, not a
+  # faithful translation of the old branch's step-based schedule.
   warmup_epochs: 10
   warmup_start_lr: 1e-8
   eta_min: 1e-8
@@ -89,24 +86,24 @@ model:
   linear_decoder: False
   feature_size: 16
   skip_connection: True
-  token_selection: point # Only used when do_ap:True; not used by this baseline (do_ap:False) -- shown here so it's easy to find if you turn adaptive patching on.
+  token_selection: point # "point" (default), "smallest_overlap", "area_weighted", or "cross_attention" -- see UCF_VIT.model.arch.UNETR._adaptive_token_grid_index/_adaptive_token_grid_weights/_cross_attention_query_and_mask.
   area_weighted_alpha: 0 # Only used when token_selection:area_weighted.
 
 # ---------------------------- TILING --------------------------------------------
 tiling:
   do_tiling: True
-  div: 4 # data.img_size (256) / div -> tile_size 64 in every dimension, matching the old config's tile_size:[64,64,64].
+  div: 4 # data.img_size (256) / div -> tile_size 64 in every dimension.
   tile_overlap: 0
   use_all_data: False
 
 # ---------------------------- AP ------------------------------------------------
 
 ap:
-  do_ap: False
-  fixed_length: 512
+  do_ap: True
+  fixed_length: 729 # 9^3 -- see this file's own header comment.
   separate_channels: False
   use_adaptive_pos_emb: True
-  interp_size: 32 # Only used when do_ap:True; not used by this baseline (do_ap:False) -- shown here so it's easy to find if you turn adaptive patching on.
+  interp_size: 8 # Side length each adaptive leaf patch is interpolated to -- see this file's own header comment.
 
 # ---------------------------- DATA ----------------------------------------------
 data:
@@ -117,7 +114,6 @@ data:
   # Required explicitly for "sst" (no cheap header to auto-detect from).
   img_size: [256, 256, 256]
   twoD: False
-  patch_size: 8 # Only used when do_ap:False (standard patching) -- tile_size (64) / patch_size (8) = 8 tokens per axis, 8^3 = 512 total, matching ap.fixed_length above.
   dict_root_dirs: {
     'P1F4R32': '/lustre/orion/world-shared/stf006/muraligm/CFD135/data_iso/max_ent/binary_data/P1F4R32_training/raw_data/',
   }
@@ -161,7 +157,7 @@ dataloader:
 dataset_options:
   # "sst" only -- the true full on-disk domain size [nz, ny, nx] of one raw
   # file, bigger than data.img_size above (the per-chunk size) in the y/x
-  # dimensions -- see this file's own header comment and
+  # dimensions -- see base_config.yaml's own header comment and
   # UCF_VIT.utils.misc.process_root_dirs's docstring for why.
   full_domain_size: {
     'P1F4R32': [256, 512, 512],

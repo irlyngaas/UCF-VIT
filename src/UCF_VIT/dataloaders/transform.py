@@ -171,7 +171,14 @@ class Patchify_3D(torch.nn.Module):
                 loading).
             interp_size: Side length each (cubic) leaf patch is interpolated to.
             num_channels: Number of volume channels.
-            dataset: Dataset name; kept for interface compatibility with `Patchify`.
+            dataset: Dataset name. Mostly kept for interface compatibility
+                with `Patchify`, except for `"sst"`: its raw CFD fields are
+                in arbitrary physical units, not the ~[0,1] scale
+                `canny_thresholds` assumes (true for `basic_ct` only
+                because it's min-max normalized once at file-read time) --
+                `"sst"` gets its edge-detection input (only -- not the real
+                patch content) locally, per-channel min-max normalized
+                instead. Every other dataset's behavior is unaffected.
             return_edges: If True, also return the computed edge volume from
                 `forward`.
         """
@@ -208,7 +215,23 @@ class Patchify_3D(torch.nn.Module):
         # this class's own docstring).
         edges_combined_counter = np.zeros(img.shape[:3], dtype=np.uint8)
         for j in range(self.num_channels):
-            channel_img = sitk.GetImageFromArray(img[:, :, :, j].astype(np.float32))
+            channel = img[:, :, :, j].astype(np.float32)
+            if self.dataset == "sst":
+                # "sst"'s raw CFD fields (density/velocity/pressure) are in
+                # arbitrary physical units, not the ~[0,1] scale
+                # canny_thresholds assumes (see this class's own docstring
+                # -- true for basic_ct because it's min-max normalized once
+                # at file-read time, not true here at all). Normalizing
+                # *only* this edge-detection input, per channel, keeps the
+                # existing thresholds meaningful without touching the real
+                # patch content below (octree.serialize still gets `img`
+                # unmodified, so the model trains on real physical values,
+                # not a renormalized proxy). Scoped to "sst" specifically --
+                # every other dataset's edge-detection input is unchanged.
+                lo, hi = channel.min(), channel.max()
+                if hi > lo:
+                    channel = (channel - lo) / (hi - lo)
+            channel_img = sitk.GetImageFromArray(channel)
             channel_edges = sitk.CannyEdgeDetection(
                 channel_img,
                 lowerThreshold=self.canny_thresholds[0], upperThreshold=self.canny_thresholds[1],

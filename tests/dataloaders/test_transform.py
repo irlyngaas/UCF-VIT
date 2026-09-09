@@ -188,3 +188,74 @@ def test_patchify_3d_shape_and_dtype():
     assert edges.shape == (D, H, W)
     assert edges.dtype == np.uint8
     assert edges.sum() > 0
+
+
+def test_patchify_3d_sst_normalizes_only_edge_detection_input_not_real_patch_content():
+    """"sst"'s raw CFD fields are in arbitrary physical units, not the
+    ~[0,1] scale canny_thresholds assumes (true for basic_ct only because
+    it's min-max normalized once at file-read time -- see this class's own
+    docstring). dataset:"sst" must locally, per-channel min-max normalize
+    only the array fed into CannyEdgeDetection -- confirmed here by
+    checking it reproduces the exact same edge map a manually
+    pre-normalized [0,1] volume gets on the default (non-"sst") path --
+    while leaving the real patch content (seq_img, what the model actually
+    trains against) at the real, un-normalized physical values.
+    """
+    D = H = W = 16
+    raw_vol = np.full((D, H, W, 1), 500.0, dtype=np.float32)
+    raw_vol[6:10, :, :, 0] = 800.0  # a real step, but far outside [0,1]
+    normalized_vol = (raw_vol - raw_vol.min()) / (raw_vol.max() - raw_vol.min())  # same shape, values in {0.0, 1.0}
+
+    kwargs = dict(sths=[0.5], fixed_length=8, canny_thresholds=(0.05, 0.15), interp_size=4, num_channels=1, return_edges=True)
+    seq_img_sst, _, _, _, edges_sst_raw = Patchify_3D(dataset="sst", **kwargs)(raw_vol)
+    _, _, _, _, edges_manually_normalized = Patchify_3D(dataset="basic_ct", **kwargs)(normalized_vol)
+
+    np.testing.assert_array_equal(edges_sst_raw, edges_manually_normalized)
+    assert edges_sst_raw.sum() > 0  # sanity: the step was actually detected, not just identically absent
+    # The real patch content -- what the model actually trains against --
+    # must still be the real, un-normalized physical values (500/800), not
+    # the [0,1]-rescaled proxy only used internally for edge detection.
+    real_values = set(np.unique(seq_img_sst))
+    assert real_values <= {500.0, 800.0}
+    assert not (real_values <= {0.0, 1.0})
+
+
+def test_patchify_3d_non_sst_dataset_unaffected():
+    """Regression test: adding the "sst" branch must not change any other
+    dataset's edge-detection input -- basic_ct (and everything else) keeps
+    operating on the array exactly as given, no local renormalization.
+    """
+    D = H = W = 16
+    vol = np.full((D, H, W, 1), 500.0, dtype=np.float32)
+    vol[6:10, :, :, 0] = 800.0
+
+    kwargs = dict(sths=[0.5], fixed_length=8, canny_thresholds=(0.05, 0.15), interp_size=4, num_channels=1, return_edges=True)
+    _, _, _, _, edges_basic_ct = Patchify_3D(dataset="basic_ct", **kwargs)(vol)
+    _, _, _, _, edges_sst = Patchify_3D(dataset="sst", **kwargs)(vol)
+
+    # Real gradient (300) easily clears canny_thresholds either way, but the
+    # two datasets' *edge maps* still shouldn't be forced identical by
+    # construction -- basic_ct sees the raw 500/800 values, sst sees them
+    # rescaled to 0/1 -- this just confirms basic_ct's own path wasn't
+    # touched by adding the sst-specific branch (still detects the real
+    # step it's always detected).
+    assert edges_basic_ct.sum() > 0
+
+
+def test_patchify_3d_sst_detects_edge_too_small_for_raw_scale():
+    """Direct demonstration of the actual failure mode this fixes: a real
+    physical step whose raw magnitude (0.001) is far below
+    canny_thresholds' own lower bound (0.05) -- undetectable without
+    normalization, easily detectable once rescaled to use the full [0,1]
+    range.
+    """
+    D = H = W = 16
+    vol = np.zeros((D, H, W, 1), dtype=np.float32)
+    vol[6:10, :, :, 0] = 0.001  # real step, but ~50x smaller than the lower threshold
+
+    kwargs = dict(sths=[0.5], fixed_length=8, canny_thresholds=(0.05, 0.15), interp_size=4, num_channels=1, return_edges=True)
+    _, _, _, _, edges_unnormalized = Patchify_3D(dataset="basic_ct", **kwargs)(vol)
+    _, _, _, _, edges_sst = Patchify_3D(dataset="sst", **kwargs)(vol)
+
+    assert edges_unnormalized.sum() == 0  # real edge, missed entirely at raw scale
+    assert edges_sst.sum() > 0  # same real edge, found once rescaled
