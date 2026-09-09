@@ -4262,3 +4262,42 @@ path from the old branch's own config
 (`/lustre/orion/stf006/world-shared/muraligm/CFD135/data_iso/super_res/
 binary_data/P1F4R32_nx512ny512nz256_6vars`); needs a real run to confirm
 end to end, especially the `+2`-padding fix.
+
+#### Follow-up: Tier 2 real-pipeline coverage, and a real narrowing gap it found before ever running
+
+Before trying a real Frontier training run, added
+`tests/distributed/test_sst_real_pipeline.py` -- same idea as this
+directory's own `test_dataloader_real_pipeline.py`
+(basic_ct/imagenet/catsdogs), real `srun -n 8`, real `parse_config` +
+`calculate_load_balancing_on_the_fly` + `NativePytorchDataModule`
+construction (train.py's own, including the new `dict_out_variables`/
+`img_size`/`full_domain_size` kwargs), pulling real batches and checking
+shape/dtype (`float32`, not the usual `int64` class-index label -- this is
+a regression target). `configs/sst/unetr/base_config.yaml`'s
+`parallelism.simple_ddp_size:"auto"` (so the same config works at any real
+node count) is overridden to a fixed `8` in this file specifically, to
+match the real 8-rank launch the same way `test_dataloader_real_
+pipeline.py`'s basic_ct/imagenet configs already do.
+
+Writing this surfaced a real gap that would have crashed the very first
+narrowing attempt: `tests/integration/run_training_smoke.py`'s
+`compute_narrow_dict_idx` calls `process_root_dirs` directly, without ever
+passing `img_size`/`full_domain_size` through -- harmless for every
+dataset that predates "sst" (those two parameters default to `None` and are
+only ever read inside `process_root_dirs`'s own `"sst"` branch), but for
+"sst" itself `process_root_dirs` unconditionally subscripts `img_size`,
+so omitting it would raise a `TypeError` on the very first real narrowing
+attempt. Fixed by threading both through from the raw config the same way
+`conf["data"]["img_size"]` is already read elsewhere in that file. This
+same fix is what makes `tests/dataloaders/test_dataset_speed_real_data.py`'s
+and `tests/distributed/test_dataloader_speed_real_pipeline.py`'s generic,
+`--speed-config`-driven tests (see their own "Running the dataloader speed
+tests" section above) work for `--speed-config
+../../configs/sst/unetr/base_config.yaml` too -- both narrow via this same
+`compute_narrow_dict_idx` call.
+
+**Tier 1 coverage:** none needed beyond what `test_sst.py` already covers
+-- this fix is exercised for real the moment `test_real_pipeline_sst_unetr`
+(or the speed tests, pointed at the sst config) actually run on Frontier.
+Confirmed locally: collects and skips cleanly (no real `srun` launch
+present), and the rest of the local suite is unaffected.

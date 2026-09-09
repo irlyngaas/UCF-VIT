@@ -223,8 +223,17 @@ def compute_narrow_dict_idx(conf, min_files):
     dict_root_dirs = conf["data"]["dict_root_dirs"]
     data_par_size = conf["parallelism"]["fsdp_size"] * conf["parallelism"]["simple_ddp_size"]
 
+    # "sst" repurposes img_size as the per-chunk size and needs it (plus the
+    # optional true full_domain_size) to enumerate/chunk real files at all --
+    # see process_root_dirs' own docstring. Both come straight from the raw
+    # (un-parsed) config the same way conf["data"]["img_size"] is read
+    # elsewhere in this file -- required, not defaulted, for "sst" (parse.py
+    # itself requires data.img_size to be set explicitly for this dataset).
+    img_size = conf["data"]["img_size"] if dataset == "sst" else None
+    full_domain_size = conf.get("dataset_options", {}).get("full_domain_size") if dataset == "sst" else None
+
     try:
-        dict_lister_trains = process_root_dirs(dataset, dict_root_dirs, data_par_size)
+        dict_lister_trains = process_root_dirs(dataset, dict_root_dirs, data_par_size, img_size=img_size, full_domain_size=full_domain_size)
     except FileNotFoundError as e:
         # process_root_dirs' imagenet branch does a bare os.listdir(root_dir);
         # a root_dir that doesn't exist at all (as opposed to existing but
