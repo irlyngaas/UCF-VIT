@@ -210,6 +210,38 @@ def test_tiledataiter_3d_twod_false_full_3d_tiles():
     assert covered.all()
 
 
+def test_tiledataiter_3d_twod_false_with_segmentation_label():
+    """Regression test: basic_ct's real segmentation label is a bare
+    (X, Y, Z) array with *no* channel dimension at this point in the
+    pipeline (ProcessChannels adds it later) -- unlike `data`, which is
+    always channel-first. A prior refactor (_slice_tile, added for "sst"'s
+    own list-of-memmaps case) briefly unified label slicing with data's
+    always-channel-first `[:, ...]` convention, which crashed immediately
+    ("too many indices for array: array is 3-dimensional, but 4 were
+    indexed") the moment a real 3D, non-"sst" label reached it -- this is
+    exactly basic_ct/UNETR's real, already-shipped case.
+    """
+    C, X, Y, Z = 1, 8, 8, 8
+    div = 2
+    t = X // div
+    data = np.arange(C * X * Y * Z, dtype=np.float32).reshape(C, X, Y, Z)
+    label = np.arange(X * Y * Z, dtype=np.int64).reshape(X, Y, Z)  # no channel dim -- basic_ct's real convention
+    source = _FakeSource([(data, label, ("v0",))])
+    tdi = TileDataIter(source, tile_size=(t, t, t), twoD=False, return_label=True, div=div, tile_overlap=(0, 0, 0), classification=False)
+
+    results = list(tdi)
+    assert len(results) == div ** 3
+
+    for (data_tile, label_tile, _), (x_idx, y_idx, z_idx) in zip(results, itertools.product(range(div), range(div), range(div))):
+        sx, ex = x_idx * t, (x_idx + 1) * t
+        sy, ey = y_idx * t, (y_idx + 1) * t
+        sz, ez = z_idx * t, (z_idx + 1) * t
+        assert data_tile.shape == (C, t, t, t)
+        assert label_tile.shape == (t, t, t)  # no channel dim, matching the input label's own shape
+        np.testing.assert_array_equal(data_tile, data[:, sx:ex, sy:ey, sz:ez])
+        np.testing.assert_array_equal(label_tile, label[sx:ex, sy:ey, sz:ez])
+
+
 def test_tiledataiter_div_one_returns_full_image():
     C, H, W = 1, 6, 6
     data = np.arange(C * H * W, dtype=np.float32).reshape(C, H, W)

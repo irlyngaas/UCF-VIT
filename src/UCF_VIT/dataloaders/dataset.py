@@ -398,25 +398,37 @@ class TileDataIter(IterableDataset):
         self.classification = classification
 
     @staticmethod
-    def _slice_tile(data, x_bounds, y_bounds, z_bounds):
+    def _slice_tile(data, x_bounds, y_bounds, z_bounds, channel_first=True):
         """Slices one `(start, end)`-bounded tile out of `data` along its 3
-        spatial axes, returning a real, materialized (not lazy)
-        channel-first ndarray -- only used by the 3D (non-`twoD`) branches
-        below, the only ones "sst" (the one dataset that can pass a list
-        here) ever reaches; `data` is a single already-stacked channel-first
-        ndarray for every other dataset.
+        spatial axes, returning a real, materialized (not lazy) ndarray --
+        only used by the 3D (non-`twoD`) branches below, the only ones
+        "sst" (the one dataset that can pass a list here) ever reaches;
+        `data` is a single already-stacked ndarray for every other dataset.
 
         `data` is either that single ndarray, or (only for "sst" -- see
         `FileReader.read_process_file`'s own docstring) a list of per-channel
         memmap views. In the list case, only the tile actually being cut is
         ever read from disk: `np.asarray` is what forces the read, and it
         only ever sees this one small tile's worth, never the whole
-        (potentially many-GB) volume `FileReader` handed off.
+        (potentially many-GB) volume `FileReader` handed off -- `channel_first`
+        is irrelevant here, the stack always has a leading channel dim.
+
+        `channel_first` only matters for the plain-ndarray case: `data`
+        itself is always channel-first (`(C, X, Y, Z)`) for every dataset,
+        but `label` isn't -- `basic_ct`'s real segmentation label is a bare
+        `(X, Y, Z)` array at this point in the pipeline (`ProcessChannels`
+        adds the channel dim later), so slicing it with a leading `:,`
+        would be wrong (and previously *was* wrong -- this parameter fixes
+        a real regression: every non-"sst" 3D label, e.g. basic_ct/UNETR's,
+        crashed with "too many indices" the moment this got unified with
+        `data`'s own always-channel-first slicing).
         """
         sx, sy, sz = slice(*x_bounds), slice(*y_bounds), slice(*z_bounds)
         if isinstance(data, list):
             return np.stack([np.asarray(channel[sx, sy, sz]) for channel in data], axis=0)
-        return data[:, sx, sy, sz]
+        if channel_first:
+            return data[:, sx, sy, sz]
+        return data[sx, sy, sz]
 
     def __iter__(self):
         """Yields one tile at a time from every sample produced by `self.dataset`.
@@ -462,7 +474,7 @@ class TileDataIter(IterableDataset):
                                     if self.classification:
                                         yield self._slice_tile(data, x_bounds, y_bounds, z_bounds), label, variables
                                     else:
-                                        yield self._slice_tile(data, x_bounds, y_bounds, z_bounds), self._slice_tile(label, x_bounds, y_bounds, z_bounds), variables
+                                        yield self._slice_tile(data, x_bounds, y_bounds, z_bounds), self._slice_tile(label, x_bounds, y_bounds, z_bounds, channel_first=False), variables
 
             else:
                 for (data,variables) in self.dataset:

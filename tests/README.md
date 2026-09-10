@@ -4466,3 +4466,38 @@ land, the actual behavior `overlap > 0` exists for). No test added for
 `plotting.py` -- pure `matplotlib` rendering helpers with no return-value
 logic to assert against, consistent with how this repo doesn't test other
 purely-visual helpers either. Confirmed the full local suite is unaffected.
+
+#### Fixed a real regression the `TileDataIter._slice_tile` refactor introduced
+
+Real Frontier run (job 5455940, `test.py`) crashed immediately with
+`IndexError: too many indices for array: array is 3-dimensional, but 4
+were indexed`, on every rank -- this session's own `_slice_tile` refactor
+(added for `"sst"`'s list-of-memmaps case) unified `data`'s and `label`'s
+tile-slicing under one shared helper that always sliced with a leading
+`[:, ...]` channel dimension. That's correct for `data` (always
+channel-first, every dataset), but wrong for `label`: `basic_ct`'s real
+segmentation label is a bare `(X, Y, Z)` array with *no* channel dimension
+at this point in the pipeline (`ProcessChannels` adds it later) -- the
+*original* code sliced `label` without the leading `:,` specifically for
+this reason, and the refactor silently dropped that distinction. This
+broke every non-`"sst"` 3D dataset's real segmentation label immediately
+(`div:1` or not -- `_slice_tile` still runs once per sample either way),
+including `basic_ct`/`UNETR`'s already-shipped, real-data-tested config --
+not a hypothetical, the real crash above is direct proof.
+
+Fixed by adding a `channel_first` parameter to `_slice_tile` (default
+`True`, matching `data`'s own convention), with the label call site
+passing `channel_first=False` explicitly -- irrelevant for `"sst"`'s own
+list-of-memmaps case (that branch is checked first and always produces a
+channel-first stack regardless), so `"sst"`'s existing tests needed no
+changes and were re-confirmed passing.
+
+**Tier 1 coverage:** the real gap that let this ship in the first place --
+`tests/dataloaders/test_dataset.py` had `test_tiledataiter_3d_twod_false_
+full_3d_tiles` (3D, non-`twoD`, no label) but no equivalent test *with* a
+real segmentation label at all, the exact branch that broke. Added
+`test_tiledataiter_3d_twod_false_with_segmentation_label` (a bare,
+channel-less `(X, Y, Z)` label, matching `basic_ct`'s real convention) --
+confirmed it reproduces the exact same `IndexError` against the pre-fix
+code (verified directly, `git stash`-ing just the source change back in)
+and passes cleanly against the fix. Full local suite confirmed unaffected.
