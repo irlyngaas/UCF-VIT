@@ -23,6 +23,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATHS = sorted(glob.glob(os.path.join(REPO_ROOT, "configs", "**", "*.yaml"), recursive=True))
 SAP_CONFIG = os.path.join(REPO_ROOT, "configs", "basic_ct", "sap", "base_config.yaml")
 UNETR_CONFIG = os.path.join(REPO_ROOT, "configs", "basic_ct", "unetr", "base_config.yaml")
+SST_UNETR_CONFIG = os.path.join(REPO_ROOT, "configs", "sst", "unetr", "base_config.yaml")
 
 
 @pytest.mark.parametrize("config_path", CONFIG_PATHS, ids=lambda p: os.path.relpath(p, REPO_ROOT))
@@ -439,3 +440,53 @@ def test_inference_output_save_false_ignores_other_fields():
         }
     finally:
         os.remove(path)
+
+
+# ---------------------------------------------------------------------------
+# "sst" time-stepping: dict_in_variables/dict_out_variables entries may be a
+# plain variable name (offset 0, no real timestepping) or a [variable,
+# offset] pair -- see UCF_VIT.parse._normalize_sst_variable_entry.
+# ---------------------------------------------------------------------------
+
+
+def test_sst_time_offsets_normalizes_var_offset_pairs_and_derives_time_offsets():
+    """[var, offset] entries must normalize to real (var, offset) tuples,
+    default_vars must contain only variable names (no offsets), and
+    time_offsets must be the sorted set of every offset actually referenced
+    -- across both dict_in_variables and dict_out_variables.
+    """
+    with open(SST_UNETR_CONFIG) as f:
+        conf = yaml.load(f, Loader=yaml.FullLoader)
+    conf["data"]["num_channels"]["P1F4R32"] = 5
+    conf["data"]["dict_in_variables"]["P1F4R32"] = ["r", ["u", -1], ["v", -1], ["w", -1], ["p", -1]]
+    conf["data"]["dict_out_variables"]["P1F4R32"] = [["u", 0], ["v", 0], ["w", 0], ["r", 0], ["p", 0]]
+    conf["model"]["num_classes"] = 5
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    os.close(fd)
+    try:
+        with open(path, "w") as f:
+            yaml.dump(conf, f)
+        args = argparse.Namespace(config=path, pretrained_config="")
+        parsed = parse_config(args, load_balance_offline=True)
+    finally:
+        os.remove(path)
+
+    assert parsed["data"]["dict_in_variables"]["P1F4R32"] == ["r", ("u", -1), ("v", -1), ("w", -1), ("p", -1)]
+    assert parsed["data"]["dict_out_variables"]["P1F4R32"] == [("u", 0), ("v", 0), ("w", 0), ("r", 0), ("p", 0)]
+    assert parsed["data"]["time_offsets"] == [-1, 0]
+    assert sorted(parsed["data"]["default_vars"]) == ["p", "r", "u", "v", "w"]
+
+
+def test_sst_plain_string_variables_default_time_offsets_to_zero():
+    """Every "sst" config shipped before time-stepping existed uses plain
+    variable-name strings -- must keep parsing to time_offsets:[0] (which
+    UCF_VIT.utils.misc.process_root_dirs treats identically to no real
+    timestepping) and leave dict_in_variables/dict_out_variables as plain
+    strings, unchanged.
+    """
+    parsed = validate_config(SST_UNETR_CONFIG)
+
+    assert parsed["data"]["time_offsets"] == [0]
+    assert all(isinstance(e, str) for e in parsed["data"]["dict_in_variables"]["P1F4R32"])
+    assert all(isinstance(e, str) for e in parsed["data"]["dict_out_variables"]["P1F4R32"])

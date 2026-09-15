@@ -6,6 +6,24 @@ import numpy as np
 import torch.distributed as dist
 from UCF_VIT.utils.misc import detect_img_size, detect_num_channels, is_power_of_two, find_repo_root
 
+def _normalize_sst_variable_entry(entry):
+    """Normalizes one `dict_in_variables`/`dict_out_variables` entry for "sst".
+
+    A plain string (e.g. "r") means offset 0 -- no real timestepping,
+    identical to every "sst" config shipped before time-stepping existed.
+    A 2-element list (YAML's native pair syntax, e.g. `["p", -2]`) is a
+    `(variable, offset)` pair: `UCF_VIT.dataloaders.dataset.FileReader.
+    read_process_file` reads that variable at whatever real timestamp
+    resolves to that offset -- see `UCF_VIT.utils.misc.process_root_dirs`'s
+    own docstring. Returned as a real tuple (not left as a list) since
+    `read_process_file`'s own `isinstance(entry, tuple)` dispatch is what
+    tells it "this entry carries an explicit offset".
+    """
+    if isinstance(entry, (list, tuple)):
+        var, offset = entry
+        return (var, int(offset))
+    return entry
+
 def get_kwargs(model_type, conf):
     """Build the architecture-specific keyword arguments for a given model type.
 
@@ -791,12 +809,25 @@ def parse_config(args, load_balance_offline=False):
                 in_variables_list.append(str(i))
             dict_in_variables.update(in_variables_list)
 
-    #Create default_vars from dict_in_variables
-    for i,k in enumerate(conf['data']['dict_in_variables']):
+    #"sst" only -- entries may be a plain variable name (offset 0, no real
+    #timestepping) or a `[variable, offset]` pair; normalize the latter to a
+    #real tuple so downstream code (FileReader.read_process_file, time_offsets
+    #below) can dispatch on isinstance(entry, tuple). See
+    #_normalize_sst_variable_entry's own docstring.
+    if dataset == "sst":
+        dict_in_variables = {k: [_normalize_sst_variable_entry(e) for e in v] for k, v in dict_in_variables.items()}
+
+    #Create default_vars from dict_in_variables -- variable *names* only,
+    #dropping any "sst" (variable, offset) pair's offset (the model's
+    #variable embedding is keyed on the name alone; a future timestep
+    #embedding, keyed on offset, is entirely separate -- see time_offsets
+    #below).
+    for i,k in enumerate(dict_in_variables):
+        names = [e[0] if isinstance(e, tuple) else e for e in dict_in_variables[k]]
         if i == 0:
-            default_vars = conf['data']['dict_in_variables'][k]
+            default_vars = names
         else:
-            default_vars = list(set(default_vars + conf['data']['dict_in_variables'][k]))
+            default_vars = list(set(default_vars + names))
 
     #dict_out_variables: regression-target variable names per dataset key --
     #only meaningful for "sst" (every other dataset's label comes from a
@@ -811,6 +842,22 @@ def parse_config(args, load_balance_offline=False):
             sys.exit("data.dict_out_variables is required for dataset:\"sst\" with a model type that returns a label")
     else:
         dict_out_variables = conf['data'].get('dict_out_variables')
+
+    if dataset == "sst" and dict_out_variables is not None:
+        dict_out_variables = {k: [_normalize_sst_variable_entry(e) for e in v] for k, v in dict_out_variables.items()}
+
+    #time_offsets: sorted list of every distinct timestep offset referenced
+    #across dict_in_variables/dict_out_variables (e.g. [-2, -1, 0] for "2
+    #past steps predict the current step") -- only meaningful for "sst"; see
+    #UCF_VIT.utils.misc.process_root_dirs's own docstring. A plain-string
+    #entry means offset 0, so an all-plain-string config (every "sst" config
+    #shipped before time-stepping existed) always resolves to [0] here,
+    #which process_root_dirs treats identically to no real timestepping.
+    if dataset == "sst":
+        var_lists = list(dict_in_variables.values()) + (list(dict_out_variables.values()) if dict_out_variables else [])
+        time_offsets = sorted({e[1] if isinstance(e, tuple) else 0 for var_list in var_lists for e in var_list})
+    else:
+        time_offsets = None
 
     #If using adaptive patching check if fixed length is compatible with tile_size
     if ap_conf['do_ap']:
@@ -874,6 +921,7 @@ def parse_config(args, load_balance_offline=False):
         "num_channels": num_channels,
         "dict_in_variables": dict_in_variables,
         "dict_out_variables": dict_out_variables,
+        "time_offsets": time_offsets,
         "in_chans": in_chans,
     }
 

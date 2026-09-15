@@ -196,6 +196,7 @@ def main():
                 dict_out_variables = conf["data"]["dict_out_variables"],
                 img_size = conf["data"]["img_size"],
                 full_domain_size = conf["dataset_options"]["full_domain_size"],
+                time_offsets = conf["data"]["time_offsets"],
             )
 
             data_module.setup()

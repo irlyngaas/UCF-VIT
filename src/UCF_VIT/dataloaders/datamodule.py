@@ -12,7 +12,7 @@ from .dataset import (
     ShuffleIterableDataset,
     ProcessChannels,
 )
-from UCF_VIT.utils.misc import bucket_file_list, slice_file_list
+from UCF_VIT.utils.misc import bucket_file_list, slice_file_list, sst_temporal_sort_key
 from UCF_VIT.utils.misc import process_root_dirs as process_root_dirs_shared
 
 def collate_fn(batch, return_label, adaptive_patching, separate_channels, dataset, num_labels, return_qdt, dict_key):
@@ -219,6 +219,10 @@ class NativePytorchDataModule(torch.nn.Module):
             from `img_size` (i.e. more than 1 chunk per file). A key missing from
             this dict (or the dict being entirely absent) means 1 chunk for that
             key.
+        time_offsets (list, optional): "sst" only -- sorted list of every
+            distinct timestep offset referenced across `dict_in_variables`/
+            `dict_out_variables` (see `UCF_VIT.utils.misc.process_root_dirs`'s
+            own docstring). `None` or `[0]` means no real timestepping.
     """
 
     def __init__(
@@ -255,6 +259,7 @@ class NativePytorchDataModule(torch.nn.Module):
         dict_out_variables: Optional[Dict] = None,
         img_size: Optional[list] = None,
         full_domain_size: Optional[Dict] = None,
+        time_offsets: Optional[list] = None,
     ):
         """Initializes the data module and builds the per-dataset file listings.
 
@@ -321,6 +326,7 @@ class NativePytorchDataModule(torch.nn.Module):
             self.dict_out_variables = dict_out_variables
             self.img_size = img_size
             self.full_domain_size = full_domain_size or {}
+            self.time_offsets = time_offsets
 
         in_variables = {}
         for k, list_out in dict_in_variables.items():
@@ -339,12 +345,17 @@ class NativePytorchDataModule(torch.nn.Module):
         # restarts or epochs. Sorting also avoids relying on process_root_dirs's own
         # (unstable) listing order. set_iterative_dataloader passes a no-op
         # start_idx=0.0/end_idx=1.0 to FileReader since slicing happens here.
+        # For "sst", plain string order scrambles real timestamp order (see
+        # sst_temporal_sort_key's own docstring) -- immaterial before time-
+        # stepping existed, but load-bearing now: it's what makes earlier real
+        # time land in train and later real time land in val/test.
+        sort_key = sst_temporal_sort_key if self.dataset == "sst" else None
         for k in self.dict_lister_trains:
             if self.dataset == "imagenet":
                 start_idx, end_idx = self.dict_start_idx["imagenet"], self.dict_end_idx["imagenet"]
             else:
                 start_idx, end_idx = self.dict_start_idx[k], self.dict_end_idx[k]
-            self.dict_lister_trains[k] = slice_file_list(sorted(self.dict_lister_trains[k]), start_idx, end_idx)
+            self.dict_lister_trains[k] = slice_file_list(sorted(self.dict_lister_trains[k], key=sort_key), start_idx, end_idx)
 
         if self.dataset == "imagenet":
             # Buckets are purely a rank/GPU-group assignment mechanism (labels
@@ -378,6 +389,7 @@ class NativePytorchDataModule(torch.nn.Module):
         if self.dataset == "sst":
             return process_root_dirs_shared(
                 self.dataset, self.dict_root_dirs, img_size=self.img_size, full_domain_size=self.full_domain_size,
+                time_offsets=self.time_offsets,
             )
         return process_root_dirs_shared(self.dataset, self.dict_root_dirs)
 

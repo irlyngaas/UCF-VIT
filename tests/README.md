@@ -4501,3 +4501,89 @@ channel-less `(X, Y, Z)` label, matching `basic_ct`'s real convention) --
 confirmed it reproduces the exact same `IndexError` against the pre-fix
 code (verified directly, `git stash`-ing just the source change back in)
 and passes cleanly against the fix. Full local suite confirmed unaffected.
+
+## Added time-stepping to the `"sst"` dataloader (dataloader/schema layer)
+
+First stage of a 3-stage feature: given N past timesteps of some
+variable(s), predict some (possibly different) variable(s) at a future
+timestep. This stage covers only the dataloader/schema layer -- listing,
+reading, load-balancing, and config plumbing -- since everything else
+(adaptive-patching's octree-reuse-across-T, and the model's new
+`time_embed`/cross-attention aggregation) depends on knowing the exact
+shapes/semantics this layer produces. Deliberately designed so every
+`"sst"` config shipped before this (plain-string `dict_in_variables`/
+`dict_out_variables`, no offsets) parses and runs byte-identically to
+before -- confirmed by dedicated tests, not just by inspection.
+
+**Schema:** `dict_in_variables`/`dict_out_variables` entries stay plain
+variable-name strings (implicit offset 0) *or* become a `[variable,
+offset]` YAML pair (e.g. `["p", -2]`), normalized in `parse.py`
+(`_normalize_sst_variable_entry`) to a real `(var, offset)` tuple.
+`FileReader.read_process_file` dispatches on `isinstance(entry, tuple)`
+to know whether an entry carries an explicit offset. `time_offsets` (the
+sorted set of every offset actually referenced across both variable
+dicts) is derived once in `parse.py` and threaded through
+`calculate_load_balancing_on_the_fly`/`NativePytorchDataModule` down to
+`UCF_VIT.utils.misc.process_root_dirs`, which turns each real timestamp
+into a synthetic *window* -- a `"__t<off1>=<ts1>,<off2>=<ts2>,..."`-suffixed
+entry bundling the real timestamp resolved for every offset, composable
+with the existing `"__chunk<z>_<y>_<x>"` chunk-splitting suffix. Windows
+near either end of the sorted timestamp list, without enough real
+neighbors to cover the full offset span, are dropped -- the only
+load-balancing impact of time-stepping is this fixed, small reduction in
+sample count at the tail, confirmed directly by comparing
+`calculate_load_balancing_on_the_fly`'s output with and without offsets in
+`test_calculate_load_balancing_on_the_fly_sst_time_offsets_shrinks_sample_
+count`.
+
+**Two real bugs found and fixed along the way, both about temporal order:**
+
+- `process_root_dirs`'s own timestamp listing sorted timestamps as plain
+  strings (`"10.0" < "2.0"`) -- harmless while order only mattered for
+  deduplication, but a real correctness bug the moment offsets/window
+  order matters at all. Fixed with `key=float`.
+- A second, separate instance of the same bug one level up:
+  `calculate_load_balancing_on_the_fly` and `NativePytorchDataModule.
+  __init__` each independently re-sort `process_root_dirs`'s (already
+  correctly time-ordered) output via a plain `sorted()` on the full path
+  string, silently re-scrambling it -- meaningless before time-stepping
+  (order just needed to be deterministic), but load-bearing now: it's
+  what makes the existing train/val/test ratio-slice put earlier real
+  time in train and later real time in val/test (no future-to-past
+  leakage in evaluation). Fixed by adding `sst_temporal_sort_key`
+  (`misc.py`) -- resolves any `"sst"` entry (plain or windowed, chunked or
+  not) to its earliest real timestamp as a float -- and passing it as
+  `sorted()`'s `key=` at both call sites.
+
+**Tier 1 coverage** (`tests/dataloaders/test_sst.py`,
+`tests/test_config_validation.py`): numeric-vs-lexicographic timestamp
+sorting; window construction with correct boundary truncation; `time_
+offsets:[0]` producing output identical to no-timestepping; windowing
+composed with chunk-splitting; `read_process_file` resolving each
+`(var, offset)` entry to its real, distinguishable timestamp's file
+(caught as a value mismatch, not just a shape check) alongside a
+plain-string backward-compatibility test; a full `NativePytorchDataModule`
+end-to-end run (real memmap files, `setup` -> `train_dataloader` ->
+collate) proving input/label read genuinely different real timestamps 100
+apart; `sst_temporal_sort_key` unit tests (plain timestamps, windows,
+chunk-suffixed); `calculate_load_balancing_on_the_fly`'s time_offsets
+threading and sample-count shrinkage; and `parse.py` schema tests
+confirming `[var, offset]` pairs normalize to tuples, `default_vars`
+contains only variable names (no offsets), and `time_offsets` derives
+correctly from both `dict_in_variables` and `dict_out_variables` --
+alongside a matching test that plain-string-only configs still resolve
+`time_offsets` to `[0]` and leave every entry as a plain string. Every
+`"sst"` config shipped before this stage re-confirmed parsing/passing
+unchanged. Full local suite (339 passed, 4 skipped) confirmed no
+regressions elsewhere.
+
+**Not yet done** (next two stages): adaptive patching's "build the octree
+from one reference past timestep, reuse across all T" mode in
+`Patchify_3D`/`ProcessChannels`; the model-architecture piece in `arch.py`/
+`building_blocks.py` (a `time_embed` mirroring `var_embed`, keyed by real
+offset value, and a `TimeMapping_Attention`-style cross-attention
+collapsing `T -> 1`, composed *after* variable-aggregation, disabled
+entirely for `T=1`); and the two target UNETR configs (the existing
+u,v,w,r->p config needs no changes; a new N-past-steps->future-step
+config predicting all 5 variables still needs to be created once the
+model piece exists).

@@ -9,6 +9,7 @@ import glob
 from PIL import Image
 import cv2 as cv
 import torchdata.datapipes as dp
+from pathlib import Path
 from UCF_VIT.utils.lr_scheduler import LinearWarmupCosineAnnealingLR
 
 def find_repo_root():
@@ -385,7 +386,7 @@ def shard_attention_state_dict(full_state_dict, num_heads, tensor_par_size, tp_r
     return sharded
 
 
-def process_root_dirs(dataset, dict_root_dirs, data_par_size=None, img_size=None, full_domain_size=None):
+def process_root_dirs(dataset, dict_root_dirs, data_par_size=None, img_size=None, full_domain_size=None, time_offsets=None):
     """Builds per-dataset-key lists of file paths (or, for "sst", synthetic
     per-sample identifiers -- see below).
 
@@ -449,6 +450,19 @@ def process_root_dirs(dataset, dict_root_dirs, data_par_size=None, img_size=None
             for "sst"; a key missing from this dict (or the dict being
             entirely absent) defaults to `img_size` itself for that key --
             i.e. 1 chunk, matching every shipped "sst" config today.
+        time_offsets: Sorted list of every distinct timestep offset
+            referenced across `dict_in_variables`/`dict_out_variables` (e.g.
+            `[-2, -1, 0]` for "2 past steps predict the current step"). Only
+            used for "sst". `None` or `[0]` (every shipped "sst" config
+            today) means no real timestepping -- entries stay plain
+            "<root_dir>/<timestamp>" strings, identical to today. Otherwise
+            each real timestamp becomes a *window*: a synthetic entry
+            bundling the real timestamps at every offset in `time_offsets`
+            relative to that timestamp (offset `0`) -- windows near either
+            end of the sorted timestamp list, without enough real
+            neighbors to cover the full `[min(time_offsets),
+            max(time_offsets)]` span, are dropped entirely (there's no real
+            data to fill them with).
 
     Returns:
         Dict mapping each `dict_root_dirs` key to its (sorted) list of file
@@ -465,13 +479,17 @@ def process_root_dirs(dataset, dict_root_dirs, data_par_size=None, img_size=None
             dict_lister_trains[k] = img_list
     elif dataset == "sst":
         full_domain_size = full_domain_size or {}
+        offsets = sorted(set(time_offsets)) if time_offsets else [0]
         dict_lister_trains = {}
         for k, root_dir in dict_root_dirs.items():
+            # key=float: these are real timestamp values, not opaque names --
+            # a plain string sort ("10.5" < "9.5") would silently scramble
+            # temporal order, meaningless the moment offsets are used at all.
             timestamps = sorted({
                 fname.partition("_")[2]
                 for fname in os.listdir(root_dir)
                 if "_" in fname
-            })
+            }, key=float)
 
             this_full_size = full_domain_size.get(k, img_size)
             num_chunks = [this_full_size[i] // img_size[i] for i in range(3)]
@@ -481,20 +499,58 @@ def process_root_dirs(dataset, dict_root_dirs, data_par_size=None, img_size=None
                 f"{[this_full_size[i] % img_size[i] for i in range(3)]}."
             )
 
+            if offsets == [0]:
+                windows = list(timestamps)
+            else:
+                min_off, max_off = offsets[0], offsets[-1]
+                windows = [
+                    "__t" + ",".join(f"{off}={timestamps[i + off]}" for off in offsets)
+                    for i in range(-min_off, len(timestamps) - max_off)
+                ]
+
             if num_chunks == [1, 1, 1]:
-                entries = [os.path.join(root_dir, t) for t in timestamps]
+                entries = [os.path.join(root_dir, w) for w in windows]
             else:
                 entries = [
-                    os.path.join(root_dir, t) + f"__chunk{zz}_{yy}_{xx}"
+                    os.path.join(root_dir, w) + f"__chunk{zz}_{yy}_{xx}"
                     for zz in range(num_chunks[0])
                     for yy in range(num_chunks[1])
                     for xx in range(num_chunks[2])
-                    for t in timestamps
+                    for w in windows
                 ]
             dict_lister_trains[k] = entries
     else:
         dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in dict_root_dirs.items() }
     return dict_lister_trains
+
+
+def sst_temporal_sort_key(entry):
+    """Sort key resolving an "sst" `process_root_dirs` entry to its earliest
+    real timestamp, as a float.
+
+    Plain `sorted()`/`sorted(entry_list)` on these entries compares them as
+    opaque strings -- fine for every other dataset (order just needs to be
+    deterministic), but for "sst" it silently scrambles real temporal order
+    ("10.0" sorts before "2.0"), which matters once time-windowed entries
+    exist at all: callers that slice a sorted list into train/val/test
+    (`calculate_load_balancing_on_the_fly`, `NativePytorchDataModule.
+    __init__`) rely on earlier real time landing in train and later real
+    time landing in val/test, not on incidental string order.
+
+    Works on both plain "<root_dir>/<timestamp>" entries and windowed
+    "<root_dir>/__t<off1>=<ts1>,<off2>=<ts2>,..." entries (each optionally
+    suffixed with "__chunk<z>_<y>_<x>"), mirroring `FileReader.
+    read_process_file`'s own parsing of the same suffixes. For a window,
+    the *earliest* offset's real timestamp is used -- by construction (see
+    `process_root_dirs`'s own window-building loop), that's monotonically
+    increasing with window order regardless of which offsets are
+    semantically "input" vs. "target".
+    """
+    raw_path, _, _ = entry.partition("__chunk")
+    stem = Path(raw_path).name
+    if stem.startswith("__t"):
+        return min(float(pair.split("=")[1]) for pair in stem[len("__t"):].split(","))
+    return float(stem)
 
 
 def bucket_file_list(file_list, num_buckets, shuffle_seed=None):
@@ -782,7 +838,8 @@ def calculate_load_balancing_on_the_fly(conf, VERBOSE=False):
         resize = None
 
     full_domain_size = conf['dataset_options'].get('full_domain_size') if dataset == "sst" else None
-    dict_lister_trains = process_root_dirs(dataset, dict_root_dirs, img_size=img_size, full_domain_size=full_domain_size)
+    time_offsets = conf['data'].get('time_offsets') if dataset == "sst" else None
+    dict_lister_trains = process_root_dirs(dataset, dict_root_dirs, img_size=img_size, full_domain_size=full_domain_size, time_offsets=time_offsets)
 
     # For imagenet, dict_start_idx/dict_end_idx's ratio slice (on a sorted,
     # deterministic order) must happen *before* any rank-count-dependent bucketing,
@@ -811,7 +868,8 @@ def calculate_load_balancing_on_the_fly(conf, VERBOSE=False):
         else:
             start_idx = int(dict_start_idx[k] * len(lister_train))
             end_idx = int(dict_end_idx[k] * len(lister_train))
-            keys = sorted(lister_train)[start_idx:end_idx]
+            sort_key = sst_temporal_sort_key if dataset == "sst" else None
+            keys = sorted(lister_train, key=sort_key)[start_idx:end_idx]
             # Fails clearly here rather than falling through to a bare
             # ZeroDivisionError further down (total_tiles_all_data would be 0) --
             # a dataset key resolving to zero files is always a config problem,

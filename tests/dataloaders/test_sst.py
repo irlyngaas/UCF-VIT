@@ -24,7 +24,7 @@ import torch
 
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.dataloaders.dataset import FileReader, TileDataIter
-from UCF_VIT.utils.misc import process_root_dirs
+from UCF_VIT.utils.misc import calculate_load_balancing_on_the_fly, process_root_dirs, sst_temporal_sort_key
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +87,66 @@ def test_process_root_dirs_sst_uneven_division_raises_clearly(tmp_path):
 
     with pytest.raises(AssertionError, match="full_domain_size"):
         process_root_dirs("sst", {"k1": root_dir}, img_size=[2, 2, 2], full_domain_size={"k1": [3, 4, 4]})
+
+
+def test_process_root_dirs_sst_sorts_timestamps_numerically_not_lexicographically(tmp_path):
+    """Regression test: a plain string sort ("10.0" < "2.0") would silently
+    scramble real temporal order -- meaningless the moment time_offsets are
+    used at all, but was already a latent bug even before this (just never
+    triggered, since order didn't matter for plain deduplication).
+    """
+    root_dir = str(tmp_path)
+    _touch_variable_files(root_dir, variables=["r"], timestamps=["2.0", "10.0", "1.0"])
+
+    dict_lister_trains = process_root_dirs("sst", {"k1": root_dir}, img_size=[2, 2, 2])
+
+    assert dict_lister_trains["k1"] == [os.path.join(root_dir, t) for t in ["1.0", "2.0", "10.0"]]
+
+
+def test_process_root_dirs_sst_time_offsets_builds_windows_and_truncates_boundary(tmp_path):
+    """time_offsets=[-2,-1,0] ("2 past steps predict the current step") must
+    lose exactly 2 window-starts at the front (not enough real past
+    neighbors) and resolve every offset to its real timestamp correctly.
+    """
+    root_dir = str(tmp_path)
+    _touch_variable_files(root_dir, variables=["r"], timestamps=["1.0", "2.0", "3.0", "4.0", "10.0", "11.0"])
+
+    dict_lister_trains = process_root_dirs("sst", {"k1": root_dir}, img_size=[2, 2, 2], time_offsets=[-2, -1, 0])
+
+    assert dict_lister_trains["k1"] == [
+        os.path.join(root_dir, "__t-2=1.0,-1=2.0,0=3.0"),
+        os.path.join(root_dir, "__t-2=2.0,-1=3.0,0=4.0"),
+        os.path.join(root_dir, "__t-2=3.0,-1=4.0,0=10.0"),
+        os.path.join(root_dir, "__t-2=4.0,-1=10.0,0=11.0"),
+    ]
+
+
+def test_process_root_dirs_sst_time_offsets_zero_only_matches_no_timestepping(tmp_path):
+    root_dir = str(tmp_path)
+    _touch_variable_files(root_dir, variables=["r"], timestamps=["1.0", "2.0"])
+
+    no_offsets = process_root_dirs("sst", {"k1": root_dir}, img_size=[2, 2, 2])
+    offsets_zero = process_root_dirs("sst", {"k1": root_dir}, img_size=[2, 2, 2], time_offsets=[0])
+
+    assert no_offsets == offsets_zero
+
+
+def test_process_root_dirs_sst_time_offsets_composes_with_chunking(tmp_path):
+    """Windowing and chunk-splitting are independent axes -- each window
+    still gets split into every real chunk, same as the no-timestepping case.
+    """
+    root_dir = str(tmp_path)
+    _touch_variable_files(root_dir, variables=["r"], timestamps=["1.0", "2.0", "3.0"])
+
+    dict_lister_trains = process_root_dirs(
+        "sst", {"k1": root_dir}, img_size=[2, 2, 2], full_domain_size={"k1": [2, 2, 4]}, time_offsets=[-1, 0],
+    )
+
+    # 3 timestamps, offsets [-1,0] -> 2 valid windows; full_domain_size doubles
+    # the x-axis -> 2 chunks per window -> 4 entries total.
+    entries = dict_lister_trains["k1"]
+    assert len(entries) == 4
+    assert all("__t-1=" in e and "__chunk" in e for e in entries)
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +220,58 @@ def test_read_process_file_sst_chunk_suffix_reads_correct_sub_region(tmp_path):
     # Sanity: chunk 1 must actually differ from chunk 0 (real test of the offset, not a
     # tautology that would pass even with a hardcoded chunk_idx=[0,0,0]).
     assert not np.array_equal(np.asarray(data_list[0]), _expected_channel(raw_r, [0, 0, 0], chunk_size))
+
+
+def test_read_process_file_sst_time_offsets_resolves_each_offset_to_its_real_timestamp(tmp_path):
+    """Real timestepped window: variables/variables_out as (var, offset)
+    pairs must each read the *real* timestamp resolved for that offset, not
+    e.g. all reading the same (reference) file -- distinct content per
+    (var, offset) makes any mix-up show up as a value mismatch.
+    """
+    root_dir = str(tmp_path)
+    chunk_size = [2, 2, 2]
+    raw_shape = (chunk_size[0], chunk_size[1], chunk_size[2] + 2)
+
+    contents = {}  # (var, timestamp) -> distinct constant value
+    for var, var_base in [("r", 0.0), ("p", 100.0)]:
+        for ts, ts_base in [("1.0", 0.0), ("2.0", 10.0), ("3.0", 20.0)]:
+            value = var_base + ts_base
+            contents[(var, ts)] = value
+            _write_memmap(os.path.join(root_dir, f"{var}_{ts}"), raw_shape, lambda s, v=value: np.full(s, v, dtype=np.float32))
+
+    path = os.path.join(root_dir, "__t-2=1.0,-1=2.0,0=3.0")
+    reader = FileReader(
+        file_list=[path], start_idx=0.0, end_idx=1.0,
+        variables=[("r", -2), ("r", -1), ("r", 0)], gx="1", ddp_group=None, dataset="sst", return_label=True,
+        variables_out=[("p", 0)], chunk_size=chunk_size, full_domain_size=chunk_size,
+    )
+
+    data_list, label_list = reader.read_process_file(path)
+
+    assert np.asarray(data_list[0]).flat[0] == contents[("r", "1.0")]  # offset -2 -> timestamp 1.0
+    assert np.asarray(data_list[1]).flat[0] == contents[("r", "2.0")]  # offset -1 -> timestamp 2.0
+    assert np.asarray(data_list[2]).flat[0] == contents[("r", "3.0")]  # offset  0 -> timestamp 3.0
+    assert np.asarray(label_list[0]).flat[0] == contents[("p", "3.0")]  # label: p at the same (offset 0) timestamp
+
+
+def test_read_process_file_sst_plain_string_variables_still_work(tmp_path):
+    """Backward compatibility: plain variable-name strings (no real
+    timestepping) must keep working exactly as before -- read_process_file
+    treats them as (var, 0) implicitly.
+    """
+    root_dir = str(tmp_path)
+    chunk_size = [2, 2, 2]
+    _write_memmap(os.path.join(root_dir, "r_1.0"), (chunk_size[0], chunk_size[1], chunk_size[2] + 2), lambda s: np.full(s, 5.0, dtype=np.float32))
+
+    path = os.path.join(root_dir, "1.0")
+    reader = FileReader(
+        file_list=[path], start_idx=0.0, end_idx=1.0,
+        variables=["r"], gx="1", ddp_group=None, dataset="sst", return_label=False,
+        chunk_size=chunk_size, full_domain_size=chunk_size,
+    )
+
+    data_list = reader.read_process_file(path)
+    assert np.asarray(data_list[0]).flat[0] == 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -315,3 +427,134 @@ def test_native_pytorch_data_module_sst_mae_pretraining_needs_no_dict_out_variab
     assert len(batches) == 1
     inp, variables, dict_key = batches[0]
     assert inp.shape == (1, 2, 4, 4, 2)
+
+
+def test_native_pytorch_data_module_sst_time_offsets_end_to_end(tmp_path):
+    """Real memmap files on disk, through the full pipeline
+    (NativePytorchDataModule.setup -> train_dataloader -> collate_fn) with
+    time_offsets threaded all the way from the constructor through
+    process_root_dirs/FileReader -- input is "r" one step in the past,
+    label is "r" at the current step. 3 real timestamps + offsets [-1, 0]
+    -> exactly 2 valid windows (see process_root_dirs's own boundary-
+    truncation logic), each reading a genuinely distinct real timestamp for
+    input vs. label.
+    """
+    root_dir = str(tmp_path)
+    img_size = [2, 2, 2]
+    raw_shape = (img_size[0], img_size[1], img_size[2] + 2)
+
+    for t, value in [("1.0", 100.0), ("2.0", 200.0), ("3.0", 300.0)]:
+        _write_memmap(os.path.join(root_dir, f"r_{t}"), raw_shape, lambda s, v=value: np.full(s, v, dtype=np.float32))
+
+    data_module = NativePytorchDataModule(
+        dict_root_dirs={"P1F4R32": root_dir},
+        dict_start_idx={"P1F4R32": 0.0},
+        dict_end_idx={"P1F4R32": 1.0},
+        dict_buffer_sizes={"P1F4R32": 10},
+        dict_in_variables={"P1F4R32": [("r", -1)]},
+        num_channels_used={"P1F4R32": 1},
+        batch_size=2,
+        num_workers=0,
+        tile_size=(2, 2, 2),
+        twoD=False,
+        return_label=True,
+        batches_per_rank_epoch={"P1F4R32": 1},  # 2 windows / batch_size 2
+        div=1,
+        tile_overlap=(0, 0, 0),
+        data_par_size=1,
+        dataset="sst",
+        dict_out_variables={"P1F4R32": [("r", 0)]},
+        img_size=img_size,
+        time_offsets=[-1, 0],
+    )
+    data_module.setup()
+
+    assert len(data_module.dict_lister_trains["P1F4R32"]) == 2
+
+    loader = data_module.train_dataloader()
+    batches = list(loader)
+
+    assert len(batches) == 1
+    inp, label, variables, dict_key = batches[0]
+    assert inp.shape == (2, 1, 2, 2, 2)
+    assert label.shape == (2, 1, 2, 2, 2)
+    # Each window's label is exactly 100 more than its input (r_2.0 -
+    # r_1.0, or r_3.0 - r_2.0) -- confirms offset -1/0 each resolved to a
+    # genuinely distinct, correctly-ordered real timestamp, not e.g. both
+    # reading the same file.
+    for b in range(2):
+        assert (label[b, 0].unique() - inp[b, 0].unique()).item() == pytest.approx(100.0)
+
+
+# ---------------------------------------------------------------------------
+# sst_temporal_sort_key
+# ---------------------------------------------------------------------------
+
+
+def test_sst_temporal_sort_key_orders_plain_timestamps_numerically():
+    entries = ["/root/10.0", "/root/2.0", "/root/1.0"]
+    assert sorted(entries, key=sst_temporal_sort_key) == ["/root/1.0", "/root/2.0", "/root/10.0"]
+
+
+def test_sst_temporal_sort_key_orders_windows_by_earliest_offset():
+    entries = [
+        "/root/__t-2=10.0,-1=11.0,0=12.0",
+        "/root/__t-2=1.0,-1=2.0,0=3.0",
+        "/root/__t-2=2.0,-1=3.0,0=4.0",
+    ]
+    assert sorted(entries, key=sst_temporal_sort_key) == [
+        "/root/__t-2=1.0,-1=2.0,0=3.0",
+        "/root/__t-2=2.0,-1=3.0,0=4.0",
+        "/root/__t-2=10.0,-1=11.0,0=12.0",
+    ]
+
+
+def test_sst_temporal_sort_key_ignores_chunk_suffix():
+    entries = ["/root/10.0__chunk0_0_0", "/root/2.0__chunk1_0_0"]
+    assert sorted(entries, key=sst_temporal_sort_key) == ["/root/2.0__chunk1_0_0", "/root/10.0__chunk0_0_0"]
+
+
+# ---------------------------------------------------------------------------
+# calculate_load_balancing_on_the_fly -- time_offsets threading
+# ---------------------------------------------------------------------------
+
+
+def test_calculate_load_balancing_on_the_fly_sst_time_offsets_shrinks_sample_count(tmp_path):
+    """The only load-balancing impact of time-stepping is a fixed reduction
+    in sample count at the tail of the timestamp list (boundary windows with
+    no real neighbors to fill them are dropped) -- confirmed here by
+    comparing time_offsets:[0] (5 timestamps -> 5 samples) against
+    time_offsets:[-2,-1,0] (5 timestamps -> 3 valid windows).
+    """
+    root_dir = str(tmp_path)
+    _touch_variable_files(root_dir, variables=["r"], timestamps=["1.0", "2.0", "3.0", "4.0", "5.0"])
+
+    def _conf(time_offsets):
+        return {
+            "data": {
+                "dict_root_dirs": {"P1F4R32": root_dir},
+                "img_size": [2, 2, 2],
+                "tile_size": (2, 2, 2),
+                "patch_size": 2,
+                "twoD": False,
+                "dataset": "sst",
+                "time_offsets": time_offsets,
+            },
+            "dataloader": {
+                "dict_start_idx": {"P1F4R32": 0.0},
+                "dict_end_idx": {"P1F4R32": 1.0},
+                "batch_size": 1,
+                "num_workers": 1,
+            },
+            "tiling": {"div": 1},
+            "ap": {"do_ap": False},
+            "parallelism": {"data_par_size": 1},
+            "dataset_options": {},
+        }
+
+    _, grouplist_no_offsets = calculate_load_balancing_on_the_fly(_conf([0]))
+    batches_windowed, grouplist_windowed = calculate_load_balancing_on_the_fly(_conf([-2, -1, 0]))
+
+    assert grouplist_no_offsets == grouplist_windowed == "1"
+    # 5 timestamps, offsets [-2,-1,0] -> 3 valid windows, batch_size 1 -> 3 batches/epoch.
+    assert batches_windowed["P1F4R32"] == 3

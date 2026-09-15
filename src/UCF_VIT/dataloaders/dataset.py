@@ -208,22 +208,33 @@ class FileReader(IterableDataset):
                     return data
 
         elif self.dataset == "sst":
-            # "path" is a synthetic "<root_dir>/<timestamp>" identifier (see
-            # process_root_dirs's own docstring), optionally suffixed with
-            # "__chunk<z>_<y>_<x>" when this dataset key is split into more
-            # than one chunk per raw file.
+            # "path" is a synthetic identifier (see process_root_dirs's own
+            # docstring), optionally suffixed with "__chunk<z>_<y>_<x>" when
+            # this dataset key is split into more than one chunk per raw
+            # file. Before that, it's either "<root_dir>/<timestamp>" (no
+            # real timestepping -- self.variables/variables_out are
+            # (var, 0) pairs, all reading the one timestamp in the path) or
+            # "<root_dir>/__t<off1>=<ts1>,<off2>=<ts2>,..." (a real
+            # timestepped window -- every offset actually referenced by
+            # self.variables/variables_out resolved to its real timestamp).
             raw_path, _, chunk_suffix = path.partition("__chunk")
             chunk_idx = [int(v) for v in chunk_suffix.split("_")] if chunk_suffix else [0, 0, 0]
 
             root_path = Path(raw_path)
             parent = root_path.parent
             stem = root_path.name
+            if stem.startswith("__t"):
+                offset_to_timestamp = dict(pair.split("=") for pair in stem[len("__t"):].split(","))
+                offset_to_timestamp = {int(k): v for k, v in offset_to_timestamp.items()}
+            else:
+                offset_to_timestamp = {0: stem}
+
             nz_full, ny_full, nx_full = self.full_domain_size
             nz, ny, nx = self.chunk_size
             z0, y0, x0 = chunk_idx[0] * nz, chunk_idx[1] * ny, chunk_idx[2] * nx
 
-            def _read_channel(var):
-                channel_path = os.path.join(parent, f"{var}_{stem}")
+            def _read_channel(var, offset):
+                channel_path = os.path.join(parent, f"{var}_{offset_to_timestamp[offset]}")
                 # +2 on the x axis: a fixed, real characteristic of this CFD
                 # data's on-disk layout (ghost cells), not a tunable config
                 # value. Confirmed: the real domain is the *first* nx_full
@@ -242,10 +253,17 @@ class FileReader(IterableDataset):
                 # a (small) piece of it.
                 return chunk.transpose(2, 1, 0)
 
-            data_list = [_read_channel(var) for var in self.variables]
+            # Each entry is either a plain variable name (no real
+            # timestepping -- implicitly offset 0, reading the one
+            # timestamp resolved above) or a (var, offset) pair (real
+            # timestepping).
+            def _var_offset(entry):
+                return entry if isinstance(entry, tuple) else (entry, 0)
+
+            data_list = [_read_channel(*_var_offset(entry)) for entry in self.variables]
 
             if self.return_label:
-                label_list = [_read_channel(var) for var in self.variables_out]
+                label_list = [_read_channel(*_var_offset(entry)) for entry in self.variables_out]
                 return data_list, label_list
             else:
                 return data_list

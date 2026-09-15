@@ -110,6 +110,7 @@ def main():
                 dict_out_variables = test_conf["data"]["dict_out_variables"],
                 img_size = test_conf["data"]["img_size"],
                 full_domain_size = test_conf["dataset_options"]["full_domain_size"],
+                time_offsets = test_conf["data"]["time_offsets"],
             )
 
             data_module.setup()
