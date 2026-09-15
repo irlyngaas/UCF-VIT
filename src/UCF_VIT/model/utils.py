@@ -238,6 +238,15 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
         twoD=conf["data"]["twoD"],
         default_vars=conf["data"]["default_vars"],
         use_varemb=conf["model"]["use_channel_aggregation"], #TODO: Change use_varemb to use_channel_aggregation in arch.py
+        # "sst" time-stepping only -- a real timestep offset per input
+        # channel (see UCF_VIT.utils.misc.process_root_dirs's own
+        # docstring). time_offsets is None/[0] for every other dataset and
+        # every "sst" config without real timestepping, so use_timeemb is
+        # False there -- the whole time_embed/cross-attention mechanism is
+        # skipped entirely, not just degenerate (see VIT.use_timeemb's own
+        # docstring in arch.py).
+        default_time_offsets=conf["data"].get("time_offsets"),
+        use_timeemb=bool(conf["model"]["use_channel_aggregation"] and conf["data"].get("time_offsets") and len(conf["data"]["time_offsets"]) > 1),
         adaptive_patching=conf["ap"]["do_ap"],
         fixed_length=conf["ap"]["fixed_length"],
         FusedAttn_option=FusedAttn_option,

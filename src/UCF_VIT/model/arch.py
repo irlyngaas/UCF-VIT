@@ -125,6 +125,18 @@ def global_pool_nlc(
 
     return x
 
+def _variable_name(entry):
+    """The variable-name half of a `variables` entry -- a plain string
+    (offset 0, no real timestepping) or a `(variable, offset)` tuple (see
+    `UCF_VIT.utils.misc.process_root_dirs`'s own docstring for the "sst"
+    time-stepping schema this mirrors).
+    """
+    return entry[0] if isinstance(entry, tuple) else entry
+
+def _variable_offset(entry):
+    """The offset half of a `variables` entry -- 0 for a plain string."""
+    return entry[1] if isinstance(entry, tuple) else 0
+
 class VIT(nn.Module):
     """Vision Transformer encoder (2D/3D), optionally with a classification head.
 
@@ -169,6 +181,8 @@ class VIT(nn.Module):
             fixed_length: Optional[int] = 4096,
             default_vars: List = None,
             use_varemb: bool = False,
+            default_time_offsets: List = None,
+            use_timeemb: bool = False,
             tensor_par_size: int = 1,
             tensor_par_group: Optional[dist.ProcessGroup] = None,
             FusedAttn_option = FusedAttn.NONE,
@@ -220,6 +234,21 @@ class VIT(nn.Module):
             fixed_length: Length for adaptive patches, only used if adative_patching=True
             default_vars: List of different potential modalities to be used as input.
             use_varemb: Whether to use variable embedding tokens as an additional learnable parameter
+            default_time_offsets: "sst" time-stepping only -- sorted list of every
+                distinct timestep offset ever configured (see
+                `UCF_VIT.utils.misc.process_root_dirs`'s own docstring). Required
+                when `use_timeemb` is True; unused otherwise.
+            use_timeemb: Whether input channels carry a real timestep offset (a
+                `variables` entry is a `(variable, offset)` tuple, not just a
+                plain variable name) that should be aggregated separately from
+                variable identity. Requires `use_varemb`: variable-aggregation
+                (collapsing variables to one token *within* each timestep) runs
+                first, then time-aggregation (collapsing those per-timestep
+                tokens across time, via a learned `time_embed`/cross-attention
+                mirroring `var_embed`/`aggregate_variables`) runs second. `False`
+                (the default, and every config without real timestepping) skips
+                this entirely -- not just a degenerate one-token case -- so
+                `use_varemb`-only behavior is completely unaffected.
             tensor_par_size: Number of tensor-parallel ranks to shard attention/MLP
                 layers across.
             tensor_par_group: Process group for tensor-parallel communication.
@@ -260,6 +289,11 @@ class VIT(nn.Module):
         self.default_vars = default_vars
         self.use_varemb = use_varemb
         self.aggregated_variables = 1 #Change this to an argument when adding different variable aggregation strategies
+        self.default_time_offsets = default_time_offsets
+        self.use_timeemb = use_timeemb
+        self.aggregated_times = 1 #Change this to an argument when adding different time aggregation strategies
+        if self.use_timeemb:
+            assert self.use_varemb, "use_timeemb requires use_varemb -- time-aggregation runs on top of per-variable tokenization"
         self.class_token = class_token
         self.tensor_par_size = tensor_par_size
         self.tensor_par_group = tensor_par_group
@@ -370,6 +404,11 @@ class VIT(nn.Module):
             #TODO: Different parameter for specifying num_heads in var_agg rather than encoder num_heads
             self.var_agg = VariableMapping_Attention(self.embed_dim, fused_attn=self.FusedAttn_option, num_heads=self.num_heads, qkv_bias=False, tensor_par_size = self.tensor_par_size, tensor_par_group = self.tensor_par_group)
 
+        if self.use_timeemb:
+            self.time_embed, self.time_map = self.create_time_embedding(self.embed_dim)
+            self.time_query = nn.Parameter(torch.zeros(1, self.aggregated_times, self.embed_dim), requires_grad=True)
+            self.time_agg = VariableMapping_Attention(self.embed_dim, fused_attn=self.FusedAttn_option, num_heads=self.num_heads, qkv_bias=False, tensor_par_size = self.tensor_par_size, tensor_par_group = self.tensor_par_group)
+
         if self.use_adaptive_pos_emb:
             if self.twoD:
                 self.adaptive_pos_dep_emb = nn.Sequential(
@@ -445,6 +484,14 @@ class VIT(nn.Module):
             var_embed = get_1d_sincos_pos_embed_from_grid(self.var_embed.shape[-1], np.arange(len(self.default_vars)))
             self.var_embed.data.copy_(torch.from_numpy(var_embed).float().unsqueeze(0))
 
+        if self.use_timeemb:
+            # Positions are the real offset *values* (not just row index) --
+            # unlike var_embed (variable identity has no natural order),
+            # offsets do, and this keeps irregular strides (e.g. [-5,-3,-1])
+            # meaningfully spaced rather than treated as evenly-spaced ranks.
+            time_embed = get_1d_sincos_pos_embed_from_grid(self.time_embed.shape[-1], np.array(sorted(self.default_time_offsets)))
+            self.time_embed.data.copy_(torch.from_numpy(time_embed).float().unsqueeze(0))
+
         named_apply(get_init_weights_vit(head_bias), self)
 
     def _pos_embed(self, x: torch.Tensor, seq_ps) -> torch.Tensor:
@@ -516,13 +563,16 @@ class VIT(nn.Module):
         """Looks up the embedding row index for each variable name, cached per `(vars, device)`.
 
         Args:
-            vars: Tuple of variable names to look up in `self.var_map`.
+            vars: Tuple of variable names (or, for "sst" time-stepping,
+                `(variable, offset)` tuples -- only the name half is looked
+                up here; `get_time_ids` handles the offset half) to look up
+                in `self.var_map`.
             device: Device to place the resulting index tensor on.
 
         Returns:
             LongTensor of indices into `self.var_embed`, one per entry in `vars`.
         """
-        ids = np.array([self.var_map[var] for var in vars])
+        ids = np.array([self.var_map[_variable_name(var)] for var in vars])
         return torch.from_numpy(ids).to(device)
 
     def get_var_emb(self, var_emb, vars):
@@ -538,6 +588,98 @@ class VIT(nn.Module):
         ids = self.get_var_ids(vars, var_emb.device)
         return var_emb[:, ids, :]
 
+    def create_time_embedding(self, dim):
+        """Creates a learned embedding parameter and offset-to-index map for each offset in `self.default_time_offsets`.
+
+        Mirrors `create_var_embedding` exactly, keyed by real offset *value*
+        (not list position) -- see `use_timeemb`'s own docstring for why
+        that's what makes irregular strides (e.g. `[-5, -3, -1]`) work with
+        no special-casing.
+
+        Args:
+            dim: Embedding dimension for each timestep offset.
+
+        Returns:
+            A tuple `(time_embed, time_map)`: `time_embed` is a
+            `(1, len(default_time_offsets), dim)` parameter, and `time_map`
+            maps each offset to its row index in `time_embed`.
+        """
+        time_map = {}
+        idx = 0
+        for offset in self.default_time_offsets:
+            time_map[offset] = idx
+            idx += 1
+
+        time_embed = nn.Parameter(torch.zeros(1, len(self.default_time_offsets), dim), requires_grad=True)
+        return time_embed, time_map
+
+    @lru_cache(maxsize=None)
+    def get_time_ids(self, offsets, device):
+        """Looks up the embedding row index for each timestep offset, cached per `(offsets, device)`.
+
+        Args:
+            offsets: Tuple of real timestep offsets to look up in `self.time_map`.
+            device: Device to place the resulting index tensor on.
+
+        Returns:
+            LongTensor of indices into `self.time_embed`, one per entry in `offsets`.
+        """
+        ids = np.array([self.time_map[offset] for offset in offsets])
+        return torch.from_numpy(ids).to(device)
+
+    def get_time_emb(self, time_emb, offsets):
+        """Selects the rows of `time_emb` corresponding to `offsets`.
+
+        Args:
+            time_emb: Timestep-offset embedding table, shape
+                (1, len(default_time_offsets), D).
+            offsets: Timestep offsets to select embeddings for.
+
+        Returns:
+            Tensor of shape (1, len(offsets), D).
+        """
+        ids = self.get_time_ids(offsets, time_emb.device)
+        return time_emb[:, ids, :]
+
+    def _cross_attend_aggregate(self, x: torch.Tensor, query: torch.Tensor, agg: nn.Module, aggregated_count: int):
+        """Cross-attends `query` over `x`'s grouping dimension (dim 1) to aggregate it into `aggregated_count` tokens.
+
+        Shared implementation for `aggregate_variables` (grouping dimension
+        is per-variable tokens) and `aggregate_times` (grouping dimension is
+        per-timestep tokens, see `use_timeemb`).
+
+        Args:
+            x: Per-group token sequence, shape (B, G, L, D).
+            query: Learned query parameter, shape (1, aggregated_count, D).
+            agg: Cross-attention module (`VariableMapping_Attention`) to
+                cross-attend `query` over `x`'s groups with.
+            aggregated_count: Number of tokens `query`/`agg` collapse `x`'s
+                G groups into.
+
+        Returns:
+            Aggregated token sequence, shape (B, L, D) if
+            `aggregated_count == 1`, otherwise (B, G~, L, D) where G~ is
+            `aggregated_count`.
+        """
+        b, _, l, _ = x.shape
+        x = torch.einsum("bgld->blgd", x)
+        x = x.flatten(0, 1)  # BxL, G, D
+
+        group_query = query.expand(x.shape[0], -1, -1).contiguous()
+        x = agg(group_query, x)  # BxL, G~, D, where G~ is aggregated_count
+        x = x.squeeze()
+
+        if self.tensor_par_size > 1:
+            src_rank = dist.get_rank() - dist.get_rank(group=self.tensor_par_group)
+            x = F_Identity_B_Broadcast(x, src_rank, group=self.tensor_par_group)
+
+        x = x.unflatten(dim=0, sizes=(b, l))  # B, L, G~, D
+
+        if aggregated_count > 1:
+            x = rearrange(x,'b l g d -> b g l d')
+
+        return x
+
     def aggregate_variables(self, x: torch.Tensor):
         """Cross-attends over the per-variable dimension to aggregate a variable number of input channels into a fixed set.
 
@@ -549,26 +691,54 @@ class VIT(nn.Module):
             `self.aggregated_variables == 1`, otherwise (B, V~, L, D) where V~ is
             `self.aggregated_variables`.
         """
-        b, _, l, _ = x.shape
-        x = torch.einsum("bvld->blvd", x)
-        x = x.flatten(0, 1)  # BxL, V, D
+        return self._cross_attend_aggregate(x, self.var_query, self.var_agg, self.aggregated_variables)
 
-        #var_query = self.var_query.repeat_interleave(x.shape[0], dim=0)
-        #x , _ = self.var_agg(var_query, x, x)  # BxL, V~ , D, where V~ is the aggregated variables
-        var_query = self.var_query.expand(x.shape[0], -1, -1).contiguous()
-        x = self.var_agg(var_query, x)  # BxL, V~ , D, where V~ is the aggregated variables
-        x = x.squeeze()
+    def aggregate_times(self, x: torch.Tensor):
+        """Cross-attends over the per-timestep dimension to aggregate a variable number of timesteps into a fixed set.
 
-        if self.tensor_par_size > 1:
-            src_rank = dist.get_rank() - dist.get_rank(group=self.tensor_par_group)
-            x = F_Identity_B_Broadcast(x, src_rank, group=self.tensor_par_group)
+        Only meaningful when `self.use_timeemb` -- see its own docstring.
 
-        x = x.unflatten(dim=0, sizes=(b, l))  # B, L, V~, D
+        Args:
+            x: Per-timestep token sequence (each timestep already collapsed
+                across variables by `aggregate_variables`), shape (B, T, L, D).
 
-        if self.aggregated_variables >1:
-            x = rearrange(x,'b l v d -> b v l d')
+        Returns:
+            Aggregated token sequence, shape (B, L, D) if
+            `self.aggregated_times == 1`, otherwise (B, T~, L, D) where T~ is
+            `self.aggregated_times`.
+        """
+        return self._cross_attend_aggregate(x, self.time_query, self.time_agg, self.aggregated_times)
 
-        return x
+    def aggregate_variables_then_times(self, x: torch.Tensor, variables):
+        """Two-stage aggregation for time-stepped input.
+
+        Collapses the per-variable dimension *within* each timestep first
+        (`aggregate_variables`, independently per offset group), then
+        collapses the resulting per-timestep tokens *across* time second
+        (`aggregate_times`) -- the ordering the "sst" time-stepping feature
+        was designed around (see `use_timeemb`'s own docstring). Only
+        called when `self.use_timeemb` is True.
+
+        Args:
+            x: Per-variable token sequence with variable embedding already
+                added, shape (B, V, L, D).
+            variables: The same variable/`(variable, offset)` entries `x`'s
+                V dimension corresponds to (one per channel, in the same
+                order).
+
+        Returns:
+            Aggregated token sequence, shape (B, L, D).
+        """
+        offsets = [_variable_offset(v) for v in variables]
+        unique_offsets = sorted(set(offsets))
+        per_time = [
+            self.aggregate_variables(x[:, [i for i, o in enumerate(offsets) if o == off]])
+            for off in unique_offsets
+        ]
+        x = torch.stack(per_time, dim=1)  # B, T, L, D
+        time_embed = self.get_time_emb(self.time_embed, tuple(unique_offsets))  # 1, T, D
+        x = x + time_embed.unsqueeze(2)  # 1, T, D -> 1, T, 1, D
+        return self.aggregate_times(x)  # B, L, D
 
     def forward_features(self, x: torch.Tensor, variables, seq_ps) -> torch.Tensor:
         """Embeds patches/tokens, adds positional embeddings, and runs them through the transformer encoder.
@@ -606,7 +776,10 @@ class VIT(nn.Module):
             var_embed = self.get_var_emb(self.var_embed, variables) # 1, V, D
             x = torch.stack(embeds, dim=1)  # B, L, D -> B, V, L, D
             x = x + var_embed.unsqueeze(2)  # 1, V, D -> 1, V, 1, D
-            x = self.aggregate_variables(x)  # B, V~ , L, D, where V~ is the aggregated variables
+            if self.use_timeemb:
+                x = self.aggregate_variables_then_times(x, variables)  # B, L, D
+            else:
+                x = self.aggregate_variables(x)  # B, V~ , L, D, where V~ is the aggregated variables
         else:
             if self.adaptive_patching:
                 x = rearrange(x, 'b c s p -> b s (p c)')
@@ -1783,7 +1956,10 @@ class UNETR(VIT):
             var_embed = self.get_var_emb(self.var_embed, variables) # 1, V, D
             x = torch.stack(embeds, dim=1)  # B, L, D -> B, V, L, D
             x = x + var_embed.unsqueeze(2)  # 1, V, D -> 1, V, 1, D
-            x = self.aggregate_variables(x)  # B, V~ , L, D, where V~ is the aggregated variables
+            if self.use_timeemb:
+                x = self.aggregate_variables_then_times(x, variables)  # B, L, D
+            else:
+                x = self.aggregate_variables(x)  # B, V~ , L, D, where V~ is the aggregated variables
         else:
             if self.adaptive_patching:
                 x = rearrange(x, 'b c s p -> b s (p c)')

@@ -74,6 +74,143 @@ def test_effective_patch_size_adaptive_missing_interp_size_raises():
 
 
 # ---------------------------------------------------------------------------
+# use_timeemb -- "sst" time-stepping's time_embed/cross-attention aggregation
+# ---------------------------------------------------------------------------
+
+
+def _make_timeemb_vit(**overrides):
+    kwargs = dict(
+        default_vars=["r", "u"],
+        use_varemb=True,
+        default_time_offsets=[-1, 0],
+        use_timeemb=True,
+    )
+    kwargs.update(overrides)
+    return _make_vit(**kwargs)
+
+
+def test_use_timeemb_requires_use_varemb():
+    with pytest.raises(AssertionError, match="use_timeemb requires use_varemb"):
+        _make_vit(use_varemb=False, use_timeemb=True, default_time_offsets=[-1, 0])
+
+
+def test_time_map_is_keyed_by_real_offset_value_not_position():
+    """Irregular strides (e.g. [-5, -1, 0], not evenly spaced) must still
+    resolve correctly -- time_map is keyed by the real offset value itself,
+    not by its position in default_time_offsets.
+    """
+    model = _make_timeemb_vit(default_time_offsets=[-5, -1, 0])
+    assert model.time_map == {-5: 0, -1: 1, 0: 2}
+    assert model.time_embed.shape == (1, 3, model.embed_dim)
+
+
+def test_get_time_emb_selects_correct_rows_regardless_of_query_order():
+    model = _make_timeemb_vit(default_time_offsets=[-5, -1, 0])
+    full = model.time_embed
+    # Query in a different order than default_time_offsets itself -- must
+    # select by real offset value, not by iterating default_time_offsets.
+    selected = model.get_time_emb(full, (0, -5))
+    assert torch.allclose(selected[0, 0], full[0, 2])  # offset 0 -> row 2
+    assert torch.allclose(selected[0, 1], full[0, 0])  # offset -5 -> row 0
+
+
+def test_aggregate_variables_then_times_is_invariant_to_channel_order():
+    """The actual novel logic under test: grouping input channels by their
+    real offset (not by position) before the per-timestep
+    aggregate_variables call. Shuffling which index holds which
+    (variable, offset) entry -- while keeping `variables` in sync -- must
+    produce an identical result, since grouping is driven by the `variables`
+    labels, not position. A wrong indexing/grouping bug would show up here
+    as a real numeric mismatch, not just a wrong shape.
+    """
+    model = _make_timeemb_vit()
+    model.eval()
+    variables = [("r", -1), ("u", -1), ("r", 0), ("u", 0)]
+    B, V, L, D = 2, 4, 3, model.embed_dim
+    x = torch.randn(B, V, L, D)
+
+    with torch.no_grad():
+        out1 = model.aggregate_variables_then_times(x, variables)
+
+        perm = [2, 0, 3, 1]
+        x2 = x[:, perm]
+        variables2 = [variables[i] for i in perm]
+        out2 = model.aggregate_variables_then_times(x2, variables2)
+
+    assert out1.shape == (B, L, D)
+    assert torch.allclose(out1, out2, atol=1e-6)
+
+
+def test_aggregate_variables_then_times_matches_manual_two_stage_computation():
+    """Regression test for the ordering itself: collapsing variables within
+    each timestep first, then collapsing across timesteps second, must
+    match calling aggregate_variables per offset group and aggregate_times
+    on the result by hand -- confirming aggregate_variables_then_times is
+    just that, not some other order (e.g. collapsing time first).
+    """
+    model = _make_timeemb_vit()
+    model.eval()
+    variables = [("r", -1), ("u", -1), ("r", 0), ("u", 0)]
+    B, V, L, D = 2, 4, 3, model.embed_dim
+    x = torch.randn(B, V, L, D)
+
+    with torch.no_grad():
+        actual = model.aggregate_variables_then_times(x, variables)
+
+        per_time = [model.aggregate_variables(x[:, [0, 1]]), model.aggregate_variables(x[:, [2, 3]])]
+        stacked = torch.stack(per_time, dim=1)  # B, T, L, D
+        time_embed = model.get_time_emb(model.time_embed, (-1, 0))
+        stacked = stacked + time_embed.unsqueeze(2)
+        expected = model.aggregate_times(stacked)
+
+    assert torch.allclose(actual, expected, atol=1e-6)
+
+
+def test_forward_features_with_use_timeemb_matches_no_timeemb_output_shape():
+    """Drop-in compatibility: turning on use_timeemb must not change what
+    forward_features hands to the rest of the encoder -- same (B, N,
+    embed_dim) shape as the plain use_varemb (no time-stepping) path.
+    """
+    timeemb_model = _make_timeemb_vit()
+    timeemb_model.eval()
+    plain_model = _make_vit(default_vars=["r", "u"], use_varemb=True)
+    plain_model.eval()
+
+    B = 2
+    x_timeemb = torch.randn(B, 4, 16, 16)  # r@-1, u@-1, r@0, u@0
+    x_plain = torch.randn(B, 2, 16, 16)  # r, u
+
+    with torch.no_grad():
+        out_timeemb = timeemb_model.forward_features(x_timeemb, [("r", -1), ("u", -1), ("r", 0), ("u", 0)], None)
+        out_plain = plain_model.forward_features(x_plain, ["r", "u"], None)
+
+    assert out_timeemb.shape == out_plain.shape
+
+
+def test_unetr_forward_intermediates_with_use_timeemb_runs_end_to_end():
+    """UNETR.forward_intermediates (not VIT.forward_features) is the real
+    path both target "sst" UNETR configs use (skip_connection:True) --
+    confirms the same use_timeemb wiring runs a full real transformer
+    forward pass there too, not just in the shared base class.
+    """
+    model = UNETR(
+        img_size=(16, 16), patch_size=4, in_chans=1, num_classes=2, embed_dim=4, depth=1, num_heads=1,
+        mlp_ratio=1.0, twoD=True, adaptive_patching=False, fixed_length=16, class_token=False,
+        pos_embed="none", feature_size=4, skip_connection=False, linear_decoder=False,
+        default_vars=["r", "u"], use_varemb=True, default_time_offsets=[-1, 0], use_timeemb=True,
+    )
+    model.eval()
+
+    x = torch.randn(2, 4, 16, 16)  # r@-1, u@-1, r@0, u@0
+    variables = [("r", -1), ("u", -1), ("r", 0), ("u", 0)]
+    with torch.no_grad():
+        x_out, intermediates = model.forward_intermediates(x, variables, seq_ps=None, indices=None)
+
+    assert x_out.shape == (2, 16, model.embed_dim)  # 16 tokens: (16/4)**2
+    assert len(intermediates) == 1
+
+
+# ---------------------------------------------------------------------------
 # SAP.mask_head -- per-token output (not a dense grid built by raw reshape)
 # ---------------------------------------------------------------------------
 

@@ -4579,11 +4579,101 @@ regressions elsewhere.
 
 **Not yet done** (next two stages): adaptive patching's "build the octree
 from one reference past timestep, reuse across all T" mode in
-`Patchify_3D`/`ProcessChannels`; the model-architecture piece in `arch.py`/
-`building_blocks.py` (a `time_embed` mirroring `var_embed`, keyed by real
-offset value, and a `TimeMapping_Attention`-style cross-attention
-collapsing `T -> 1`, composed *after* variable-aggregation, disabled
-entirely for `T=1`); and the two target UNETR configs (the existing
-u,v,w,r->p config needs no changes; a new N-past-steps->future-step
-config predicting all 5 variables still needs to be created once the
-model piece exists).
+`Patchify_3D`/`ProcessChannels`; and the two target UNETR configs (the
+existing u,v,w,r->p config needs no changes; a new N-past-steps->future-
+step config predicting all 5 variables still needs to be created).
+
+## Added the model-architecture piece: `time_embed`/cross-attention aggregation for time-stepped input (`arch.py`)
+
+Second stage of the time-stepping feature (see the dataloader/schema
+stage above). Confirmed first (with the user) that this is genuinely
+needed regardless of adaptive patching: even the plain, non-adaptive
+UNETR path tokenizes each input channel separately once
+`model.use_channel_aggregation:True` (`arch.py`'s `use_varemb`), and with
+time-stepped input, multiple channels are now the *same* variable at
+different offsets -- something has to decide how those get combined into
+one token stream before the shared transformer encoder. Confirmed by
+direct code reading (not guessed) that every shipped config -- including
+both existing `"sst"` configs -- actually has `use_channel_aggregation:
+False` today, so this whole mechanism (old and new) is currently inactive
+in production; the new time-stepped config (still to be created) will be
+the first to turn it on.
+
+**Design, as agreed with the user:** variable-aggregation runs first,
+*within* each timestep independently (collapsing that timestep's V
+variables to 1 token, via the existing `aggregate_variables`); time-
+aggregation runs second, *across* the resulting per-timestep tokens
+(collapsing T timesteps to 1, via a new `aggregate_times`) -- mirroring
+`var_embed`/`aggregate_variables` with a new `time_embed`/`time_query`/
+`time_agg` (reusing `VariableMapping_Attention` as-is; it's already fully
+generic over what it's cross-attending over). `time_map` (in
+`create_time_embedding`) is keyed by the real offset *value*, not list
+position -- exactly like `time_offsets` itself, this is what makes
+irregular strides (e.g. `[-5, -3, -1]`) work with zero special-casing.
+`use_timeemb` (new, mirrors `use_varemb`) gates the entire mechanism off
+by construction whenever there's only one real timestep -- not a
+degenerate one-token cross-attention, the code path is never entered at
+all -- so every existing `use_varemb` config (time-stepped or not) is
+provably unaffected. Wired into the two real call sites that matter for
+`"sst"`: `VIT.forward_features` (shared base, used whenever
+`skip_connection:False`) and `UNETR.forward_intermediates` (its own
+near-identical copy, used by every shipped UNETR config since they all
+have `skip_connection:True`) -- deliberately not touched in `MAE`/
+`DiffusionVIT`'s own near-identical copies, since time-stepped `"sst"`
+never uses either model type.
+
+`variables` entries (already normalized to plain strings or `(variable,
+offset)` tuples by the dataloader/schema stage) flow straight through to
+the model unchanged -- `get_var_ids` now extracts just the name half
+(`_variable_name`) before looking up `var_map`, so a tuple entry still
+resolves to the right row. Per-variable `token_embeds`/`var_embed` are
+keyed by variable name only (offset-agnostic) with no changes needed at
+all: the same variable at different offsets already shares one token-
+embed module and one `var_embed` row, which is exactly the desired
+"one shared patch-embed across all T timesteps" behavior the user wanted
+(simpler than the per-variable case, which does use separate weights).
+
+`aggregate_variables`'s cross-attention body was factored out into a
+shared `_cross_attend_aggregate` helper (grouping dimension generalized
+from "variable" to "group") so `aggregate_times` isn't a copy-pasted
+duplicate -- confirmed byte-identical to the original, unrefactored
+`aggregate_variables` (same random weights, same input, `torch.equal`)
+before trusting it.
+
+**Verification note:** `tests/model/test_arch.py` (and `arch.py`/
+`building_blocks.py` generally) can't actually execute in this session's
+shell -- `building_blocks.py`'s unconditional `from xformers.components.
+attention.core import ...` fails here (`ModuleNotFoundError`, this
+environment's xformers build doesn't match its torch/Python version), the
+same pre-existing gap the file's own `importorskip` already guards
+against for every other test in it. Added real Tier 1 tests anyway
+(`test_use_timeemb_requires_use_varemb`, `test_time_map_is_keyed_by_real_
+offset_value_not_position`, `test_get_time_emb_selects_correct_rows_
+regardless_of_query_order`, `test_aggregate_variables_then_times_is_
+invariant_to_channel_order` -- permutes which channel index holds which
+`(variable, offset)` and confirms the output doesn't change, the direct
+regression test that grouping is driven by the `variables` labels and not
+by position -- `test_aggregate_variables_then_times_matches_manual_two_
+stage_computation`, `test_forward_features_with_use_timeemb_matches_no_
+timeemb_output_shape`, `test_unetr_forward_intermediates_with_use_timeemb_
+runs_end_to_end`), all skip cleanly here via the existing `importorskip`
+guard, matching this file's established convention.
+
+Before reporting this stage done, additionally verified for real (not
+just by inspection) by stubbing the three broken `xformers.components.*`
+submodules with empty placeholder modules in a scratch-only script
+(`FusedAttn.NONE` is the default here, so the actual broken xformers ops
+are never called, only imported) -- this let the real `VIT`/`UNETR`
+classes import and run under this session's CPU-only torch. Every one of
+the new tests' assertions, replayed directly against the real classes
+this way, passed, including a real end-to-end `UNETR.forward_intermediates`
+forward pass with `use_timeemb:True`. This scratch verification is not
+part of the committed test suite (masking a real environment gap for
+every other developer here would be worse than leaving it to
+`importorskip`) -- it's this session's own substitute for `pytest`
+actually running `test_arch.py`'s new cases, not a replacement for a real
+run in a working environment (or on Frontier) confirming the same.
+
+**Not yet done** (still pending): adaptive patching's "build the octree
+from one reference past timestep, reuse across all T" mode; the two
+target UNETR configs.
