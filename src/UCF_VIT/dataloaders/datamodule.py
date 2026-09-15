@@ -223,6 +223,14 @@ class NativePytorchDataModule(torch.nn.Module):
             distinct timestep offset referenced across `dict_in_variables`/
             `dict_out_variables` (see `UCF_VIT.utils.misc.process_root_dirs`'s
             own docstring). `None` or `[0]` means no real timestepping.
+        profile_dataloader (bool, optional): Diagnostic only, off by default --
+            forwarded to `ProcessChannels`/`Patchify_3D` (3D adaptive patching
+            only). Times the real per-sample Canny/octree-build/serialize
+            cost from inside the `DataLoader` worker process(es) -- see
+            `UCF_VIT.dataloaders.transform.Patchify_3D`'s own `profile`
+            docstring entry, and `UCF_VIT.training.train_epoch`'s
+            `profile_dataloader` handling for the complementary main-process
+            timing this is meant to be compared against.
     """
 
     def __init__(
@@ -260,6 +268,7 @@ class NativePytorchDataModule(torch.nn.Module):
         img_size: Optional[list] = None,
         full_domain_size: Optional[Dict] = None,
         time_offsets: Optional[list] = None,
+        profile_dataloader: bool = False,
     ):
         """Initializes the data module and builds the per-dataset file listings.
 
@@ -303,6 +312,7 @@ class NativePytorchDataModule(torch.nn.Module):
         self.data_par_size = data_par_size
         self.ddp_group = ddp_group
         self.dataset = dataset
+        self.profile_dataloader = profile_dataloader
 
         #Optional Inputs
         self.num_classes = num_classes
@@ -473,6 +483,7 @@ class NativePytorchDataModule(torch.nn.Module):
                 self.twoD,
                 self.dataset,
                 self.return_qdt,
+                profile=self.profile_dataloader,
             )
         else:
             dict_data_train[k] = ProcessChannels(
@@ -513,6 +524,7 @@ class NativePytorchDataModule(torch.nn.Module):
                 self.twoD,
                 self.dataset,
                 self.return_qdt,
+                profile=self.profile_dataloader,
             )
         return dict_data_train
         

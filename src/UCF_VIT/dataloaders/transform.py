@@ -1,9 +1,13 @@
+import os
+import time
+
 import numpy as np
 import cv2 as cv
 import torch
 import random
 import SimpleITK as sitk
 from skimage.feature import canny as skimage_canny
+from torch.utils.data import get_worker_info
 from .quadtree import FixedQuadTree
 from .octree import FixedOctTree
 
@@ -148,7 +152,7 @@ class Patchify_3D(torch.nn.Module):
     by the weighting above rather than in a single multi-channel call.
     """
 
-    def __init__(self, sths=[0.5,1.0,2.0], fixed_length=196, canny_thresholds=(0.05, 0.15), interp_size=16, num_channels=3, dataset="basic_ct", return_edges=False) -> None:
+    def __init__(self, sths=[0.5,1.0,2.0], fixed_length=196, canny_thresholds=(0.05, 0.15), interp_size=16, num_channels=3, dataset="basic_ct", return_edges=False, profile=False) -> None:
         """Initializes the randomization ranges and patch parameters for the transform.
 
         Args:
@@ -181,6 +185,14 @@ class Patchify_3D(torch.nn.Module):
                 instead. Every other dataset's behavior is unaffected.
             return_edges: If True, also return the computed edge volume from
                 `forward`.
+            profile: Diagnostic only, off by default -- see `UCF_VIT.training.
+                train_epoch`'s own `profile_dataloader` handling, which this
+                mirrors from inside the DataLoader worker process (this class
+                runs inside `num_workers`'s forked worker(s), not the main
+                training process, so `train_epoch`'s own timing can't see
+                this call's *raw* cost -- only whether the worker keeps up).
+                When True, times the per-channel Canny loop, the `FixedOctTree`
+                build, and `serialize` separately and prints them every call.
         """
         super().__init__()
 
@@ -191,6 +203,7 @@ class Patchify_3D(torch.nn.Module):
         self.num_channels = num_channels
         self.dataset = dataset
         self.return_edges = return_edges
+        self.profile = profile
 
     def forward(self, img):  # we assume inputs are always structured like this
         """Computes a 3D edge volume for `img` and adaptively patchifies it via an octree.
@@ -207,6 +220,9 @@ class Patchify_3D(torch.nn.Module):
         """
         self.smooth_factor = random.choice(self.sths)
         variance = [float(self.smooth_factor)] * 3
+
+        if self.profile:
+            t_edge_start = time.time()
 
         # One real 3D Canny call per channel (SimpleITK.CannyEdgeDetection
         # doesn't support multi-channel/vector images directly), summed
@@ -241,9 +257,28 @@ class Patchify_3D(torch.nn.Module):
 
         edges = edges_combined_counter
 
+        if self.profile:
+            t_octree_start = time.time()
+            edge_time = t_octree_start - t_edge_start
+
         octtree = FixedOctTree(domain=edges, fixed_length=self.fixed_length)
 
+        if self.profile:
+            t_serialize_start = time.time()
+            octree_time = t_serialize_start - t_octree_start
+
         seq_img, seq_size, seq_pos = octtree.serialize(img, size=(self.interp_size,self.interp_size,self.interp_size, self.num_channels))
+
+        if self.profile:
+            serialize_time = time.time() - t_serialize_start
+            worker_info = get_worker_info()
+            print(
+                "patchify_3d worker_pid", os.getpid(), "worker_id", worker_info.id if worker_info is not None else None,
+                "edge_time", edge_time, "octree_time", octree_time, "serialize_time", serialize_time,
+                "patchify_time", edge_time + octree_time + serialize_time,
+                flush=True,
+            )
+
         seq_size = np.asarray(seq_size)
         seq_img = np.asarray(seq_img, dtype=np.float32)
         if self.num_channels > 1:

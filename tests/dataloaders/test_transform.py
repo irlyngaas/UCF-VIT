@@ -190,6 +190,45 @@ def test_patchify_3d_shape_and_dtype():
     assert edges.sum() > 0
 
 
+def test_patchify_3d_profile_prints_edge_octree_serialize_timings(capsys):
+    """Diagnostic only, off by default -- when profile=True, forward() must
+    print real (non-negative) timings for each of the 3 real per-sample
+    CPU-bound stages (Canny edge loop, octree build, serialize), summing to
+    patchify_time, from inside whatever process actually calls it (a
+    DataLoader worker in real use) -- confirmed here by parsing the exact
+    printed line, not just "no exception".
+    """
+    D = H = W = 24
+    vol = np.zeros((D, H, W, 2), dtype=np.float32)
+    vol[8:16, 8:16, 8:16, :] = 1.0
+
+    p = Patchify_3D(sths=[1.0], fixed_length=8, canny_thresholds=(0.05, 0.15), interp_size=4, num_channels=2, dataset="basic_ct", profile=True)
+    p(vol)
+
+    out = capsys.readouterr().out
+    lines = [line for line in out.splitlines() if line.startswith("patchify_3d")]
+    assert len(lines) == 1
+    tokens = lines[0].split()[1:]  # drop the leading "patchify_3d" label
+    fields = dict(zip(tokens[0::2], tokens[1::2]))
+    edge_time = float(fields["edge_time"])
+    octree_time = float(fields["octree_time"])
+    serialize_time = float(fields["serialize_time"])
+    patchify_time = float(fields["patchify_time"])
+    assert edge_time >= 0
+    assert octree_time >= 0
+    assert serialize_time >= 0
+    assert patchify_time == pytest.approx(edge_time + octree_time + serialize_time)
+
+
+def test_patchify_3d_profile_defaults_to_false_and_prints_nothing():
+    D = H = W = 24
+    vol = np.zeros((D, H, W, 2), dtype=np.float32)
+    vol[8:16, 8:16, 8:16, :] = 1.0
+
+    p = Patchify_3D(sths=[1.0], fixed_length=8, canny_thresholds=(0.05, 0.15), interp_size=4, num_channels=2, dataset="basic_ct")
+    assert p.profile is False
+
+
 def test_patchify_3d_sst_normalizes_only_edge_detection_input_not_real_patch_content():
     """"sst"'s raw CFD fields are in arbitrary physical units, not the
     ~[0,1] scale canny_thresholds assumes (true for basic_ct only because

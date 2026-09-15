@@ -401,6 +401,28 @@ def test_processchannels_separate_channels_does_not_crash():
     assert seq_pos.shape[:2] == (num_channels, fixed_length)
 
 
+@pytest.mark.parametrize("separate_channels", [False, True])
+def test_processchannels_threads_profile_through_to_patchify_3d(separate_channels):
+    """profile is diagnostic-only, off by default -- confirms ProcessChannels
+    actually forwards it to the real Patchify_3D instance it builds (3D
+    adaptive patching only), in both separate_channels modes, rather than
+    silently dropping it.
+    """
+    pc_profiling_off = ProcessChannels(
+        _FakeSource([]), num_channels=2, batch_size=1, return_label=False,
+        adaptive_patching=True, separate_channels=separate_channels, interp_size=4,
+        fixed_length=8, twoD=False, _dataset="basic_ct", return_qdt=False,
+    )
+    assert pc_profiling_off.patchify.profile is False
+
+    pc_profiling_on = ProcessChannels(
+        _FakeSource([]), num_channels=2, batch_size=1, return_label=False,
+        adaptive_patching=True, separate_channels=separate_channels, interp_size=4,
+        fixed_length=8, twoD=False, _dataset="basic_ct", return_qdt=False, profile=True,
+    )
+    assert pc_profiling_on.patchify.profile is True
+
+
 # ---------------------------------------------------------------------------
 # FileReader worker sharding
 # ---------------------------------------------------------------------------

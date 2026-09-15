@@ -111,6 +111,7 @@ def main():
                 img_size = test_conf["data"]["img_size"],
                 full_domain_size = test_conf["dataset_options"]["full_domain_size"],
                 time_offsets = test_conf["data"]["time_offsets"],
+                profile_dataloader = test_conf["trainer"]["profile_dataloader"],
             )
 
             data_module.setup()

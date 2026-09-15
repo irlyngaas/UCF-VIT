@@ -4839,3 +4839,89 @@ tested anywhere locally (no fixture builds a real CUDA-backed model/
 dataloader for it) -- the profiling code path is otherwise unverified
 here beyond `py_compile` and manual review; a real Frontier run with
 `profile_dataloader:True` is what actually exercises it.
+
+## Split `profile_dataloader` into forward_time/backward_time; added a complementary in-worker timer
+
+Two follow-ups to the diagnostic above.
+
+First, `compute_time` was too coarse to see whether adaptive patching's
+sequence-length difference (shorter *or* longer) is actually moving the
+needle on the model side at all -- split it into `forward_time`
+(`forward_step` alone) and `backward_time` (`backward()` alone), each with
+its own `torch.cuda.synchronize()` pair. Required splitting the grad-
+scaler/optimizer-step `if` block into two stages (backward, then step) so
+`backward_time` doesn't include the optimizer step.
+
+Second, a real conceptual gap in `data_time` itself: with `persistent_
+workers:True` and `num_workers:1`, one background worker process really
+does prepare the *next* batch while the main loop runs forward/backward on
+the *current* one (PyTorch's own default `prefetch_factor` -- see below --
+lets it queue ahead). `process_batch`'s `next(it_loader)` call -- what
+`data_time` times -- therefore measures how long the main loop sat
+*waiting* for a ready batch, not the worker's raw per-sample cost: if the
+worker keeps up, `data_time` reads near-zero even though real CPU work is
+still happening, just fully hidden behind GPU compute. That's actually the
+right thing to measure for "is the dataloader the bottleneck" (a stall
+there is definitionally the throughput cost, whatever the worker's
+absolute cost is) -- but it can't answer the complementary question of
+how expensive the raw per-sample work actually is in isolation.
+
+Added a second, complementary timer for that: `Patchify_3D` (3D adaptive
+patching only) takes a new `profile` param (diagnostic only, off by
+default, mirroring `profile_dataloader`) and, when True, times its 3 real
+per-sample CPU stages -- the per-channel Canny loop, the `FixedOctTree`
+build, and `serialize` -- printing each (plus their sum, `patchify_time`)
+every call, tagged with `os.getpid()` and the `DataLoader` worker's own
+`id` (`torch.utils.data.get_worker_info()`) since this runs *inside* the
+worker process(es), not the main training process `train_epoch`'s own
+timers see. Threaded through as `profile` on `ProcessChannels` and
+`profile_dataloader` on `NativePytorchDataModule` (reusing `conf["trainer"]
+["profile_dataloader"]` end to end -- one flag now turns on both the
+main-process and in-worker timers together), and into `train.py`/`val.py`/
+`test.py`'s `NativePytorchDataModule(...)` calls.
+
+**Tier 1 coverage:** unlike `train_epoch`, this piece *is* directly
+testable locally -- `transform.py` has no `building_blocks.py`/xformers
+dependency, so `tests/dataloaders/test_transform.py` runs for real here.
+Added `test_patchify_3d_profile_prints_edge_octree_serialize_timings`
+(parses the actual printed line via `capsys`, confirms all 3 timings are
+non-negative and sum to `patchify_time` -- not just "no exception") and
+`test_patchify_3d_profile_defaults_to_false_and_prints_nothing`.
+`test_processchannels_threads_profile_through_to_patchify_3d`
+(`test_dataset.py`, parametrized over `separate_channels`) confirms the
+wiring reaches the real `Patchify_3D` instance `ProcessChannels` builds.
+While adding that last test, caught and fixed a self-inflicted mistake
+before it landed: an earlier edit's `old_string` match didn't include a
+sibling test's trailing 2 assertions, silently orphaning them outside any
+function -- caught immediately by running the file's tests right after
+(`NameError: name 'seq_size' is not defined`), not left for later.
+
+### On `dataloader.num_workers`/`prefetch_factor` for this workflow
+
+Asked in the same conversation: is the current setup (both shipped `sst`
+UNETR configs use `num_workers:1`, `prefetch_factor` left at PyTorch's own
+default) reasonable, or worth tuning?
+
+`prefetch_factor` defaults to 2 per worker whenever `num_workers > 0`
+(confirmed directly against the installed `torch` (2.13.0)'s own
+`DataLoader.__init__` source, not assumed) -- it controls how many batches
+*one* worker is allowed to queue ahead of the consumer, which only smooths
+*transient* bursts in GPU compute time; it doesn't add any parallelism,
+since a single worker process still prepares batches strictly one at a
+time regardless of how deep its queue is allowed to get. The real evidence
+from the earlier throughput comparison (526 vs. 6,628 batches in the same
+window) looks like a *sustained* rate mismatch, not a transient burst --
+with only 1 worker, no queue depth fixes a producer that's consistently
+slower than the consumer, once that queue runs dry (which happens almost
+immediately under a sustained mismatch). So `prefetch_factor` is very
+unlikely to be the lever that matters here.
+
+`num_workers` is the actual lever: it adds real parallelism (multiple
+worker *processes*, each independently running `Patchify_3D`'s CPU work on
+separate cores), directly increasing the aggregate production rate --
+`launch/sst/unetr.sh`'s `--cpus-per-task=7` leaves real headroom above
+today's `num_workers:1`. Not changed in this session (no shipped config
+touched) -- a real Frontier comparison across a few `num_workers` values,
+with `profile_dataloader:True` on to see `data_time` actually drop, is the
+natural next real-data experiment once the timing pieces above are
+confirmed working.

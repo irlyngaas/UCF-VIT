@@ -126,6 +126,7 @@ def main():
                 img_size = val_conf["data"]["img_size"],
                 full_domain_size = val_conf["dataset_options"]["full_domain_size"],
                 time_offsets = val_conf["data"]["time_offsets"],
+                profile_dataloader = val_conf["trainer"]["profile_dataloader"],
             )
 
             data_module.setup()

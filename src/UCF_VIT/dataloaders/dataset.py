@@ -595,7 +595,7 @@ class ProcessChannels(IterableDataset):
     with the same quadtree/octree used for the image).
     """
 
-    def __init__(self, dataset, num_channels: int, batch_size: int, return_label: bool, adaptive_patching: bool, separate_channels: bool, interp_size: int, fixed_length: int, twoD: bool, _dataset: str, return_qdt: bool) -> None:
+    def __init__(self, dataset, num_channels: int, batch_size: int, return_label: bool, adaptive_patching: bool, separate_channels: bool, interp_size: int, fixed_length: int, twoD: bool, _dataset: str, return_qdt: bool, profile: bool = False) -> None:
         """Initializes the batching buffer and, if needed, the adaptive-patching transform.
 
         Args:
@@ -617,6 +617,10 @@ class ProcessChannels(IterableDataset):
                 handling and the patchifier's edge-detection behavior.
             return_qdt: Whether to also yield the quadtree/octree object(s) used
                 for each sample.
+            profile: Diagnostic only, off by default -- forwarded to
+                `Patchify_3D` (3D only, see its own `profile` docstring entry);
+                times the real per-sample Canny/octree-build/serialize cost
+                from inside this DataLoader worker process.
         """
         super().__init__()
         self.dataset = dataset
@@ -634,12 +638,12 @@ class ProcessChannels(IterableDataset):
                 if self.twoD:
                     self.patchify = Patchify(fixed_length=fixed_length, interp_size=interp_size, num_channels=1, dataset=self._dataset)
                 else:
-                    self.patchify = Patchify_3D(fixed_length=fixed_length, interp_size=interp_size, num_channels=1, dataset=self._dataset)
+                    self.patchify = Patchify_3D(fixed_length=fixed_length, interp_size=interp_size, num_channels=1, dataset=self._dataset, profile=profile)
             else:
                 if self.twoD:
                     self.patchify = Patchify(fixed_length=fixed_length, interp_size=interp_size, num_channels=num_channels, dataset=self._dataset)
                 else:
-                    self.patchify = Patchify_3D(fixed_length=fixed_length, interp_size=interp_size, num_channels=num_channels, dataset=self._dataset)
+                    self.patchify = Patchify_3D(fixed_length=fixed_length, interp_size=interp_size, num_channels=num_channels, dataset=self._dataset, profile=profile)
 
     def __iter__(self):
         """Buffers `self.batch_size` upstream samples, then yields them one by one, patchified if configured.
