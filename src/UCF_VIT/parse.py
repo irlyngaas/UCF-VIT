@@ -821,13 +821,19 @@ def parse_config(args, load_balance_offline=False):
     #dropping any "sst" (variable, offset) pair's offset (the model's
     #variable embedding is keyed on the name alone; a future timestep
     #embedding, keyed on offset, is entirely separate -- see time_offsets
-    #below).
-    for i,k in enumerate(dict_in_variables):
-        names = [e[0] if isinstance(e, tuple) else e for e in dict_in_variables[k]]
-        if i == 0:
-            default_vars = names
-        else:
-            default_vars = list(set(default_vars + names))
+    #below). Deduped in first-occurrence order, not via set() -- set()'s
+    #iteration order depends on Python's per-process string hash
+    #randomization, which would make var_map's name->row assignment
+    #(create_var_embedding, in arch.py) inconsistent across separate
+    #process launches (different DDP ranks, or a training run vs. a later
+    #eval run). Dedup is required (not just cosmetic) once a key's own
+    #variable list can repeat a name at multiple offsets -- e.g. "sst"
+    #time-stepping's dict_in_variables=[["u",-2],...,["u",-1],...].
+    default_vars = []
+    for k in dict_in_variables:
+        for name in (e[0] if isinstance(e, tuple) else e for e in dict_in_variables[k]):
+            if name not in default_vars:
+                default_vars.append(name)
 
     #dict_out_variables: regression-target variable names per dataset key --
     #only meaningful for "sst" (every other dataset's label comes from a
@@ -1257,12 +1263,16 @@ def parse_pretrained_config(args, conf):
                     in_variables_list.append(str(i))
                 dict_in_variables.update(in_variables_list)
 
-        #Create default_vars from dict_in_variables
-        for i,k in enumerate(pretrained_conf['data']['dict_in_variables']):
-            if i == 0:
-                default_vars = pretrained_conf['data']['dict_in_variables'][k]
-            else:
-                default_vars = list(set(default_vars + pretrained_conf['data']['dict_in_variables'][k]))
+        #Create default_vars from dict_in_variables -- deduped in first-
+        #occurrence order, not via set(); see parse_config's own identical
+        #derivation for why (set()'s per-process string hash randomization
+        #would make var_map's name->row assignment inconsistent across
+        #separate process launches).
+        default_vars = []
+        for k in pretrained_conf['data']['dict_in_variables']:
+            for name in pretrained_conf['data']['dict_in_variables'][k]:
+                if name not in default_vars:
+                    default_vars.append(name)
 
         #Check if dict_in_variables from this model are in the default_vars list for the pre-trained model
         if use_channel_aggregation: 

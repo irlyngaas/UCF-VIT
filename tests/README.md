@@ -4675,5 +4675,78 @@ actually running `test_arch.py`'s new cases, not a replacement for a real
 run in a working environment (or on Frontier) confirming the same.
 
 **Not yet done** (still pending): adaptive patching's "build the octree
-from one reference past timestep, reuse across all T" mode; the two
-target UNETR configs.
+from one reference past timestep, reuse across all T" mode.
+
+## Added the two target UNETR configs, and two more real bugs found while building them
+
+Third and final stage of the time-stepping feature. Target 1 ("a UNETR
+setup like I have already with inputs u,v,w,r and predict p") already
+existed as `configs/sst/unetr/base_config.yaml` and needed zero changes,
+per the whole feature's backward-compatibility design -- re-confirmed by
+`test_shipped_config_parses[configs/sst/unetr/base_config.yaml]` still
+passing unchanged. Target 2 (new: N past timesteps of u,v,w,r,p predicting
+u,v,w,r,p at a future timestep) is `configs/sst/unetr/timestep_config.yaml`
+-- `dict_in_variables` lists u,v,w,r,p at offsets -2 and -1 (`[variable,
+offset]` pairs, `num_channels:10`), `dict_out_variables` lists them at
+offset 0 (`num_classes:5`), and `model.use_channel_aggregation:True` (new
+-- every other shipped config leaves this `False`) turns on the per-
+variable tokenization + `time_embed`/cross-attention aggregation from the
+previous stage. Deliberately non-adaptive (`ap.do_ap:False`), same as
+`base_config.yaml` was before its own `adaptive_config.yaml` follow-up --
+the octree-time-reuse mode isn't implemented yet.
+
+Validating this real config (not just a synthetic test fixture) surfaced
+two more real bugs, both pre-existing (not introduced this session) but
+newly *reachable* because this is the first config to actually exercise
+the code paths they're in:
+
+- **`default_vars` never deduplicated a single dataset key's own variable
+  list**, only a *merge across multiple keys* (via `set()`) did. Harmless
+  before time-stepping (a variable name never repeated within one key's
+  list), but `timestep_config.yaml`'s real `dict_in_variables` lists "u"
+  (and every other variable) twice -- once per offset -- which produced a
+  10-entry `default_vars` with duplicates, corrupting `create_var_
+  embedding`'s row count/sizing in `arch.py`. Fixed with an order-
+  preserving dedup (first-occurrence, not `set()`) in both `parse_config`
+  and the mirrored derivation in `parse_pretrained_config` -- deliberately
+  *not* `list(set(...))`: `set()`'s per-process string hash randomization
+  would make `var_map`'s name->row assignment inconsistent across separate
+  process launches (different DDP ranks, or a training run vs. a later
+  eval run), a real correctness bug the original `set()`-based multi-key
+  merge branch already had latent, now fixed for both. Caught immediately
+  by running the new config through `validate_config` and inspecting the
+  real parsed `default_vars` before ever writing a test for it.
+- **`save_inference_batch` dispatched classification-vs-regression off
+  `output.shape[1] == 1`** -- wrong the moment a real regression task has
+  more than 1 output channel, exactly `timestep_config.yaml`'s
+  `num_classes:5` (predicting 5 variables at once). Fixed by making
+  `regression` an explicit parameter the caller (`training.py`'s
+  `eval_epoch`, which already has `conf["model"]["loss_fn"]`) passes in,
+  instead of inferring it from the output shape.
+
+**Tier 1 coverage:** `test_sst_default_vars_dedupes_variable_repeated_
+across_offsets` (`test_config_validation.py`) -- the same variable at two
+different offsets in one `dict_in_variables` list, confirming `default_
+vars` comes out deduped and in first-occurrence order, not `set()`-shuffled.
+`test_save_inference_batch_multi_channel_regression_not_argmaxed`
+(`test_inference_output.py`) -- a 5-channel regression output, confirming
+it saves the raw continuous first channel instead of getting argmaxed.
+Every existing `save_inference_batch` test updated to pass `regression`
+explicitly. `configs/sst/unetr/timestep_config.yaml` itself is covered by
+the existing `test_shipped_config_parses` glob (auto-discovers every real
+config under `configs/`) with no test changes needed.
+
+**Verification beyond parsing:** constructed a small-scale `UNETR` with
+the config's exact real flag combination (`in_chans=10`, `num_classes=5`,
+`use_varemb`+`use_timeemb` both True with 3 real offsets, `skip_
+connection:True` -- the same path every shipped UNETR config takes) via
+the same scratch xformers-stub technique as the previous stage, and ran a
+full real forward pass end to end: `model(x, variables, seq_ps=None,
+x_seq=None)` produced the expected `(B, num_classes, *img_size)` output
+with no shape errors anywhere in the encoder, skip-connection decoder, or
+output head. Not a substitute for a real Frontier run at the config's
+actual scale, but real evidence beyond "the YAML parses."
+
+This completes all three stages of the "sst" time-stepping feature.
+Nothing here has been run on Frontier yet -- that's the natural next
+step, at whatever scale/data the user has available.

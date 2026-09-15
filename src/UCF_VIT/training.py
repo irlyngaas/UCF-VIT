@@ -794,7 +794,7 @@ def eval_epoch(conf, model, eval_dataloader, epoch, iterations_per_epoch, device
                     acc = dice_acc(y_pred=eval_output_convert, y=eval_labels_convert)
 
                 if conf["inference_output"]["save"] and (conf["inference_output"]["all_batches"] or counter <= conf["inference_output"]["num_batches"]):
-                    save_inference_batch(conf["inference_output"]["output_dir"], batch, output, counter, dist.get_rank())
+                    save_inference_batch(conf["inference_output"]["output_dir"], batch, output, counter, dist.get_rank(), regression=conf["model"]["loss_fn"] == "MSE")
 
             if dist.get_rank() == 0:
                 if conf["model"]["type"] in ["VIT", "UNETR"]:

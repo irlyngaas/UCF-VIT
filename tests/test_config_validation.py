@@ -478,6 +478,39 @@ def test_sst_time_offsets_normalizes_var_offset_pairs_and_derives_time_offsets()
     assert sorted(parsed["data"]["default_vars"]) == ["p", "r", "u", "v", "w"]
 
 
+def test_sst_default_vars_dedupes_variable_repeated_across_offsets():
+    """Regression test: default_vars used to be built from the first
+    dataset key's raw dict_in_variables list with no deduplication at all
+    (only a later merge across *multiple* keys deduped, via set()) --
+    harmless before time-stepping existed (a variable never appeared twice
+    in one list), but once the same variable can appear at multiple
+    offsets (e.g. "u" at both -2 and -1, exactly this test's config), the
+    undeduped list corrupts create_var_embedding's var_map/var_embed
+    sizing in arch.py. Also confirms dedup order is deterministic
+    (first-occurrence), not set()-based -- set()'s per-process string hash
+    randomization would make var_map's row assignment inconsistent across
+    separate process launches.
+    """
+    with open(SST_UNETR_CONFIG) as f:
+        conf = yaml.load(f, Loader=yaml.FullLoader)
+    conf["data"]["num_channels"]["P1F4R32"] = 4
+    conf["data"]["dict_in_variables"]["P1F4R32"] = [["u", -2], ["r", -2], ["u", -1], ["r", -1]]
+    conf["data"]["dict_out_variables"]["P1F4R32"] = [["u", 0], ["r", 0]]
+    conf["model"]["num_classes"] = 2
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    os.close(fd)
+    try:
+        with open(path, "w") as f:
+            yaml.dump(conf, f)
+        args = argparse.Namespace(config=path, pretrained_config="")
+        parsed = parse_config(args, load_balance_offline=True)
+    finally:
+        os.remove(path)
+
+    assert parsed["data"]["default_vars"] == ["u", "r"]
+
+
 def test_sst_plain_string_variables_default_time_offsets_to_zero():
     """Every "sst" config shipped before time-stepping existed uses plain
     variable-name strings -- must keep parsing to time_offsets:[0] (which

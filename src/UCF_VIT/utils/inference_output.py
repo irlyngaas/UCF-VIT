@@ -4,7 +4,7 @@ import numpy as np
 import nibabel as nib
 
 
-def save_inference_batch(output_dir, batch, output, batch_idx, rank):
+def save_inference_batch(output_dir, batch, output, batch_idx, rank, regression):
     """Saves one UNETR batch's input/label/prediction volumes as NIfTI files.
 
     Intended for visual inspection (e.g. in 3D Slicer/ITK-SNAP) of a UNETR
@@ -14,15 +14,18 @@ def save_inference_batch(output_dir, batch, output, batch_idx, rank):
     there's no real affine available to preserve here).
 
     Handles both of UNETR's two tasks (see `training.forward_step`'s own
-    `model.loss_fn` dispatch): classification/segmentation (`num_classes >=
-    2`, discrete `DiceCELoss`) and regression (`num_classes == 1`,
-    `loss_fn:"MSE"`, e.g. the "sst" pred task) -- `output.shape[1]` alone
-    distinguishes them, since a real segmentation task never has exactly 1
-    class. Classification argmaxes to a discrete class-index volume (as
-    before); regression saves the raw continuous prediction directly, with
-    no `_label` filename suffix (that suffix exists specifically to make
-    viewers like Slicer auto-load a *discrete* Labelmap -- exactly wrong for
-    a continuous field, which should render as an ordinary Scalar Volume).
+    `model.loss_fn` dispatch): classification/segmentation (discrete
+    `DiceCELoss`) and regression (`loss_fn:"MSE"`, e.g. the "sst" pred task).
+    Which one is the caller's own responsibility (`regression`), not
+    inferred from `output.shape[1]` -- a real regression task can have more
+    than 1 output channel (e.g. predicting multiple "sst" variables at once,
+    not just pressure), which `output.shape[1] == 1` would have wrongly
+    treated as classification and argmaxed. Classification argmaxes to a
+    discrete class-index volume (as before); regression saves the raw
+    continuous prediction directly, with no `_label` filename suffix (that
+    suffix exists specifically to make viewers like Slicer auto-load a
+    *discrete* Labelmap -- exactly wrong for a continuous field, which
+    should render as an ordinary Scalar Volume).
 
     Args:
         output_dir: Directory to write into; created if it doesn't exist.
@@ -30,24 +33,25 @@ def save_inference_batch(output_dir, batch, output, batch_idx, rank):
             `batch["data"]` (raw input volume, shape (B, C, H, W[, D])) and
             `batch["label"]` (ground-truth class-index labels for
             classification, or the real continuous target for regression;
-            shape (B, 1, H, W[, D]) either way). Only `batch["data"][:, 0]`
-            (the first channel) is saved -- every real config this is used
-            against today has `num_channels:1` for classification; for
-            multi-channel regression inputs (e.g. "sst"'s r/u/v/w), only the
-            first input channel is currently dumped.
+            shape (B, 1, H, W[, D]) either way). Only `batch["data"][:, 0]`/
+            `batch["label"][:, 0]` (the first channel) is saved -- for
+            multi-channel regression input/output (e.g. "sst"'s r/u/v/w/p),
+            only the first channel is currently dumped.
         output: Model's raw output, shape (B, num_classes, H, W[, D]) --
             per-class logits for classification, or the raw continuous
-            prediction (`num_classes == 1`) for regression.
+            prediction for regression.
         batch_idx: This batch's index within the current rank's local
             iteration (`eval_epoch`'s own `counter`), used in filenames.
         rank: This process's global rank (`dist.get_rank()`), used in
             filenames so concurrent ranks writing to the same `output_dir`
             don't collide -- each rank only ever saves its own local shard
             of batches, never another rank's.
+        regression: Whether `output`/`batch["label"]` are a continuous
+            regression target (True, e.g. `conf["model"]["loss_fn"] ==
+            "MSE"`) or discrete class labels (False).
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    regression = output.shape[1] == 1
     data = batch["data"][:, 0].cpu().numpy().astype(np.float32)  # (B, H, W[, D])
     if regression:
         pred = output[:, 0].cpu().numpy().astype(np.float32)  # (B, H, W[, D])
