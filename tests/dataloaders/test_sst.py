@@ -254,6 +254,36 @@ def test_read_process_file_sst_time_offsets_resolves_each_offset_to_its_real_tim
     assert np.asarray(label_list[0]).flat[0] == contents[("p", "3.0")]  # label: p at the same (offset 0) timestamp
 
 
+def test_read_process_file_sst_predicts_multiple_future_offsets_at_once(tmp_path):
+    """variables_out may reference more than one distinct offset (e.g.
+    predicting both the immediate next step and the one after) -- nothing
+    about label reading assumes a single output timestep. Each predicted
+    offset must resolve to its own distinct real timestamp.
+    """
+    root_dir = str(tmp_path)
+    chunk_size = [2, 2, 2]
+    raw_shape = (chunk_size[0], chunk_size[1], chunk_size[2] + 2)
+
+    contents = {}
+    for ts, value in [("1.0", 100.0), ("2.0", 200.0), ("3.0", 300.0)]:
+        contents[ts] = value
+        _write_memmap(os.path.join(root_dir, f"r_{ts}"), raw_shape, lambda s, v=value: np.full(s, v, dtype=np.float32))
+
+    path = os.path.join(root_dir, "__t-1=1.0,0=2.0,1=3.0")
+    reader = FileReader(
+        file_list=[path], start_idx=0.0, end_idx=1.0,
+        variables=[("r", -1)], gx="1", ddp_group=None, dataset="sst", return_label=True,
+        variables_out=[("r", 0), ("r", 1)],  # predict 2 future steps at once
+        chunk_size=chunk_size, full_domain_size=chunk_size,
+    )
+
+    data_list, label_list = reader.read_process_file(path)
+
+    assert np.asarray(data_list[0]).flat[0] == contents["1.0"]  # offset -1
+    assert np.asarray(label_list[0]).flat[0] == contents["2.0"]  # offset 0 (first future step)
+    assert np.asarray(label_list[1]).flat[0] == contents["3.0"]  # offset 1 (second future step)
+
+
 def test_read_process_file_sst_plain_string_variables_still_work(tmp_path):
     """Backward compatibility: plain variable-name strings (no real
     timestepping) must keep working exactly as before -- read_process_file
@@ -484,6 +514,59 @@ def test_native_pytorch_data_module_sst_time_offsets_end_to_end(tmp_path):
     # reading the same file.
     for b in range(2):
         assert (label[b, 0].unique() - inp[b, 0].unique()).item() == pytest.approx(100.0)
+
+
+def test_native_pytorch_data_module_sst_predicts_multiple_future_offsets_end_to_end(tmp_path):
+    """One-shot multi-step prediction: dict_out_variables listing 2 distinct
+    future offsets (not just 1) must come out as 2 real, distinct label
+    channels through the full real pipeline -- no code changes needed
+    beyond what dict_out_variables/time_offsets already support (this is
+    the direct regression test for that finding, not a new mechanism).
+    """
+    root_dir = str(tmp_path)
+    img_size = [2, 2, 2]
+    raw_shape = (img_size[0], img_size[1], img_size[2] + 2)
+
+    for t, value in [("1.0", 100.0), ("2.0", 200.0), ("3.0", 300.0), ("4.0", 400.0)]:
+        _write_memmap(os.path.join(root_dir, f"r_{t}"), raw_shape, lambda s, v=value: np.full(s, v, dtype=np.float32))
+
+    data_module = NativePytorchDataModule(
+        dict_root_dirs={"P1F4R32": root_dir},
+        dict_start_idx={"P1F4R32": 0.0},
+        dict_end_idx={"P1F4R32": 1.0},
+        dict_buffer_sizes={"P1F4R32": 10},
+        dict_in_variables={"P1F4R32": [("r", -1)]},
+        num_channels_used={"P1F4R32": 1},
+        batch_size=1,
+        num_workers=0,
+        tile_size=(2, 2, 2),
+        twoD=False,
+        return_label=True,
+        batches_per_rank_epoch={"P1F4R32": 2},  # 2 valid windows / batch_size 1
+        div=1,
+        tile_overlap=(0, 0, 0),
+        data_par_size=1,
+        dataset="sst",
+        dict_out_variables={"P1F4R32": [("r", 0), ("r", 1)]},  # predict 2 future steps at once
+        img_size=img_size,
+        time_offsets=[-1, 0, 1],
+    )
+    data_module.setup()
+
+    assert len(data_module.dict_lister_trains["P1F4R32"]) == 2
+
+    loader = data_module.train_dataloader()
+    batches = list(loader)
+
+    assert len(batches) == 2
+    for inp, label, variables, dict_key in batches:
+        assert inp.shape == (1, 1, 2, 2, 2)
+        assert label.shape == (1, 2, 2, 2, 2)  # 2 predicted future channels
+        # offset 0 is exactly 100 past the input; offset 1 is 200 past it --
+        # confirms both future channels resolved distinct, correctly-ordered
+        # real timestamps, not e.g. both reading the same file.
+        assert (label[0, 0].unique() - inp[0, 0].unique()).item() == pytest.approx(100.0)
+        assert (label[0, 1].unique() - inp[0, 0].unique()).item() == pytest.approx(200.0)
 
 
 # ---------------------------------------------------------------------------

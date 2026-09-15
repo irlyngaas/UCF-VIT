@@ -1,17 +1,23 @@
 # UNETR regression on the "sst" CFD dataset, with real time-stepping: given
 # u,v,w,r,p at 2 past timesteps (offsets -2 and -1), predicts u,v,w,r,p at
-# the following timestep (offset 0) -- via model.loss_fn:"MSE" and
-# model.num_classes:5 (one per predicted variable), same as base_config.yaml's
-# single-variable regression, not the usual classification/segmentation
-# DiceCELoss path.
+# *both* of the following 2 timesteps (offsets 0 and 1) in one shot -- via
+# model.loss_fn:"MSE" and model.num_classes:10 (5 variables x 2 predicted
+# steps), same as base_config.yaml's single-variable regression, not the
+# usual classification/segmentation DiceCELoss path. One-shot, not
+# autoregressive: both future steps come out of a single forward pass over
+# the same past window, not by feeding a prediction back in as new input.
 #
 # dict_in_variables/dict_out_variables entries are [variable, offset] pairs
 # (not just plain variable-name strings) -- see UCF_VIT.utils.misc.
 # process_root_dirs's own docstring for the full "sst" time-stepping
 # writeup, and tests/README.md's "Added time-stepping to the 'sst'
-# dataloader" section for the design this was built against. time_offsets
-# ([-2, -1, 0], every offset referenced below) is derived automatically by
-# UCF_VIT.parse -- nothing to configure separately.
+# dataloader" section for the design this was built against. Predicting
+# more than one future offset needed no dataloader/model changes at all --
+# dict_out_variables (and thus a predicted output channel) was never tied
+# to a single distinct offset in the first place, confirmed directly via
+# test_native_pytorch_data_module_sst_predicts_multiple_future_offsets_end_
+# to_end. time_offsets ([-2, -1, 0, 1], every offset referenced below) is
+# derived automatically by UCF_VIT.parse -- nothing to configure separately.
 #
 # model.use_channel_aggregation:True (unlike every other shipped UNETR
 # config, which leaves this False) is required here: with time-stepped
@@ -84,9 +90,9 @@ model:
   drop_path: 0.0
   drop_rate: 0.0
   use_channel_aggregation: True # Required for time-stepping -- see this file's own header comment.
-  loss_fn: "MSE" # Regression, not classification -- see UCF_VIT.training.forward_step's model.loss_fn dispatch. Requires num_classes to match the number of predicted variables (5) below.
+  loss_fn: "MSE" # Regression, not classification -- see UCF_VIT.training.forward_step's model.loss_fn dispatch. Requires num_classes to match the number of predicted (variable, offset) entries below.
 
-  num_classes: 5 # Predicting u,v,w,r,p at once (all of dict_out_variables), not a real class count -- see model.loss_fn above.
+  num_classes: 10 # u,v,w,r,p at both offset 0 and offset 1 (all of dict_out_variables), not a real class count -- see model.loss_fn above.
   linear_decoder: False
   feature_size: 16
   skip_connection: True
@@ -146,8 +152,13 @@ data:
      ["w", 0],
      ["r", 0],
      ["p", 0],
+     ["u", 1],
+     ["v", 1],
+     ["w", 1],
+     ["r", 1],
+     ["p", 1],
     ],
-  } # Regression target(s) at the future timestep (offset 0) -- required for "sst" whenever the model returns a label (every model type this dataset supports: UNETR).
+  } # Regression target(s) at both future timesteps (offsets 0 and 1), predicted in one shot -- required for "sst" whenever the model returns a label (every model type this dataset supports: UNETR).
 
 # ---------------------------- DATALOADER ----------------------------------------
 dataloader:
@@ -187,8 +198,8 @@ dataset_options:
 # meaningful for model.type:"UNETR". When save:True, each rank saves its own local
 # batches' input/label/prediction volumes as NIfTI files (see
 # UCF_VIT.utils.inference_output.save_inference_batch) for visual inspection --
-# for this regression config, only the first predicted variable's channel is
-# dumped (see save_inference_batch's own docstring), not all 5.
+# for this regression config, only the first predicted channel (u at offset
+# 0) is dumped (see save_inference_batch's own docstring), not all 10.
 # Uncomment to turn on:
 #inference_output:
 #  save: True

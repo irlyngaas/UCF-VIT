@@ -4750,3 +4750,36 @@ actual scale, but real evidence beyond "the YAML parses."
 This completes all three stages of the "sst" time-stepping feature.
 Nothing here has been run on Frontier yet -- that's the natural next
 step, at whatever scale/data the user has available.
+
+## Confirmed one-shot multi-future-step prediction already works; extended `timestep_config.yaml` to use it
+
+Follow-up ask: predict *multiple* future timesteps, not just 1 (the user
+correctly pointed out `timestep_config.yaml` only predicted offset 0).
+Checked first whether this needed real new code -- clarified with the
+user that "one-shot" (all future offsets predicted in a single forward
+pass from the same past window, as opposed to autoregressive rollout,
+which would be a genuinely new mechanism) is what was meant.
+
+Investigated directly (code reading + real execution, not just
+inspection) and found the dataloader/schema layer already supports this
+with zero code changes: `dict_out_variables`/`variables_out` were never
+tied to a single distinct offset anywhere -- `process_root_dirs`'s window
+construction, `read_process_file`'s per-entry offset resolution, and the
+model's output head are all already generic over however many `(var,
+offset)` entries `dict_out_variables` lists, in any mix of offsets.
+Confirmed with a real end-to-end run (`NativePytorchDataModule`, real
+memmap files, `dict_out_variables={"P1F4R32": [("r", 0), ("r", 1)]}`) --
+both output channels resolved their own distinct real timestamps
+correctly. Added this as permanent Tier 1 coverage: `test_read_process_
+file_sst_predicts_multiple_future_offsets_at_once` and `test_native_
+pytorch_data_module_sst_predicts_multiple_future_offsets_end_to_end`
+(`tests/dataloaders/test_sst.py`).
+
+Updated `configs/sst/unetr/timestep_config.yaml` itself to actually use
+this: `dict_out_variables` now lists u,v,w,r,p at *both* offset 0 and
+offset 1 (`num_classes:10`, `time_offsets` becomes `[-2,-1,0,1]`), instead
+of only offset 0. Re-validated the updated config parses correctly (real
+`default_vars`/`time_offsets`/`num_classes` inspected, not just "no
+exception") and re-ran the same small-scale real-`UNETR`-forward-pass
+scratch verification from the previous stage with the new 10-channel
+output -- correct shape, no errors.
