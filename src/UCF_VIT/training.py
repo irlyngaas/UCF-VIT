@@ -620,9 +620,9 @@ def train_epoch(conf, model, train_dataloader, epoch, iterations_per_epoch, opti
 
     When `conf["trainer"]["profile_dataloader"]` is True (diagnostic only, off by
     default), also times and prints, per batch and per epoch, how much wall clock
-    is spent waiting on the dataloader (`process_batch`) versus everything else
-    (forward/backward/optimizer step) -- see that flag's own comment in
-    `parse.py`'s `trainer_conf`.
+    is spent waiting on the dataloader (`process_batch`), in the forward pass
+    (`forward_step`), and in the backward pass (`backward()`) -- see that flag's
+    own comment in `parse.py`'s `trainer_conf`.
 
     Args:
         conf: Parsed training configuration dict (as returned by `parse_config`).
@@ -663,14 +663,20 @@ def train_epoch(conf, model, train_dataloader, epoch, iterations_per_epoch, opti
     # parse.py's trainer_conf. Answers "is the dataloader the bottleneck"
     # directly: data_time is process_batch's own wall clock (dataloader
     # fetch + host->device transfer, including any real per-sample decode
-    # cost like adaptive patching's Canny edge detection/octree build),
-    # compute_time is everything else in the loop body (forward pass, loss,
-    # accuracy metric, backward, optimizer step). torch.cuda.synchronize()
-    # at each boundary is required for either number to mean anything --
-    # CUDA ops are async, so a bare time.time() around them would mostly
-    # measure how fast Python can enqueue kernels, not how long they take.
+    # cost like adaptive patching's Canny edge detection/octree build);
+    # forward_time/backward_time isolate forward_step's model-forward-plus-
+    # loss call and the backward() call themselves; compute_time is
+    # everything else in the loop body (those two, plus the accuracy metric
+    # and optimizer step) -- forward_time + backward_time is always <=
+    # compute_time, the gap being the accuracy metric/optimizer step's own
+    # cost. torch.cuda.synchronize() at each boundary is required for any of
+    # these numbers to mean anything -- CUDA ops are async, so a bare
+    # time.time() around them would mostly measure how fast Python can
+    # enqueue kernels, not how long they take.
     profile = conf["trainer"].get("profile_dataloader", False)
     epoch_data_time = 0.0
+    epoch_forward_time = 0.0
+    epoch_backward_time = 0.0
     epoch_compute_time = 0.0
 
     epoch_loss = torch.tensor(0.0 , dtype=torch.float32, device=device)
@@ -694,6 +700,11 @@ def train_epoch(conf, model, train_dataloader, epoch, iterations_per_epoch, opti
             loss, output = forward_step(conf, batch, model)
         elif conf["model"]["type"] in ["MAE", "SAP", "DiffusionVIT"]:
             loss = forward_step(conf, batch, model)
+
+        if profile:
+            torch.cuda.synchronize()
+            t_forward_end = time.time()
+            forward_time = t_forward_end - t_data_end
 
         epoch_loss += loss.detach()
 
@@ -725,14 +736,26 @@ def train_epoch(conf, model, train_dataloader, epoch, iterations_per_epoch, opti
             elif conf["model"]["type"] in ["MAE", "SAP", "DiffusionVIT"]:
                 print("epoch: ", epoch, "batch_idx", counter, "it_loss ", loss, flush=True)
 
+        if profile:
+            torch.cuda.synchronize()
+            t_backward_start = time.time()
+
         if conf["grad_scaler"]["use_grad_scaler"]:
             grad_scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+        if profile:
+            torch.cuda.synchronize()
+            t_backward_end = time.time()
+            backward_time = t_backward_end - t_backward_start
+
+        if conf["grad_scaler"]["use_grad_scaler"]:
             grad_scaler.step(optimizer)
             grad_scaler.update()
             if grad_scaler._scale < min_scale:
                 grad_scaler._scale = torch.tensor(min_scale).to(grad_scaler._scale)
         else:
-            loss.backward()
             optimizer.step()
         optimizer.zero_grad()
 
@@ -740,9 +763,15 @@ def train_epoch(conf, model, train_dataloader, epoch, iterations_per_epoch, opti
             torch.cuda.synchronize()
             compute_time = time.time() - t_data_end
             epoch_data_time += data_time
+            epoch_forward_time += forward_time
+            epoch_backward_time += backward_time
             epoch_compute_time += compute_time
             if dist.get_rank() == 0:
-                print("epoch: ", epoch, "batch_idx", counter, "data_time", data_time, "compute_time", compute_time, flush=True)
+                print(
+                    "epoch: ", epoch, "batch_idx", counter,
+                    "data_time", data_time, "forward_time", forward_time, "backward_time", backward_time, "compute_time", compute_time,
+                    flush=True,
+                )
 
     scheduler.step()
     loss_list.append(epoch_loss)
@@ -754,7 +783,9 @@ def train_epoch(conf, model, train_dataloader, epoch, iterations_per_epoch, opti
         if profile:
             print(
                 "epoch: ", epoch,
-                "epoch_data_time", epoch_data_time, "epoch_compute_time", epoch_compute_time,
+                "epoch_data_time", epoch_data_time,
+                "epoch_forward_time", epoch_forward_time, "epoch_backward_time", epoch_backward_time,
+                "epoch_compute_time", epoch_compute_time,
                 "data_time_fraction", epoch_data_time / (epoch_data_time + epoch_compute_time),
                 flush=True,
             )

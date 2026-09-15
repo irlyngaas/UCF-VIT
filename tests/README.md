@@ -4803,28 +4803,33 @@ room to overlap it with GPU compute) as the actual bottleneck.
 Added `trainer.profile_dataloader` (default `False`, every shipped config
 unaffected) to `UCF_VIT.training.train_epoch` to confirm this directly
 instead of by inference from overall throughput: when `True`, each batch
-is timed in two pieces -- `data_time` (`process_batch`'s own wall clock:
-the dataloader fetch, including any real per-sample decode cost, plus the
-host->device transfer) and `compute_time` (everything else: forward pass,
-loss, accuracy metric, backward, optimizer step) -- printed per batch
-(`"data_time" ... "compute_time" ...`, matching the existing per-batch
-print's style) and summed per epoch (`"epoch_data_time" ...
-"epoch_compute_time" ... "data_time_fraction" ...`). Requires a real
-`torch.cuda.synchronize()` at each timing boundary for either number to
-mean anything (CUDA ops are async -- a bare `time.time()` around them
-would mostly measure how fast Python enqueues kernels, not how long they
-actually take), which is why this is opt-in rather than always-on: it's a
-real, if modest, overhead not worth paying on every training run, only
-when actually diagnosing a throughput question like this one. Not wired
-into `eval_epoch` -- the observation motivating this was from real
-training runs specifically.
+is timed in pieces -- `data_time` (`process_batch`'s own wall clock: the
+dataloader fetch, including any real per-sample decode cost, plus the
+host->device transfer), `forward_time` (`forward_step` alone: the model
+forward pass plus loss), `backward_time` (`backward()` alone), and
+`compute_time` (everything non-`data_time` in the loop body -- `forward_
+time` + `backward_time` plus the accuracy metric and optimizer step, so
+`compute_time` is always >= the other two combined) -- printed per batch
+and summed per epoch (`"epoch_data_time" ... "epoch_forward_time" ...
+"epoch_backward_time" ... "epoch_compute_time" ... "data_time_fraction"
+...`). Requires a real `torch.cuda.synchronize()` at each timing boundary
+for any of these numbers to mean anything (CUDA ops are async -- a bare
+`time.time()` around them would mostly measure how fast Python enqueues
+kernels, not how long they actually take), which is why this is opt-in
+rather than always-on: it's a real, if modest, overhead not worth paying
+on every training run, only when actually diagnosing a throughput
+question like this one. Not wired into `eval_epoch` -- the observation
+motivating this was from real training runs specifically.
 
 To use it on Frontier: add `profile_dataloader: True` under `trainer:` in
 whichever config is being compared (not committed into the shipped `sst`
 configs themselves, since it's a temporary diagnostic, not a production
-setting) and look for the `data_time_fraction` on each epoch's summary
-line -- close to 1.0 means the dataloader is essentially the entire
-wall-clock cost, confirming this session's hypothesis directly.
+setting). `data_time_fraction` close to 1.0 on each epoch's summary line
+means the dataloader is essentially the entire wall-clock cost, confirming
+this session's hypothesis directly; `epoch_forward_time`/`epoch_backward_
+time` additionally show whether adaptive patching's shorter/longer
+sequence length is actually moving the needle on the model side at all,
+however small a share of the total it turns out to be.
 
 **Tier 1 coverage:** `test_profile_dataloader_defaults_to_false_when_
 omitted`/`test_profile_dataloader_threads_through_when_set`
