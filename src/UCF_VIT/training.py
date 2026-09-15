@@ -1,3 +1,5 @@
+import time
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -616,6 +618,12 @@ def train_epoch(conf, model, train_dataloader, epoch, iterations_per_epoch, opti
     After the loop, steps the scheduler, appends the epoch loss to `loss_list`, and
     saves a checkpoint if `epoch` falls on the configured save frequency.
 
+    When `conf["trainer"]["profile_dataloader"]` is True (diagnostic only, off by
+    default), also times and prints, per batch and per epoch, how much wall clock
+    is spent waiting on the dataloader (`process_batch`) versus everything else
+    (forward/backward/optimizer step) -- see that flag's own comment in
+    `parse.py`'s `trainer_conf`.
+
     Args:
         conf: Parsed training configuration dict (as returned by `parse_config`).
         model: Model being trained.
@@ -651,13 +659,36 @@ def train_epoch(conf, model, train_dataloader, epoch, iterations_per_epoch, opti
         if tensor_par_size == 1 or dist.get_rank(tensor_par_group) == 0:
             it_loader = iter(train_dataloader)
 
+    # Diagnostic only, off by default -- see this key's own comment in
+    # parse.py's trainer_conf. Answers "is the dataloader the bottleneck"
+    # directly: data_time is process_batch's own wall clock (dataloader
+    # fetch + host->device transfer, including any real per-sample decode
+    # cost like adaptive patching's Canny edge detection/octree build),
+    # compute_time is everything else in the loop body (forward pass, loss,
+    # accuracy metric, backward, optimizer step). torch.cuda.synchronize()
+    # at each boundary is required for either number to mean anything --
+    # CUDA ops are async, so a bare time.time() around them would mostly
+    # measure how fast Python can enqueue kernels, not how long they take.
+    profile = conf["trainer"].get("profile_dataloader", False)
+    epoch_data_time = 0.0
+    epoch_compute_time = 0.0
+
     epoch_loss = torch.tensor(0.0 , dtype=torch.float32, device=device)
     epoch_accuracy = torch.tensor(0.0 , dtype=torch.float32, device=device)
     counter = 0
     while counter < iterations_per_epoch:
         counter = counter + 1
 
+        if profile:
+            torch.cuda.synchronize()
+            t_data_start = time.time()
+
         batch = process_batch(conf, it_loader, device, tensor_par_group, ddpm_scheduler)
+
+        if profile:
+            torch.cuda.synchronize()
+            t_data_end = time.time()
+            data_time = t_data_end - t_data_start
 
         if conf["model"]["type"] in ["VIT", "UNETR"]:
             loss, output = forward_step(conf, batch, model)
@@ -705,6 +736,14 @@ def train_epoch(conf, model, train_dataloader, epoch, iterations_per_epoch, opti
             optimizer.step()
         optimizer.zero_grad()
 
+        if profile:
+            torch.cuda.synchronize()
+            compute_time = time.time() - t_data_end
+            epoch_data_time += data_time
+            epoch_compute_time += compute_time
+            if dist.get_rank() == 0:
+                print("epoch: ", epoch, "batch_idx", counter, "data_time", data_time, "compute_time", compute_time, flush=True)
+
     scheduler.step()
     loss_list.append(epoch_loss)
     if dist.get_rank() == 0:
@@ -712,6 +751,13 @@ def train_epoch(conf, model, train_dataloader, epoch, iterations_per_epoch, opti
             print("epoch: ", epoch, "epoch_loss ", epoch_loss, "epoch_accuracy ", epoch_accuracy, flush=True)
         elif conf["model"]["type"] in ["MAE", "UNETR", "SAP", "DiffusionVIT"]:
             print("epoch: ", epoch, "epoch_loss ", epoch_loss, flush=True)
+        if profile:
+            print(
+                "epoch: ", epoch,
+                "epoch_data_time", epoch_data_time, "epoch_compute_time", epoch_compute_time,
+                "data_time_fraction", epoch_data_time / (epoch_data_time + epoch_compute_time),
+                flush=True,
+            )
 
     if epoch % conf["trainer"]["save_frequency"] == 0:
         save_checkpoint(conf, model, optimizer, scheduler, epoch, loss_list)

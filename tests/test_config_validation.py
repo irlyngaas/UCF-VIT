@@ -367,6 +367,37 @@ def test_epoch_shuffle_seed_threads_through_when_set():
 
 
 # ---------------------------------------------------------------------------
+# trainer.profile_dataloader -- diagnostic dataloader-vs-compute timing, see
+# UCF_VIT.training.train_epoch's own profile_dataloader handling
+# ---------------------------------------------------------------------------
+
+
+def test_profile_dataloader_defaults_to_false_when_omitted():
+    # No shipped config sets this -- it's a diagnostic, not meant to be left
+    # on for a real training run (torch.cuda.synchronize() at every batch
+    # boundary is real, if modest, overhead).
+    parsed = validate_config(UNETR_CONFIG)
+    assert parsed["trainer"]["profile_dataloader"] is False
+
+
+def test_profile_dataloader_threads_through_when_set():
+    with open(UNETR_CONFIG) as f:
+        conf = yaml.load(f, Loader=yaml.FullLoader)
+    conf["trainer"]["profile_dataloader"] = True
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    os.close(fd)
+    try:
+        with open(path, "w") as f:
+            yaml.dump(conf, f)
+        args = argparse.Namespace(config=path, pretrained_config="")
+        parsed = parse_config(args, load_balance_offline=True)
+        assert parsed["trainer"]["profile_dataloader"] is True
+    finally:
+        os.remove(path)
+
+
+# ---------------------------------------------------------------------------
 # inference_output -- optional test.py/val.py sample-inference dump, see
 # UCF_VIT.utils.inference_output.save_inference_batch
 # ---------------------------------------------------------------------------

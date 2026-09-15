@@ -467,6 +467,17 @@ def parse_config(args, load_balance_offline=False):
         "save_frequency": save_frequency,
         "optimizer_type": optimizer_type,
         "scheduler_type": scheduler_type,
+        # Diagnostic only, off by default -- see UCF_VIT.training.train_epoch's
+        # own profile_dataloader handling. When True, times how much of each
+        # batch's wall clock is spent waiting on the dataloader (process_batch,
+        # including any real per-sample decode cost like adaptive patching's
+        # Canny edge detection/octree build) vs. the actual forward/backward/
+        # optimizer-step compute, to answer "is the dataloader the bottleneck"
+        # directly instead of by inference from overall throughput. Adds a
+        # torch.cuda.synchronize() at each timing boundary, which is real
+        # (if modest) overhead not present otherwise -- not meant to be left
+        # on for a real training run, just to A/B compare configs.
+        "profile_dataloader": conf['trainer'].get('profile_dataloader', False),
     }
 
 

@@ -4783,3 +4783,54 @@ of only offset 0. Re-validated the updated config parses correctly (real
 exception") and re-ran the same small-scale real-`UNETR`-forward-pass
 scratch verification from the previous stage with the new 10-channel
 output -- correct shape, no errors.
+
+## Added an opt-in `trainer.profile_dataloader` timing diagnostic
+
+Motivated by a real observation: two real Frontier runs of `configs/sst/
+unetr/base_config.yaml` (job 5455196, non-adaptive) and `adaptive_config.
+yaml` (job 5460602, adaptive) hit the *same* 15-minute SLURM time limit
+(`launch/sst/unetr.sh`, same 1 node/8 GPU/`batch_size:2` setup) -- the
+non-adaptive run completed 6,628 batches in that window, the adaptive run
+only 526 (roughly 12.6x fewer). Adaptive patching's `fixed_length:729` is
+actually *larger* than non-adaptive's 512-token sequence here too (kept to
+match an old codebase's constraint, see `adaptive_config.yaml`'s own
+header comment), so the gap can't be attention-compute-cost-driven in
+either direction -- pointing squarely at `Patchify_3D`'s real per-sample
+CPU work (`SimpleITK.CannyEdgeDetection` + `FixedOctTree` build/serialize,
+all on CPU, with `dataloader.num_workers:1` in both configs leaving no
+room to overlap it with GPU compute) as the actual bottleneck.
+
+Added `trainer.profile_dataloader` (default `False`, every shipped config
+unaffected) to `UCF_VIT.training.train_epoch` to confirm this directly
+instead of by inference from overall throughput: when `True`, each batch
+is timed in two pieces -- `data_time` (`process_batch`'s own wall clock:
+the dataloader fetch, including any real per-sample decode cost, plus the
+host->device transfer) and `compute_time` (everything else: forward pass,
+loss, accuracy metric, backward, optimizer step) -- printed per batch
+(`"data_time" ... "compute_time" ...`, matching the existing per-batch
+print's style) and summed per epoch (`"epoch_data_time" ...
+"epoch_compute_time" ... "data_time_fraction" ...`). Requires a real
+`torch.cuda.synchronize()` at each timing boundary for either number to
+mean anything (CUDA ops are async -- a bare `time.time()` around them
+would mostly measure how fast Python enqueues kernels, not how long they
+actually take), which is why this is opt-in rather than always-on: it's a
+real, if modest, overhead not worth paying on every training run, only
+when actually diagnosing a throughput question like this one. Not wired
+into `eval_epoch` -- the observation motivating this was from real
+training runs specifically.
+
+To use it on Frontier: add `profile_dataloader: True` under `trainer:` in
+whichever config is being compared (not committed into the shipped `sst`
+configs themselves, since it's a temporary diagnostic, not a production
+setting) and look for the `data_time_fraction` on each epoch's summary
+line -- close to 1.0 means the dataloader is essentially the entire
+wall-clock cost, confirming this session's hypothesis directly.
+
+**Tier 1 coverage:** `test_profile_dataloader_defaults_to_false_when_
+omitted`/`test_profile_dataloader_threads_through_when_set`
+(`test_config_validation.py`), mirroring `inference_output`'s own
+default-off/threads-through test pair. `train_epoch` itself isn't unit-
+tested anywhere locally (no fixture builds a real CUDA-backed model/
+dataloader for it) -- the profiling code path is otherwise unverified
+here beyond `py_compile` and manual review; a real Frontier run with
+`profile_dataloader:True` is what actually exercises it.
