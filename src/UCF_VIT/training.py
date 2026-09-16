@@ -121,6 +121,11 @@ def forward_step(conf, batch, model):
     if conf["model"]["type"] == "VIT":
         if dataloader_do_ap:
             output = model.forward(batch["seq"], batch["variables"], batch["seq_ps"])
+        elif conf["ap"]["do_gpu_ap"]:
+            # VIT.forward returns (output, seq_ps) under do_gpu_ap -- VIT's
+            # own loss (below) never needs seq_ps, unlike SAP's (which
+            # inherits this same forward()).
+            output, _ = model.forward(batch["data"], batch["variables"])
         else:
             output = model.forward(batch["data"], batch["variables"], batch["seq_ps"])
         criterion = nn.CrossEntropyLoss()
@@ -129,24 +134,49 @@ def forward_step(conf, batch, model):
         return loss, output
 
     elif conf["model"]["type"] == "SAP":
-        # do_gpu_ap not yet supported here -- see parse.py's own assertion
-        # (native_resolution_dice_loss needs seq_ps outside forward(), which
-        # do_gpu_ap doesn't expose) -- always the dataloader-supplied path.
-        output = model.forward(batch["seq"], batch["variables"], batch["seq_ps"])
-        seq_size = batch["seq_ps"][..., 0]
-        seq_pos = batch["seq_ps"][..., 1:]
+        if conf["ap"]["do_gpu_ap"]:
+            # SAP inherits VIT.forward, which returns (output, seq_ps) under
+            # do_gpu_ap -- native_resolution_dice_loss needs seq_ps outside
+            # forward(), computed on-device inside this call otherwise.
+            output, seq_ps = model.forward(batch["data"], batch["variables"])
+            seq_size = seq_ps[..., 0]
+            seq_pos = seq_ps[..., 1:]
+        else:
+            output = model.forward(batch["seq"], batch["variables"], batch["seq_ps"])
+            seq_size = batch["seq_ps"][..., 0]
+            seq_pos = batch["seq_ps"][..., 1:]
         loss = native_resolution_dice_loss(output, batch["label"], seq_size, seq_pos, conf["data"]["interp_size"], conf["data"]["twoD"], conf["model"]["kwargs"]["num_classes"])
         return loss
 
     elif conf["model"]["type"] == "MAE":
-        # do_gpu_ap not yet supported here for *any* loss_fn -- see parse.py's
-        # own assertion. Every MAE loss variant reconstructs against the
-        # patchified sequence itself (batch["seq"], or patchify(batch["data"])
-        # in the non-adaptive case) as its target, which do_gpu_ap computes
-        # only *inside* forward() and never exposes back to this function --
-        # unlike VIT/UNETR, whose losses compare against batch["label"], a
-        # genuine external target unrelated to how the input got patchified.
-        if conf["ap"]["do_ap"]:
+        # Every MAE loss variant reconstructs against the patchified sequence
+        # itself (batch["seq"], or patchify(batch["data"]) in the non-adaptive
+        # case) as its target -- unlike VIT/UNETR, whose losses compare
+        # against batch["label"], a genuine external target unrelated to how
+        # the input got patchified. Under do_gpu_ap, MAE.forward returns the
+        # on-device-computed sequence (x_seq) and seq_ps directly, since
+        # neither is otherwise available outside that call.
+        if conf["ap"]["do_gpu_ap"]:
+            if conf["model"]["loss_fn"] == "MSE":
+                output, _, x_seq, _ = model.forward(batch["data"], batch["variables"])
+                criterion = nn.MSELoss()
+                target = einops.rearrange(x_seq, 'b c s p -> b s (p c)')
+                loss = criterion(output, target)
+            elif conf["model"]["loss_fn"] == "maskMSE":
+                output, mask, x_seq, _ = model.forward(batch["data"], batch["variables"])
+                criterion = masked_mse
+                target = einops.rearrange(x_seq, 'b c s p -> b s (p c)')
+                loss = criterion(output, target, mask)
+            elif conf["model"]["loss_fn"] in ("nativeResMSE", "nativeResMaskMSE"):
+                output, mask, _, seq_ps = model.forward(batch["data"], batch["variables"])
+                seq_size = seq_ps[..., 0].unsqueeze(1)
+                seq_pos = seq_ps[..., 1:].unsqueeze(1)
+                if conf["model"]["loss_fn"] == "nativeResMSE":
+                    loss = native_resolution_patch_mse(output, batch["data"], seq_size, seq_pos, conf["data"]["interp_size"], conf["data"]["twoD"])
+                else:
+                    loss = native_resolution_patch_masked_mse(output, batch["data"], seq_size, seq_pos, conf["data"]["interp_size"], conf["data"]["twoD"], mask.unsqueeze(1))
+
+        elif conf["ap"]["do_ap"]:
             if conf["model"]["loss_fn"] == "MSE":
                 output, _ = model.forward(batch["seq"], batch["variables"], batch["seq_ps"])
                 criterion = nn.MSELoss()

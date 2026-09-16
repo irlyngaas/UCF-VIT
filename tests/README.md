@@ -5210,15 +5210,65 @@ shape or gradient errors. Not a substitute for a real Frontier run at real
 config scale, but real evidence the wiring (and the two bugs above) are
 fixed, not just plausible by inspection.
 
-**A known test gap, not filled here:** `parse.py`'s new `do_gpu_ap`
+**A known test gap, not filled here:** `parse.py`'s `do_gpu_ap`
 validation (the congruence check above, the `twoD`/`separate_channels`
-rejections, and the `SAP`/`MAE` blocking asserts) has no dedicated
-`test_config_validation.py` coverage yet -- every config that file's tests
-mutate-and-reparse from (`SAP_CONFIG`, `UNETR_CONFIG`, `SST_UNETR_CONFIG`,
-and every other shipped config with `ap.do_ap:True`) is 3D, and `do_gpu_ap`
-is 2D-only, so there's no real shipped config to base a test on without
-hand-writing a full synthetic 2D+`do_ap` config from scratch (this repo's
-own tests avoid that -- they all start from a real shipped file). Exercised
-indirectly today via `GPUPatchify2D`'s own direct tests (same formula) and
-the real model-level forward/backward verification above; revisit once a
-real 2D+`do_gpu_ap` config exists to build a test on, or if a bug surfaces.
+rejections) has no dedicated `test_config_validation.py` coverage yet --
+every config that file's tests mutate-and-reparse from (`SAP_CONFIG`,
+`UNETR_CONFIG`, `SST_UNETR_CONFIG`, and every other shipped config with
+`ap.do_ap:True`) is 3D, and `do_gpu_ap` is 2D-only, so there's no real
+shipped config to base a test on without hand-writing a full synthetic
+2D+`do_ap` config from scratch (this repo's own tests avoid that -- they
+all start from a real shipped file). Exercised indirectly today via
+`GPUPatchify2D`'s own direct tests (same formula) and the real
+model-level forward/backward verification above; revisit once a real
+2D+`do_gpu_ap` config exists to build a test on, or if a bug surfaces.
+
+## Resolved the SAP/MAE do_gpu_ap gap: extended forward()'s return signature
+
+Follow-up to the previous entry's open design question, resolved with the
+user's explicit choice ("extend `forward()`'s return signature" over "have
+`forward_step` call `GPUPatchify2D` directly" or "leave blocked") --
+`SAP` and `MAE` now support `ap.do_gpu_ap:True`.
+
+`VIT.forward` (covering `SAP` via inheritance) now returns `(output,
+seq_ps)` instead of just `output` when `self.do_gpu_ap` is True --
+`seq_ps` is otherwise unavailable outside `forward()` (it's computed
+on-device, inside the call, from the raw image), and `SAP`'s
+`native_resolution_dice_loss` needs it. `MAE.forward` returns `(output,
+mask, x_seq, seq_ps)` instead of `(output, mask)` -- `x_seq` (the
+on-device-patchified sequence itself) is needed too, since *every* MAE
+loss variant reconstructs against the patchified sequence as its target,
+not just the `nativeRes*` ones. Every other model type's return signature
+is unchanged (`do_gpu_ap` is only True for `VIT`/`SAP`/`MAE`/`UNETR`
+instances that opt in; `UNETR.forward` itself needs no change at all --
+its loss already compares against `batch["label"]`, a genuine external
+target that was never affected by this gap). `training.py`'s
+`forward_step` unpacks the extra return value(s) in the `VIT`, `SAP`, and
+`MAE` branches when `conf["ap"]["do_gpu_ap"]` is set (mirroring the
+existing `ap.do_ap:True`/`False` branch structure, just against a third,
+new case), and the two `parse.py` assertions blocking `SAP`/`MAE` from
+`do_gpu_ap` are removed.
+
+**Tier 1 coverage** (`tests/test_forward_step.py`, 8 new tests, extending
+the file's existing fake-model-stub pattern to a 2-arg
+`.forward(data, variables)` stub matching `do_gpu_ap`'s real calling
+convention -- no `seq_ps` argument, unlike every other path in this file):
+`test_forward_step_vit_do_gpu_ap_uses_only_the_returned_output` (confirms
+the `(output, seq_ps)` tuple unpacks correctly and `seq_ps` doesn't leak
+into `VIT`'s own loss), `test_forward_step_sap_do_gpu_ap_matches_native_
+resolution_dice_loss` (reuses `test_metrics.py`'s own confident-correct-
+prediction fixture, dispatched through `forward_step` this time), and four
+MAE tests mirroring the existing `ap.do_ap:True` ones exactly (`maskMSE`,
+`MSE`, `nativeResMSE`, `nativeResMaskMSE`) but through the new `do_gpu_ap`
+branch, reusing the same expected-value machinery so a real dispatch bug
+(wrong tensor, wrong branch) would show up as a wrong number, not just a
+wrong shape.
+
+**Verification beyond the fake-model tests:** real `SAP` and `MAE`
+instances (same scratch xformers-stub technique as the earlier stages),
+run through the *real* `forward_step` (not a fake model) end to end --
+`SAP` with `native_resolution_dice_loss`, `MAE` with `maskMSE` and
+`nativeResMSE` -- each produced a real loss number and a clean
+`loss.backward()` with no shape or gradient errors. Full local suite
+(`pytest tests/ --ignore=tests/distributed`) passes, 367 passed / 4
+skipped.

@@ -44,7 +44,7 @@ import pytest
 import torch
 
 from UCF_VIT.training import forward_step
-from UCF_VIT.utils.metrics import native_resolution_patch_masked_mse, native_resolution_patch_mse
+from UCF_VIT.utils.metrics import native_resolution_dice_loss, native_resolution_patch_masked_mse, native_resolution_patch_mse
 from UCF_VIT.utils.misc import patchify
 
 PATCH_SIZE = 2
@@ -264,3 +264,171 @@ def test_forward_step_unetr_default_still_uses_dicece_classification():
     expected = criterion(output, label)
     assert loss.item() == pytest.approx(expected.item())
     assert returned_output is output
+
+
+# ---------------------------------------------------------------------------
+# ap.do_gpu_ap:True -- VIT/SAP/MAE.forward computes seq/seq_ps on-device and
+# returns it alongside its normal output (VIT/SAP: `(output, seq_ps)`; MAE:
+# `(output, mask, x_seq, seq_ps)`), since do_gpu_ap doesn't hand a
+# pre-patchified sequence to forward_step beforehand the way ap.do_ap:True's
+# dataloader-supplied batch["seq"]/batch["seq_ps"] does. These tests use a
+# 2-arg `.forward(data, variables)` stub (matching do_gpu_ap's real calling
+# convention -- no seq_ps argument, unlike every other path in this file) and
+# reuse the same expected-value machinery as the equivalent do_ap:True tests
+# above, so a real dispatch bug (wrong tensor, wrong branch) shows up as a
+# wrong number, not just a wrong shape.
+# ---------------------------------------------------------------------------
+
+
+class _FakeVITModel:
+    """Stub for VIT/SAP.forward under do_gpu_ap -- `.forward(data, variables)`
+    returns `(output, seq_ps)`, matching VIT.forward's own do_gpu_ap return.
+    """
+
+    def __init__(self, output, seq_ps):
+        self._output = output
+        self._seq_ps = seq_ps
+        self.calls = []
+
+    def forward(self, data, variables):
+        self.calls.append(data)
+        return self._output, self._seq_ps
+
+
+def test_forward_step_vit_do_gpu_ap_uses_only_the_returned_output():
+    # VIT's own loss (CrossEntropyLoss against a label) never needs seq_ps --
+    # this just confirms the (output, seq_ps) tuple is unpacked correctly and
+    # doesn't leak into the loss.
+    output = torch.tensor([[10.0, -10.0], [-10.0, 10.0]])
+    label = torch.tensor([0, 1])
+    model = _FakeVITModel(output, seq_ps=torch.zeros(2, 3, 3))
+    data = torch.zeros(2, 1, 4, 4)
+    batch = {"data": data, "variables": ["ct1"], "label": label}
+    conf = {"model": {"type": "VIT"}, "ap": {"do_ap": True, "do_gpu_ap": True}}
+
+    loss, returned_output = forward_step(conf, batch, model)
+
+    expected = torch.nn.functional.cross_entropy(output, label)
+    assert loss.item() == pytest.approx(expected.item())
+    assert returned_output is output
+    assert model.calls[0] is data
+
+
+def test_forward_step_sap_do_gpu_ap_matches_native_resolution_dice_loss():
+    y = torch.zeros(1, 1, 20, 40)
+    y[0, 0, 2:8, 20:26] = 1.0  # class 1 region
+
+    patch_size = 4
+    seq_size = torch.tensor([[6.0]])  # (B=1, S=1) -- no adaptive_patching_channels dim (SAP's own convention)
+    seq_pos = torch.tensor([[[23.0, 5.0]]])  # matches the region exactly
+    seq_ps = torch.cat([seq_size.unsqueeze(-1), seq_pos], dim=-1)  # (1, 1, 3)
+
+    output = torch.full((1, 1, 2, patch_size, patch_size), -10.0)
+    output[:, :, 1] = 10.0  # confident, correct class-1 prediction
+
+    model = _FakeVITModel(output, seq_ps)
+    data = torch.zeros(1, 1, 20, 40)
+    batch = {"data": data, "variables": ["ct1"], "label": y}
+    conf = {
+        "model": {"type": "SAP", "kwargs": {"num_classes": 2}},
+        "ap": {"do_ap": True, "do_gpu_ap": True},
+        "data": {"interp_size": patch_size, "twoD": True},
+    }
+
+    loss = forward_step(conf, batch, model)
+
+    expected = native_resolution_dice_loss(output, y, seq_size, seq_pos, patch_size, twoD=True, num_classes=2)
+    assert loss.item() == pytest.approx(expected.item())
+    assert loss.item() == pytest.approx(0.0, abs=1e-3)
+    assert model.calls[0] is data
+
+
+class _FakeMAEModelGPUAP:
+    """Stub for MAE.forward under do_gpu_ap -- `.forward(data, variables)`
+    returns `(output, mask, x_seq, seq_ps)`, matching MAE.forward's own
+    do_gpu_ap return (the on-device-computed sequence and seq_ps, otherwise
+    unavailable to forward_step, are returned directly).
+    """
+
+    def __init__(self, output, mask, x_seq, seq_ps):
+        self._output = output
+        self._mask = mask
+        self._x_seq = x_seq
+        self._seq_ps = seq_ps
+        self.calls = []
+
+    def forward(self, data, variables):
+        self.calls.append(data)
+        return self._output, self._mask, self._x_seq, self._seq_ps
+
+
+def _gpu_ap_conf(loss_fn):
+    return {
+        "model": {"type": "MAE", "loss_fn": loss_fn},
+        "ap": {"do_ap": True, "do_gpu_ap": True},
+        "data": {"patch_size": PATCH_SIZE, "twoD": True},
+    }
+
+
+def test_forward_step_mae_maskmse_do_gpu_ap_averages_only_masked_patches():
+    output = TARGET_DO_AP + ERROR_PER_ELEMENT
+    model = _FakeMAEModelGPUAP(output, MASK, x_seq=SEQ_DO_AP, seq_ps=torch.zeros(1, 4, 3))
+    data = torch.zeros(1, 1, 4, 4)
+    batch = {"data": data, "variables": ["v0"]}
+
+    loss = forward_step(_gpu_ap_conf("maskMSE"), batch, model)
+
+    assert loss.item() == pytest.approx(EXPECTED_MASKED_MSE)
+    assert model.calls[0] is data
+
+
+def test_forward_step_mae_mse_do_gpu_ap_averages_over_every_patch():
+    output = TARGET_DO_AP + ERROR_PER_ELEMENT
+    model = _FakeMAEModelGPUAP(output, MASK, x_seq=SEQ_DO_AP, seq_ps=torch.zeros(1, 4, 3))
+    data = torch.zeros(1, 1, 4, 4)
+    batch = {"data": data, "variables": ["v0"]}
+
+    loss = forward_step(_gpu_ap_conf("MSE"), batch, model)
+
+    assert loss.item() == pytest.approx(EXPECTED_FULL_MSE)
+    assert model.calls[0] is data
+
+
+def _native_res_gpu_ap_conf(loss_fn):
+    return {
+        "model": {"type": "MAE", "loss_fn": loss_fn},
+        "ap": {"do_ap": True, "do_gpu_ap": True},
+        "data": {"interp_size": NATIVE_RES_PATCH_SIZE, "twoD": True},
+    }
+
+
+def test_forward_step_mae_nativeresmse_do_gpu_ap_matches_native_resolution_patch_mse():
+    model = _FakeMAEModelGPUAP(NATIVE_RES_OUTPUT, NATIVE_RES_MASK, x_seq=SEQ_DO_AP, seq_ps=NATIVE_RES_SEQ_PS)
+    batch = {"data": NATIVE_RES_DATA, "variables": ["v0"]}
+
+    loss = forward_step(_native_res_gpu_ap_conf("nativeResMSE"), batch, model)
+
+    expected = native_resolution_patch_mse(
+        NATIVE_RES_OUTPUT, NATIVE_RES_DATA,
+        NATIVE_RES_SEQ_SIZE.unsqueeze(1), NATIVE_RES_SEQ_POS.unsqueeze(1),
+        NATIVE_RES_PATCH_SIZE, twoD=True,
+    )
+    assert loss.item() == pytest.approx(expected.item())
+    assert loss.item() == pytest.approx(0.0, abs=1e-6)
+    assert model.calls[0] is NATIVE_RES_DATA
+
+
+def test_forward_step_mae_nativeresmaskmse_do_gpu_ap_matches_native_resolution_patch_masked_mse():
+    model = _FakeMAEModelGPUAP(NATIVE_RES_OUTPUT, NATIVE_RES_MASK, x_seq=SEQ_DO_AP, seq_ps=NATIVE_RES_SEQ_PS)
+    batch = {"data": NATIVE_RES_DATA, "variables": ["v0"]}
+
+    loss = forward_step(_native_res_gpu_ap_conf("nativeResMaskMSE"), batch, model)
+
+    expected = native_resolution_patch_masked_mse(
+        NATIVE_RES_OUTPUT, NATIVE_RES_DATA,
+        NATIVE_RES_SEQ_SIZE.unsqueeze(1), NATIVE_RES_SEQ_POS.unsqueeze(1),
+        NATIVE_RES_PATCH_SIZE, twoD=True, mask=NATIVE_RES_MASK.unsqueeze(1),
+    )
+    assert loss.item() == pytest.approx(expected.item())
+    assert loss.item() == pytest.approx(0.0, abs=1e-6)
+    assert model.calls[0] is NATIVE_RES_DATA

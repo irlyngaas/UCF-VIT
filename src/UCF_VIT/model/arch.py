@@ -904,12 +904,18 @@ class VIT(nn.Module):
                 is True.
 
         Returns:
-            Classification logits, shape (B, num_classes).
+            Classification logits, shape (B, num_classes) -- or, when
+            `self.do_gpu_ap` is True, `(logits, seq_ps)`: callers whose loss
+            needs `seq_ps` (e.g. `SAP`'s `native_resolution_dice_loss`, via
+            inheritance) have no other way to get it, since it's computed
+            on-device inside this call and never handed to them beforehand.
         """
         if self.do_gpu_ap:
             x, seq_ps = self._maybe_gpu_patchify(x)
         x = self.forward_features(x, variables, seq_ps)
         x = self.forward_head(x)
+        if self.do_gpu_ap:
+            return x, seq_ps
         return x
 
 class SAP(VIT):
@@ -1337,12 +1343,21 @@ class MAE(VIT):
         Returns:
             A tuple `(x, mask)`: `x` is the reconstructed per-patch pixel values
             and `mask` is the binary mask (0=kept, 1=masked) in original token
-            order.
+            order. When `self.do_gpu_ap` is True, returns `(x, mask, x_seq,
+            seq_ps)` instead -- every MAE loss variant reconstructs against
+            the patchified sequence itself (`x_seq`) as its target, and the
+            `nativeRes*` variants also need `seq_ps`; neither is otherwise
+            available to the caller, since both are computed on-device
+            inside this call.
         """
+        x_seq = None
         if self.do_gpu_ap:
-            x, seq_ps = self._maybe_gpu_patchify(x)
+            x_seq, seq_ps = self._maybe_gpu_patchify(x)
+            x = x_seq
         x, mask, ids_restore = self.forward_features(x, variables, seq_ps)
         x = self.forward_head(x, ids_restore, seq_ps)
+        if self.do_gpu_ap:
+            return x, mask, x_seq, seq_ps
         return x, mask
 
 class UNETR(VIT):

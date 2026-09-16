@@ -925,27 +925,6 @@ def parse_config(args, load_balance_offline=False):
         else:
             assert ap_conf["fixed_length"] % 7 == 1 % 7, "Octtree fixed length needs to be 7n+1, where n is some integer"
 
-        # SAP's loss (native_resolution_dice_loss) always needs seq_ps outside
-        # the model's forward() -- do_gpu_ap computes seq_ps *inside*
-        # forward() and doesn't return it, so this combination isn't wired up
-        # yet (a real, still-open design question -- extend forward()'s
-        # return signature, or have forward_step call the GPU patchify itself
-        # -- not decided).
-        assert not (ap_conf["do_gpu_ap"] and model_type == "SAP"), (
-            "do_gpu_ap is not yet supported for SAP -- its loss needs seq_ps "
-            "outside the model's forward(), which do_gpu_ap doesn't expose."
-        )
-        # Same reason, same open question -- *every* MAE loss variant
-        # reconstructs against the patchified sequence itself as its target
-        # (not just nativeResMSE/nativeResMaskMSE), which also needs exposing
-        # outside forward(); do_gpu_ap doesn't expose it for any of them.
-        assert not (ap_conf["do_gpu_ap"] and model_type == "MAE"), (
-            "do_gpu_ap is not yet supported for MAE (any loss_fn) -- its "
-            "reconstruction target is the patchified sequence itself, which "
-            "needs to be visible outside the model's forward(), and "
-            "do_gpu_ap doesn't expose it."
-        )
-
         # Only SAP's mask_head needs fixed_length to be an exact square/cube (UNETR's proj_feat doesn't).
         if model_type == "SAP":
             if twoD:
