@@ -5696,3 +5696,66 @@ shipped_config_parses`/`test_config_validation.py`'s other tests, parses
 through `parse_config` with no behavior change. Full local suite (`pytest
 tests/ --ignore=tests/distributed`) passes, 416 passed / 4 skipped -- same
 count as before this change, confirming zero functional impact anywhere.
+
+## Two new real-hardware tests for do_gpu_ap/region_backend, neither runnable in this session
+
+Follow-up ask: does `do_gpu_ap` need distributed-test coverage, and can
+`region_backend="cupyx"` be verified for real anywhere? Both answered yes,
+for different reasons -- one is a genuine multi-rank correctness question
+(added to `tests/distributed/`, real hardware needed but no new
+dependency), the other needs a real `cupy` install that isn't a project
+dependency at all (a new single-GPU test, real hardware *and* an optional
+package needed). Neither could be executed in this session (no GPU, no
+`cupy`) -- both are written to skip cleanly here and are meant to be run
+for real on Frontier.
+
+**`tests/distributed/test_do_gpu_ap_real_pipeline.py`** (new file):
+`process_batch`'s own comment on `do_gpu_ap` states a real design
+assumption directly -- under `do_gpu_ap:True`, every rank in a tensor-
+parallel group independently calls the model's on-device patchify on its
+own (already-broadcast) copy of the raw image, "redundantly but
+deterministically identically," rather than computing it once and
+broadcasting the result. That assumption was never checked against real
+(and possibly physically different) GPU hardware in one job -- a local
+single-process run can't tell you whether two different physical GPUs,
+given bit-identical input, produce bit-identical output from the same ops
+(e.g. non-deterministic reduction order in a fused kernel). The new test
+constructs `GPUPatchify2D` directly (no model, no FSDP -- the property
+under test is about `GPUPatchify2D`'s own cross-device determinism, not
+attention/MLP's tensor-parallel sharding, already covered by `test_
+tensor_parallel_correctness.py`), runs a real `process_batch` under
+`tensor_par_size > 1` with `do_gpu_ap:True`, and confirms (via the same
+MIN/MAX-`all_reduce`-fingerprint technique `test_tensor_parallel_
+correctness.py`'s own determinism canary uses, scoped to `group=
+tensor_par_group` since different tensor-parallel groups are expected to
+get different batches) that every rank in the group ends up with an
+identical broadcast image *and* an identical patchify result. Picked up
+automatically by the existing `launch/tests/run_distributed_tests.sh` --
+no new launch script needed.
+
+**`tests/model/test_gpu_adaptive_patching_cupyx_real.py`** (new file):
+every existing `region_backend="cupyx"` test fakes `cupy`/`cupyx` out
+entirely -- real coverage of the *dispatch* logic, but none of them can
+say anything about whether `cupyx.scipy.ndimage.label`'s real numerics
+actually match `scipy.ndimage.label`'s on real hardware, the thing the
+whole upgrade is trusting. This file skips cleanly (module-level) unless a
+real CUDA/ROCm device *and* a real `cupy` install are both present, then
+runs `GPUPatchify2D`/`GPUPatchify3D` with `region_backend="cupyx"` and
+`"scipy"` on the identical input and asserts the outputs match exactly
+(not approximately -- `region_backend` only changes the final connected-
+components step, not the merge decisions that precede it, so an exact
+match is the right bar). New `launch/tests/run_cupyx_smoke.sh` (single
+GPU, no `srun`/distributed launch needed) runs it -- includes a note on
+which `cupy` package matches the `rocm/6.2.4` module already loaded there,
+since `cupy` isn't a project dependency and needs installing once in the
+`forge-vit` conda env before this can run for real.
+
+**Verification:** both new files compile and collect cleanly; both
+correctly skip (not error) in this session's environment (no SLURM launch,
+no CUDA, no `cupy`) -- confirmed directly, not assumed. Full local suite
+(`pytest tests/ --ignore=tests/distributed`) still passes, 416 passed / 5
+skipped (one more skip than before, from the new cupyx-real test file;
+the new distributed test isn't part of this count at all, excluded by
+`--ignore=tests/distributed`). Neither new test's real pass/fail behavior
+has been observed -- that requires an actual Frontier `sbatch` run, the
+natural next step whenever convenient.
