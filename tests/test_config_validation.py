@@ -24,6 +24,7 @@ CONFIG_PATHS = sorted(glob.glob(os.path.join(REPO_ROOT, "configs", "**", "*.yaml
 SAP_CONFIG = os.path.join(REPO_ROOT, "configs", "basic_ct", "sap", "base_config.yaml")
 UNETR_CONFIG = os.path.join(REPO_ROOT, "configs", "basic_ct", "unetr", "base_config.yaml")
 SST_UNETR_CONFIG = os.path.join(REPO_ROOT, "configs", "sst", "unetr", "base_config.yaml")
+SST_UNETR_ADAPTIVE_CONFIG = os.path.join(REPO_ROOT, "configs", "sst", "unetr", "adaptive_config.yaml")
 
 
 @pytest.mark.parametrize("config_path", CONFIG_PATHS, ids=lambda p: os.path.relpath(p, REPO_ROOT))
@@ -243,6 +244,70 @@ def test_score_fn_invalid_value_raises_clearly():
             yaml.dump(conf, f)
         args = argparse.Namespace(config=path, pretrained_config="")
         with pytest.raises(AssertionError, match="ap.score_fn"):
+            parse_config(args, load_balance_offline=True)
+    finally:
+        os.remove(path)
+
+
+# ---------------------------------------------------------------------------
+# ap.do_gpu_ap -- now dispatches between GPUPatchify2D and GPUPatchify3D on
+# data.twoD (arch.py's own dispatch), so parse.py's fixed_length congruence
+# check must do the same (mod 3/exponent 2 for 2D, mod 7/exponent 3 for 3D).
+# SST_UNETR_ADAPTIVE_CONFIG is a real shipped 3D (twoD:False) config with
+# ap.do_ap:True already set, closing the "no real config to test this
+# against" gap noted when do_gpu_ap was 2D-only.
+# ---------------------------------------------------------------------------
+
+
+def _sst_adaptive_conf_for_do_gpu_ap():
+    with open(SST_UNETR_ADAPTIVE_CONFIG) as f:
+        conf = yaml.load(f, Loader=yaml.FullLoader)
+    # simple_ddp_size:"auto" needs a live distributed process group to read
+    # world_size from (see parse.py's own assertion) -- validate_config's
+    # init_single_process_dist handles this for test_shipped_config_parses,
+    # but these tests mutate ap.* directly via parse_config instead, so an
+    # explicit int sidesteps needing a real process group here too.
+    conf["parallelism"]["simple_ddp_size"] = 1
+    conf["ap"]["do_gpu_ap"] = True
+    return conf
+
+
+def test_do_gpu_ap_works_on_a_real_3d_config():
+    # img_size=(256,256,256), tile_size derives to the same (div:1, no
+    # overlap) -- gpu_ap_min_size defaults to 2, giving real_max_blocks=128,
+    # 128**3 leaves; fixed_length=729 (this config's own do_ap:True default)
+    # satisfies (128**3 - 729) % 7 == 0 already, so no fixed_length override
+    # needed here.
+    conf = _sst_adaptive_conf_for_do_gpu_ap()
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    os.close(fd)
+    try:
+        with open(path, "w") as f:
+            yaml.dump(conf, f)
+        args = argparse.Namespace(config=path, pretrained_config="")
+        parsed = parse_config(args, load_balance_offline=True)
+        assert parsed["ap"]["do_gpu_ap"] is True
+        assert parsed["ap"]["score_fn"] == "variance"
+    finally:
+        os.remove(path)
+
+
+def test_do_gpu_ap_3d_fixed_length_congruence_uses_modulus_7_not_3():
+    # 128**3 - fixed_length must be divisible by 7 (8 children merge into 1
+    # parent), not 3 (which the old 2D-only check used unconditionally) --
+    # 728 satisfies neither modulus by coincidence-proofing: (128**3-728)%7==6,
+    # so this must raise under the *new*, twoD-dispatched check.
+    conf = _sst_adaptive_conf_for_do_gpu_ap()
+    conf["ap"]["fixed_length"] = 728
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    os.close(fd)
+    try:
+        with open(path, "w") as f:
+            yaml.dump(conf, f)
+        args = argparse.Namespace(config=path, pretrained_config="")
+        with pytest.raises(AssertionError, match="GPUPatchify3D"):
             parse_config(args, load_balance_offline=True)
     finally:
         os.remove(path)

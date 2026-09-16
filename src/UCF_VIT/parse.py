@@ -927,28 +927,37 @@ def parse_config(args, load_balance_offline=False):
             assert p2, f"Tile Size in the {i} dimension must be a power of 2"
 
         if ap_conf["do_gpu_ap"]:
-            assert twoD, "do_gpu_ap (GPUPatchify2D) is 2D-only for now -- 3D generalization not implemented yet"
-            # Mirrors GPUPatchify2D.__init__'s own identical computation: the
-            # real level-0 grid run_merge_batch operates on is the *padded*
-            # grid, not tile_size[0] // gpu_ap_min_size directly -- whenever
-            # tile_size isn't already a multiple of the coarsest block size,
-            # padding grows the real block count (this is normally a no-op
-            # since tile_size and the default gpu_ap_min_size=2 are both
-            # powers of 2, but a non-power-of-2 gpu_ap_min_size would
-            # otherwise make this check silently disagree with the real
-            # module and either wrongly reject or wrongly allow a config).
+            # Mirrors GPUPatchify2D/GPUPatchify3D.__init__'s own identical
+            # computation (dispatched on twoD, matching arch.py's own
+            # GPUPatchify2D/GPUPatchify3D dispatch): the real level-0 grid
+            # run_merge_batch operates on is the *padded* grid, not
+            # tile_size[0] // gpu_ap_min_size directly -- whenever tile_size
+            # isn't already a multiple of the coarsest block size, padding
+            # grows the real block count (this is normally a no-op since
+            # tile_size and the default gpu_ap_min_size=2 are both powers of
+            # 2, but a non-power-of-2 gpu_ap_min_size would otherwise make
+            # this check silently disagree with the real module and either
+            # wrongly reject or wrongly allow a config). tile_size[0] is
+            # always the reference axis (GPUPatchify2D/3D's own shortest-
+            # axis convention -- tile_size must already be sorted ascending
+            # for do_gpu_ap, same as GPUPatchify3D's own D <= H <= W
+            # requirement).
             max_blocks = tile_size[0] // ap_conf["gpu_ap_min_size"]
             max_level = int(math.floor(math.log2(max_blocks))) if max_blocks >= 1 else 0
-            pad_bh = ap_conf["gpu_ap_min_size"] * (2 ** max_level)
-            padded_h = -(-tile_size[0] // pad_bh) * pad_bh
-            real_max_blocks = padded_h // ap_conf["gpu_ap_min_size"]
-            initial_leaves = real_max_blocks ** 2
-            assert (initial_leaves - ap_conf["fixed_length"]) % 3 == 0, (
+            pad_b = ap_conf["gpu_ap_min_size"] * (2 ** max_level)
+            padded_ref = -(-tile_size[0] // pad_b) * pad_b
+            real_max_blocks = padded_ref // ap_conf["gpu_ap_min_size"]
+            exponent = 2 if twoD else 3
+            modulus = 3 if twoD else 7
+            gpu_patchify_name = "GPUPatchify2D" if twoD else "GPUPatchify3D"
+            initial_leaves = real_max_blocks ** exponent
+            assert (initial_leaves - ap_conf["fixed_length"]) % modulus == 0, (
                 f"ap.fixed_length ({ap_conf['fixed_length']}) must satisfy "
-                f"(real_max_blocks**2 - fixed_length) % 3 == 0 for GPUPatchify2D's bottom-up merge "
-                f"-- real_max_blocks**2 is {initial_leaves} here (tile_size[0] {tile_size[0]} padded "
-                f"to a multiple of {pad_bh}, ap.gpu_ap_min_size {ap_conf['gpu_ap_min_size']}). See "
-                "GPUPatchify2D.__init__'s own identical assertion for why."
+                f"(real_max_blocks**{exponent} - fixed_length) % {modulus} == 0 for "
+                f"{gpu_patchify_name}'s bottom-up merge -- real_max_blocks**{exponent} is "
+                f"{initial_leaves} here (tile_size[0] {tile_size[0]} padded to a multiple of "
+                f"{pad_b}, ap.gpu_ap_min_size {ap_conf['gpu_ap_min_size']}). See "
+                f"{gpu_patchify_name}.__init__'s own identical assertion for why."
             )
         elif twoD:
             assert ap_conf["fixed_length"] % 3 == 1 % 3, "Quadtree fixed length needs to be 3n+1, where n is some integer"

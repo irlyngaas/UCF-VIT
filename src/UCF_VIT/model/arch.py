@@ -26,7 +26,7 @@ import torch.distributed as dist
 
 from UCF_VIT.utils.dist_functions import F_Identity_B_Broadcast,F_Broadcast_B_Identity, F_Identity_B_AllReduce
 from UCF_VIT.utils.fused_attn import FusedAttn
-from UCF_VIT.model.gpu_adaptive_patching import GPUPatchify2D
+from UCF_VIT.model.gpu_adaptive_patching import GPUPatchify2D, GPUPatchify3D
 
 from einops import rearrange
 
@@ -242,22 +242,23 @@ class VIT(nn.Module):
             fixed_length: Length for adaptive patches, only used if adative_patching=True
             do_gpu_ap: Whether adaptive patching happens on-device inside
                 `forward()` (`UCF_VIT.model.gpu_adaptive_patching.
-                GPUPatchify2D`, given the raw image) instead of in the
-                dataloader (`UCF_VIT.dataloaders.transform.Patchify`,
+                GPUPatchify2D`/`GPUPatchify3D`, given the raw image,
+                dispatched on `twoD`) instead of in the dataloader
+                (`UCF_VIT.dataloaders.transform.Patchify`/`Patchify_3D`,
                 already-patchified sequence handed to `forward()`).
-                Requires `adaptive_patching` and `twoD` (`GPUPatchify2D` is
-                2D-only for now) -- everything *downstream* of tokenization
-                (per-variable embedding, `aggregate_variables`, `_pos_embed`)
-                is identical either way, only *where* the patchify
-                computation happens changes. `False` (the default, and
-                every config without this) leaves the existing CPU/
-                dataloader-side path completely unaffected.
-            gpu_ap_min_size: `GPUPatchify2D`'s finest block side length.
-                Only used when `do_gpu_ap` is True.
-            gpu_ap_score_fn: `GPUPatchify2D`'s merge-cost scoring measure --
-                `"variance"` (default) or `"canny"` (edge-density). Only
-                used when `do_gpu_ap` is True; see `GPUPatchify2D`'s own
-                docstring for why the two need different merge-cost formulas.
+                Requires `adaptive_patching` -- everything *downstream* of
+                tokenization (per-variable embedding, `aggregate_
+                variables`, `_pos_embed`) is identical either way, only
+                *where* the patchify computation happens changes. `False`
+                (the default, and every config without this) leaves the
+                existing CPU/dataloader-side path completely unaffected.
+            gpu_ap_min_size: `GPUPatchify2D`/`GPUPatchify3D`'s finest block
+                side length. Only used when `do_gpu_ap` is True.
+            gpu_ap_score_fn: `GPUPatchify2D`/`GPUPatchify3D`'s merge-cost
+                scoring measure -- `"variance"` (default) or `"canny"`
+                (edge-density). Only used when `do_gpu_ap` is True; see
+                either class's own docstring for why the two need
+                different merge-cost formulas.
             gpu_ap_canny_sigma: Gaussian smoothing sigma before gradient
                 computation. Only used when `do_gpu_ap` is True and
                 `gpu_ap_score_fn == "canny"`.
@@ -327,7 +328,6 @@ class VIT(nn.Module):
         self.do_gpu_ap = do_gpu_ap
         if self.do_gpu_ap:
             assert self.adaptive_patching, "do_gpu_ap requires adaptive_patching"
-            assert self.twoD, "do_gpu_ap (GPUPatchify2D) is 2D-only for now -- 3D generalization not implemented yet"
         self.default_vars = default_vars
         self.use_varemb = use_varemb
         self.aggregated_variables = 1 #Change this to an argument when adding different variable aggregation strategies
@@ -347,7 +347,8 @@ class VIT(nn.Module):
             assert self.interp_size is not None, "interp_size is required when adaptive_patching is turned on"
 
         if self.do_gpu_ap:
-            self.gpu_patchify = GPUPatchify2D(
+            gpu_patchify_cls = GPUPatchify2D if self.twoD else GPUPatchify3D
+            self.gpu_patchify = gpu_patchify_cls(
                 img_size=img_size, fixed_length=self.fixed_length,
                 interp_size=self.interp_size, min_size=gpu_ap_min_size,
                 score_fn=gpu_ap_score_fn, canny_sigma=gpu_ap_canny_sigma,
@@ -801,17 +802,19 @@ class VIT(nn.Module):
         `do_gpu_ap`'s own docstring entry in `__init__`.
 
         Args:
-            x: Raw input tensor, shape (B, C, H, W).
+            x: Raw input tensor, shape (B, C, H, W) or (B, C, D, H, W).
 
         Returns:
             `(x_seq, seq_ps)` when `self.do_gpu_ap` is True -- `x_seq`
             matches the CPU-patchified sequence's own shape contract
-            (`UCF_VIT.dataloaders.transform.Patchify`), and `seq_ps` is
-            built from `GPUPatchify2D`'s own `seq_size`/`seq_pos` exactly
-            like `UCF_VIT.training.process_batch` builds it for the CPU
-            path (`cat([size.unsqueeze(-1), pos], dim=-1)`). `(None, None)`
-            when `self.do_gpu_ap` is False -- callers should use whatever
-            `x_seq`/`seq_ps` they were already given in that case.
+            (`UCF_VIT.dataloaders.transform.Patchify`/`Patchify_3D`), and
+            `seq_ps` is built from `self.gpu_patchify`'s own `seq_size`/
+            `seq_pos` (`GPUPatchify2D` or `GPUPatchify3D`, dispatched on
+            `self.twoD`) exactly like `UCF_VIT.training.process_batch`
+            builds it for the CPU path (`cat([size.unsqueeze(-1), pos],
+            dim=-1)`). `(None, None)` when `self.do_gpu_ap` is False --
+            callers should use whatever `x_seq`/`seq_ps` they were already
+            given in that case.
         """
         if not self.do_gpu_ap:
             return None, None

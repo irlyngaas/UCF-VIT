@@ -5593,8 +5593,70 @@ forward+backward-free forward-only runs on an 8-octant synthetic volume
 confirming exact per-octant content, and a non-cuboid-volume run
 confirming no axis transposition.
 
-**Explicitly not done yet:** wiring `GPUPatchify3D` into `arch.py`'s
-`ap.do_gpu_ap` (currently asserts `twoD` by construction) -- a separate
-follow-up, matching how `GPUPatchify2D` itself was staged; randomized 3D
-Canny parameters; real GPU-hardware verification of the `"cupyx"` path
-(not possible in this session's environment).
+**Explicitly not done yet (at the time):** wiring `GPUPatchify3D` into
+`arch.py`'s `ap.do_gpu_ap` (currently asserts `twoD` by construction) --
+a separate follow-up, matching how `GPUPatchify2D` itself was staged;
+randomized 3D Canny parameters; real GPU-hardware verification of the
+`"cupyx"` path (not possible in this session's environment).
+
+## Wired GPUPatchify3D into ap.do_gpu_ap -- the twoD restriction was staging, not a limitation
+
+Follow-up ask, prompted by the user asking directly why `do_gpu_ap` was
+2D-only: the restriction was never a technical limitation of `do_gpu_ap`
+as a concept -- `GPUPatchify3D` already existed, fully built and tested,
+from the entry immediately above. `arch.py`'s `do_gpu_ap` dispatch just
+hadn't been updated to also construct it, deferred as its own explicit
+staging step at the time (matching how `GPUPatchify2D` itself was staged
+before its own wiring pass).
+
+The fix is small because `training.py`'s `do_gpu_ap` dispatch
+(`dataloader_do_ap`, the `VIT`/`SAP`/`MAE`/`UNETR` branches) was already
+dimension-agnostic -- it only ever checks `conf["ap"]["do_gpu_ap"]`, never
+`twoD`, so it needed zero changes. Only two real changes:
+- `arch.py`'s `VIT.__init__` drops the `assert self.twoD` and picks
+  `GPUPatchify2D` or `GPUPatchify3D` at construction time based on
+  `self.twoD` (`gpu_patchify_cls = GPUPatchify2D if self.twoD else
+  GPUPatchify3D`) -- everything downstream of that (`_maybe_gpu_patchify`,
+  `forward`/`MAE.forward`/`UNETR.forward`) already only calls `self.
+  gpu_patchify(...)` generically, so needed no changes either.
+- `parse.py`'s `do_gpu_ap` fixed_length congruence check (previously
+  2D-only, asserting `twoD` explicitly) now branches its exponent/modulus
+  on `twoD` too (`exponent = 2 if twoD else 3`, `modulus = 3 if twoD else
+  7`), mirroring `GPUPatchify2D`/`GPUPatchify3D.__init__`'s own identical
+  computation -- same padded-grid derivation either way, just the final
+  power/modulus differs.
+
+`model/utils.py`'s `get_model` construction call needed no changes at all
+-- it already passed `gpu_ap_*` kwargs through generically (only its
+comment claiming "sst/2D-only currently" was stale, now fixed).
+
+**Tier 1 coverage:** `tests/test_config_validation.py` gains 2 tests using
+`configs/sst/unetr/adaptive_config.yaml` -- a real shipped 3D (`twoD:
+False`) config that already has `ap.do_ap:True` -- as the base: `ap.
+do_gpu_ap:True` parses successfully against this config's own real
+`fixed_length` (729, already `% 7`-congruent by coincidence -- confirmed,
+not assumed), and an off-by-one `fixed_length` (728) is correctly rejected
+by the *new*, `twoD`-dispatched check (`% 7`, not the old unconditional
+`% 3`) with a message naming `GPUPatchify3D` specifically. This closes the
+"no real shipped 2D+do_gpu_ap config to test against" gap noted in the
+`do_gpu_ap` stage's own entry above -- for the 2D case that gap still
+exists (no shipped 2D config tiles at all yet), but the 3D case now has
+real coverage.
+
+**Verification beyond the new tests:** real `VIT`, `SAP`, `MAE`, and
+`UNETR` instances (the same scratch xformers-stub technique as every
+earlier `do_gpu_ap` stage) constructed with `twoD:False`, `do_gpu_ap:
+True`, a cubic `img_size` -- confirmed each one's `self.gpu_patchify` is
+actually a `GPUPatchify3D` (not silently still `GPUPatchify2D`), and ran
+real forward+backward passes through `training.py`'s real `forward_step`
+for all four model types, matching the exact verification pattern used
+when `do_gpu_ap` first shipped for 2D. Full local suite (`pytest tests/
+--ignore=tests/distributed`) passes, 416 passed / 4 skipped.
+
+**Still not done:** no shipped config actually ships with `do_gpu_ap:True`
+turned on by default anywhere (the new tests mutate a copy in a tempfile);
+`SAP`/`MAE` were already unblocked for `do_gpu_ap` in an earlier stage
+(extending `forward()`'s return signature) and that continues to work
+unchanged for 3D, verified above -- no new gap there. Randomized 3D Canny
+parameters and real GPU-hardware verification of `region_backend="cupyx"`
+remain not possible in this session's environment.

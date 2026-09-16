@@ -249,8 +249,9 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
         use_timeemb=bool(conf["model"]["use_channel_aggregation"] and conf["data"].get("time_offsets") and len(conf["data"]["time_offsets"]) > 1),
         adaptive_patching=conf["ap"]["do_ap"],
         fixed_length=conf["ap"]["fixed_length"],
-        # "sst"/2D-only currently -- see arch.py's own do_gpu_ap docstring
-        # entry. False (default) for every config without this leaves the
+        # See arch.py's own do_gpu_ap docstring entry -- dispatches between
+        # GPUPatchify2D/GPUPatchify3D there based on conf["data"]["twoD"].
+        # False (default) for every config without this leaves the
         # existing CPU/dataloader-side adaptive-patching path unaffected.
         do_gpu_ap=conf["ap"]["do_gpu_ap"],
         gpu_ap_min_size=conf["ap"]["gpu_ap_min_size"] or 2,
