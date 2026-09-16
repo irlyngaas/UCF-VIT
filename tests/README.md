@@ -5104,3 +5104,121 @@ regression tests above (single- and multi-channel, square and non-square).
 validation, `training.py`'s calling convention, the pluggable Canny-vs-
 variance scoring option (both CPU and GPU sides), the 3D generalization
 itself, and the `cupyx.scipy.ndimage.label` region-detection upgrade.
+
+## Wired GPUPatchify2D into every model type, found two more real bugs by actually running it
+
+Stage 2 of the GPU adaptive-patching effort: wires the Stage 1 module into
+the model, per the user's explicit request to cover every model type that
+already supports CPU `ap.do_ap` -- `VIT`, `SAP` (via inheritance, since it
+has no `forward()` override), `MAE`, and `UNETR` -- not just `VIT`/`UNETR`
+as the plan had assumed.
+
+`VIT.__init__` gains `do_gpu_ap: bool = False` and `gpu_ap_min_size: int = 2`
+and, when set, constructs `self.gpu_patchify = GPUPatchify2D(...)`.
+`self.adaptive_patching` keeps meaning "model structured for adaptive
+patching" (token embed/pos embed sizing); `do_gpu_ap` is an orthogonal axis
+-- *where* the patchify computation happens (on-device inside `forward()`,
+given the raw image, vs. in the dataloader, already-patchified). A shared
+`_maybe_gpu_patchify(self, x)` helper (returns `(None, None)` when
+`do_gpu_ap` is off) is called once at the top of `VIT.forward` (covering
+`SAP` too), `MAE.forward`, and `UNETR.forward` (careful there to keep the
+raw `x` intact for `encoder1`'s convolutional skip connection, only
+replacing the transformer's own input). `parse.py` threads through
+`ap.do_gpu_ap`/`ap.gpu_ap_min_size`, validates 2D-only and the
+`initial_leaves % 3` congruence at config-parse time (mirroring the
+existing octree/quadtree checks), and rejects `separate_channels`.
+`training.py` and `train.py`/`val.py`/`test.py` gain a
+`dataloader_do_ap = conf["ap"]["do_ap"] and not conf["ap"]["do_gpu_ap"]`
+derived flag -- the dataloader must stop adaptively patching once the model
+does it instead, while `conf["ap"]["do_ap"]` itself keeps its original,
+model-structural meaning everywhere else.
+
+**A real limitation found, not yet resolved:** `SAP`'s
+`native_resolution_dice_loss` and *every* `MAE` loss variant (not just the
+`nativeRes*` ones -- plain `MSE`/`maskMSE` too, since MAE's reconstruction
+target is the patchified sequence itself) need `seq`/`seq_ps` computed
+*outside* `forward()`, for the loss function to consume directly. `do_gpu_ap`
+only computes these *inside* `forward()` and doesn't expose them. Rather than
+silently produce wrong losses, `parse.py` now asserts `do_gpu_ap` can't be
+combined with `SAP` (any config) or `MAE` (any `loss_fn`) at all, with a
+message pointing at this exact gap. Resolving it for real needs a design
+decision -- extend `forward()`'s return signature to also expose `seq_ps`
+under `do_gpu_ap`, or have `forward_step` call `GPUPatchify2D` directly from
+`training.py` (partially contradicting the original "patchify happens
+inside forward()" design) -- not decided yet.
+
+**Two more real bugs found by actually running the wired code**, not just by
+inspection (`arch.py`/`building_blocks.py` can't import in this session's
+shell -- see the earlier `use_timeemb` stage's own note on the same gap --
+so verification used the same scratch xformers-stub technique to construct
+real `VIT`/`SAP`/`MAE`/`UNETR` instances with `do_gpu_ap:True` and run a
+real forward+backward pass on each):
+
+- **`GPUPatchify2D.__init__`'s `fixed_length` congruence assertion checked
+  the wrong grid.** It computed `initial_leaves` from
+  `img_size[0] // min_size` -- the *unpadded* grid -- but `forward()` runs
+  on `_pad_tensor`'s *padded* grid, which is strictly larger whenever
+  `img_size` isn't already a multiple of `_pad_size()` (e.g. `img_size=
+  (12,12)`, `min_size=2` pads to `(16,16)`: a real 8x8=64-leaf grid, not the
+  6x6=36 the old assertion checked). A `fixed_length` that satisfied the
+  stale check but not the real one didn't error or misbehave -- it hung
+  forever: `run_merge_batch`'s per-image merge budget
+  (`(leaves_remaining - fixed_length) // 3`) permanently floors to 0 once
+  `leaves_remaining` can never land exactly on `fixed_length`, so the
+  `while (leaves_remaining > end_leaves).any()` loop never exits for that
+  image. Caught directly -- the scratch verification script's first `VIT`
+  construction ran for minutes at 100% CPU with no output, not a crash with
+  a traceback, which is what made it worth tracing rather than assuming a
+  slow import. Fixed by deriving `initial_leaves` from the real padded grid
+  size; added `test_forward_terminates_when_img_size_needs_padding`
+  (`tests/model/test_gpu_adaptive_patching.py`) using exactly this
+  padding-changes-the-grid scenario, since a reappearance of this bug would
+  hang the test rather than fail it.
+- **`_serialize_batch` squeezed the channel axis for `C == 1`,** matching
+  `UCF_VIT.dataloaders.transform.Patchify.forward`'s own per-*sample*
+  (no batch dim yet) `C == 1` squeeze -- the right contract for the CPU
+  path, where a later collation step adds the batch (and channel) dim back,
+  but wrong here: `GPUPatchify2D` already operates on a full batch and its
+  output is consumed directly by `forward_features`'s
+  `rearrange(x, 'b c s p -> b s (p c)')`, which requires a real `C` axis
+  with no collation step to restore it. Surfaced immediately as a shape
+  error the moment `VIT.forward` actually ran (not caught by Stage 1's own
+  tests, which only exercised `GPUPatchify2D` standalone, never through a
+  real model). Fixed by always keeping the channel axis in `_serialize_batch`
+  /`forward`'s return value (`[B, C, N, interp_size**2]` unconditionally);
+  updated the two affected Stage 1 tests
+  (`test_serialize_batch_extracts_each_regions_true_content`,
+  `test_serialize_batch_non_square_image_does_not_transpose_regions`) to
+  index the now-explicit channel axis.
+
+Also fixed `parse.py`'s own `ap.fixed_length` congruence check for
+`do_gpu_ap`, which duplicated the same padding-unaware formula (it's a
+config-parse-time mirror of `GPUPatchify2D.__init__`'s assertion, so it
+inherited the identical bug) -- now derives `real_max_blocks` from the
+padded grid the same way. In practice this was never wrong for any config
+reachable through today's power-of-2 `tile_size` constraint plus the
+default `gpu_ap_min_size:2` (both powers of 2 always pad to a no-op), but
+a non-power-of-2 `gpu_ap_min_size` would have silently disagreed with the
+real module.
+
+**Verification:** full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 361 passed / 4 skipped. Real forward+backward passes
+(scratch xformers-stub construction, `do_gpu_ap:True`, `img_size=(16,16)`,
+`fixed_length=16`) confirmed for `VIT`, `SAP`, `MAE`, and `UNETR` -- each
+produced the expected output shape and a clean `loss.backward()` with no
+shape or gradient errors. Not a substitute for a real Frontier run at real
+config scale, but real evidence the wiring (and the two bugs above) are
+fixed, not just plausible by inspection.
+
+**A known test gap, not filled here:** `parse.py`'s new `do_gpu_ap`
+validation (the congruence check above, the `twoD`/`separate_channels`
+rejections, and the `SAP`/`MAE` blocking asserts) has no dedicated
+`test_config_validation.py` coverage yet -- every config that file's tests
+mutate-and-reparse from (`SAP_CONFIG`, `UNETR_CONFIG`, `SST_UNETR_CONFIG`,
+and every other shipped config with `ap.do_ap:True`) is 3D, and `do_gpu_ap`
+is 2D-only, so there's no real shipped config to base a test on without
+hand-writing a full synthetic 2D+`do_ap` config from scratch (this repo's
+own tests avoid that -- they all start from a real shipped file). Exercised
+indirectly today via `GPUPatchify2D`'s own direct tests (same formula) and
+the real model-level forward/backward verification above; revisit once a
+real 2D+`do_gpu_ap` config exists to build a test on, or if a bug surfaces.

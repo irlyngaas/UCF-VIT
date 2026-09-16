@@ -96,7 +96,7 @@ def main():
                 batches_per_rank_epoch = batches_per_rank_epoch,
                 div = test_conf["tiling"]["div"],
                 tile_overlap = test_conf["tiling"]["tile_overlap"],
-                adaptive_patching = test_conf["ap"]["do_ap"],
+                adaptive_patching = test_conf["ap"]["do_ap"] and not test_conf["ap"]["do_gpu_ap"],
                 fixed_length = test_conf["ap"]["fixed_length"],
                 separate_channels = test_conf["ap"]["separate_channels"],
                 data_par_size = test_conf["parallelism"]["data_par_size"],

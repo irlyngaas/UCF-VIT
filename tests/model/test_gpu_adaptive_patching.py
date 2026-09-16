@@ -21,8 +21,10 @@ from UCF_VIT.model.gpu_adaptive_patching import GPUPatchify2D
 
 def test_pad_tensor_pads_to_coarsest_block_size():
     # img_size=(12,12), min_size=2 -> max_blocks=6, max_level=2 (2**2=4<=6<8),
-    # coarsest block = 2*4=8 -- 12 is not a multiple of 8, needs padding to 16.
-    p = GPUPatchify2D(img_size=(12, 12), fixed_length=3, interp_size=4, min_size=2)
+    # coarsest block = 2*4=8 -- 12 is not a multiple of 8, needs padding to 16,
+    # which is also why the *real* level-0 grid is 16/2=8 -> 64 leaves, not
+    # 6*6=36 -- fixed_length must satisfy (64 - fixed_length) % 3 == 0.
+    p = GPUPatchify2D(img_size=(12, 12), fixed_length=4, interp_size=4, min_size=2)
     t = torch.arange(12 * 12, dtype=torch.float32).reshape(1, 1, 12, 12)
 
     padded, orig = p._pad_tensor(t)
@@ -103,6 +105,28 @@ def test_merge_cost_prefers_merging_flat_region_over_a_step_edge():
     assert torch.equal(level2.flatten()[1:], torch.zeros(level2.numel() - 1))
 
 
+def test_forward_terminates_when_img_size_needs_padding():
+    """Regression test for a real hang: `__init__`'s congruence assertion
+    used to check `(img_size[0] // min_size) ** 2` (the *unpadded* grid),
+    but `forward()` actually operates on `_pad_tensor`'s *padded* grid, which
+    is strictly larger whenever img_size isn't already a multiple of
+    `_pad_size()` -- e.g. img_size=(12,12), min_size=2 pads to (16,16): a
+    real 8*8=64-leaf grid, not the 6*6=36 the old assertion checked against.
+    An off-by-wrong-modulus fixed_length silently passed that stale check,
+    then `run_merge_batch`'s per-image budget (`(leaves_remaining -
+    fixed_length) // 3`) permanently floors to 0 once leaves_remaining can
+    never land exactly on fixed_length -- an infinite loop, not a wrong
+    answer, so this test would hang (not fail) if the bug reappeared.
+    """
+    p = GPUPatchify2D(img_size=(12, 12), fixed_length=4, interp_size=4, min_size=2)
+    img = torch.rand(2, 1, 12, 12)
+
+    seq_img, seq_size, seq_pos = p(img)
+
+    assert seq_size.shape == (2, 4)
+    assert seq_pos.shape == (2, 4, 2)
+
+
 def test_run_merge_batch_reaches_fixed_length_independently_per_image():
     """Two images with different content, same fixed_length target -- each
     must land on exactly fixed_length regions on its own (not, e.g.,
@@ -141,11 +165,11 @@ def test_serialize_batch_extracts_each_regions_true_content():
 
     seq_img, seq_size, seq_pos = p(img)
 
-    assert seq_img.shape == (1, 4, 16)  # fixed_length=4, interp_size**2=16
+    assert seq_img.shape == (1, 1, 4, 16)  # B, C, fixed_length, interp_size**2
     for i in range(4):
         x, y = seq_pos[0, i].tolist()
         expected = 1.0 if (x < 8 and y < 8) else 2.0 if (x >= 8 and y < 8) else 3.0 if (x < 8 and y >= 8) else 4.0
-        patch = seq_img[0, i]
+        patch = seq_img[0, 0, i]
         assert torch.allclose(patch, torch.full_like(patch, expected), atol=1e-4)
 
 
@@ -173,7 +197,7 @@ def test_serialize_batch_non_square_image_does_not_transpose_regions():
     for i in range(4):
         x, y = seq_pos[0, i].tolist()
         expected = 1.0 if (x < 8 and y < 4) else 2.0 if (x >= 8 and y < 4) else 3.0 if (x < 8 and y >= 4) else 4.0
-        assert torch.allclose(seq_img[0, i], torch.full_like(seq_img[0, i], expected), atol=1e-4)
+        assert torch.allclose(seq_img[0, 0, i], torch.full_like(seq_img[0, 0, i], expected), atol=1e-4)
 
 
 def test_serialize_batch_multi_channel_does_not_scramble_channels():

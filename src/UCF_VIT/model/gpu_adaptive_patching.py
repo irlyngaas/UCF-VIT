@@ -84,14 +84,24 @@ class GPUPatchify2D(torch.nn.Module):
 
         self.max_level = int(math.floor(math.log2(max_blocks))) if max_blocks >= 1 else 0
 
-        initial_leaves = max_blocks ** 2
+        # initial_leaves must reflect the *padded* grid run_merge_batch actually
+        # operates on, not the raw img_size//min_size above -- whenever img_size
+        # isn't already a multiple of _pad_size(), _pad_tensor grows H/W, which
+        # grows the real level-0 block count too (e.g. img_size=(12,12),
+        # min_size=2 pads to (16,16): 8x8=64 real level-0 blocks, not 6x6=36).
+        pad_bh = self.min_size[0] * (2 ** self.max_level)
+        padded_h = -(-img_size[0] // pad_bh) * pad_bh  # ceil to a multiple of pad_bh
+        real_max_blocks = padded_h // self.min_size[0]
+
+        initial_leaves = real_max_blocks ** 2
         assert (initial_leaves - fixed_length) % 3 == 0, (
-            f"fixed_length ({fixed_length}) must satisfy (max_blocks**2 - fixed_length) % 3 == 0 "
-            f"-- max_blocks**2 is {initial_leaves} here (img_size {img_size}, min_size {min_size}), "
-            "so every image's merge loop can land on exactly fixed_length leaves (each merge "
-            "removes exactly 3 leaves). Off-target leaf counts would silently break "
-            "_serialize_batch's whole-batch grid_sample call, which assumes every image in "
-            "the batch has the same region count."
+            f"fixed_length ({fixed_length}) must satisfy (real_max_blocks**2 - fixed_length) % 3 == 0 "
+            f"-- real_max_blocks**2 is {initial_leaves} here (img_size {img_size} padded to a multiple "
+            f"of {pad_bh}, min_size {min_size}), so every image's merge loop can land on exactly "
+            "fixed_length leaves (each merge removes exactly 3 leaves). Off-target leaf counts would "
+            "either silently break _serialize_batch's whole-batch grid_sample call (which assumes "
+            "every image in the batch has the same region count), or -- if unreachable exactly -- "
+            "make run_merge_batch's per-image budget hit 0 forever, hanging."
         )
         self.initial_leaves = initial_leaves
 
@@ -391,8 +401,13 @@ class GPUPatchify2D(torch.nn.Module):
             imgs_batch: `[B, C, H, W]` (padded).
 
         Returns:
-            `[B, N, interp_size**2]` (`C == 1`) or `[B, C, N, interp_size**2]`
-            (`C > 1`).
+            `[B, C, N, interp_size**2]` -- always keeps the channel axis
+            (even when `C == 1`), since this is consumed directly by
+            `forward()`'s caller (`VIT`/`MAE`/`UNETR.forward`'s non-varemb
+            `rearrange('b c s p -> b s (p c)')` path expects a real `C`
+            axis) with no later collation step to add it back, unlike
+            `UCF_VIT.dataloaders.transform.Patchify.forward`'s own
+            per-*sample* (no batch dim yet) `C == 1` squeeze.
         """
         B, C, H, W = imgs_batch.shape
         N = all_regions[0].N
@@ -426,7 +441,7 @@ class GPUPatchify2D(torch.nn.Module):
         patches = F.grid_sample(imgs_rep, grids, mode="bilinear", padding_mode="border", align_corners=True)
         patches = patches.reshape(B, N, C, P * P)
 
-        return patches.permute(0, 2, 1, 3) if C > 1 else patches[:, :, 0, :]
+        return patches.permute(0, 2, 1, 3)
 
     def forward(self, img):
         """Adaptively patchifies `img` into a fixed-length sequence, entirely on `img`'s own device.
@@ -435,11 +450,11 @@ class GPUPatchify2D(torch.nn.Module):
             img: `[B, C, H, W]`.
 
         Returns:
-            `(seq_img, seq_size, seq_pos)`: `seq_img` matches
-            `Patchify.forward`'s existing shape contract
-            (`UCF_VIT.dataloaders.transform`) -- `[B, fixed_length,
-            interp_size**2]` (`C == 1`) or `[B, C, fixed_length,
-            interp_size**2]` (`C > 1`). `seq_size` is `[B, fixed_length]`
+            `(seq_img, seq_size, seq_pos)`: `seq_img` is `[B, C,
+            fixed_length, interp_size**2]` -- see `_serialize_batch`'s own
+            docstring for why the channel axis is always kept, unlike
+            `UCF_VIT.dataloaders.transform.Patchify.forward`'s per-sample
+            `C == 1` squeeze. `seq_size` is `[B, fixed_length]`
             (each region's side length along the taller axis -- regions
             aren't always square when `min_size` isn't, unlike
             `FixedQuadTree`'s leaves). `seq_pos` is `[B, fixed_length, 2]`

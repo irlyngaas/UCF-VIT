@@ -86,7 +86,7 @@ class _FakeMAEModel:
 def _conf(loss_fn, do_ap):
     return {
         "model": {"type": "MAE", "loss_fn": loss_fn},
-        "ap": {"do_ap": do_ap},
+        "ap": {"do_ap": do_ap, "do_gpu_ap": False},
         "data": {"patch_size": PATCH_SIZE, "twoD": True},
     }
 
@@ -167,7 +167,7 @@ NATIVE_RES_MASK = torch.tensor([[1.0, 0.0]])  # only the real (non-padding) patc
 def _native_res_conf(loss_fn):
     return {
         "model": {"type": "MAE", "loss_fn": loss_fn},
-        "ap": {"do_ap": True},
+        "ap": {"do_ap": True, "do_gpu_ap": False},
         "data": {"interp_size": NATIVE_RES_PATCH_SIZE, "twoD": True},
     }
 
@@ -227,7 +227,7 @@ class _FakeUNETRModel:
 
 
 def _unetr_conf(loss_fn):
-    return {"model": {"type": "UNETR", "loss_fn": loss_fn}, "ap": {"do_ap": False}}
+    return {"model": {"type": "UNETR", "loss_fn": loss_fn}, "ap": {"do_ap": False, "do_gpu_ap": False}}
 
 
 def test_forward_step_unetr_mse_regression_uses_plain_mse_not_dicece():

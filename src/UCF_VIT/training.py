@@ -111,9 +111,15 @@ def forward_step(conf, batch, model):
         For "VIT" and "UNETR": a tuple `(loss, output)`. For "SAP", "MAE", and
         "DiffusionVIT": just `loss`.
     """
+    # do_gpu_ap runs adaptive patching on-device inside the model's own
+    # forward() (given the raw image) instead of via a dataloader-supplied
+    # pre-patchified sequence -- dataloader_do_ap is "does the dataloader
+    # actually hand us batch['seq']/batch['seq_ps']", not just "is the model
+    # structured for adaptive patching" (that's conf["ap"]["do_ap"] alone).
+    dataloader_do_ap = conf["ap"]["do_ap"] and not conf["ap"]["do_gpu_ap"]
 
     if conf["model"]["type"] == "VIT":
-        if conf["ap"]["do_ap"]:
+        if dataloader_do_ap:
             output = model.forward(batch["seq"], batch["variables"], batch["seq_ps"])
         else:
             output = model.forward(batch["data"], batch["variables"], batch["seq_ps"])
@@ -121,8 +127,11 @@ def forward_step(conf, batch, model):
         loss = criterion(output, batch["label"])
 
         return loss, output
-    
+
     elif conf["model"]["type"] == "SAP":
+        # do_gpu_ap not yet supported here -- see parse.py's own assertion
+        # (native_resolution_dice_loss needs seq_ps outside forward(), which
+        # do_gpu_ap doesn't expose) -- always the dataloader-supplied path.
         output = model.forward(batch["seq"], batch["variables"], batch["seq_ps"])
         seq_size = batch["seq_ps"][..., 0]
         seq_pos = batch["seq_ps"][..., 1:]
@@ -130,6 +139,13 @@ def forward_step(conf, batch, model):
         return loss
 
     elif conf["model"]["type"] == "MAE":
+        # do_gpu_ap not yet supported here for *any* loss_fn -- see parse.py's
+        # own assertion. Every MAE loss variant reconstructs against the
+        # patchified sequence itself (batch["seq"], or patchify(batch["data"])
+        # in the non-adaptive case) as its target, which do_gpu_ap computes
+        # only *inside* forward() and never exposes back to this function --
+        # unlike VIT/UNETR, whose losses compare against batch["label"], a
+        # genuine external target unrelated to how the input got patchified.
         if conf["ap"]["do_ap"]:
             if conf["model"]["loss_fn"] == "MSE":
                 output, _ = model.forward(batch["seq"], batch["variables"], batch["seq_ps"])
@@ -171,10 +187,12 @@ def forward_step(conf, batch, model):
         return loss
 
     elif conf["model"]["type"] == "UNETR":
-        if conf["ap"]["do_ap"]:
+        if dataloader_do_ap:
             output = model.forward(batch["data"], batch["variables"], batch["seq_ps"], batch["seq"])
-
         else:
+            # Also covers do_gpu_ap:True -- UNETR.forward computes x_seq/
+            # seq_ps itself, on-device, from batch["data"] (the raw tile),
+            # when self.do_gpu_ap is set.
             output = model.forward(batch["data"], batch["variables"])
 
         if conf["model"]["loss_fn"] == "MSE":
@@ -212,15 +230,19 @@ def get_batch(conf, it_loader):
         "seq_pos", and "label"; entries not applicable to the current model
         type/adaptive-patching setting are set to None.
     """
+    # See forward_step's own dataloader_do_ap comment -- "does the dataloader
+    # actually hand us a pre-patchified sequence" (False for do_gpu_ap:True,
+    # even though the model is still structured for adaptive patching).
+    dataloader_do_ap = conf["ap"]["do_ap"] and not conf["ap"]["do_gpu_ap"]
     try:
         if conf["model"]["type"] in ["VIT", "UNETR", "SAP"]:
-            if conf["ap"]["do_ap"]:
+            if dataloader_do_ap:
                 data, seq, seq_size, seq_pos, label, variables, dict_key = next(it_loader)
             else:
                 data, label, variables, dict_key = next(it_loader)
 
         elif conf["model"]["type"] in ["MAE", "DiffusionVIT"]:
-            if conf["ap"]["do_ap"]:
+            if dataloader_do_ap:
                 data, seq, seq_size, seq_pos, variables, dict_key = next(it_loader)
             else:
                 data, variables, dict_key = next(it_loader)
@@ -262,9 +284,9 @@ def get_batch(conf, it_loader):
     return { "data": data,
              "variables": variables,
              "dict_key": dict_key,
-             "seq": seq if conf["ap"]["do_ap"] else None,
-             "seq_size": seq_size if conf["ap"]["do_ap"] else None,
-             "seq_pos": seq_pos if conf["ap"]["do_ap"] else None,
+             "seq": seq if dataloader_do_ap else None,
+             "seq_size": seq_size if dataloader_do_ap else None,
+             "seq_pos": seq_pos if dataloader_do_ap else None,
              "label": label if conf["dataloader"]["return_label"] else None,
            }
 
@@ -304,6 +326,15 @@ def process_batch(conf, it_loader, device, tensor_par_group, ddpm_scheduler):
         patching setting are set to None.
     """
     tensor_par_size = conf["parallelism"]["tensor_par_size"]
+    # See forward_step's own dataloader_do_ap comment. do_gpu_ap:True falls
+    # through to exactly the same branches as plain non-adaptive patching
+    # below (only `data`/`variables`/`label` need broadcasting across a
+    # tensor-parallel group) -- every rank in the group independently calls
+    # the model's own on-device patchify from its own (already-broadcast)
+    # copy of `data`, computing seq_ps internally, redundantly but
+    # deterministically identically, rather than the dataloader-supplied
+    # seq/seq_size/seq_pos this function would otherwise broadcast once.
+    dataloader_do_ap = conf["ap"]["do_ap"] and not conf["ap"]["do_gpu_ap"]
 
     if conf["trainer"]["data_type"] == "float32":
         precision_dt = torch.float32
@@ -313,7 +344,7 @@ def process_batch(conf, it_loader, device, tensor_par_group, ddpm_scheduler):
         raise RuntimeError("Data type not supported")
 
     if tensor_par_size == 1:
-        if conf["ap"]["do_ap"]:
+        if dataloader_do_ap:
             batch = get_batch(conf, it_loader)
             # .to(device) before .to(precision_dt): casting first would allocate a
             # fresh, unpinned CPU tensor whenever precision_dt differs from the
@@ -360,12 +391,12 @@ def process_batch(conf, it_loader, device, tensor_par_group, ddpm_scheduler):
         # `data` is always the pre-patchification image), not just when
         # do_ap is False.
         tile_size = conf["data"]["tile_size"]
-        if conf["ap"]["do_ap"]:
+        if dataloader_do_ap:
             fixed_length = conf["ap"]["fixed_length"]
             interp_size = conf["data"]["interp_size"]
             separate_channels = conf["ap"]["separate_channels"]
 
-        if conf["ap"]["do_ap"]:
+        if dataloader_do_ap:
             if dist.get_rank(tensor_par_group) == 0:
                 batch = get_batch(conf, it_loader)
                 # .to(device) before .to(precision_dt), non_blocking=True
@@ -547,7 +578,7 @@ def process_batch(conf, it_loader, device, tensor_par_group, ddpm_scheduler):
                 dist.broadcast(e, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
 
     #Convert seq_size and seq_pos to form used for adaptive position embedding
-    if conf["ap"]["do_ap"]:
+    if dataloader_do_ap:
         if conf["ap"]["separate_channels"]:
             #TODO: Move seq_size and seq_pos to a single channel
             seq_ps = None
@@ -570,8 +601,8 @@ def process_batch(conf, it_loader, device, tensor_par_group, ddpm_scheduler):
     return { "data": data,
              "variables": variables,
              "dict_key": dict_key,
-             "seq": seq if conf["ap"]["do_ap"] else None,
-             "seq_ps": seq_ps if conf["ap"]["do_ap"] else None,
+             "seq": seq if dataloader_do_ap else None,
+             "seq_ps": seq_ps if dataloader_do_ap else None,
              "label": label if conf["dataloader"]["return_label"] else None,
              "t": t if conf["model"]["type"] == "DiffusionVIT" else None,
              "e": e if conf["model"]["type"] == "DiffusionVIT" else None,

@@ -26,6 +26,7 @@ import torch.distributed as dist
 
 from UCF_VIT.utils.dist_functions import F_Identity_B_Broadcast,F_Broadcast_B_Identity, F_Identity_B_AllReduce
 from UCF_VIT.utils.fused_attn import FusedAttn
+from UCF_VIT.model.gpu_adaptive_patching import GPUPatchify2D
 
 from einops import rearrange
 
@@ -179,6 +180,8 @@ class VIT(nn.Module):
             twoD: Optional[bool] = True,
             adaptive_patching: Optional[bool] = False,
             fixed_length: Optional[int] = 4096,
+            do_gpu_ap: bool = False,
+            gpu_ap_min_size: int = 2,
             default_vars: List = None,
             use_varemb: bool = False,
             default_time_offsets: List = None,
@@ -232,6 +235,20 @@ class VIT(nn.Module):
             twoD: Variable for indicating two or three dimensionsal input, if False, three dimensional input.
             adaptive_patching: Whether to use adaptive patching
             fixed_length: Length for adaptive patches, only used if adative_patching=True
+            do_gpu_ap: Whether adaptive patching happens on-device inside
+                `forward()` (`UCF_VIT.model.gpu_adaptive_patching.
+                GPUPatchify2D`, given the raw image) instead of in the
+                dataloader (`UCF_VIT.dataloaders.transform.Patchify`,
+                already-patchified sequence handed to `forward()`).
+                Requires `adaptive_patching` and `twoD` (`GPUPatchify2D` is
+                2D-only for now) -- everything *downstream* of tokenization
+                (per-variable embedding, `aggregate_variables`, `_pos_embed`)
+                is identical either way, only *where* the patchify
+                computation happens changes. `False` (the default, and
+                every config without this) leaves the existing CPU/
+                dataloader-side path completely unaffected.
+            gpu_ap_min_size: `GPUPatchify2D`'s finest block side length.
+                Only used when `do_gpu_ap` is True.
             default_vars: List of different potential modalities to be used as input.
             use_varemb: Whether to use variable embedding tokens as an additional learnable parameter
             default_time_offsets: "sst" time-stepping only -- sorted list of every
@@ -286,6 +303,10 @@ class VIT(nn.Module):
         self.depth = depth
         self.adaptive_patching = adaptive_patching
         self.fixed_length = fixed_length
+        self.do_gpu_ap = do_gpu_ap
+        if self.do_gpu_ap:
+            assert self.adaptive_patching, "do_gpu_ap requires adaptive_patching"
+            assert self.twoD, "do_gpu_ap (GPUPatchify2D) is 2D-only for now -- 3D generalization not implemented yet"
         self.default_vars = default_vars
         self.use_varemb = use_varemb
         self.aggregated_variables = 1 #Change this to an argument when adding different variable aggregation strategies
@@ -303,6 +324,12 @@ class VIT(nn.Module):
 
         if self.adaptive_patching:
             assert self.interp_size is not None, "interp_size is required when adaptive_patching is turned on"
+
+        if self.do_gpu_ap:
+            self.gpu_patchify = GPUPatchify2D(
+                img_size=img_size, fixed_length=self.fixed_length,
+                interp_size=self.interp_size, min_size=gpu_ap_min_size,
+            )
 
         #ASSUMES INPUT HAS ALREADY BEEN ADAPTIVELY PATCHED
         if self.adaptive_patching:
@@ -740,6 +767,33 @@ class VIT(nn.Module):
         x = x + time_embed.unsqueeze(2)  # 1, T, D -> 1, T, 1, D
         return self.aggregate_times(x)  # B, L, D
 
+    def _maybe_gpu_patchify(self, x: torch.Tensor):
+        """Adaptively patchifies `x` on-device via `self.gpu_patchify`, when `self.do_gpu_ap` is set.
+
+        Shared by every subclass's own `forward()` (`VIT`/`SAP` via
+        inheritance, `MAE`, `UNETR`) so each just calls this once, at the
+        top, instead of reimplementing the same dispatch -- see
+        `do_gpu_ap`'s own docstring entry in `__init__`.
+
+        Args:
+            x: Raw input tensor, shape (B, C, H, W).
+
+        Returns:
+            `(x_seq, seq_ps)` when `self.do_gpu_ap` is True -- `x_seq`
+            matches the CPU-patchified sequence's own shape contract
+            (`UCF_VIT.dataloaders.transform.Patchify`), and `seq_ps` is
+            built from `GPUPatchify2D`'s own `seq_size`/`seq_pos` exactly
+            like `UCF_VIT.training.process_batch` builds it for the CPU
+            path (`cat([size.unsqueeze(-1), pos], dim=-1)`). `(None, None)`
+            when `self.do_gpu_ap` is False -- callers should use whatever
+            `x_seq`/`seq_ps` they were already given in that case.
+        """
+        if not self.do_gpu_ap:
+            return None, None
+        seq_img, seq_size, seq_pos = self.gpu_patchify(x)
+        seq_ps = torch.cat([seq_size.unsqueeze(-1), seq_pos], dim=-1)
+        return seq_img, seq_ps
+
     def forward_features(self, x: torch.Tensor, variables, seq_ps) -> torch.Tensor:
         """Embeds patches/tokens, adds positional embeddings, and runs them through the transformer encoder.
 
@@ -840,14 +894,20 @@ class VIT(nn.Module):
         """Runs the full encoder + classification head forward pass.
 
         Args:
-            x: Input patch/pixel tensor.
+            x: Input patch/pixel tensor -- the raw image when `self.
+                do_gpu_ap` is True (patchified on-device below), otherwise
+                a raw image (non-adaptive) or an already-patchified
+                sequence (CPU/dataloader-side adaptive patching).
             variables: Variable/channel names for `x`.
             seq_ps: Per-patch size/position tensor for adaptive positional
-                embeddings.
+                embeddings; ignored (and recomputed) when `self.do_gpu_ap`
+                is True.
 
         Returns:
             Classification logits, shape (B, num_classes).
         """
+        if self.do_gpu_ap:
+            x, seq_ps = self._maybe_gpu_patchify(x)
         x = self.forward_features(x, variables, seq_ps)
         x = self.forward_head(x)
         return x
@@ -1265,16 +1325,22 @@ class MAE(VIT):
         """Runs the full masked-autoencoding forward pass: mask, encode, decode/reconstruct.
 
         Args:
-            x: Input patch/pixel tensor.
+            x: Input patch/pixel tensor -- the raw image when `self.
+                do_gpu_ap` is True (patchified on-device below), otherwise
+                a raw image (non-adaptive) or an already-patchified
+                sequence (CPU/dataloader-side adaptive patching).
             variables: Variable/channel names for `x`.
             seq_ps: Per-patch size/position tensor for adaptive positional
-                embeddings.
+                embeddings; ignored (and recomputed) when `self.do_gpu_ap`
+                is True.
 
         Returns:
             A tuple `(x, mask)`: `x` is the reconstructed per-patch pixel values
             and `mask` is the binary mask (0=kept, 1=masked) in original token
             order.
         """
+        if self.do_gpu_ap:
+            x, seq_ps = self._maybe_gpu_patchify(x)
         x, mask, ids_restore = self.forward_features(x, variables, seq_ps)
         x = self.forward_head(x, ids_restore, seq_ps)
         return x, mask
@@ -2045,10 +2111,14 @@ class UNETR(VIT):
                 embeddings.
             x_seq: Pre-tokenized adaptive-patch sequence, used as the transformer
                 input instead of `x` when `self.adaptive_patching` is True.
+                Ignored (and recomputed from `x` on-device) when `self.
+                do_gpu_ap` is True.
 
         Returns:
             Per-class segmentation logits, shape (B, num_classes, H, W[, D]).
         """
+        if self.do_gpu_ap:
+            x_seq, seq_ps = self._maybe_gpu_patchify(x)
         if self.adaptive_patching:
             if self.skip_connection:
                 enc1 = self.encoder1(x)

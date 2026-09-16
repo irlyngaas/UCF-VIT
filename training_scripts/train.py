@@ -182,7 +182,12 @@ def main():
                 batches_per_rank_epoch = batches_per_rank_epoch,
                 div = conf["tiling"]["div"],
                 tile_overlap = conf["tiling"]["tile_overlap"],
-                adaptive_patching = conf["ap"]["do_ap"],
+                # do_gpu_ap runs adaptive patching on-device inside the
+                # model's forward() -- the dataloader must behave
+                # non-adaptively in that case (same as do_ap:False), same
+                # as UCF_VIT.training.get_batch/process_batch's own
+                # do_ap-and-not-do_gpu_ap dispatch.
+                adaptive_patching = conf["ap"]["do_ap"] and not conf["ap"]["do_gpu_ap"],
                 fixed_length = conf["ap"]["fixed_length"],
                 separate_channels = conf["ap"]["separate_channels"],
                 data_par_size = conf["parallelism"]["data_par_size"],

@@ -68,7 +68,7 @@ class _FakeMAEModel:
 def _conf(loss_fn="MSE"):
     return {
         "model": {"type": "MAE", "loss_fn": loss_fn},
-        "ap": {"do_ap": False},
+        "ap": {"do_ap": False, "do_gpu_ap": False},
         "data": {"patch_size": PATCH_SIZE, "twoD": True, "dataset": "basic_ct", "num_channels": {"ct1": 1}, "tile_size": (4, 4)},
         "dataloader": {"return_label": False, "batch_size": 1},
         "parallelism": {"tensor_par_size": 1},

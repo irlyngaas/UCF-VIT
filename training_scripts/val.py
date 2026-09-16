@@ -111,7 +111,7 @@ def main():
                 batches_per_rank_epoch = batches_per_rank_epoch,
                 div = val_conf["tiling"]["div"],
                 tile_overlap = val_conf["tiling"]["tile_overlap"],
-                adaptive_patching = val_conf["ap"]["do_ap"],
+                adaptive_patching = val_conf["ap"]["do_ap"] and not val_conf["ap"]["do_gpu_ap"],
                 fixed_length = val_conf["ap"]["fixed_length"],
                 separate_channels = val_conf["ap"]["separate_channels"],
                 data_par_size = val_conf["parallelism"]["data_par_size"],

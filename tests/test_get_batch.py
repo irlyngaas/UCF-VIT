@@ -29,7 +29,7 @@ from UCF_VIT.training import get_batch
 def _conf(num_workers, model_type="MAE", do_ap=False):
     return {
         "model": {"type": model_type},
-        "ap": {"do_ap": do_ap},
+        "ap": {"do_ap": do_ap, "do_gpu_ap": False},
         "dataloader": {"num_workers": num_workers, "return_label": False},
     }
 

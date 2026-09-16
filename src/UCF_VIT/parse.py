@@ -649,20 +649,32 @@ def parse_config(args, load_balance_offline=False):
     #TODO: Add checking on each argument, e.g. > 0
     try:
         do_ap = conf['ap']['do_ap']
+        # do_gpu_ap: adaptive patching runs on-device inside the model's own
+        # forward() (UCF_VIT.model.gpu_adaptive_patching.GPUPatchify2D, given
+        # the raw image) instead of in the dataloader (Patchify/Patchify_3D,
+        # already-patchified sequence). Requires do_ap (the model still needs
+        # to be *structured* for adaptive patching either way) -- see
+        # arch.py's own do_gpu_ap docstring entry for the full design.
+        do_gpu_ap = conf['ap'].get('do_gpu_ap', False) if do_ap else False
         ap_conf = {
             "do_ap": do_ap,
             "fixed_length": conf['ap']['fixed_length'] if do_ap else None,
             "separate_channels": conf['ap']['separate_channels'] if do_ap else False,
             "use_adaptive_pos_emb": conf['ap']['use_adaptive_pos_emb'] if do_ap else False,
+            "do_gpu_ap": do_gpu_ap,
+            "gpu_ap_min_size": conf['ap'].get('gpu_ap_min_size', 2) if do_gpu_ap else None,
         }
     except KeyError:
         if dist.get_rank() == 0:
             print("Since no ap_conf was given in the config file, this is defaulting to be ran with standard patching")
-        ap_conf = {"do_ap": False, "fixed_length": None, "separate_channels": False, "use_adaptive_pos_emb": False}
+        ap_conf = {"do_ap": False, "fixed_length": None, "separate_channels": False, "use_adaptive_pos_emb": False, "do_gpu_ap": False, "gpu_ap_min_size": None}
 
     if ap_conf["do_ap"]:
         if ap_conf["separate_channels"]:
             assert not ap_conf["use_adaptive_pos_emb"], "Capability to use separate channels and adaptive pos_emb not implemented yet"
+
+        if ap_conf["do_gpu_ap"]:
+            assert not ap_conf["separate_channels"], "do_gpu_ap (GPUPatchify2D) does not support separate_channels yet"
             
 # ---------------------------- DATA ----------------------------------------------
     #TODO: Add checking on each argument, e.g. > 0
@@ -884,10 +896,55 @@ def parse_config(args, load_balance_offline=False):
             p2 = is_power_of_two(tile_size[i])
             assert p2, f"Tile Size in the {i} dimension must be a power of 2"
 
-        if twoD:
+        if ap_conf["do_gpu_ap"]:
+            assert twoD, "do_gpu_ap (GPUPatchify2D) is 2D-only for now -- 3D generalization not implemented yet"
+            # Mirrors GPUPatchify2D.__init__'s own identical computation: the
+            # real level-0 grid run_merge_batch operates on is the *padded*
+            # grid, not tile_size[0] // gpu_ap_min_size directly -- whenever
+            # tile_size isn't already a multiple of the coarsest block size,
+            # padding grows the real block count (this is normally a no-op
+            # since tile_size and the default gpu_ap_min_size=2 are both
+            # powers of 2, but a non-power-of-2 gpu_ap_min_size would
+            # otherwise make this check silently disagree with the real
+            # module and either wrongly reject or wrongly allow a config).
+            max_blocks = tile_size[0] // ap_conf["gpu_ap_min_size"]
+            max_level = int(math.floor(math.log2(max_blocks))) if max_blocks >= 1 else 0
+            pad_bh = ap_conf["gpu_ap_min_size"] * (2 ** max_level)
+            padded_h = -(-tile_size[0] // pad_bh) * pad_bh
+            real_max_blocks = padded_h // ap_conf["gpu_ap_min_size"]
+            initial_leaves = real_max_blocks ** 2
+            assert (initial_leaves - ap_conf["fixed_length"]) % 3 == 0, (
+                f"ap.fixed_length ({ap_conf['fixed_length']}) must satisfy "
+                f"(real_max_blocks**2 - fixed_length) % 3 == 0 for GPUPatchify2D's bottom-up merge "
+                f"-- real_max_blocks**2 is {initial_leaves} here (tile_size[0] {tile_size[0]} padded "
+                f"to a multiple of {pad_bh}, ap.gpu_ap_min_size {ap_conf['gpu_ap_min_size']}). See "
+                "GPUPatchify2D.__init__'s own identical assertion for why."
+            )
+        elif twoD:
             assert ap_conf["fixed_length"] % 3 == 1 % 3, "Quadtree fixed length needs to be 3n+1, where n is some integer"
         else:
             assert ap_conf["fixed_length"] % 7 == 1 % 7, "Octtree fixed length needs to be 7n+1, where n is some integer"
+
+        # SAP's loss (native_resolution_dice_loss) always needs seq_ps outside
+        # the model's forward() -- do_gpu_ap computes seq_ps *inside*
+        # forward() and doesn't return it, so this combination isn't wired up
+        # yet (a real, still-open design question -- extend forward()'s
+        # return signature, or have forward_step call the GPU patchify itself
+        # -- not decided).
+        assert not (ap_conf["do_gpu_ap"] and model_type == "SAP"), (
+            "do_gpu_ap is not yet supported for SAP -- its loss needs seq_ps "
+            "outside the model's forward(), which do_gpu_ap doesn't expose."
+        )
+        # Same reason, same open question -- *every* MAE loss variant
+        # reconstructs against the patchified sequence itself as its target
+        # (not just nativeResMSE/nativeResMaskMSE), which also needs exposing
+        # outside forward(); do_gpu_ap doesn't expose it for any of them.
+        assert not (ap_conf["do_gpu_ap"] and model_type == "MAE"), (
+            "do_gpu_ap is not yet supported for MAE (any loss_fn) -- its "
+            "reconstruction target is the patchified sequence itself, which "
+            "needs to be visible outside the model's forward(), and "
+            "do_gpu_ap doesn't expose it."
+        )
 
         # Only SAP's mask_head needs fixed_length to be an exact square/cube (UNETR's proj_feat doesn't).
         if model_type == "SAP":

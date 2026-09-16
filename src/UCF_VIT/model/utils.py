@@ -249,6 +249,11 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
         use_timeemb=bool(conf["model"]["use_channel_aggregation"] and conf["data"].get("time_offsets") and len(conf["data"]["time_offsets"]) > 1),
         adaptive_patching=conf["ap"]["do_ap"],
         fixed_length=conf["ap"]["fixed_length"],
+        # "sst"/2D-only currently -- see arch.py's own do_gpu_ap docstring
+        # entry. False (default) for every config without this leaves the
+        # existing CPU/dataloader-side adaptive-patching path unaffected.
+        do_gpu_ap=conf["ap"]["do_gpu_ap"],
+        gpu_ap_min_size=conf["ap"]["gpu_ap_min_size"] or 2,
         FusedAttn_option=FusedAttn_option,
         use_adaptive_pos_emb=conf["ap"]["use_adaptive_pos_emb"],
         weight_init='' if conf["model"]["type"] == "VIT" else 'skip', #Choose ['' or 'skip'] If using VIT use '' otherwise use 'skip'. Option whether to use VITs weight initialization or use the one corresponding to the architecture you choose
