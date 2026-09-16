@@ -4987,3 +4987,120 @@ Gumbel-softmax-based differentiable edge-map work discussed at length in
 this same conversation -- those depend on the user's own existing
 level-parallel GPU implementation (kept elsewhere, not yet in this repo)
 being shared/ported in before any of that can actually be built here.
+
+## Ported the GPU/level-parallel adaptive patching core module (`GPUPatchify2D`), Stage 1 of that follow-up
+
+The user's own level-parallel GPU implementation, read directly from its
+real location (`~/bayes-cast/src/climate_learn/models/hub/components/
+adaptive_patching_vectorized.py`, plus `edm.py` for the calling convention),
+turned out to be a genuinely different algorithm from `FixedOctTree`/
+`FixedQuadTree`, not a GPU port of the same one -- confirmed by reading it
+in full (953 lines) rather than assuming from the name:
+
+- **UCF-VIT-claude (top-down split):** grow from 1 root node, splitting the
+  highest-*edge-density* node each time, up to `fixed_length`.
+- **bayes-cast (bottom-up, level-parallel merge):** shrink from the finest
+  possible grid, merging the 4 children with the lowest *merge cost*
+  (variance/SSE-based -- how much block-uniformity information would be
+  lost by flattening 4 children into 1 parent) into their parent each time,
+  down to exactly `fixed_length`. Every iteration considers *every*
+  mergeable candidate across every level and every image in the batch at
+  once (`torch.topk` + a vectorized per-image cumsum budget check) -- no
+  Python loop over nodes or images in the hot path.
+- Confirmed (background-agent grep across the whole `bayes-cast` repo, not
+  assumed) this is 2D-only everywhere -- no octree/volumetric/3D adaptive
+  patching exists there at all. Decided with the user: port 2D first,
+  generalize to 3D (needed for `sst`) as a separate follow-up -- this entry
+  covers only the 2D core module, not yet wired into any model/config.
+
+Researched (real web search, not assumed from training data) the
+region-detection backend question: `kornia.contrib.connected_components`
+(bayes-cast's own optional GPU-native alternative to its default
+`scipy.ndimage.label`) takes a `[1,1,H,W]` image-shaped input with no 3D
+equivalent -- confirmed it would only ever help the 2D case, never `sst`.
+`cupyx.scipy.ndimage.label` (CuPy's GPU port of `scipy.ndimage.label`) is
+the better fit for this project specifically: it mirrors scipy's own
+N-D-capable API (3D "just works" later, no separate 3D implementation
+needed) *and* has official ROCm support (`cupy-rocm-7-0` on PyPI), matching
+this codebase's real AMD (Frontier) target -- unlike kornia (2D-only
+regardless of GPU vendor) or cuCIM (RAPIDS/NVIDIA-only). Not implemented
+yet; `scipy.ndimage.label` (already a dependency, correctness reference) is
+what `GPUPatchify2D._detect_regions` uses now, structured so swapping in
+`cupyx` later only touches that one method.
+
+Added `src/UCF_VIT/model/gpu_adaptive_patching.py` (model-side, not
+dataloader-side, since this is meant to run inside a model's `forward()` --
+see the still-deferred wiring step below), a faithful port of the core
+algorithm (`_pad_tensor`, `_compute_all_levels_batch`/`_compute_level_
+stats_batch`, `_border_mask`, `RegionTensors`/`_labeled_to_region_tensors`/
+`_detect_regions`, `run_merge_batch`, `_serialize_batch`) -- deliberately
+skipping `_detect_regions_kornia` (not a dependency here), the single-image/
+EDM-temporal-history variants (`run_merge`, `_serialize_batch_time`,
+`forward_single`), and `_deserialize_batch` (confirmed by reading `UNETR.
+proj_feat`/`_adaptive_token_grid_index` in `arch.py` that this codebase's
+own decoder-side reconstruction is already generic over any `seq_ps`
+source, so it isn't needed once this is wired into `UNETR` -- a follow-up
+step, not this one). Also skipped the `device.type in ('cuda','hip')` /
+external `merge_ops` custom-CUDA-kernel branch in bayes-cast's own
+`forward_batch` -- it references a package that isn't part of `bayes-cast`
+itself, and in the source is immediately followed by an unconditional
+second call to the plain-torch `run_merge_batch` regardless of which branch
+ran, which looks like leftover/WIP code, not something to faithfully
+replicate.
+
+Added a real, load-bearing correctness check while designing this that the
+reference implementation doesn't have: `_serialize_batch` assumes every
+image in a batch lands on exactly the same region count (`N = all_regions
+[0].N`, used to size the one whole-batch `grid_sample` call), which
+`run_merge_batch`'s stopping condition (each merge removes exactly 3
+leaves) only guarantees when `(max_blocks**2 - fixed_length) % 3 == 0`.
+Added this as an explicit, clearly-worded assertion in `GPUPatchify2D.
+__init__` -- mirrors the existing `fixed_length % 3 == 1 % 3` / `% 7 == 1 %
+7` congruence assertions already in `parse.py` for the CPU quadtree/octree
+(same modulus for the 2D case, different reference point: CPU checks
+growth-from-1, this checks shrinkage-from-`max_blocks**2`).
+
+#### Found and fixed a real row/column transpose bug -- present in the reference implementation, not introduced by this port
+
+Writing real, position-aware tests for `_serialize_batch` (not just shape
+checks) caught a genuine coordinate-axis bug: `RegionTensors.x0s`/`x1s` are
+column (W-axis) bounds and `y0s`/`y1s` are row (H-axis) bounds (unambiguous
+from `_labeled_to_region_tensors`'s own `row_idx`/`col_idx` construction),
+but the original `_serialize_batch` normalized the column bounds by `H`
+(not `W`) and the row bounds by `W` (not `H`), then fed the row-derived
+values into `grid_sample`'s x/width channel and the column-derived values
+into its y/height channel -- a genuine transpose of the extracted region
+relative to the real detected bbox. Numerically silent on a square image
+(no out-of-range error, since both axes share one denominator range), which
+is exactly why a real multi-quadrant, *distinctly-valued* test caught it
+immediately (`test_serialize_batch_extracts_each_regions_true_content`
+failed with the *wrong quadrant's* value, not a shape or NaN error) where a
+generic shape-only test would have passed silently. Fixed by normalizing
+each bound by its own true axis extent and assigning `grid_x`/`grid_y` to
+their real matching channel; added a dedicated non-square regression test
+(`test_serialize_batch_non_square_image_does_not_transpose_regions`) since
+a rectangular image is the one case where the wrong denominator alone
+(independent of the axis swap) would also produce a visibly wrong value,
+not just a transposed position -- confirming both halves of the fix, not
+just the one the first failure happened to surface.
+
+**Tier 1 coverage** (`tests/model/test_gpu_adaptive_patching.py`, new file,
+10 tests, runs fully on CPU here -- no CUDA, no dataset-specific
+dependency): padding (aligned and needs-padding cases), the `fixed_length`
+congruence assertion (valid and invalid), the non-square `H > W` rejection,
+merge cost being exactly 0 for a flat region and strictly positive for a
+deterministic step-edge (not noise -- see that test's own docstring for why
+noise is a bad choice here: unbiased variance's `n-1` correction can make a
+genuinely-detailed small block's SSE come out *below* its children's summed
+SSE purely from the denominator differing by block size, an occasional
+real, surprising property of this cost formula caught by hand-checking
+values directly, not a bug), per-image-independent convergence to
+`fixed_length` in a mixed-content batch, and the two `_serialize_batch`
+regression tests above (single- and multi-channel, square and non-square).
+
+**Explicitly not done yet** (tracked in the approved plan at
+`~/.claude/plans/swirling-crunching-widget.md`): wiring `GPUPatchify2D` into
+`VIT`/`UNETR`'s `forward()` behind a new `ap.do_gpu_ap` flag, `parse.py`
+validation, `training.py`'s calling convention, the pluggable Canny-vs-
+variance scoring option (both CPU and GPU sides), the 3D generalization
+itself, and the `cupyx.scipy.ndimage.label` region-detection upgrade.
