@@ -1,3 +1,6 @@
+import heapq
+import itertools
+
 import numpy as np
 import torch
 import cv2 as cv
@@ -255,29 +258,37 @@ class FixedQuadTree:
         Populates `self.nodes` as a list of `[Rect, edge_density_score]` pairs.
         Stops early if the highest-scoring node's side length has shrunk to 2 (it
         can't be evenly halved further).
+
+        Uses a heap (keyed on the negated score, so the max is always
+        `heap[0]`) to pick which node to split each iteration -- see
+        `FixedOctTree._build_tree`'s identical comment (same pattern, 4-way
+        split instead of 8-way) for why this replaces an O(fixed_length^2)
+        list-scan approach with O(fixed_length log fixed_length).
         """
 
         h,w = self.domain.shape
         assert h>0 and w >0, "Wrong img size."
         root = Rect(0,w,0,h)
-        self.nodes = [[root, root.contains(self.domain)]]
-        while len(self.nodes)<self.fixed_length:
-            bbox, value = max(self.nodes, key=lambda x:x[1])
-            idx = self.nodes.index([bbox, value])
+        tiebreak = itertools.count()
+        heap = [(-root.contains(self.domain), next(tiebreak), root)]
+        count = 1
+        while count < self.fixed_length:
+            neg_value, _, bbox = heap[0]
             if bbox.get_size()[0] == 2:
                 break
+            heapq.heappop(heap)
 
             x1,x2,y1,y2 = bbox.get_coord()
             lt = Rect(x1, int((x1+x2)/2), int((y1+y2)/2), y2)
-            v1 = lt.contains(self.domain)
             rt = Rect(int((x1+x2)/2), x2, int((y1+y2)/2), y2)
-            v2 = rt.contains(self.domain)
             lb = Rect(x1, int((x1+x2)/2), y1, int((y1+y2)/2))
-            v3 = lb.contains(self.domain)
             rb = Rect(int((x1+x2)/2), x2, y1, int((y1+y2)/2))
-            v4 = rb.contains(self.domain)
-            
-            self.nodes = self.nodes[:idx] + [[lt,v1], [rt,v2], [lb,v3], [rb,v4]] +  self.nodes[idx+1:]
+
+            for child in (lt, rt, lb, rb):
+                heapq.heappush(heap, (-child.contains(self.domain), next(tiebreak), child))
+            count += 3  # -1 (popped parent) + 4 (pushed children)
+
+        self.nodes = [[bbox, -neg_value] for neg_value, _, bbox in heap]
 
             # print([v for _,v in self.nodes])
             

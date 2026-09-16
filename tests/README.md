@@ -4925,3 +4925,65 @@ touched) -- a real Frontier comparison across a few `num_workers` values,
 with `profile_dataloader:True` on to see `data_time` actually drop, is the
 natural next real-data experiment once the timing pieces above are
 confirmed working.
+
+## Fixed a real O(N^2) inefficiency in `FixedOctTree`/`FixedQuadTree`'s node selection
+
+Discussed and confirmed (both by direct code reading and by profiling) in
+the same conversation as the two diagnostics above: `FixedOctTree.
+_build_tree` (`octree.py`) and `FixedQuadTree._build_tree` (`quadtree.py`)
+both grew a plain Python list of `[node, score]` pairs and, every one of
+the O(fixed_length) iterations, did a `max(self.nodes, key=...)` scan
+(O(N)), a redundant `.index()` re-scan to relocate that same max (O(N)),
+and rebuilt the whole list via slicing (`nodes[:idx] + [...] +
+nodes[idx+1:]`, another O(N), copies nearly the whole list) -- three
+separate O(N) operations per iteration, giving O(fixed_length^2) overall.
+Confirmed empirically before touching the code: doubling `fixed_length`
+cost ~3.3-4x the wall time on the original implementation (matches
+O(N^2)), and profiling attributed 93% of total time to these three
+bookkeeping operations (vs. the real per-child `contains()` numpy work) at
+`fixed_length=14337`, up from 45% at `fixed_length=3585` -- the bigger
+`fixed_length` gets, the more this dominates over the "real" work.
+
+Fixed by replacing the list-based selection with a `heapq` max-heap (keyed
+on the negated score) in both files -- `heappop`/`heappush` are O(log N),
+so the whole build is now O(fixed_length log fixed_length). A plain
+`itertools.count()` tie-breaker in each heap entry means `heapq` never
+needs to compare `Cube`/`Rect` objects directly (no `__lt__` added to
+either). `self.nodes` is only ever materialized once, at the very end,
+by draining whatever's left in the heap (every node that got popped-and-
+split was already replaced by its children in the heap, so whatever
+remains *is* exactly the final leaf set) -- no per-iteration list mutation
+at all.
+
+Confirmed on the real, committed code (not just a throwaway prototype):
+doubling `fixed_length` now costs ~1.9-2.0x the wall time (matching
+O(N log N)), not the ~3.3-4x measured before. Absolute numbers at
+`fixed_length=28673`/`28801`: `FixedOctTree` **2.89s -> 0.16s (~18x
+faster)**, `FixedQuadTree` **6.70s -> 0.18s (~37x faster)**.
+
+Nothing about the node-selection *outcome* changed -- still always splits
+the true highest-scoring current leaf, same stopping condition (a node
+whose side length has shrunk to 2), same total-volume/-area conservation.
+Only the final iteration order of `self.nodes` can differ from before
+(the heap doesn't drain in the same order the old list-slicing happened
+to produce) -- confirmed this doesn't matter to any consumer:
+`serialize`/`deserialize` (octree.py) and `encode_nodes`/`decoder_nodes`
+(quadtree.py) only ever read `self.nodes` by walking it in whatever order
+it's actually in, never assume a specific one, and no existing test
+asserts an exact node ordering (`test_fixedquadtree_encode_decode_
+roundtrip` compares two trees' orders *against each other*, not against a
+hardcoded sequence, and passes unchanged since it only needs encode/decode
+to preserve whatever order `self.nodes` ends up in).
+
+**Tier 1 coverage:** all 16 existing tests in `tests/dataloaders/
+test_octree.py`/`test_quadtree.py` passed unchanged against the rewrite
+with no test changes needed -- they already checked node count, total
+volume/area, and (sorted, order-independent) node sizes, which is exactly
+the right invariant set for a change that's meant to alter performance,
+not behavior.
+
+**Not done in this session:** the GPU/level-parallel tree construction and
+Gumbel-softmax-based differentiable edge-map work discussed at length in
+this same conversation -- those depend on the user's own existing
+level-parallel GPU implementation (kept elsewhere, not yet in this repo)
+being shared/ported in before any of that can actually be built here.
