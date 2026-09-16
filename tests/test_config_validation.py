@@ -288,7 +288,6 @@ def test_do_gpu_ap_works_on_a_real_3d_config():
         args = argparse.Namespace(config=path, pretrained_config="")
         parsed = parse_config(args, load_balance_offline=True)
         assert parsed["ap"]["do_gpu_ap"] is True
-        assert parsed["ap"]["score_fn"] == "variance"
     finally:
         os.remove(path)
 

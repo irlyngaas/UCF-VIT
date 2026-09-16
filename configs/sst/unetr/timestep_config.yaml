@@ -114,6 +114,13 @@ ap:
   separate_channels: False
   use_adaptive_pos_emb: True
   interp_size: 32 # Only used when do_ap:True; not used by this baseline (do_ap:False) -- shown here so it's easy to find if you turn adaptive patching on.
+  do_gpu_ap: False # Whether adaptive patching runs on-device inside the model's forward() (UCF_VIT.model.gpu_adaptive_patching.GPUPatchify2D/GPUPatchify3D, dispatched on data.twoD) instead of in the dataloader; only used when do_ap:True. Not used here (do_gpu_ap:False) -- shown so it's easy to find if you turn it on.
+  gpu_ap_min_size: 2 # Finest block side length (level 0) for GPUPatchify2D/GPUPatchify3D. Only used when do_gpu_ap:True.
+  score_fn: canny # "canny" (edge-density) or "variance" -- scoring measure deciding where to concentrate patches, shared by the CPU (Patchify/Patchify_3D) and GPU (GPUPatchify2D/GPUPatchify3D) adaptive-patching paths. Only used when do_ap:True.
+  canny_sigma: 1.0 # Gaussian smoothing sigma before gradient computation, GPU path only. Only used when do_gpu_ap:True and score_fn:"canny".
+  canny_low_threshold: 0.1 # Lower ("weak" edge) gradient-magnitude threshold, GPU path only. Only used when do_gpu_ap:True and score_fn:"canny".
+  canny_high_threshold: 0.2 # Upper ("strong" edge) gradient-magnitude threshold, GPU path only. Only used when do_gpu_ap:True and score_fn:"canny".
+  canny_hysteresis_iters: 2 # Binary-dilation passes approximating hysteresis edge-linking, GPU path only. Only used when do_gpu_ap:True and score_fn:"canny".
 
 # ---------------------------- DATA ----------------------------------------------
 data:

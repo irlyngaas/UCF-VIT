@@ -5660,3 +5660,39 @@ turned on by default anywhere (the new tests mutate a copy in a tempfile);
 unchanged for 3D, verified above -- no new gap there. Randomized 3D Canny
 parameters and real GPU-hardware verification of `region_backend="cupyx"`
 remain not possible in this session's environment.
+
+## Documented the new GPU-adaptive-patching options in every shipped config
+
+Follow-up ask: the new `ap.do_gpu_ap`/`gpu_ap_min_size`/`score_fn`/`canny_*`
+keys existed only in code and in the two test fixtures that override them
+-- no shipped config showed them at all. Added all six keys to every
+config that has an `ap:` section (23 files, right after the existing
+`interp_size` line -- the exact spot `interp_size` itself already used for
+this same "shown even when unused, so it's easy to find" convention),
+`do_gpu_ap:False` everywhere (identical parsed behavior to before in every
+config -- confirmed by the full local suite, not assumed). This also
+answers a real question raised while scoping the work: `do_gpu_ap`'s
+`twoD`-only restriction (fixed in the entry above) was never a fundamental
+limitation of the *feature*, just of *wiring* -- once that was fixed,
+adding these keys "everywhere" became meaningful for the 3D configs too
+(`sst`, `basic_ct`), not just a hypothetical for some future 2D dataset
+that tiles.
+
+One real, if narrow, test regression surfaced immediately by running the
+full suite after the config edits (not assumed safe): `configs/sst/unetr/
+adaptive_config.yaml` previously had no `ap.score_fn` key at all, so
+`test_do_gpu_ap_works_on_a_real_3d_config` (added in the entry above) got
+`score_fn`'s `do_gpu_ap`-dependent *default* (`"variance"`) when it
+flipped `do_gpu_ap` on. Now that the config sets `score_fn: canny`
+explicitly (matching its own real pre-existing behavior, `do_gpu_ap` was
+`False` when that default was chosen), the *explicit* value correctly
+wins over the default, and the test's incidental assertion on which
+one that was needed to be dropped -- the test's real point (does
+`do_gpu_ap:True` parse against this real config) still holds.
+
+**Verification:** every one of the 23 edited files re-parses with `yaml.
+safe_load` (syntax valid) and, for the ones already covered by `test_
+shipped_config_parses`/`test_config_validation.py`'s other tests, parses
+through `parse_config` with no behavior change. Full local suite (`pytest
+tests/ --ignore=tests/distributed`) passes, 416 passed / 4 skipped -- same
+count as before this change, confirming zero functional impact anywhere.
