@@ -5272,3 +5272,116 @@ run through the *real* `forward_step` (not a fake model) end to end --
 `loss.backward()` with no shape or gradient errors. Full local suite
 (`pytest tests/ --ignore=tests/distributed`) passes, 367 passed / 4
 skipped.
+
+## Added a Canny-based scoring option to GPUPatchify2D
+
+Follow-up ask: `GPUPatchify2D` only supported variance/SSE-based merge-cost
+scoring; the CPU/dataloader-side path (`Patchify`/`Patchify_3D`) defaults to
+Canny edge-density scoring instead, and the user wanted the GPU side to
+support Canny too (CPU-side variance scoring is a separate, not-yet-built
+follow-up). Two design questions were resolved with the user before writing
+any code:
+
+- **Custom pure-`torch` Canny, not `kornia.filters.canny`.** `kornia.
+  contrib.connected_components` was already rejected for `_detect_regions`
+  specifically because it's 2D-only with no 3D equivalent (`sst` needs 3D
+  eventually) -- the identical argument applies to `kornia.filters.canny`.
+  A custom implementation built from `conv2d`/`max_pool2d`/elementwise ops
+  needs no new dependency and generalizes to `conv3d` later; confirmed with
+  the user that these ops run entirely on-device (CPU or CUDA/ROCm), no
+  CPU round-trip.
+- **Hysteresis is approximated via a few binary-dilation passes**, not
+  exact flood-fill connectivity (true hysteresis is a graph/connectivity
+  problem that doesn't vectorize cleanly). After double-thresholding into
+  strong/weak edges, the strong mask is grown by one pixel (`F.max_pool2d`
+  as binary dilation) and absorbs any weak edges it now touches, a small
+  fixed number of iterations (`canny_hysteresis_iters`, default 2). Spot-
+  checked against `skimage.feature.canny` on the same synthetic square
+  image: both agree on roughly where the edges are (IoU ~0.53 on the edge
+  pixels themselves), with the custom version's edges consistently ~1px
+  thicker -- expected from the coarser 4-direction non-max suppression and
+  the dilation-based hysteresis approximation, not a bug.
+
+**A real correctness subtlety, not just a style choice:** the existing
+variance formula (`merge_costs[level] = errors[level] - sum_children`)
+extracts the *between-group* component of variance (law of total variance --
+a coarse block's own SSE-from-its-mean minus its children's own internal
+SSEs is exactly the part caused by the children genuinely differing from
+each other). That subtraction is meaningless for edge-pixel counts, which
+are already purely additive -- `errors[level]` would always exactly equal
+`sum_children`, making every Canny merge cost come out zero if the same
+formula were reused verbatim. Instead, for `score_fn == "canny"`, a block's
+own edge count is used *directly* as its merge cost (no subtraction) --
+flat/edge-free blocks (any level) get near-zero cost (cheap to merge),
+edge-rich blocks resist merging, the same greedy intent as variance
+scoring, just measured differently. This was derived and confirmed via
+direct experimentation (`_compute_all_levels_batch` on a small step-edge
+fixture) before writing the corresponding test.
+
+Multi-channel input runs Canny per channel (each call already batched over
+`B`) and sums the resulting binary edge masks into one per-pixel edge
+count -- mirrors `Patchify_3D`'s own "weight a voxel by how many channels
+independently flag it as an edge" convention, rather than the 2D CPU
+`Patchify.forward`'s stricter `C == 1`-only limitation.
+
+New `GPUPatchify2D.__init__` params: `score_fn` (`"variance"` default or
+`"canny"`), and, only meaningful under `"canny"`: `canny_sigma`,
+`canny_low_threshold`, `canny_high_threshold`, `canny_hysteresis_iters`.
+New private methods: `_gaussian_kernel2d`, `_sobel_gradients_batch`,
+`_non_max_suppression_batch`, `_canny_edge_map_batch`, `_box_sum_batch`
+(the `.sum()` analog of `_compute_level_stats_batch`'s `.var()*area`, since
+Canny's per-level "error" is just a box-sum of one base edge map, unlike
+variance which genuinely needs recomputing from raw pixels at each level).
+`_compute_all_levels_batch` dispatches on `self.score_fn`; every other
+method (`run_merge_batch`, `_border_mask`, `_detect_regions`,
+`_serialize_batch`, `forward`) needed zero changes, exactly as anticipated
+when the module was first ported.
+
+Config plumbing mirrors how `do_gpu_ap`/`gpu_ap_min_size` were threaded
+through in the previous stage: `parse.py` gains `ap.score_fn` (default
+`"variance"`) and the four `ap.canny_*` keys, validated (only meaningful
+under `do_gpu_ap:True`; explicitly rejects `score_fn:"canny"` when
+`do_gpu_ap:False`, since CPU-side Canny-vs-variance-vs-anything-else isn't
+pluggable yet -- the CPU path always scores via Canny, unconditionally) and
+threaded through `arch.py`'s `VIT.__init__` and `model/utils.py`'s
+`get_model`. Also fixed a real, pre-existing gap surfaced while auditing
+every hand-built `conf["ap"]` dict in the test suite:
+`tests/distributed/test_eval_real_pipeline.py` and `tests/distributed/
+test_pretrained_loading_real.py` (both call `get_model` directly) were
+missing `do_gpu_ap`/`gpu_ap_min_size` entirely -- a latent bug from the
+`do_gpu_ap` stage two entries above, never caught because these are
+Frontier-only distributed tests this session can't run locally. Fixed
+alongside the new `score_fn`/`canny_*` keys.
+
+**Tier 1 coverage** (`tests/model/test_gpu_adaptive_patching.py`, 8 new
+tests): `score_fn` construction-time validation; `_canny_edge_map_batch`
+on a flat image (zero edges) and a deterministic step edge (nonzero only
+in a thin band at the boundary); multi-channel summing (two channels
+flagging the same location sum to count 2, matching `Patchify_3D`'s
+convention -- checked directly against calling the same method on a
+single channel); `_compute_all_levels_batch(score_fn="canny")`'s merge
+cost being exactly 0 for a flat region and strictly highest at the block
+actually containing a small test square (away from every block boundary,
+so Gaussian smoothing can't bleed the signal across a block edge and
+produce a flaky near-tie); and an end-to-end `forward(score_fn="canny")`
+direct analog of the existing `test_run_merge_batch_reaches_fixed_length_
+independently_per_image`, confirming edge-containing regions stay at the
+finer level through the Canny path too. Every existing variance-scoring
+test stays unchanged and passing (`score_fn` defaults to `"variance"`).
+
+**Verification beyond the new tests:** a real `VIT` instance (scratch
+xformers-stub technique) constructed with `do_gpu_ap:True`, `gpu_ap_score_
+fn:"canny"` end to end through `arch.py`'s real construction path (not
+`GPUPatchify2D` directly) -- confirmed `vit.gpu_patchify.score_fn ==
+"canny"` and ran a real forward+backward pass with no errors. Full local
+suite (`pytest tests/ --ignore=tests/distributed`) passes, 374 passed / 4
+skipped.
+
+**Explicitly not done yet** (per the approved plan): CPU-side variance
+scoring (the other half of the user's original ask, a separate follow-up
+pass); 3D generalization of Canny scoring (the ops chosen already
+generalize to `conv3d`, but not built now); wiring `score_fn`/`canny_*`
+into a real shipped 2D+`do_gpu_ap` config (none exist yet, same gap
+already noted for `do_gpu_ap` itself); randomizing Canny parameters
+per-forward-call (the CPU path randomizes smoothing/thresholds per sample
+as a light augmentation -- the GPU version stays deterministic).

@@ -31,10 +31,11 @@ class GPUPatchify2D(torch.nn.Module):
 
     Ported from a reference GPU implementation the user maintains
     elsewhere (`bayes-cast`'s `adaptive_patching_vectorized.Patchify`), 2D
-    only for now -- see this module's own tests/README.md entry for the
-    scope this port deliberately left out (3D, a pluggable Canny-based
-    scoring alternative, and a fully-GPU connected-components backend) and
-    why.
+    only for now. Merge-cost scoring is pluggable (`score_fn`, see `_compute_
+    all_levels_batch`): `"variance"` (the ported default, above) or
+    `"canny"` (edge-density, via `_canny_edge_map_batch`) -- see this
+    module's own tests/README.md entry for the scope still left out (3D,
+    and a fully-GPU connected-components backend) and why.
     """
 
     # Bounding-box + scalar fields describing each detected leaf region,
@@ -44,7 +45,11 @@ class GPUPatchify2D(torch.nn.Module):
         "RegionTensors", ["x0s", "x1s", "y0s", "y1s", "phs", "pws", "cxs", "cys", "N"]
     )
 
-    def __init__(self, img_size, fixed_length=196, interp_size=16, min_size=2):
+    def __init__(
+            self, img_size, fixed_length=196, interp_size=16, min_size=2,
+            score_fn="variance", canny_sigma=1.0, canny_low_threshold=0.1,
+            canny_high_threshold=0.2, canny_hysteresis_iters=2,
+    ):
         """Precomputes the level structure this image size implies.
 
         Args:
@@ -62,10 +67,40 @@ class GPUPatchify2D(torch.nn.Module):
                 to.
             min_size: Finest block side length (level 0), along the
                 shorter image axis.
+            score_fn: `"variance"` (default -- see `_compute_all_levels_
+                batch`'s own docstring) or `"canny"` (edge-density scoring,
+                via `_canny_edge_map_batch` -- a merge cost is that block's
+                own edge-pixel count directly, not the variance formula's
+                `errors[level] - sum_children`; see `_compute_all_levels_
+                batch` for why those two formulas can't be the same).
+            canny_sigma: Gaussian smoothing sigma applied before computing
+                gradients. Only used when `score_fn == "canny"`.
+            canny_low_threshold: Lower of the two gradient-magnitude
+                thresholds ("weak" edges) -- unnormalized, on whatever
+                scale `img` itself is in (same "starting values, not
+                empirically tuned" caveat as `UCF_VIT.dataloaders.
+                transform.Patchify_3D`'s own `canny_thresholds`). Only used
+                when `score_fn == "canny"`.
+            canny_high_threshold: Upper of the two gradient-magnitude
+                thresholds ("strong" edges). Only used when `score_fn ==
+                "canny"`.
+            canny_hysteresis_iters: Number of binary-dilation passes used
+                to approximate hysteresis edge-linking (grow the strong-
+                edge mask and absorb any weak edges it touches, repeated
+                this many times) -- not exact flood-fill connectivity, see
+                `_canny_edge_map_batch`'s own docstring. Only used when
+                `score_fn == "canny"`.
         """
         super().__init__()
         self.interp_size = interp_size
         self.fixed_length = fixed_length
+
+        assert score_fn in ("variance", "canny"), f"score_fn must be 'variance' or 'canny', got {score_fn!r}"
+        self.score_fn = score_fn
+        self.canny_sigma = canny_sigma
+        self.canny_low_threshold = canny_low_threshold
+        self.canny_high_threshold = canny_high_threshold
+        self.canny_hysteresis_iters = canny_hysteresis_iters
 
         if img_size[0] == img_size[1]:
             max_blocks = img_size[0] // min_size
@@ -141,8 +176,179 @@ class GPUPatchify2D(torch.nn.Module):
         vars_ = reshaped.var(dim=(-2, -1))  # [B,C,gh,gw]
         return vars_.sum(dim=1) * (bsh * bsw)  # [B,gh,gw]
 
+    def _box_sum_batch(self, block_size, base_map):
+        """Sum of `base_map` within each non-overlapping `block_size` block, for the whole batch.
+
+        The `.sum()` analog of `_compute_level_stats_batch`'s `.var()*area`
+        -- used for `score_fn == "canny"`, where the per-pixel edge map is
+        already additive (unlike variance, which genuinely needs
+        recomputing from raw pixels at each level -- see `_compute_all_
+        levels_batch`'s own docstring).
+
+        Args:
+            block_size: `(bsh, bsw)` block side lengths at this level.
+            base_map: `[B, H, W]`.
+
+        Returns:
+            `[B, gh, gw]`.
+        """
+        B, Hp, Wp = base_map.shape
+        bsh, bsw = block_size
+        gh, gw = Hp // bsh, Wp // bsw
+
+        reshaped = base_map.reshape(B, gh, bsh, gw, bsw).permute(0, 1, 3, 2, 4)  # [B,gh,gw,bsh,bsw]
+        return reshaped.sum(dim=(-2, -1))  # [B,gh,gw]
+
+    def _gaussian_kernel2d(self, sigma, device, dtype):
+        """Builds a fixed, normalized 2D Gaussian kernel for pre-gradient smoothing.
+
+        Args:
+            sigma: Gaussian standard deviation, in pixels.
+            device: Device the kernel should live on.
+            dtype: Dtype the kernel should be.
+
+        Returns:
+            `[1, 1, K, K]` kernel, `K = 2 * round(3 * sigma) + 1`.
+        """
+        radius = max(1, int(round(3 * sigma)))
+        coords = torch.arange(-radius, radius + 1, device=device, dtype=dtype)
+        g1d = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+        g1d = g1d / g1d.sum()
+        kernel2d = g1d.unsqueeze(0) * g1d.unsqueeze(1)  # [K, K]
+        return kernel2d.unsqueeze(0).unsqueeze(0)  # [1, 1, K, K]
+
+    def _sobel_gradients_batch(self, imgs):
+        """Horizontal/vertical Sobel gradients, for the whole batch.
+
+        Args:
+            imgs: `[B, 1, H, W]`.
+
+        Returns:
+            `(gx, gy)`, each `[B, 1, H, W]`.
+        """
+        device, dtype = imgs.device, imgs.dtype
+        sobel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], device=device, dtype=dtype).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]], device=device, dtype=dtype).view(1, 1, 3, 3)
+        padded = F.pad(imgs, (1, 1, 1, 1), mode="reflect")
+        gx = F.conv2d(padded, sobel_x)
+        gy = F.conv2d(padded, sobel_y)
+        return gx, gy
+
+    def _non_max_suppression_batch(self, mag, angle_deg):
+        """Suppresses every gradient-magnitude pixel that isn't a local max along its own gradient direction.
+
+        Direction is discretized into 4 buckets (0/45/90/135 degrees, mod
+        180 -- edge orientation is the same for `theta` and `theta+180`),
+        each compared against its own pair of neighbor pixels via a
+        shifted-tensor comparison (vectorized over the whole batch, no
+        pixel-level Python loop).
+
+        Args:
+            mag: Gradient magnitude, `[B, 1, H, W]`.
+            angle_deg: Gradient direction in degrees, already mod 180,
+                same shape as `mag`.
+
+        Returns:
+            `[B, 1, H, W]`, `mag` with every non-local-max pixel zeroed.
+        """
+        H, W = mag.shape[-2:]
+
+        def shift(t, dr, dc):
+            padded = F.pad(t, (1, 1, 1, 1), mode="replicate")
+            return padded[..., 1 + dr:1 + dr + H, 1 + dc:1 + dc + W]
+
+        neighbor_shifts = {
+            0: ((0, -1), (0, 1)),
+            45: ((-1, 1), (1, -1)),
+            90: ((-1, 0), (1, 0)),
+            135: ((-1, -1), (1, 1)),
+        }
+        bucket_order = (0, 45, 90, 135)
+        bucket = torch.round(angle_deg / 45.0).long() % 4
+
+        n1 = torch.zeros_like(mag)
+        n2 = torch.zeros_like(mag)
+        for i, direction in enumerate(bucket_order):
+            (dr1, dc1), (dr2, dc2) = neighbor_shifts[direction]
+            is_bucket = (bucket == i)
+            n1 = torch.where(is_bucket, shift(mag, dr1, dc1), n1)
+            n2 = torch.where(is_bucket, shift(mag, dr2, dc2), n2)
+
+        is_local_max = (mag >= n1) & (mag >= n2)
+        return mag * is_local_max.to(mag.dtype)
+
+    def _canny_edge_map_batch(self, imgs):
+        """Per-channel Canny edge detection, summed into a per-pixel edge count.
+
+        Runs the standard Canny pipeline (Gaussian blur -> Sobel gradients
+        -> non-max suppression -> double threshold -> hysteresis) once per
+        channel (each call already batched over `B`), then sums the
+        resulting binary edge masks into one `[B, H, W]` count -- mirrors
+        `UCF_VIT.dataloaders.transform.Patchify_3D`'s own "weight a voxel
+        by how many channels independently flag it as an edge" convention,
+        rather than requiring `C == 1` the way the 2D CPU `Patchify.forward`
+        path does.
+
+        Hysteresis here is an *approximation*: real Canny links weak edges
+        to strong ones via flood-fill connectivity, a graph problem that
+        doesn't vectorize cleanly. This instead grows the strong-edge mask
+        by one pixel (binary dilation via `F.max_pool2d`) and absorbs any
+        weak edges it touches, repeated `self.canny_hysteresis_iters`
+        times -- close to real hysteresis for a small number of iterations,
+        not an exact match.
+
+        Args:
+            imgs: `[B, C, H, W]`.
+
+        Returns:
+            `[B, H, W]` float tensor, values in `[0, C]`.
+        """
+        B, C, H, W = imgs.shape
+        device, dtype = imgs.device, imgs.dtype
+        kernel = self._gaussian_kernel2d(self.canny_sigma, device, dtype)
+        pad = kernel.shape[-1] // 2
+
+        edge_count = torch.zeros(B, H, W, device=device, dtype=dtype)
+        for c in range(C):
+            channel = imgs[:, c:c + 1]  # [B, 1, H, W]
+            blurred = F.conv2d(F.pad(channel, (pad, pad, pad, pad), mode="reflect"), kernel)
+
+            gx, gy = self._sobel_gradients_batch(blurred)
+            mag = torch.sqrt(gx ** 2 + gy ** 2 + 1e-12)
+            angle = torch.atan2(gy, gx) * (180.0 / math.pi)
+            angle = angle % 180.0
+
+            nms = self._non_max_suppression_batch(mag, angle)
+            strong = nms > self.canny_high_threshold
+            weak = (nms > self.canny_low_threshold) & (~strong)
+
+            edge = strong.clone()
+            for _ in range(self.canny_hysteresis_iters):
+                dilated = F.max_pool2d(edge.to(dtype), kernel_size=3, stride=1, padding=1) > 0
+                edge = edge | (weak & dilated)
+
+            edge_count = edge_count + edge.to(dtype).squeeze(1)
+
+        return edge_count
+
     def _compute_all_levels_batch(self, imgs):
         """Per-level block errors and the merge cost of collapsing each level's blocks into their level-below parent.
+
+        `score_fn == "variance"`: `merge_costs[level] = errors[level] -
+        sum_children`, the *between-group* component of variance (law of
+        total variance: a coarse block's own SSE-from-its-mean minus its
+        children's own internal SSEs is exactly the part caused by the
+        children genuinely differing from each other) -- meaningful for a
+        variance measure.
+
+        `score_fn == "canny"`: `merge_costs[level] = errors[level]`
+        directly, no child subtraction -- an edge-pixel count is already
+        purely additive (`errors[level]` would always exactly equal
+        `sum_children`, making the variance-style subtraction trivially
+        zero everywhere). A block's own edge density, used directly, gives
+        the same greedy intent as variance's formula: flat/edge-free
+        blocks (any level) get near-zero cost (cheap to merge), edge-rich
+        blocks resist merging.
 
         Args:
             imgs: `[B, C, H, W]`.
@@ -155,6 +361,19 @@ class GPUPatchify2D(torch.nn.Module):
         errors = []
         level_shapes = []
         merge_costs = [None] * (self.max_level + 1)
+
+        if self.score_fn == "canny":
+            edge_map = self._canny_edge_map_batch(imgs)  # [B, H, W]
+            for l in range(self.max_level + 1):
+                bs = (self.min_size[0] * (2 ** l), self.min_size[1] * (2 ** l))
+                err_l = self._box_sum_batch(bs, edge_map)
+                errors.append(err_l)
+                level_shapes.append(tuple(err_l.shape[1:]))
+
+            for level in range(1, self.max_level + 1):
+                merge_costs[level] = errors[level]
+
+            return merge_costs, level_shapes
 
         for l in range(self.max_level + 1):
             bs = (self.min_size[0] * (2 ** l), self.min_size[1] * (2 ** l))

@@ -254,6 +254,11 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
         # existing CPU/dataloader-side adaptive-patching path unaffected.
         do_gpu_ap=conf["ap"]["do_gpu_ap"],
         gpu_ap_min_size=conf["ap"]["gpu_ap_min_size"] or 2,
+        gpu_ap_score_fn=conf["ap"]["score_fn"],
+        gpu_ap_canny_sigma=conf["ap"]["canny_sigma"] or 1.0,
+        gpu_ap_canny_low_threshold=conf["ap"]["canny_low_threshold"] if conf["ap"]["canny_low_threshold"] is not None else 0.1,
+        gpu_ap_canny_high_threshold=conf["ap"]["canny_high_threshold"] if conf["ap"]["canny_high_threshold"] is not None else 0.2,
+        gpu_ap_canny_hysteresis_iters=conf["ap"]["canny_hysteresis_iters"] or 2,
         FusedAttn_option=FusedAttn_option,
         use_adaptive_pos_emb=conf["ap"]["use_adaptive_pos_emb"],
         weight_init='' if conf["model"]["type"] == "VIT" else 'skip', #Choose ['' or 'skip'] If using VIT use '' otherwise use 'skip'. Option whether to use VITs weight initialization or use the one corresponding to the architecture you choose

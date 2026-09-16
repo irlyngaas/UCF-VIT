@@ -182,6 +182,11 @@ class VIT(nn.Module):
             fixed_length: Optional[int] = 4096,
             do_gpu_ap: bool = False,
             gpu_ap_min_size: int = 2,
+            gpu_ap_score_fn: str = "variance",
+            gpu_ap_canny_sigma: float = 1.0,
+            gpu_ap_canny_low_threshold: float = 0.1,
+            gpu_ap_canny_high_threshold: float = 0.2,
+            gpu_ap_canny_hysteresis_iters: int = 2,
             default_vars: List = None,
             use_varemb: bool = False,
             default_time_offsets: List = None,
@@ -249,6 +254,22 @@ class VIT(nn.Module):
                 dataloader-side path completely unaffected.
             gpu_ap_min_size: `GPUPatchify2D`'s finest block side length.
                 Only used when `do_gpu_ap` is True.
+            gpu_ap_score_fn: `GPUPatchify2D`'s merge-cost scoring measure --
+                `"variance"` (default) or `"canny"` (edge-density). Only
+                used when `do_gpu_ap` is True; see `GPUPatchify2D`'s own
+                docstring for why the two need different merge-cost formulas.
+            gpu_ap_canny_sigma: Gaussian smoothing sigma before gradient
+                computation. Only used when `do_gpu_ap` is True and
+                `gpu_ap_score_fn == "canny"`.
+            gpu_ap_canny_low_threshold: Lower ("weak" edge) gradient-
+                magnitude threshold. Only used when `do_gpu_ap` is True and
+                `gpu_ap_score_fn == "canny"`.
+            gpu_ap_canny_high_threshold: Upper ("strong" edge) gradient-
+                magnitude threshold. Only used when `do_gpu_ap` is True and
+                `gpu_ap_score_fn == "canny"`.
+            gpu_ap_canny_hysteresis_iters: Number of binary-dilation passes
+                approximating hysteresis edge-linking. Only used when
+                `do_gpu_ap` is True and `gpu_ap_score_fn == "canny"`.
             default_vars: List of different potential modalities to be used as input.
             use_varemb: Whether to use variable embedding tokens as an additional learnable parameter
             default_time_offsets: "sst" time-stepping only -- sorted list of every
@@ -329,6 +350,10 @@ class VIT(nn.Module):
             self.gpu_patchify = GPUPatchify2D(
                 img_size=img_size, fixed_length=self.fixed_length,
                 interp_size=self.interp_size, min_size=gpu_ap_min_size,
+                score_fn=gpu_ap_score_fn, canny_sigma=gpu_ap_canny_sigma,
+                canny_low_threshold=gpu_ap_canny_low_threshold,
+                canny_high_threshold=gpu_ap_canny_high_threshold,
+                canny_hysteresis_iters=gpu_ap_canny_hysteresis_iters,
             )
 
         #ASSUMES INPUT HAS ALREADY BEEN ADAPTIVELY PATCHED

@@ -656,6 +656,15 @@ def parse_config(args, load_balance_offline=False):
         # to be *structured* for adaptive patching either way) -- see
         # arch.py's own do_gpu_ap docstring entry for the full design.
         do_gpu_ap = conf['ap'].get('do_gpu_ap', False) if do_ap else False
+        # score_fn: which merge-cost measure GPUPatchify2D uses -- "variance"
+        # (the ported default) or "canny" (edge-density, see GPUPatchify2D's
+        # own docstring for why the two need different merge-cost formulas).
+        # Only implemented for the GPU path right now -- the CPU/dataloader-
+        # side path (Patchify/Patchify_3D) always scores via Canny edge
+        # density; a pluggable CPU score_fn (e.g. variance) is a separate,
+        # not-yet-built follow-up.
+        score_fn = conf['ap'].get('score_fn', 'variance') if do_gpu_ap else 'variance'
+        use_canny = do_gpu_ap and score_fn == 'canny'
         ap_conf = {
             "do_ap": do_ap,
             "fixed_length": conf['ap']['fixed_length'] if do_ap else None,
@@ -663,18 +672,40 @@ def parse_config(args, load_balance_offline=False):
             "use_adaptive_pos_emb": conf['ap']['use_adaptive_pos_emb'] if do_ap else False,
             "do_gpu_ap": do_gpu_ap,
             "gpu_ap_min_size": conf['ap'].get('gpu_ap_min_size', 2) if do_gpu_ap else None,
+            "score_fn": score_fn,
+            "canny_sigma": conf['ap'].get('canny_sigma', 1.0) if use_canny else None,
+            "canny_low_threshold": conf['ap'].get('canny_low_threshold', 0.1) if use_canny else None,
+            "canny_high_threshold": conf['ap'].get('canny_high_threshold', 0.2) if use_canny else None,
+            "canny_hysteresis_iters": conf['ap'].get('canny_hysteresis_iters', 2) if use_canny else None,
         }
     except KeyError:
         if dist.get_rank() == 0:
             print("Since no ap_conf was given in the config file, this is defaulting to be ran with standard patching")
-        ap_conf = {"do_ap": False, "fixed_length": None, "separate_channels": False, "use_adaptive_pos_emb": False, "do_gpu_ap": False, "gpu_ap_min_size": None}
+        ap_conf = {
+            "do_ap": False, "fixed_length": None, "separate_channels": False, "use_adaptive_pos_emb": False,
+            "do_gpu_ap": False, "gpu_ap_min_size": None, "score_fn": "variance", "canny_sigma": None,
+            "canny_low_threshold": None, "canny_high_threshold": None, "canny_hysteresis_iters": None,
+        }
 
     if ap_conf["do_ap"]:
         if ap_conf["separate_channels"]:
             assert not ap_conf["use_adaptive_pos_emb"], "Capability to use separate channels and adaptive pos_emb not implemented yet"
 
+        if not ap_conf["do_gpu_ap"]:
+            assert ap_conf["score_fn"] == "variance", (
+                "ap.score_fn is only implemented for the GPU adaptive-patching path "
+                "(ap.do_gpu_ap:True) right now -- the CPU/dataloader-side path "
+                "(Patchify/Patchify_3D) always scores via Canny edge density; a "
+                "pluggable CPU score_fn (e.g. variance) is a separate, not-yet-built follow-up."
+            )
+
         if ap_conf["do_gpu_ap"]:
             assert not ap_conf["separate_channels"], "do_gpu_ap (GPUPatchify2D) does not support separate_channels yet"
+            assert ap_conf["score_fn"] in ("variance", "canny"), f"ap.score_fn must be 'variance' or 'canny', got {ap_conf['score_fn']!r}"
+            if ap_conf["score_fn"] == "canny":
+                assert ap_conf["canny_low_threshold"] < ap_conf["canny_high_threshold"], (
+                    "ap.canny_low_threshold must be less than ap.canny_high_threshold"
+                )
             
 # ---------------------------- DATA ----------------------------------------------
     #TODO: Add checking on each argument, e.g. > 0

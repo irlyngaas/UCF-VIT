@@ -200,6 +200,99 @@ def test_serialize_batch_non_square_image_does_not_transpose_regions():
         assert torch.allclose(seq_img[0, 0, i], torch.full_like(seq_img[0, 0, i], expected), atol=1e-4)
 
 
+def test_score_fn_invalid_value_raises_clearly():
+    with pytest.raises(AssertionError, match="score_fn"):
+        GPUPatchify2D(img_size=(16, 16), fixed_length=13, interp_size=4, min_size=2, score_fn="bogus")
+
+
+def test_canny_edge_map_flat_image_has_no_edges():
+    p = GPUPatchify2D(img_size=(16, 16), fixed_length=13, interp_size=4, min_size=2, score_fn="canny")
+    img = torch.full((1, 1, 16, 16), 5.0)
+
+    edges = p._canny_edge_map_batch(img)
+
+    assert torch.equal(edges, torch.zeros_like(edges))
+
+
+def test_canny_edge_map_marks_a_deterministic_step_edge():
+    """A vertical step edge (columns 0:8 at one value, 8:16 at another) --
+    the edge map must be nonzero only in a thin band straddling column 8,
+    and exactly zero everywhere else."""
+    p = GPUPatchify2D(img_size=(16, 16), fixed_length=13, interp_size=4, min_size=2, score_fn="canny")
+    img = torch.zeros(1, 1, 16, 16)
+    img[:, :, :, 8:] = 10.0
+
+    edges = p._canny_edge_map_batch(img)
+
+    assert edges[:, :, :7].sum() == 0
+    assert edges[:, :, 9:].sum() == 0
+    assert edges[:, :, 7:9].sum() > 0
+
+
+def test_canny_edge_map_multi_channel_sums_independent_edges():
+    """Two channels, each with its own step edge at a different column --
+    a pixel gets edge-count 1 if only one channel flags it, 2 if both do
+    (mirrors Patchify_3D's own "weight a voxel by how many channels
+    independently flag it as an edge" convention)."""
+    p = GPUPatchify2D(img_size=(16, 16), fixed_length=13, interp_size=4, min_size=2, score_fn="canny")
+    img = torch.zeros(1, 2, 16, 16)
+    img[:, 0, :, 8:] = 10.0  # channel 0's edge at column 8
+    img[:, 1, :, 8:] = 10.0  # channel 1's edge also at column 8 -- same location, both flag it
+
+    edges = p._canny_edge_map_batch(img)
+    single_channel_edges = p._canny_edge_map_batch(img[:, 0:1])
+
+    assert torch.equal(edges, 2 * single_channel_edges)
+
+
+def test_compute_all_levels_batch_canny_merge_cost_is_exactly_zero_for_a_flat_region():
+    """Unlike variance's `errors[level] - sum_children`, canny's merge cost
+    is the block's own edge count directly -- a perfectly flat image has
+    zero edges everywhere, so every level's cost is exactly 0, deterministically.
+    """
+    p = GPUPatchify2D(img_size=(16, 16), fixed_length=13, interp_size=4, min_size=2, score_fn="canny")
+    img = torch.full((1, 1, 16, 16), 3.0)
+
+    merge_costs, _ = p._compute_all_levels_batch(img)
+
+    for level in range(1, p.max_level + 1):
+        assert torch.equal(merge_costs[level][0], torch.zeros_like(merge_costs[level][0]))
+
+
+def test_compute_all_levels_batch_canny_merge_cost_is_highest_where_the_edge_is():
+    """A small square, strictly inside the top-left 8x8 quadrant (away from
+    every level-2 block boundary, so Gaussian smoothing can't bleed the
+    edge signal across a block edge) -- that quadrant's level-2 merge cost
+    must be strictly higher than every other level-2 block's.
+    """
+    p = GPUPatchify2D(img_size=(16, 16), fixed_length=13, interp_size=4, min_size=2, score_fn="canny")
+    img = torch.full((1, 1, 16, 16), 1.0)
+    img[0, 0, 2:6, 2:6] = 10.0
+
+    merge_costs, _ = p._compute_all_levels_batch(img)
+    level2 = merge_costs[2][0]
+
+    assert level2[0, 0] > level2.flatten()[1:].max()
+
+
+def test_forward_canny_score_keeps_edge_containing_regions_fine():
+    """Direct analog of test_run_merge_batch_reaches_fixed_length_
+    independently_per_image, through the canny score path instead of
+    variance -- image 1's step-edge quadrant must stay at the finest
+    level-1 size, never merge to the coarser size 8.
+    """
+    p = GPUPatchify2D(img_size=(16, 16), fixed_length=13, interp_size=4, min_size=2, score_fn="canny")
+    img = torch.full((2, 1, 16, 16), 1.0)
+    img[1, 0, 0:8, 4:8] = 10.0  # only image 1 has real structure
+
+    seq_img, seq_size, seq_pos = p(img)
+
+    assert seq_size.shape == (2, 13)
+    for size, pos in zip(seq_size[1].tolist(), seq_pos[1].tolist()):
+        if pos[0] < 8 and pos[1] < 8:
+            assert size == 4
+
+
 def test_serialize_batch_multi_channel_does_not_scramble_channels():
     """2-channel input, each channel a distinct constant per quadrant --
     confirms the C>1 branch's permute keeps channel/region/pixel axes
