@@ -203,6 +203,7 @@ def main():
                 full_domain_size = conf["dataset_options"]["full_domain_size"],
                 time_offsets = conf["data"]["time_offsets"],
                 profile_dataloader = conf["trainer"]["profile_dataloader"],
+                score_fn = conf["ap"]["score_fn"],
             )
 
             data_module.setup()
@@ -256,7 +257,7 @@ def main():
             # auto-split at all).
             train_list = slice_file_list(train_list, conf["dataloader"]["dict_start_idx"][dkey_train], conf["dataloader"]["dict_end_idx"][dkey_train])
 
-            train_data = conf["dataloader"]["dataset_module"](train_list, conf["data"]["dict_in_variables"][dkey_train], conf["data"]["tile_size"], adaptive_patching=conf["ap"]["do_ap"], fixed_length=conf["ap"]["fixed_length"], interp_size=conf["data"]["interp_size"], num_channels=conf["data"]["num_channels"][dkey_train], dataset=conf["data"]["dataset"], resize=conf["dataset_options"]["resize"].get(conf["data"]["dataset"]), div=conf["tiling"]["div"], tile_overlap=conf["tiling"]["tile_overlap"])
+            train_data = conf["dataloader"]["dataset_module"](train_list, conf["data"]["dict_in_variables"][dkey_train], conf["data"]["tile_size"], adaptive_patching=conf["ap"]["do_ap"], fixed_length=conf["ap"]["fixed_length"], interp_size=conf["data"]["interp_size"], num_channels=conf["data"]["num_channels"][dkey_train], dataset=conf["data"]["dataset"], resize=conf["dataset_options"]["resize"].get(conf["data"]["dataset"]), div=conf["tiling"]["div"], tile_overlap=conf["tiling"]["tile_overlap"], score_fn=conf["ap"]["score_fn"])
 
             # rank=world_rank is only correct when tensor_par_size == 1 (world_rank
             # then equals this replica's position among data_par_size replicas).

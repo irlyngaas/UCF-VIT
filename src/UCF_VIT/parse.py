@@ -656,14 +656,20 @@ def parse_config(args, load_balance_offline=False):
         # to be *structured* for adaptive patching either way) -- see
         # arch.py's own do_gpu_ap docstring entry for the full design.
         do_gpu_ap = conf['ap'].get('do_gpu_ap', False) if do_ap else False
-        # score_fn: which merge-cost measure GPUPatchify2D uses -- "variance"
-        # (the ported default) or "canny" (edge-density, see GPUPatchify2D's
-        # own docstring for why the two need different merge-cost formulas).
-        # Only implemented for the GPU path right now -- the CPU/dataloader-
-        # side path (Patchify/Patchify_3D) always scores via Canny edge
-        # density; a pluggable CPU score_fn (e.g. variance) is a separate,
-        # not-yet-built follow-up.
-        score_fn = conf['ap'].get('score_fn', 'variance') if do_gpu_ap else 'variance'
+        # score_fn: which measure decides where to concentrate patches --
+        # "canny" (edge density) or "variance" -- shared by both adaptive-
+        # patching paths (mirrors how ap.fixed_length/ap.interp_size
+        # already aren't path-specific), same as GPUPatchify2D.__init__'s
+        # own score_fn (do_gpu_ap:True) or Patchify/Patchify_3D's own
+        # score_fn (do_gpu_ap:False) actually consume. The *default* when
+        # unset is path-dependent for backward compatibility: each path has
+        # only ever behaved one specific way until now -- "canny" for the
+        # CPU path (every existing shipped do_ap:True config keeps behaving
+        # exactly as today), "variance" for the GPU path (unchanged from
+        # when do_gpu_ap was introduced). An explicit ap.score_fn always
+        # wins over that default, whichever path is active.
+        default_score_fn = "variance" if do_gpu_ap else "canny"
+        score_fn = conf['ap'].get('score_fn', default_score_fn) if do_ap else "variance"
         use_canny = do_gpu_ap and score_fn == 'canny'
         ap_conf = {
             "do_ap": do_ap,
@@ -691,17 +697,10 @@ def parse_config(args, load_balance_offline=False):
         if ap_conf["separate_channels"]:
             assert not ap_conf["use_adaptive_pos_emb"], "Capability to use separate channels and adaptive pos_emb not implemented yet"
 
-        if not ap_conf["do_gpu_ap"]:
-            assert ap_conf["score_fn"] == "variance", (
-                "ap.score_fn is only implemented for the GPU adaptive-patching path "
-                "(ap.do_gpu_ap:True) right now -- the CPU/dataloader-side path "
-                "(Patchify/Patchify_3D) always scores via Canny edge density; a "
-                "pluggable CPU score_fn (e.g. variance) is a separate, not-yet-built follow-up."
-            )
+        assert ap_conf["score_fn"] in ("variance", "canny"), f"ap.score_fn must be 'variance' or 'canny', got {ap_conf['score_fn']!r}"
 
         if ap_conf["do_gpu_ap"]:
             assert not ap_conf["separate_channels"], "do_gpu_ap (GPUPatchify2D) does not support separate_channels yet"
-            assert ap_conf["score_fn"] in ("variance", "canny"), f"ap.score_fn must be 'variance' or 'canny', got {ap_conf['score_fn']!r}"
             if ap_conf["score_fn"] == "canny":
                 assert ap_conf["canny_low_threshold"] < ap_conf["canny_high_threshold"], (
                     "ap.canny_low_threshold must be less than ap.canny_high_threshold"

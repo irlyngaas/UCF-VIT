@@ -5385,3 +5385,96 @@ into a real shipped 2D+`do_gpu_ap` config (none exist yet, same gap
 already noted for `do_gpu_ap` itself); randomizing Canny parameters
 per-forward-call (the CPU path randomizes smoothing/thresholds per sample
 as a light augmentation -- the GPU version stays deterministic).
+
+## Added a variance-based scoring option to the CPU adaptive-patching path
+
+Second half of the two-part score_fn ask: `Patchify`/`Patchify_3D`
+(`transform.py`, backing `FixedQuadTree`/`FixedOctTree`) previously always
+scored via Canny edge density, with no alternative. Adds `score_fn=
+"variance"` there too, symmetric with the GPU side above.
+
+**A correction to an assumption made in the GPU-side plan:** that plan
+assumed `Rect.contains`/`Cube.contains` (`quadtree.py`/`octree.py`) were
+"already generic over how `domain` was built" and would need no changes.
+True only for purely-additive measures (an edge-count domain, precomputed
+once and just summed per candidate rectangle -- exactly what `contains`
+already did). Not true for variance: a region's variance can't be
+reconstructed from independent per-pixel "variance contributions"
+precomputed ahead of time, it genuinely depends on that specific
+rectangle's own mean. So `contains` itself needed a real, if small,
+change: a `score_fn` parameter (`"canny"` default, or `"variance"` --
+`np.var(patch, axis=(0,1)).sum() * patch.shape[0] * patch.shape[1]` for
+`Rect`, `axis=(0,1,2)` for `Cube`), threaded from `FixedQuadTree`/
+`FixedOctTree.__init__` through every `contains()` call site. `np.var`'s
+own `axis` argument reduces only the spatial dims and leaves a trailing
+channel axis untouched if `domain` has one, so one formula handles both
+the single- and multi-channel case, and scaling by pixel/voxel count
+recovers the *SSE* (not raw variance) so differently-sized candidates in
+the same heap comparison stay comparable -- mirroring `GPUPatchify2D`'s
+own variance scoring in spirit (though not its exact merge-cost formula,
+which serves a different bottom-up-merge decision -- see this file's own
+"Added a Canny-based scoring option to GPUPatchify2D" entry above for that
+derivation). `_build_tree`/`deserialize` in both files also needed a
+one-line fix (`self.domain.shape` -> `self.domain.shape[:2]`/`[:3]`) to
+stop assuming `domain` never carries a trailing channel axis -- caught
+immediately by the first end-to-end variance-mode test, which crashed on
+construction before this fix, not silently mis-scored.
+
+A real, unplanned generalization fell out of this for free: multi-channel
+variance scoring has no equivalent to Canny's `skimage.feature.canny`-path
+`C == 1` restriction (`Patchify.forward`, every dataset except `imagenet`/
+`catsdogs`) -- `np.var` handles any channel count directly, no restriction
+needed. For `Patchify_3D` specifically, variance mode also skips the
+per-channel `SimpleITK.CannyEdgeDetection` loop entirely (not just an
+alternative -- genuinely cheaper), since `Cube.contains`'s own
+per-channel-variance-sum handles multi-channel input at query time instead
+of a precomputed per-channel loop; confirmed directly by monkeypatching
+`sitk.CannyEdgeDetection` to raise if ever called under `score_fn=
+"variance"`.
+
+**Config surface:** `ap.score_fn` (added last stage, GPU-only until now)
+becomes the single key governing whichever adaptive-patching path is
+active -- mirrors how `ap.fixed_length`/`ap.interp_size` already aren't
+path-specific. The two paths keep *different backward-compatible
+defaults* when `ap.score_fn` is unset, since each has only ever behaved
+one specific way until now: `"canny"` for the CPU path (every existing
+shipped `do_ap:True` config keeps behaving exactly as today -- confirmed
+directly against `SAP_CONFIG`, a real shipped config, not just by
+inspection), `"variance"` for the GPU path (unchanged from last stage). An
+explicit `ap.score_fn` always wins over that default. This also meant
+relaxing last stage's `parse.py` assertion that rejected any `score_fn`
+other than `"variance"` when `do_gpu_ap:False` -- it was written
+explicitly anticipating this exact follow-up. `score_fn` threads through
+five more construction sites the same way `fixed_length`/`interp_size`
+already do: `dataset.py`'s `ProcessChannels`, `datamodule.py`'s
+`NativePytorchDataModule`, `catsdogs.py`'s `CatsDogsDataset`, and both
+construction patterns in each of `train.py`/`val.py`/`test.py` (the
+`iterative_dataloader` branch's `NativePytorchDataModule(...)` and the
+`dataloader` branch's `conf["dataloader"]["dataset_module"](...)`).
+
+**Tier 1 coverage:** `test_quadtree.py`/`test_octree.py` gain
+`Rect.contains`/`Cube.contains` `score_fn="variance"` tests (flat region
+scores exactly 0, a region with real variance matches `np.var(patch)*area`
+computed directly, multi-channel domain sums per-channel variance) plus a
+`FixedQuadTree`/`FixedOctTree`-level test mirroring the existing
+Canny-favors-detail tests exactly, just with `score_fn="variance"` and a
+checkerboard region instead of a flat-vs-dense edge map.
+`test_transform.py` gains 6 new tests: `Patchify`/`Patchify_3D` variance
+mode uses `img` itself as the domain deterministically (no smoothing/Canny
+call), favors a genuinely higher-variance region over flat ones (direct
+analog of the tree-level tests, through the full pipeline), allows
+multi-channel input on `basic_ct` (impossible under `score_fn="canny"`),
+and (3D only) never calls `SimpleITK.CannyEdgeDetection` at all.
+`test_config_validation.py` gains 3 tests: an existing shipped `do_ap:True`
+config's parsed `score_fn` is `"canny"` (backward-compat confirmation),
+explicit `score_fn:"variance"` with `do_gpu_ap:False` now parses instead of
+raising, and an invalid `score_fn` value raises clearly.
+
+**Verification:** full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 391 passed / 4 skipped (17 new tests, no
+regressions). Real `Patchify`/`Patchify_3D` instances run directly (not
+just through pytest) on synthetic checkerboard-in-one-quadrant images,
+confirming the patch layout concentrates around the genuinely
+higher-variance region in both 2D and 3D. A real shipped config
+(`SAP_CONFIG`) parsed through `parse_config` end to end confirms the
+backward-compatible default.

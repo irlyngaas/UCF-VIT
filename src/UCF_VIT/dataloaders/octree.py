@@ -33,8 +33,8 @@ class Cube:
         assert y1<=y2, 'y1 > y2, wrong coordinate.'
         assert z1<=z2, 'z1 > z2, wrong coordinate.'
     
-    def contains(self, domain):
-        """Computes an edge-density score for this cube's region of `domain`.
+    def contains(self, domain, score_fn="canny"):
+        """Computes a split-priority score for this cube's region of `domain`.
 
         Deliberately not normalized by any scale factor -- see `Rect.contains`
         (`quadtree.py`)'s own docstring: this score is only ever consumed by
@@ -43,13 +43,23 @@ class Cube:
         invariant to a uniform positive scale applied to every candidate.
 
         Args:
-            domain: 3D edge-intensity volume, shape (Z, Y, X).
+            domain: `score_fn="canny"`: 3D edge-intensity volume, shape
+                (Z, Y, X). `score_fn="variance"`: the raw volume itself,
+                shape (Z, Y, X) or (Z, Y, X, C) -- see `Rect.contains`'s
+                own docstring for why variance needs the real voxels rather
+                than a precomputed per-voxel value.
+            score_fn: `"canny"` (default -- sum of `domain` within this
+                cube) or `"variance"` (this cube's own SSE -- `np.var(patch)`
+                scaled by voxel count, summed across channels if `domain`
+                has a trailing channel axis).
 
         Returns:
-            Integer edge-density score for this cube's region (summed
-            intensity).
+            Split-priority score for this cube's region -- an int (summed
+            intensity) for `"canny"`, a float (SSE) for `"variance"`.
         """
         patch = domain[self.z1:self.z2, self.y1:self.y2, self.x1:self.x2]
+        if score_fn == "variance":
+            return float(np.var(patch, axis=(0, 1, 2)).sum() * patch.shape[0] * patch.shape[1] * patch.shape[2])
         return int(np.sum(patch))
 
     def get_area(self, img):
@@ -139,15 +149,21 @@ class FixedOctTree:
     regions.
     """
 
-    def __init__(self, domain, fixed_length=128) -> None:
+    def __init__(self, domain, fixed_length=128, score_fn="canny") -> None:
         """Builds the octree over `domain`.
 
         Args:
-            domain: 3D edge-intensity volume, shape (Z, Y, X), to subdivide.
+            domain: 3D edge-intensity volume, shape (Z, Y, X), to subdivide
+                -- or, when `score_fn="variance"`, the raw volume itself,
+                shape (Z, Y, X) or (Z, Y, X, C) (see `Cube.contains`'s own
+                docstring).
             fixed_length: Target number of leaf nodes to subdivide into.
+            score_fn: `"canny"` (default) or `"variance"` -- see `Cube.
+                contains`'s own docstring for what each means.
         """
         self.domain = domain
         self.fixed_length = fixed_length
+        self.score_fn = score_fn
         self._build_tree()
 
     def _build_tree(self):
@@ -172,11 +188,11 @@ class FixedOctTree:
         directly (no `__lt__` needed on `Cube`).
         """
         #channel, height, width, depth = self.domain.shape
-        h, w, d = self.domain.shape
+        h, w, d = self.domain.shape[:3]  # domain may carry a trailing channel axis under score_fn="variance"
         assert h>0 and w >0 and d>0, "Wrong img size."
         root = Cube(0,h,0,w,0,d)
         tiebreak = itertools.count()
-        heap = [(-root.contains(self.domain), next(tiebreak), root)]
+        heap = [(-root.contains(self.domain, self.score_fn), next(tiebreak), root)]
         count = 1
         while count < self.fixed_length:
             neg_value, _, bbox = heap[0]
@@ -195,7 +211,7 @@ class FixedOctTree:
             n8 = Cube(int((x1+x2)/2), x2, int((y1+y2)/2), y2, int((z1+z2)/2), z2)
 
             for child in (n1, n2, n3, n4, n5, n6, n7, n8):
-                heapq.heappush(heap, (-child.contains(self.domain), next(tiebreak), child))
+                heapq.heappush(heap, (-child.contains(self.domain, self.score_fn), next(tiebreak), child))
             count += 7  # -1 (popped parent) + 8 (pushed children)
 
         self.nodes = [[bbox, -neg_value] for neg_value, _, bbox in heap]
@@ -282,7 +298,7 @@ class FixedOctTree:
             channels appended.
         """
 
-        H,W,D = self.domain.shape
+        H,W,D = self.domain.shape[:3]  # domain may carry a trailing channel axis under score_fn="variance"
         seq = np.reshape(seq, (self.fixed_length, patch_size, patch_size, patch_size, channel))
         #seq = seq.astype(int)
         mask = np.zeros(shape=(H, W, D, channel))

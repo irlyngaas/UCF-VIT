@@ -28,8 +28,8 @@ class Rect:
         assert x1<=x2, 'x1 > x2, wrong coordinate.'
         assert y1<=y2, 'y1 > y2, wrong coordinate.'
     
-    def contains(self, domain):
-        """Computes an edge-density score for this rectangle's region of `domain`.
+    def contains(self, domain, score_fn="canny"):
+        """Computes a split-priority score for this rectangle's region of `domain`.
 
         Deliberately not normalized by any scale factor: this score is only
         ever consumed by `FixedQuadTree._build_tree`'s own
@@ -42,13 +42,29 @@ class Rect:
         `encode_nodes`, every `draw*` method) discards this score entirely.
 
         Args:
-            domain: 2D edge-intensity image, shape (H, W).
+            domain: `score_fn="canny"`: 2D edge-intensity image, shape (H, W).
+                `score_fn="variance"`: the raw image itself, shape (H, W) or
+                (H, W, C) -- unlike edge density, variance can't be
+                precomputed into a single per-pixel value ahead of time and
+                then just summed (it genuinely depends on this specific
+                rectangle's own mean), so this case needs the real pixels.
+            score_fn: `"canny"` (default -- sum of `domain` within this
+                rectangle) or `"variance"` (this rectangle's own SSE --
+                `np.var(patch)` scaled by pixel count, summed across
+                channels if `domain` has a trailing channel axis --
+                matching `UCF_VIT.model.gpu_adaptive_patching.
+                GPUPatchify2D`'s own variance scoring in spirit, though not
+                its exact merge-cost formula, which serves a different
+                bottom-up-merge decision).
 
         Returns:
-            Integer edge-density score for this rectangle's region (summed
-            intensity).
+            Split-priority score for this rectangle's region -- an int
+            (summed intensity) for `"canny"`, a float (SSE) for
+            `"variance"`.
         """
         patch = domain[self.y1:self.y2, self.x1:self.x2]
+        if score_fn == "variance":
+            return float(np.var(patch, axis=(0, 1)).sum() * patch.shape[0] * patch.shape[1])
         return int(np.sum(patch))
 
     def get_area(self, img):
@@ -191,19 +207,24 @@ class FixedQuadTree:
     regions.
     """
 
-    def __init__(self, domain, fixed_length=128, build_from_info=False, meta_info=None) -> None:
+    def __init__(self, domain, fixed_length=128, build_from_info=False, meta_info=None, score_fn="canny") -> None:
         """Builds the quadtree over `domain`, or reconstructs it from saved metadata.
 
         Args:
-            domain: 2D edge-intensity image, shape (H, W), to subdivide.
+            domain: 2D edge-intensity image, shape (H, W), to subdivide --
+                or, when `score_fn="variance"`, the raw image itself, shape
+                (H, W) or (H, W, C) (see `Rect.contains`'s own docstring).
             fixed_length: Target number of leaf nodes to subdivide into.
             build_from_info: If True, reconstruct `self.nodes` from `meta_info`
                 instead of building the tree from scratch.
             meta_info: Node bounding-box list as returned by `encode_nodes`, used
                 only when `build_from_info` is True.
+            score_fn: `"canny"` (default) or `"variance"` -- see `Rect.
+                contains`'s own docstring for what each means.
         """
         self.domain = domain
         self.fixed_length = fixed_length
+        self.score_fn = score_fn
         if build_from_info:
             self.nodes = self.decoder_nodes(meta_info=meta_info)
         else:
@@ -248,8 +269,8 @@ class FixedQuadTree:
         for info in meta_info:
             x1,x2,y1,y2 = info
             n = Rect(x1, x2, y1, y2)
-            v = n.contains(self.domain)
-            nodes +=  [[n,v]] 
+            v = n.contains(self.domain, self.score_fn)
+            nodes +=  [[n,v]]
         return nodes
             
     def _build_tree(self):
@@ -266,11 +287,11 @@ class FixedQuadTree:
         list-scan approach with O(fixed_length log fixed_length).
         """
 
-        h,w = self.domain.shape
+        h,w = self.domain.shape[:2]  # domain may carry a trailing channel axis under score_fn="variance"
         assert h>0 and w >0, "Wrong img size."
         root = Rect(0,w,0,h)
         tiebreak = itertools.count()
-        heap = [(-root.contains(self.domain), next(tiebreak), root)]
+        heap = [(-root.contains(self.domain, self.score_fn), next(tiebreak), root)]
         count = 1
         while count < self.fixed_length:
             neg_value, _, bbox = heap[0]
@@ -285,7 +306,7 @@ class FixedQuadTree:
             rb = Rect(int((x1+x2)/2), x2, y1, int((y1+y2)/2))
 
             for child in (lt, rt, lb, rb):
-                heapq.heappush(heap, (-child.contains(self.domain), next(tiebreak), child))
+                heapq.heappush(heap, (-child.contains(self.domain, self.score_fn), next(tiebreak), child))
             count += 3  # -1 (popped parent) + 4 (pushed children)
 
         self.nodes = [[bbox, -neg_value] for neg_value, _, bbox in heap]
@@ -366,7 +387,7 @@ class FixedQuadTree:
             channels appended.
         """
 
-        H,W = self.domain.shape
+        H,W = self.domain.shape[:2]  # domain may carry a trailing channel axis under score_fn="variance"
         seq = np.reshape(seq, (self.fixed_length, patch_size, patch_size, channel))
         seq = seq.astype(int)
         mask = np.zeros(shape=(H, W, channel))

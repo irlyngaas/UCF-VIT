@@ -199,6 +199,56 @@ def test_simple_ddp_size_explicit_int_unaffected_by_auto_support(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# ap.score_fn -- shared between the CPU (do_gpu_ap:False) and GPU
+# (do_gpu_ap:True) adaptive-patching paths, with path-dependent backward-
+# compatible defaults when unset (see parse.py's own comment for why).
+# ---------------------------------------------------------------------------
+
+
+def test_score_fn_defaults_to_canny_when_do_gpu_ap_false():
+    # SAP_CONFIG already ships with ap.do_ap:True -- confirms an existing
+    # shipped config's parsed behavior is completely unchanged by this
+    # feature (score_fn was not a real config key before it).
+    parsed = validate_config(SAP_CONFIG)
+    assert parsed["ap"]["do_gpu_ap"] is False
+    assert parsed["ap"]["score_fn"] == "canny"
+
+
+def test_score_fn_variance_explicit_with_do_gpu_ap_false_now_parses():
+    with open(SAP_CONFIG) as f:
+        conf = yaml.load(f, Loader=yaml.FullLoader)
+    conf["ap"]["score_fn"] = "variance"
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    os.close(fd)
+    try:
+        with open(path, "w") as f:
+            yaml.dump(conf, f)
+        args = argparse.Namespace(config=path, pretrained_config="")
+        parsed = parse_config(args, load_balance_offline=True)
+        assert parsed["ap"]["score_fn"] == "variance"
+    finally:
+        os.remove(path)
+
+
+def test_score_fn_invalid_value_raises_clearly():
+    with open(SAP_CONFIG) as f:
+        conf = yaml.load(f, Loader=yaml.FullLoader)
+    conf["ap"]["score_fn"] = "bogus"
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    os.close(fd)
+    try:
+        with open(path, "w") as f:
+            yaml.dump(conf, f)
+        args = argparse.Namespace(config=path, pretrained_config="")
+        with pytest.raises(AssertionError, match="ap.score_fn"):
+            parse_config(args, load_balance_offline=True)
+    finally:
+        os.remove(path)
+
+
+# ---------------------------------------------------------------------------
 # UNETR's do_ap token_selection / area_weighted_alpha -- get_kwargs' own
 # plumbing, not covered by test_arch.py's model-level tests (which construct
 # UNETR directly, bypassing parse.py entirely)

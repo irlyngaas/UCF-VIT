@@ -34,6 +34,30 @@ def test_cube_contains():
     assert empty.contains(domain) == 0
 
 
+def test_cube_contains_variance_flat_region_scores_zero():
+    domain = np.full((8, 8, 8), 3.0)
+    c = Cube(x1=0, x2=8, y1=0, y2=8, z1=0, z2=8)
+    assert c.contains(domain, score_fn="variance") == 0.0
+
+
+def test_cube_contains_variance_matches_np_var_times_volume():
+    domain = np.arange(8 ** 3, dtype=np.float64).reshape(8, 8, 8)
+    c = Cube(x1=1, x2=5, y1=2, y2=6, z1=0, z2=4)
+    patch = domain[0:4, 2:6, 1:5]
+    expected = float(np.var(patch) * patch.size)
+    assert c.contains(domain, score_fn="variance") == pytest.approx(expected)
+
+
+def test_cube_contains_variance_sums_across_channels():
+    domain = np.zeros((8, 8, 8, 2))
+    domain[0:4, 0:4, 0:4, 0] = np.arange(64).reshape(4, 4, 4)
+    domain[0:4, 0:4, 0:4, 1] = np.arange(64).reshape(4, 4, 4) * 10
+    c = Cube(x1=0, x2=4, y1=0, y2=4, z1=0, z2=4)
+    patch = domain[0:4, 0:4, 0:4]
+    expected = sum(float(np.var(patch[..., ch]) * 64) for ch in range(2))
+    assert c.contains(domain, score_fn="variance") == pytest.approx(expected)
+
+
 def test_cube_get_area():
     img = np.arange(4 * 4 * 4 * 2).reshape(4, 4, 4, 2)
     c = Cube(x1=1, x2=3, y1=0, y2=2, z1=0, z2=4)
@@ -73,4 +97,19 @@ def test_fixedocttree_further_subdivides_dense_region():
     sizes = sorted(c.get_size() for c, _ in tree.nodes)
     # the single dense 8x8x8 octant gets split again into eight 4x4x4s; the
     # other seven original 8x8x8 octants stay untouched
+    assert sizes == [(4, 4, 4)] * 8 + [(8, 8, 8)] * 7
+
+
+def test_fixedocttree_variance_further_subdivides_high_variance_region():
+    """score_fn="variance" analog of test_fixedocttree_further_subdivides_
+    dense_region -- domain here is the raw voxel content itself (not a
+    precomputed edge volume), and the high-variance octant is the one that
+    gets split further.
+    """
+    domain = np.full((16, 16, 16), 5.0)
+    domain[0:8, 0:8, 0:8] = np.tile([[[1., 9.], [9., 1.]], [[9., 1.], [1., 9.]]], (4, 4, 4))
+    tree = FixedOctTree(domain=domain, fixed_length=15, score_fn="variance")
+    assert len(tree.nodes) == 15
+    assert _total_volume(tree) == 16 ** 3
+    sizes = sorted(c.get_size() for c, _ in tree.nodes)
     assert sizes == [(4, 4, 4)] * 8 + [(8, 8, 8)] * 7

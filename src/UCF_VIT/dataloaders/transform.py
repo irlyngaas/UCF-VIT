@@ -29,7 +29,7 @@ class Patchify(torch.nn.Module):
     (real multi-channel photos) keep `cv2.Canny`.
     """
 
-    def __init__(self, sths=[0,1,3,5], fixed_length=196, cannys=[50, 100], canny_quantiles=(0.7, 0.9), interp_size=16, num_channels=3, dataset="imagenet", return_edges=False) -> None:
+    def __init__(self, sths=[0,1,3,5], fixed_length=196, cannys=[50, 100], canny_quantiles=(0.7, 0.9), interp_size=16, num_channels=3, dataset="imagenet", return_edges=False, score_fn="canny") -> None:
         """Initializes the randomization ranges and patch parameters for the transform.
 
         Args:
@@ -40,21 +40,31 @@ class Patchify(torch.nn.Module):
                 other dataset (`skimage.feature.canny`'s own `sigma`), a
                 standard deviation (float) -- these aren't numerically
                 equivalent, so pass different values for a `dataset` that isn't
-                `imagenet`/`catsdogs`.
+                `imagenet`/`catsdogs`. Unused when `score_fn="variance"`.
             fixed_length: Fixed number of patches the image is serialized into.
             cannys: `imagenet`/`catsdogs` only (`cv2.Canny`): `[low, high)`
                 range of absolute lower thresholds to randomly choose from; the
-                corresponding upper threshold is `low + 50`.
+                corresponding upper threshold is `low + 50`. Unused when
+                `score_fn="variance"`.
             canny_quantiles: Every other dataset only (`skimage.feature.canny`,
                 `use_quantiles=True`): `(low, high)` hysteresis thresholds, as
                 quantiles of the edge-magnitude distribution in `[0, 1]` --
                 dataset-scale-independent by construction, unlike `cannys`'
                 absolute values. Starting values, not empirically tuned.
+                Unused when `score_fn="variance"`.
             interp_size: Side length each (square) leaf patch is interpolated to.
             num_channels: Number of image channels.
             dataset: Dataset name; controls how edges are computed/normalized
-                ("imagenet"/"catsdogs" vs. other datasets).
-            return_edges: If True, also return the computed edge map from `forward`.
+                ("imagenet"/"catsdogs" vs. other datasets). Unused when
+                `score_fn="variance"`.
+            return_edges: If True, also return the computed edge map from
+                `forward`. When `score_fn="variance"`, the "edge map" is
+                `img` itself (see `forward`'s own docstring).
+            score_fn: `"canny"` (default -- randomly-smoothed Canny edge
+                density, as described above) or `"variance"` (`img` itself
+                is used as `FixedQuadTree`'s domain, deterministically, no
+                smoothing/thresholds -- see `UCF_VIT.dataloaders.quadtree.
+                Rect.contains`'s own docstring for what that scores).
         """
         super().__init__()
 
@@ -66,23 +76,32 @@ class Patchify(torch.nn.Module):
         self.num_channels = num_channels
         self.dataset = dataset
         self.return_edges = return_edges
+        self.score_fn = score_fn
 
     def forward(self, img):  # we assume inputs are always structured like this
-        """Computes an edge map for `img` and adaptively patchifies it via a quadtree.
+        """Computes an edge map (or, in variance mode, uses `img` directly) and adaptively patchifies it via a quadtree.
 
         Args:
-            img: Input 2D image array, shape (H, W[, C]). For any `dataset`
-                other than `imagenet`/`catsdogs`, `C` (if present) must be 1 --
-                `skimage.feature.canny` only accepts single-channel input (see
-                this class's own docstring).
+            img: Input 2D image array, shape (H, W[, C]). For `score_fn=
+                "canny"` and any `dataset` other than `imagenet`/`catsdogs`,
+                `C` (if present) must be 1 -- `skimage.feature.canny` only
+                accepts single-channel input (see this class's own
+                docstring). `score_fn="variance"` has no such restriction
+                (any `C`, any `dataset`).
 
         Returns:
             If `self.return_edges` is False: `(seq_img, seq_size, seq_pos, qdt)`.
             If True: `(seq_img, seq_size, seq_pos, qdt, edges)`. `seq_img` is the
             flattened patch sequence, `seq_size` the per-patch side length,
             `seq_pos` the per-patch center position, `qdt` the `FixedQuadTree`
-            instance, and `edges` the computed edge map.
+            instance, and `edges` the computed edge map (`img` itself, under
+            `score_fn="variance"`).
         """
+        if self.score_fn == "variance":
+            edges = img
+            qdt = FixedQuadTree(domain=edges, fixed_length=self.fixed_length, score_fn=self.score_fn)
+            return self._serialize(img, qdt, edges)
+
         # Do some transformations. Here, we're just passing though the input
 
         self.smooth_factor = random.choice(self.sths)
@@ -120,7 +139,24 @@ class Patchify(torch.nn.Module):
                 # consistent scale works; boolean-as-uint8 is fine as-is.
                 edges = edges.astype(np.uint8)
 
-        qdt = FixedQuadTree(domain=edges, fixed_length=self.fixed_length)
+        qdt = FixedQuadTree(domain=edges, fixed_length=self.fixed_length, score_fn=self.score_fn)
+        return self._serialize(img, qdt, edges)
+
+    def _serialize(self, img, qdt, edges):
+        """Serializes `img` through an already-built `qdt`, and packages the return value.
+
+        Shared tail of `forward`'s canny and variance branches -- everything
+        after the domain/tree is decided is identical either way.
+
+        Args:
+            img: Input image, shape (H, W[, C]), as passed to `forward`.
+            qdt: `FixedQuadTree` already built over this call's domain.
+            edges: The domain array used to build `qdt` -- only returned
+                when `self.return_edges` is True.
+
+        Returns:
+            Same as `forward`'s own return value.
+        """
         seq_img, seq_size, seq_pos = qdt.serialize(img, size=(self.interp_size,self.interp_size,self.num_channels))
         seq_size = np.asarray(seq_size)
         seq_img = np.asarray(seq_img, dtype=np.float32)
@@ -152,7 +188,7 @@ class Patchify_3D(torch.nn.Module):
     by the weighting above rather than in a single multi-channel call.
     """
 
-    def __init__(self, sths=[0.5,1.0,2.0], fixed_length=196, canny_thresholds=(0.05, 0.15), interp_size=16, num_channels=3, dataset="basic_ct", return_edges=False, profile=False) -> None:
+    def __init__(self, sths=[0.5,1.0,2.0], fixed_length=196, canny_thresholds=(0.05, 0.15), interp_size=16, num_channels=3, dataset="basic_ct", return_edges=False, profile=False, score_fn="canny") -> None:
         """Initializes the randomization ranges and patch parameters for the transform.
 
         Args:
@@ -163,7 +199,8 @@ class Patchify_3D(torch.nn.Module):
                 internally (no separate blur step needed, unlike the old
                 pipeline). Note: `variance`, not standard deviation (sigma)
                 -- not numerically equivalent to this parameter's old
-                meaning, needs its own tuning regardless.
+                meaning, needs its own tuning regardless. Unused when
+                `score_fn="variance"`.
             fixed_length: Fixed number of patches the volume is serialized into.
             canny_thresholds: `(low, high)` hysteresis thresholds for
                 `SimpleITK.CannyEdgeDetection` -- absolute values on the
@@ -172,7 +209,7 @@ class Patchify_3D(torch.nn.Module):
                 quantile-threshold option. Starting values, not empirically
                 tuned; assumes roughly `[0,1]`-scale input intensities
                 (matches this repo's own min-max-normalized `basic_ct`
-                loading).
+                loading). Unused when `score_fn="variance"`.
             interp_size: Side length each (cubic) leaf patch is interpolated to.
             num_channels: Number of volume channels.
             dataset: Dataset name. Mostly kept for interface compatibility
@@ -183,8 +220,10 @@ class Patchify_3D(torch.nn.Module):
                 `"sst"` gets its edge-detection input (only -- not the real
                 patch content) locally, per-channel min-max normalized
                 instead. Every other dataset's behavior is unaffected.
+                Unused when `score_fn="variance"`.
             return_edges: If True, also return the computed edge volume from
-                `forward`.
+                `forward`. When `score_fn="variance"`, the "edge volume" is
+                `img` itself (see `forward`'s own docstring).
             profile: Diagnostic only, off by default -- see `UCF_VIT.training.
                 train_epoch`'s own `profile_dataloader` handling, which this
                 mirrors from inside the DataLoader worker process (this class
@@ -193,6 +232,14 @@ class Patchify_3D(torch.nn.Module):
                 this call's *raw* cost -- only whether the worker keeps up).
                 When True, times the per-channel Canny loop, the `FixedOctTree`
                 build, and `serialize` separately and prints them every call.
+            score_fn: `"canny"` (default -- per-channel 3D Canny, as
+                described above) or `"variance"` (`img` itself is used as
+                `FixedOctTree`'s domain, deterministically -- skips the
+                per-channel `SimpleITK.CannyEdgeDetection` loop entirely,
+                since `Cube.contains`'s own per-channel-variance-sum handles
+                multi-channel input at query time instead; see `UCF_VIT.
+                dataloaders.octree.Cube.contains`'s own docstring for what
+                that scores).
         """
         super().__init__()
 
@@ -204,9 +251,10 @@ class Patchify_3D(torch.nn.Module):
         self.dataset = dataset
         self.return_edges = return_edges
         self.profile = profile
+        self.score_fn = score_fn
 
     def forward(self, img):  # we assume inputs are always structured like this
-        """Computes a 3D edge volume for `img` and adaptively patchifies it via an octree.
+        """Computes a 3D edge volume for `img` (or, in variance mode, uses `img` directly) and adaptively patchifies it via an octree.
 
         Args:
             img: Input 3D volume array, shape (D, H, W, C).
@@ -216,8 +264,29 @@ class Patchify_3D(torch.nn.Module):
             octtree)`. If True: `(seq_img, seq_size, seq_pos, octtree, edges)`.
             `seq_img` is the flattened patch sequence, `seq_size` the per-patch side
             length, `seq_pos` the per-patch center position, `octtree` the
-            `FixedOctTree` instance, and `edges` the computed edge volume.
+            `FixedOctTree` instance, and `edges` the computed edge volume
+            (`img` itself, under `score_fn="variance"`).
         """
+        if self.score_fn == "variance":
+            edges = img
+            if self.profile:
+                t_octree_start = time.time()
+            octtree = FixedOctTree(domain=edges, fixed_length=self.fixed_length, score_fn=self.score_fn)
+            if self.profile:
+                t_serialize_start = time.time()
+                octree_time = t_serialize_start - t_octree_start
+            seq_img, seq_size, seq_pos = octtree.serialize(img, size=(self.interp_size,self.interp_size,self.interp_size, self.num_channels))
+            if self.profile:
+                serialize_time = time.time() - t_serialize_start
+                worker_info = get_worker_info()
+                print(
+                    "patchify_3d worker_pid", os.getpid(), "worker_id", worker_info.id if worker_info is not None else None,
+                    "edge_time", 0.0, "octree_time", octree_time, "serialize_time", serialize_time,
+                    "patchify_time", octree_time + serialize_time,
+                    flush=True,
+                )
+            return self._serialize_return(seq_img, seq_size, seq_pos, octtree, edges)
+
         self.smooth_factor = random.choice(self.sths)
         variance = [float(self.smooth_factor)] * 3
 
@@ -261,7 +330,7 @@ class Patchify_3D(torch.nn.Module):
             t_octree_start = time.time()
             edge_time = t_octree_start - t_edge_start
 
-        octtree = FixedOctTree(domain=edges, fixed_length=self.fixed_length)
+        octtree = FixedOctTree(domain=edges, fixed_length=self.fixed_length, score_fn=self.score_fn)
 
         if self.profile:
             t_serialize_start = time.time()
@@ -279,6 +348,25 @@ class Patchify_3D(torch.nn.Module):
                 flush=True,
             )
 
+        return self._serialize_return(seq_img, seq_size, seq_pos, octtree, edges)
+
+    def _serialize_return(self, seq_img, seq_size, seq_pos, octtree, edges):
+        """Reshapes `octtree.serialize`'s raw output and packages `forward`'s return value.
+
+        Shared tail of `forward`'s canny and variance branches -- everything
+        after `octtree.serialize` is called is identical either way.
+
+        Args:
+            seq_img: Raw patch sequence from `octtree.serialize`.
+            seq_size: Raw per-patch side lengths from `octtree.serialize`.
+            seq_pos: Raw per-patch center positions from `octtree.serialize`.
+            octtree: `FixedOctTree` used to produce the above.
+            edges: The domain array used to build `octtree` -- only returned
+                when `self.return_edges` is True.
+
+        Returns:
+            Same as `forward`'s own return value.
+        """
         seq_size = np.asarray(seq_size)
         seq_img = np.asarray(seq_img, dtype=np.float32)
         if self.num_channels > 1:

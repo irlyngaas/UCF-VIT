@@ -82,6 +82,48 @@ def test_patchify_non_photo_branch_rejects_multi_channel():
         p(img)
 
 
+def test_patchify_variance_mode_uses_raw_image_as_domain():
+    """score_fn="variance" skips smoothing/Canny entirely -- the domain
+    handed to FixedQuadTree is img itself, deterministically (unlike
+    score_fn="canny", which randomizes smoothing/thresholds every call)."""
+    img = _box_image()[:, :, None]
+    p = Patchify(fixed_length=16, interp_size=8, num_channels=1, dataset="basic_ct", score_fn="variance", return_edges=True)
+
+    _, _, _, _, edges1 = p(img)
+    _, _, _, _, edges2 = p(img)
+
+    assert edges1 is img
+    assert edges2 is img
+    np.testing.assert_array_equal(edges1, edges2)
+
+
+def test_patchify_variance_mode_favors_higher_variance_region():
+    """Direct analog of FixedQuadTree's own test_fixedquadtree_variance_
+    further_subdivides_high_variance_region, through the full Patchify
+    pipeline -- a checkerboard quadrant (real pixel variance) gets split
+    further than the three flat quadrants."""
+    img = np.full((16, 16), 5.0, dtype=np.float32)
+    img[0:8, 0:8] = np.tile([[1., 9.], [9., 1.]], (4, 4))
+    img = img[:, :, None]
+
+    p = Patchify(fixed_length=7, interp_size=4, num_channels=1, dataset="basic_ct", score_fn="variance")
+    _, seq_size, _, qdt = p(img)
+
+    assert qdt.count_patches() == 7
+    assert sorted(seq_size) == [4] * 4 + [8] * 3
+
+
+def test_patchify_variance_mode_allows_multi_channel_on_non_photo_dataset():
+    """score_fn="variance" has no equivalent to score_fn="canny"'s C == 1
+    restriction on non-imagenet/catsdogs datasets (skimage.feature.canny
+    only accepts single-channel input; np.var handles any channel count) --
+    this is a real generalization, not just a different scoring formula."""
+    img = np.stack([_box_image()] * 3, axis=-1)  # (H, W, 3)
+    p = Patchify(fixed_length=16, interp_size=8, num_channels=3, dataset="basic_ct", score_fn="variance")
+
+    p(img)  # does not raise
+
+
 def test_patchify_3d_detects_edge_purely_along_depth():
     """The direct regression test for the switch to SimpleITK.CannyEdgeDetection:
     a step function purely along depth (uniform *within* every single slice,
@@ -121,6 +163,49 @@ def test_patchify_3d_weights_by_channel_agreement():
     assert set(np.unique(edges)).issubset({0, 1, 2})
     assert set(np.unique(edges[8, 8:16, 8:16])) == {2}  # shared box's edge face: both channels agree
     assert set(np.unique(edges[2, 2:6, 2:6])) == {1}    # channel-1-only box's edge face
+
+
+def test_patchify_3d_variance_mode_uses_raw_image_as_domain():
+    vol = np.random.RandomState(0).rand(16, 16, 16, 1).astype(np.float32)
+    p = Patchify_3D(fixed_length=8, interp_size=4, num_channels=1, dataset="basic_ct", score_fn="variance", return_edges=True)
+
+    _, _, _, _, edges = p(vol)
+
+    assert edges is vol
+
+
+def test_patchify_3d_variance_mode_skips_the_simpleitk_canny_loop_entirely(monkeypatch):
+    """score_fn="variance" should never call SimpleITK.CannyEdgeDetection at
+    all -- not just get an equivalent result via a different path. Confirms
+    the "cheaper, not just an alternative" claim by making the real Canny
+    call raise if it's ever reached.
+    """
+    import UCF_VIT.dataloaders.transform as transform_module
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("SimpleITK.CannyEdgeDetection should not be called under score_fn='variance'")
+
+    monkeypatch.setattr(transform_module.sitk, "CannyEdgeDetection", _boom)
+
+    vol = np.random.RandomState(0).rand(16, 16, 16, 1).astype(np.float32)
+    p = Patchify_3D(fixed_length=8, interp_size=4, num_channels=1, dataset="basic_ct", score_fn="variance")
+
+    p(vol)  # does not raise
+
+
+def test_patchify_3d_variance_mode_favors_higher_variance_region():
+    """Direct analog of FixedOctTree's own test_fixedocttree_variance_
+    further_subdivides_high_variance_region, through the full Patchify_3D
+    pipeline."""
+    vol = np.full((16, 16, 16), 5.0, dtype=np.float32)
+    vol[0:8, 0:8, 0:8] = np.tile([[[1., 9.], [9., 1.]], [[9., 1.], [1., 9.]]], (4, 4, 4))
+    vol = vol[:, :, :, None]
+
+    p = Patchify_3D(fixed_length=15, interp_size=4, num_channels=1, dataset="basic_ct", score_fn="variance")
+    _, seq_size, _, octtree = p(vol)
+
+    assert len(octtree.nodes) == 15
+    assert sorted(seq_size) == [4] * 8 + [8] * 7
 
 
 def test_patchify_multi_channel_reshape_does_not_scramble_channels():

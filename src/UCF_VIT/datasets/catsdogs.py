@@ -58,7 +58,7 @@ class CatsDogsDataset(Dataset):
     image.
     """
 
-    def __init__(self, file_list, variables, tile_size, twoD = True, adaptive_patching = False, fixed_length=196, interp_size=16, num_channels=3, dataset="catsdogs", resize=None, div=1, tile_overlap=(0, 0)):
+    def __init__(self, file_list, variables, tile_size, twoD = True, adaptive_patching = False, fixed_length=196, interp_size=16, num_channels=3, dataset="catsdogs", resize=None, div=1, tile_overlap=(0, 0), score_fn="canny"):
         """Initializes the dataset over a list of image file paths.
 
         Args:
@@ -89,6 +89,8 @@ class CatsDogsDataset(Dataset):
                 tiles total). `1` (the default) means no tiling.
             tile_overlap: `(height overlap, width overlap)` total overlap between
                 adjacent tiles per axis, only used when `div > 1`.
+            score_fn: `"canny"` (default) or `"variance"` -- forwarded to
+                `Patchify`/`Patchify_3D`, when `adaptive_patching` is True.
         """
         self.file_list = file_list
         self.variables = variables
@@ -101,6 +103,7 @@ class CatsDogsDataset(Dataset):
         self.twoD = twoD
         self.resize = resize
         self.div = div
+        self.score_fn = score_fn
 
         # start_overlap/end_overlap and tile_size_no_overlap use the same
         # [height, width]-ordered convention as tile_size/tile_overlap
@@ -114,9 +117,9 @@ class CatsDogsDataset(Dataset):
 
         if self.adaptive_patching:
             if self.twoD:
-                self.patchify = Patchify(fixed_length=fixed_length, interp_size=interp_size, num_channels=num_channels, dataset=self.dataset)
+                self.patchify = Patchify(fixed_length=fixed_length, interp_size=interp_size, num_channels=num_channels, dataset=self.dataset, score_fn=self.score_fn)
             else:
-                self.patchify = Patchify_3D(fixed_length=fixed_length, interp_size=interp_size, num_channels=num_channels, dataset=self.dataset)
+                self.patchify = Patchify_3D(fixed_length=fixed_length, interp_size=interp_size, num_channels=num_channels, dataset=self.dataset, score_fn=self.score_fn)
 
     def __len__(self):
         """Returns the number of (file, tile) samples in the dataset.

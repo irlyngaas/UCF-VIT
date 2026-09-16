@@ -169,6 +169,10 @@ class NativePytorchDataModule(torch.nn.Module):
             `adaptive_patching` is True.
         separate_channels (bool, optional): Whether adaptive patching is done independently per
             channel (True) or jointly across all channels (False).
+        score_fn (str, optional): `"canny"` (default) or `"variance"` --
+            forwarded to `Patchify`/`Patchify_3D`, when `adaptive_patching`
+            is True. See their own `score_fn` docstring entries for what
+            each means.
         data_par_size (int, optional): the size of the data parallelism
         dataset (str, optional): Dataset name, e.g. "imagenet" or "basic_ct"; determines how
             files are listed and how samples are processed/collated.
@@ -269,6 +273,7 @@ class NativePytorchDataModule(torch.nn.Module):
         full_domain_size: Optional[Dict] = None,
         time_offsets: Optional[list] = None,
         profile_dataloader: bool = False,
+        score_fn: str = "canny",
     ):
         """Initializes the data module and builds the per-dataset file listings.
 
@@ -309,6 +314,7 @@ class NativePytorchDataModule(torch.nn.Module):
         self.adaptive_patching = adaptive_patching
         self.fixed_length = fixed_length
         self.separate_channels = separate_channels
+        self.score_fn = score_fn
         self.data_par_size = data_par_size
         self.ddp_group = ddp_group
         self.dataset = dataset
@@ -484,6 +490,7 @@ class NativePytorchDataModule(torch.nn.Module):
                 self.dataset,
                 self.return_qdt,
                 profile=self.profile_dataloader,
+                score_fn=self.score_fn,
             )
         else:
             dict_data_train[k] = ProcessChannels(
@@ -525,6 +532,7 @@ class NativePytorchDataModule(torch.nn.Module):
                 self.dataset,
                 self.return_qdt,
                 profile=self.profile_dataloader,
+                score_fn=self.score_fn,
             )
         return dict_data_train
         

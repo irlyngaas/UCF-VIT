@@ -32,6 +32,30 @@ def test_rect_contains():
     assert empty.contains(domain) == 0
 
 
+def test_rect_contains_variance_flat_region_scores_zero():
+    domain = np.full((8, 8), 3.0)
+    r = Rect(x1=0, x2=8, y1=0, y2=8)
+    assert r.contains(domain, score_fn="variance") == 0.0
+
+
+def test_rect_contains_variance_matches_np_var_times_area():
+    domain = np.arange(64, dtype=np.float64).reshape(8, 8)
+    r = Rect(x1=1, x2=5, y1=2, y2=6)
+    patch = domain[2:6, 1:5]
+    expected = float(np.var(patch) * patch.size)
+    assert r.contains(domain, score_fn="variance") == pytest.approx(expected)
+
+
+def test_rect_contains_variance_sums_across_channels():
+    domain = np.zeros((8, 8, 2))
+    domain[0:4, 0:4, 0] = np.arange(16).reshape(4, 4)
+    domain[0:4, 0:4, 1] = np.arange(16).reshape(4, 4) * 10
+    r = Rect(x1=0, x2=4, y1=0, y2=4)
+    patch = domain[0:4, 0:4]
+    expected = sum(float(np.var(patch[..., c]) * 16) for c in range(2))
+    assert r.contains(domain, score_fn="variance") == pytest.approx(expected)
+
+
 def test_rect_get_area():
     img = np.arange(4 * 4 * 3).reshape(4, 4, 3)
     r = Rect(x1=1, x2=3, y1=0, y2=2)
@@ -68,6 +92,21 @@ def test_fixedquadtree_further_subdivides_dense_region():
     sizes = sorted(r.get_size() for r, _ in qdt.nodes)
     # the dense 8x8 quadrant gets split again into four 4x4s; the other
     # three original 8x8 quadrants stay untouched
+    assert sizes == [(4, 4)] * 4 + [(8, 8)] * 3
+
+
+def test_fixedquadtree_variance_further_subdivides_high_variance_region():
+    """score_fn="variance" analog of test_fixedquadtree_further_subdivides_
+    dense_region -- domain here is the raw pixel content itself (not a
+    precomputed edge map), and the high-variance quadrant (a checkerboard,
+    not flat) is the one that gets split further.
+    """
+    domain = np.full((16, 16), 5.0)
+    domain[0:8, 0:8] = np.tile([[1., 9.], [9., 1.]], (4, 4))
+    qdt = FixedQuadTree(domain=domain, fixed_length=7, score_fn="variance")
+    assert qdt.count_patches() == 7
+    assert _total_area(qdt) == 16 * 16
+    sizes = sorted(r.get_size() for r, _ in qdt.nodes)
     assert sizes == [(4, 4)] * 4 + [(8, 8)] * 3
 
 
