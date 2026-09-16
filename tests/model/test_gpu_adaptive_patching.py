@@ -13,10 +13,13 @@ Runs fully on CPU (`torch`, `scipy.ndimage`, `torch.nn.functional.grid_sample`
 -- no CUDA, no dataset-specific dependency).
 """
 
+import sys
+import types
+
 import pytest
 import torch
 
-from UCF_VIT.model.gpu_adaptive_patching import GPUPatchify2D
+from UCF_VIT.model.gpu_adaptive_patching import GPUPatchify2D, _label_regions
 
 
 def test_pad_tensor_pads_to_coarsest_block_size():
@@ -59,6 +62,84 @@ def test_fixed_length_congruence_assertion():
 def test_non_square_requires_shorter_first_dimension():
     with pytest.raises(NotImplementedError, match="img_size"):
         GPUPatchify2D(img_size=(16, 8), fixed_length=1, interp_size=4, min_size=2)
+
+
+# ---------------------------------------------------------------------------
+# region_backend -- "scipy" (default, CPU round-trip) is exercised by every
+# other test in this file unchanged. "cupyx" (opt-in, GPU-native) can't be
+# tested against real cupy/GPU hardware in this environment (no CUDA/ROCm
+# device, cupy not installed) -- these tests cover (a) the real, honest
+# behavior here (cupy genuinely missing -> a clear ImportError, not a silent
+# fallback) and (b) the dispatch logic itself with cupy/cupyx faked out,
+# trusting cupy's documented scipy.ndimage.label API compatibility for the
+# real numerics.
+# ---------------------------------------------------------------------------
+
+
+def test_region_backend_invalid_value_raises_clearly():
+    border_mask = torch.zeros(4, 4, dtype=torch.bool)
+    with pytest.raises(AssertionError, match="region_backend"):
+        _label_regions(border_mask, region_backend="bogus")
+
+
+def test_region_backend_cupyx_without_cupy_installed_raises_import_error():
+    # A real, meaningful assertion in *this* environment: cupy genuinely
+    # isn't installed here, so this exercises the actual (not simulated)
+    # error path a user would hit without it.
+    border_mask = torch.zeros(4, 4, dtype=torch.bool)
+    with pytest.raises(ImportError, match="cupy"):
+        _label_regions(border_mask, region_backend="cupyx")
+
+
+def test_region_backend_cupyx_requires_a_cuda_tensor(monkeypatch):
+    # Fakes cupy/cupyx being installed (so the ImportError above doesn't
+    # fire) to isolate the *next* check: region_backend="cupyx" must still
+    # refuse a CPU tensor rather than silently using it.
+    monkeypatch.setitem(sys.modules, "cupy", types.ModuleType("cupy"))
+    fake_ndimage = types.ModuleType("cupyx.scipy.ndimage")
+    fake_ndimage.label = lambda x: (x, 0)
+    monkeypatch.setitem(sys.modules, "cupyx.scipy.ndimage", fake_ndimage)
+
+    border_mask = torch.zeros(4, 4, dtype=torch.bool)
+    with pytest.raises(AssertionError, match="CUDA"):
+        _label_regions(border_mask, region_backend="cupyx")
+
+
+def test_region_backend_cupyx_dispatch_with_cupy_faked_out(monkeypatch):
+    """Confirms the "cupyx" branch is actually reached and its
+    (labeled, num_features) result is wrapped back correctly -- a
+    dispatch-logic test, not a real-numerics test. cupy.from_dlpack and
+    cupyx.scipy.ndimage.label are faked to operate directly on plain torch
+    tensors (torch.from_dlpack already accepts a real torch.Tensor
+    unchanged, confirmed directly -- no need to fake that half too).
+    """
+    fake_cupy = types.ModuleType("cupy")
+    fake_cupy.from_dlpack = lambda t: t  # "cupy array" is just the same tensor here
+    monkeypatch.setitem(sys.modules, "cupy", fake_cupy)
+
+    calls = []
+
+    def fake_label(interior):
+        calls.append(interior)
+        labeled = torch.zeros_like(interior, dtype=torch.int32)
+        labeled[interior] = 1
+        return labeled, 1
+
+    fake_ndimage = types.ModuleType("cupyx.scipy.ndimage")
+    fake_ndimage.label = fake_label
+    monkeypatch.setitem(sys.modules, "cupyx.scipy.ndimage", fake_ndimage)
+
+    # is_cuda is a read-only property on real tensors -- patch it at the
+    # class level so a plain CPU tensor reports True for this test only.
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+
+    border_mask = torch.tensor([[True, False], [False, False]])
+    labeled, num_features = _label_regions(border_mask, region_backend="cupyx")
+
+    assert num_features == 1
+    assert len(calls) == 1
+    torch.testing.assert_close(calls[0], ~border_mask)
+    torch.testing.assert_close(labeled, torch.tensor([[0, 1], [1, 1]], dtype=torch.int32))
 
 
 def test_merge_cost_is_exactly_zero_for_a_flat_region():

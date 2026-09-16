@@ -7,6 +7,62 @@ import torch.nn.functional as F
 from scipy.ndimage import label as scipy_label
 
 
+def _label_regions(border_mask, region_backend="scipy"):
+    """Connected components of `~border_mask` -> `(labeled, num_features)`.
+
+    Shared by `GPUPatchify2D`/`GPUPatchify3D._detect_regions` -- dimension-
+    agnostic, since both `scipy.ndimage.label` and `cupyx.scipy.ndimage.
+    label` already work on N-D arrays unchanged.
+
+    Args:
+        border_mask: Bool tensor, any number of dims, `True` on block
+            borders/faces (see `GPUPatchify2D._border_mask`/`GPUPatchify3D.
+            _face_mask`).
+        region_backend: `"scipy"` (default) -- CPU round-trip via `scipy.
+            ndimage.label`, today's exact behavior. `"cupyx"` -- GPU-native
+            via `cupyx.scipy.ndimage.label`, using the DLPack protocol
+            (`cupy`/`torch` both implement `__dlpack__` directly, no
+            manual `to_dlpack`/`toDlpack` needed) to move `border_mask`
+            to/from `cupy` with no CPU round-trip. Opt-in and explicit,
+            not auto-detected: raises clearly if `cupy` isn't importable
+            or `border_mask` isn't on a CUDA device, rather than silently
+            falling back to `"scipy"`. Not verified on real GPU hardware
+            in this session (no CUDA/ROCm device, `cupy` not installed
+            here) -- trusts `cupyx`'s documented `scipy.ndimage.label`
+            API compatibility for the real numerics.
+
+    Returns:
+        `(labeled, num_features)`: `labeled` is an integer-dtype tensor on
+        `border_mask`'s own device, same shape, `0` = background;
+        `num_features` is a plain `int`.
+    """
+    assert region_backend in ("scipy", "cupyx"), f"region_backend must be 'scipy' or 'cupyx', got {region_backend!r}"
+
+    if region_backend == "cupyx":
+        try:
+            import cupy
+            from cupyx.scipy.ndimage import label as cupyx_label
+        except ImportError as e:
+            raise ImportError(
+                "region_backend='cupyx' requires the cupy package (with a CUDA or "
+                "ROCm build matching this environment's GPU), which isn't installed "
+                "here."
+            ) from e
+        assert border_mask.is_cuda, (
+            "region_backend='cupyx' requires border_mask to be on a CUDA device -- "
+            f"got device {border_mask.device}. Use region_backend='scipy' for CPU tensors."
+        )
+        interior_cp = cupy.from_dlpack(~border_mask)
+        labeled_cp, num_features = cupyx_label(interior_cp)
+        labeled = torch.from_dlpack(labeled_cp)
+        return labeled, int(num_features)
+
+    device = border_mask.device
+    interior = ~border_mask.cpu().numpy()
+    labeled_np, num_features = scipy_label(interior)
+    return torch.from_numpy(labeled_np).to(device), int(num_features)
+
+
 class GPUPatchify2D(torch.nn.Module):
     """GPU-native, level-parallel adaptive patchification for 2D images.
 
@@ -49,6 +105,7 @@ class GPUPatchify2D(torch.nn.Module):
             self, img_size, fixed_length=196, interp_size=16, min_size=2,
             score_fn="variance", canny_sigma=1.0, canny_low_threshold=0.1,
             canny_high_threshold=0.2, canny_hysteresis_iters=2,
+            region_backend="scipy",
     ):
         """Precomputes the level structure this image size implies.
 
@@ -90,6 +147,8 @@ class GPUPatchify2D(torch.nn.Module):
                 this many times) -- not exact flood-fill connectivity, see
                 `_canny_edge_map_batch`'s own docstring. Only used when
                 `score_fn == "canny"`.
+            region_backend: `"scipy"` (default) or `"cupyx"` -- see
+                `_label_regions`'s own docstring for what each means.
         """
         super().__init__()
         self.interp_size = interp_size
@@ -101,6 +160,7 @@ class GPUPatchify2D(torch.nn.Module):
         self.canny_low_threshold = canny_low_threshold
         self.canny_high_threshold = canny_high_threshold
         self.canny_hysteresis_iters = canny_hysteresis_iters
+        self.region_backend = region_backend
 
         if img_size[0] == img_size[1]:
             max_blocks = img_size[0] // min_size
@@ -489,18 +549,15 @@ class GPUPatchify2D(torch.nn.Module):
     def _detect_regions(self, border_mask):
         """Connected components of `border_mask`'s interior -> `RegionTensors`.
 
-        The `scipy.ndimage.label` call itself runs on CPU (a real device
-        round-trip) -- everything else, including the bbox extraction in
-        `_labeled_to_region_tensors`, stays on `border_mask`'s own device.
-        A fully-GPU alternative is possible (`cupyx.scipy.ndimage.label` --
-        deliberately not `kornia.contrib.connected_components`, which has
-        no 3D equivalent) but not implemented here; swapping it in only
-        requires replacing this one method.
+        Delegates to the shared `_label_regions` (module-level) -- `"scipy"`
+        (default) does a real CPU round-trip; `"cupyx"` (opt-in via `self.
+        region_backend`, deliberately not `kornia.contrib.connected_
+        components`, which has no 3D equivalent) stays fully on-device.
+        See `_label_regions`'s own docstring for what each means and what's
+        verified.
         """
-        device = border_mask.device
-        interior = ~border_mask.cpu().numpy()
-        labeled_np, num_features = scipy_label(interior)
-        return self._labeled_to_region_tensors(torch.from_numpy(labeled_np).to(device), num_features)
+        labeled, num_features = _label_regions(border_mask, self.region_backend)
+        return self._labeled_to_region_tensors(labeled, num_features)
 
     def run_merge_batch(self, batch_merge_costs, level_shapes, padded_hwc):
         """Merges every image in the batch down to exactly `fixed_length` leaves, in lockstep.
@@ -689,5 +746,698 @@ class GPUPatchify2D(torch.nn.Module):
 
         seq_size = torch.stack([rt.phs for rt in all_regions]).float()  # [B, N]
         seq_pos = torch.stack([torch.stack([rt.cxs, rt.cys], dim=-1) for rt in all_regions])  # [B, N, 2]
+
+        return seq_img, seq_size, seq_pos
+
+
+class GPUPatchify3D(torch.nn.Module):
+    """GPU-native, level-parallel adaptive patchification for 3D volumes.
+
+    3D generalization of `GPUPatchify2D` -- mirrors `UCF_VIT.dataloaders.
+    transform`'s own `Patchify`/`Patchify_3D` convention (a separate class
+    per dimensionality, not a unified N-D class), so `GPUPatchify2D` itself
+    is untouched. Every design decision `GPUPatchify2D`'s own docstring and
+    `tests/README.md` entries describe (level-parallel bottom-up merge,
+    pluggable `score_fn`, why the merge-cost formula differs between
+    `"variance"` and `"canny"`) applies unchanged here; only the mechanics
+    generalize: 8 children merge into 1 parent (not 4), block "borders"
+    become block "faces" (2D faces on a 3D boundary volume, not 1D lines),
+    Canny's non-max suppression discretizes gradient direction into 13
+    canonical directions (the antipodal neighbor-direction pairs of a
+    3x3x3 voxel neighborhood, not 2D's 4), and `_serialize_batch` uses a
+    5D (volumetric) `grid_sample` call instead of 4D.
+
+    Not yet wired into any model (`ap.do_gpu_ap` currently asserts `twoD`
+    by construction in `arch.py`) -- see this module's own tests/README.md
+    entry for what's deferred.
+    """
+
+    RegionTensors3D = namedtuple(
+        "RegionTensors3D",
+        ["x0s", "x1s", "y0s", "y1s", "z0s", "z1s", "phs", "pws", "pds", "cxs", "cys", "czs", "N"],
+    )
+
+    def __init__(
+            self, img_size, fixed_length=344, interp_size=16, min_size=2,
+            score_fn="variance", canny_sigma=1.0, canny_low_threshold=0.1,
+            canny_high_threshold=0.2, canny_hysteresis_iters=2,
+            region_backend="scipy",
+    ):
+        """Precomputes the level structure this volume size implies.
+
+        Args:
+            img_size: `(D, H, W)` of the (unpadded) input. Requires
+                `D <= H <= W` (extends `GPUPatchify2D`'s own `H <= W`
+                requirement -- the reference implementation's min_size-
+                ratio trick, generalized to two ratios, `H/D` and `W/D`,
+                each truncated to `int` exactly like `GPUPatchify2D`'s own
+                single ratio already is).
+            fixed_length: Target number of leaf regions to merge down to.
+                Must satisfy `(real_max_blocks**3 - fixed_length) % 7 == 0`
+                (every merge removes exactly 7 leaves -- 8 children into 1
+                parent -- matching `FixedOctTree`'s own modulus; see
+                `GPUPatchify2D.__init__`'s identical `% 3` assertion for
+                the analogous 2D reasoning, and `_serialize_batch`'s own
+                docstring for why every image in a batch must land on the
+                same leaf count).
+            interp_size: Side length each (cubic) leaf region is resized to.
+            min_size: Finest block side length (level 0), along the
+                shortest volume axis (`D`).
+            score_fn: `"variance"` (default) or `"canny"` -- see
+                `GPUPatchify2D`'s own `score_fn` docstring entry; identical
+                reasoning, generalized to 3 axes.
+            canny_sigma: Gaussian smoothing sigma applied before computing
+                gradients. Only used when `score_fn == "canny"`.
+            canny_low_threshold: Lower ("weak" edge) gradient-magnitude
+                threshold. Only used when `score_fn == "canny"`.
+            canny_high_threshold: Upper ("strong" edge) gradient-magnitude
+                threshold. Only used when `score_fn == "canny"`.
+            canny_hysteresis_iters: Number of binary-dilation passes
+                approximating hysteresis edge-linking. Only used when
+                `score_fn == "canny"`.
+            region_backend: `"scipy"` (default) or `"cupyx"` -- see
+                `_label_regions`'s own docstring for what each means.
+        """
+        super().__init__()
+        self.interp_size = interp_size
+        self.fixed_length = fixed_length
+
+        assert score_fn in ("variance", "canny"), f"score_fn must be 'variance' or 'canny', got {score_fn!r}"
+        self.score_fn = score_fn
+        self.canny_sigma = canny_sigma
+        self.canny_low_threshold = canny_low_threshold
+        self.canny_high_threshold = canny_high_threshold
+        self.canny_hysteresis_iters = canny_hysteresis_iters
+        self.region_backend = region_backend
+
+        D, H, W = img_size
+        if not (D <= H <= W):
+            raise NotImplementedError(
+                f"GPUPatchify3D requires img_size sorted D <= H <= W, got {img_size} "
+                "-- extends GPUPatchify2D's own H <= W requirement (its min_size-ratio "
+                "trick, which keeps every axis at the same block count per level, only "
+                "derives an integer ratio from the shortest axis)."
+            )
+        ratio_h = int(H / D)
+        ratio_w = int(W / D)
+        max_blocks = D // min_size
+        self.min_size = [min_size, min_size * ratio_h, min_size * ratio_w]
+
+        self.max_level = int(math.floor(math.log2(max_blocks))) if max_blocks >= 1 else 0
+
+        # See GPUPatchify2D.__init__'s identical comment: initial_leaves
+        # must reflect the *padded* grid run_merge_batch actually operates
+        # on, not the raw img_size // min_size above.
+        pad_bd = self.min_size[0] * (2 ** self.max_level)
+        padded_d = -(-img_size[0] // pad_bd) * pad_bd
+        real_max_blocks = padded_d // self.min_size[0]
+
+        initial_leaves = real_max_blocks ** 3
+        assert (initial_leaves - fixed_length) % 7 == 0, (
+            f"fixed_length ({fixed_length}) must satisfy (real_max_blocks**3 - fixed_length) % 7 == 0 "
+            f"-- real_max_blocks**3 is {initial_leaves} here (img_size {img_size} padded to a multiple "
+            f"of {pad_bd}, min_size {min_size}), so every image's merge loop can land on exactly "
+            "fixed_length leaves (each merge removes exactly 7 leaves). Off-target leaf counts would "
+            "either silently break _serialize_batch's whole-batch grid_sample call (which assumes "
+            "every image in the batch has the same region count), or -- if unreachable exactly -- "
+            "make run_merge_batch's per-image budget hit 0 forever, hanging."
+        )
+        self.initial_leaves = initial_leaves
+
+    def _pad_size(self):
+        """The block size `(bd, bh, bw)` the padded volume's D/H/W must be divisible by."""
+        return tuple(s * (2 ** self.max_level) for s in self.min_size)
+
+    def _compute_padding(self, D, H, W):
+        bd, bh, bw = self._pad_size()
+        return (bd - (D % bd)) % bd, (bh - (H % bh)) % bh, (bw - (W % bw)) % bw
+
+    def _pad_tensor(self, t):
+        """Edge-replication-pads a `[..., D, H, W]` tensor so D/H/W divide evenly by the coarsest block size."""
+        D, H, W = t.shape[-3], t.shape[-2], t.shape[-1]
+        pad_d, pad_h, pad_w = self._compute_padding(D, H, W)
+        if pad_d == 0 and pad_h == 0 and pad_w == 0:
+            return t, (D, H, W)
+        return F.pad(t, (0, pad_w, 0, pad_h, 0, pad_d), mode="replicate"), (D, H, W)
+
+    def _compute_level_stats_batch(self, block_size, imgs):
+        """Per-block variance-based error (SSE) at one level, for the whole batch.
+
+        3D analog of `GPUPatchify2D`'s own method of the same name --
+        identical reasoning, one more spatial axis.
+
+        Args:
+            block_size: `(bsd, bsh, bsw)` block side lengths at this level.
+            imgs: `[B, C, D, H, W]`.
+
+        Returns:
+            `[B, gd, gh, gw]`.
+        """
+        B, C, Dp, Hp, Wp = imgs.shape
+        bsd, bsh, bsw = block_size
+        gd, gh, gw = Dp // bsd, Hp // bsh, Wp // bsw
+
+        reshaped = imgs.reshape(B, C, gd, bsd, gh, bsh, gw, bsw).permute(0, 1, 2, 4, 6, 3, 5, 7)  # [B,C,gd,gh,gw,bsd,bsh,bsw]
+        vars_ = reshaped.var(dim=(-3, -2, -1))  # [B,C,gd,gh,gw]
+        return vars_.sum(dim=1) * (bsd * bsh * bsw)  # [B,gd,gh,gw]
+
+    def _box_sum_batch(self, block_size, base_map):
+        """Sum of `base_map` within each non-overlapping `block_size` block, for the whole batch.
+
+        3D analog of `GPUPatchify2D`'s own method of the same name.
+
+        Args:
+            block_size: `(bsd, bsh, bsw)` block side lengths at this level.
+            base_map: `[B, D, H, W]`.
+
+        Returns:
+            `[B, gd, gh, gw]`.
+        """
+        B, Dp, Hp, Wp = base_map.shape
+        bsd, bsh, bsw = block_size
+        gd, gh, gw = Dp // bsd, Hp // bsh, Wp // bsw
+
+        reshaped = base_map.reshape(B, gd, bsd, gh, bsh, gw, bsw).permute(0, 1, 3, 5, 2, 4, 6)  # [B,gd,gh,gw,bsd,bsh,bsw]
+        return reshaped.sum(dim=(-3, -2, -1))  # [B,gd,gh,gw]
+
+    def _gaussian_kernel3d(self, sigma, device, dtype):
+        """Builds a fixed, normalized 3D Gaussian kernel for pre-gradient smoothing.
+
+        Args:
+            sigma: Gaussian standard deviation, in voxels.
+            device: Device the kernel should live on.
+            dtype: Dtype the kernel should be.
+
+        Returns:
+            `[1, 1, K, K, K]` kernel, `K = 2 * round(3 * sigma) + 1`.
+        """
+        radius = max(1, int(round(3 * sigma)))
+        coords = torch.arange(-radius, radius + 1, device=device, dtype=dtype)
+        g1d = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+        g1d = g1d / g1d.sum()
+        kernel3d = g1d.view(-1, 1, 1) * g1d.view(1, -1, 1) * g1d.view(1, 1, -1)  # [K, K, K]
+        return kernel3d.unsqueeze(0).unsqueeze(0)  # [1, 1, K, K, K]
+
+    def _sobel_gradients_batch(self, imgs):
+        """Depth/height/width Sobel gradients, for the whole batch.
+
+        Each 3x3x3 kernel is separable: a `[-1,0,1]` derivative along its
+        own axis, `[1,2,1]` smoothing along the other two -- the direct 3D
+        generalization of `GPUPatchify2D`'s own 2D Sobel kernels (each an
+        outer product of a `[-1,0,1]` derivative and a `[1,2,1]` smoothing
+        vector).
+
+        Args:
+            imgs: `[B, 1, D, H, W]`.
+
+        Returns:
+            `(gd, gh, gw)`, each `[B, 1, D, H, W]`.
+        """
+        device, dtype = imgs.device, imgs.dtype
+        deriv = torch.tensor([-1., 0., 1.], device=device, dtype=dtype)
+        smooth = torch.tensor([1., 2., 1.], device=device, dtype=dtype)
+
+        kd = (deriv.view(3, 1, 1) * smooth.view(1, 3, 1) * smooth.view(1, 1, 3)).view(1, 1, 3, 3, 3)
+        kh = (smooth.view(3, 1, 1) * deriv.view(1, 3, 1) * smooth.view(1, 1, 3)).view(1, 1, 3, 3, 3)
+        kw = (smooth.view(3, 1, 1) * smooth.view(1, 3, 1) * deriv.view(1, 1, 3)).view(1, 1, 3, 3, 3)
+
+        padded = F.pad(imgs, (1, 1, 1, 1, 1, 1), mode="reflect")
+        gd = F.conv3d(padded, kd)
+        gh = F.conv3d(padded, kh)
+        gw = F.conv3d(padded, kw)
+        return gd, gh, gw
+
+    def _non_max_suppression_batch(self, mag, gvec):
+        """Suppresses every gradient-magnitude voxel that isn't a local max along its own gradient direction.
+
+        3D generalization of `GPUPatchify2D`'s own method: direction is
+        discretized into the 13 canonical directions of a 3x3x3 voxel
+        neighborhood (the 13 antipodal pairs among its 26 non-zero
+        integer offsets), picked via cosine-similarity argmax against the
+        gradient vector (`abs()` of the cosine, since a direction and its
+        negation are the same axis -- the 3D analog of 2D's `angle_deg %
+        180` removing sign ambiguity before bucketing), then compared
+        against that direction's own antipodal voxel-shift pair -- direct
+        generalization of 2D's 4-entry `neighbor_shifts` dict to 13
+        entries.
+
+        Args:
+            mag: Gradient magnitude, `[B, 1, D, H, W]`.
+            gvec: `(gd, gh, gw)`, the raw (unnormalized) gradient
+                components, each `[B, 1, D, H, W]`.
+
+        Returns:
+            `[B, 1, D, H, W]`, `mag` with every non-local-max voxel zeroed.
+        """
+        D, H, W = mag.shape[-3:]
+
+        def shift(t, dd, dh, dw):
+            padded = F.pad(t, (1, 1, 1, 1, 1, 1), mode="replicate")
+            return padded[..., 1 + dd:1 + dd + D, 1 + dh:1 + dh + H, 1 + dw:1 + dw + W]
+
+        raw_dirs = []
+        for a in (-1, 0, 1):
+            for b in (-1, 0, 1):
+                for c in (-1, 0, 1):
+                    if (a, b, c) == (0, 0, 0):
+                        continue
+                    if a > 0 or (a == 0 and b > 0) or (a == 0 and b == 0 and c > 0):
+                        raw_dirs.append((a, b, c))
+        assert len(raw_dirs) == 13
+
+        gd, gh, gw = gvec
+        norm = torch.sqrt(gd ** 2 + gh ** 2 + gw ** 2 + 1e-12)
+        gd_n, gh_n, gw_n = gd / norm, gh / norm, gw / norm
+
+        dots = []
+        for (a, b, c) in raw_dirs:
+            dnorm = math.sqrt(a * a + b * b + c * c)
+            dots.append(((gd_n * a + gh_n * b + gw_n * c) / dnorm).abs())
+        bucket = torch.stack(dots, dim=0).argmax(dim=0)  # [B,1,D,H,W]
+
+        n1 = torch.zeros_like(mag)
+        n2 = torch.zeros_like(mag)
+        for i, (a, b, c) in enumerate(raw_dirs):
+            is_bucket = (bucket == i)
+            n1 = torch.where(is_bucket, shift(mag, a, b, c), n1)
+            n2 = torch.where(is_bucket, shift(mag, -a, -b, -c), n2)
+
+        is_local_max = (mag >= n1) & (mag >= n2)
+        return mag * is_local_max.to(mag.dtype)
+
+    def _canny_edge_map_batch(self, imgs):
+        """Per-channel Canny edge detection, summed into a per-voxel edge count.
+
+        3D analog of `GPUPatchify2D`'s own method -- identical pipeline
+        and hysteresis-by-dilation approximation (via `F.max_pool3d`
+        instead of `F.max_pool2d`), one more spatial axis throughout.
+
+        Args:
+            imgs: `[B, C, D, H, W]`.
+
+        Returns:
+            `[B, D, H, W]` float tensor, values in `[0, C]`.
+        """
+        B, C, D, H, W = imgs.shape
+        device, dtype = imgs.device, imgs.dtype
+        kernel = self._gaussian_kernel3d(self.canny_sigma, device, dtype)
+        pad = kernel.shape[-1] // 2
+
+        edge_count = torch.zeros(B, D, H, W, device=device, dtype=dtype)
+        for c in range(C):
+            channel = imgs[:, c:c + 1]  # [B, 1, D, H, W]
+            blurred = F.conv3d(F.pad(channel, (pad, pad, pad, pad, pad, pad), mode="reflect"), kernel)
+
+            gd, gh, gw = self._sobel_gradients_batch(blurred)
+            mag = torch.sqrt(gd ** 2 + gh ** 2 + gw ** 2 + 1e-12)
+
+            nms = self._non_max_suppression_batch(mag, (gd, gh, gw))
+            strong = nms > self.canny_high_threshold
+            weak = (nms > self.canny_low_threshold) & (~strong)
+
+            edge = strong.clone()
+            for _ in range(self.canny_hysteresis_iters):
+                dilated = F.max_pool3d(edge.to(dtype), kernel_size=3, stride=1, padding=1) > 0
+                edge = edge | (weak & dilated)
+
+            edge_count = edge_count + edge.to(dtype).squeeze(1)
+
+        return edge_count
+
+    def _compute_all_levels_batch(self, imgs):
+        """Per-level block errors and the merge cost of collapsing each level's blocks into their level-below parent.
+
+        3D analog of `GPUPatchify2D`'s own method -- identical `score_fn`
+        dispatch and merge-cost formulas (see that method's own docstring
+        for the full reasoning), 3-axis block sizes, and an 8-way children
+        sum (not 4-way) for variance's between-group subtraction.
+
+        Args:
+            imgs: `[B, C, D, H, W]`.
+
+        Returns:
+            `(merge_costs, level_shapes)`: `merge_costs[level]` is
+            `[B, gd, gh, gw]` (`None` at level 0), `level_shapes[level]` is
+            `(gd, gh, gw)`.
+        """
+        errors = []
+        level_shapes = []
+        merge_costs = [None] * (self.max_level + 1)
+
+        if self.score_fn == "canny":
+            edge_map = self._canny_edge_map_batch(imgs)  # [B, D, H, W]
+            for l in range(self.max_level + 1):
+                bs = tuple(s * (2 ** l) for s in self.min_size)
+                err_l = self._box_sum_batch(bs, edge_map)
+                errors.append(err_l)
+                level_shapes.append(tuple(err_l.shape[1:]))
+
+            for level in range(1, self.max_level + 1):
+                merge_costs[level] = errors[level]
+
+            return merge_costs, level_shapes
+
+        for l in range(self.max_level + 1):
+            bs = tuple(s * (2 ** l) for s in self.min_size)
+            sse_l = self._compute_level_stats_batch(bs, imgs)
+            errors.append(sse_l)
+            level_shapes.append(tuple(sse_l.shape[1:]))
+
+        for level in range(1, self.max_level + 1):
+            child_err = errors[level - 1]  # [B, Dp2, Hp2, Wp2]
+            Dp, Hp, Wp = child_err.shape[1] // 2, child_err.shape[2] // 2, child_err.shape[3] // 2
+            sum_children = child_err.reshape(-1, Dp, 2, Hp, 2, Wp, 2).sum(dim=(2, 4, 6))  # [B,Dp,Hp,Wp]
+            merge_costs[level] = errors[level] - sum_children
+
+        return merge_costs, level_shapes
+
+    def _face_mask(self, alive, img):
+        """Marks the voxel-grid faces around every currently-alive block.
+
+        3D analog of `GPUPatchify2D`'s own `_border_mask`: every alive
+        block independently stamps all 6 of its own faces (2D planes, not
+        1D lines) via the same vectorized-indexing style (`arange` +
+        `expand` + advanced indexing, no Python loop over blocks), so two
+        adjacent alive blocks (even same-size ones) always get a face
+        stamped between them.
+
+        Args:
+            alive: List (one per level) of `[Dp, Hp, Wp]` bool tensors,
+                one volume's worth.
+            img: `[Dp, Hp, Wp, C]`, only used for its shape.
+
+        Returns:
+            `[D, H, W]` bool tensor, `True` on the face between (or at the
+            outer face of) alive blocks.
+        """
+        D, H, W = img.shape[0], img.shape[1], img.shape[2]
+        device = img.device
+        out = torch.zeros(D + 1, H + 1, W + 1, dtype=torch.bool, device=device)
+
+        for level in reversed(range(len(alive))):
+            bsd = self.min_size[0] * (2 ** level)
+            bsh = self.min_size[1] * (2 ** level)
+            bsw = self.min_size[2] * (2 ** level)
+            if bsd < self.min_size[0] or bsh < self.min_size[1] or bsw < self.min_size[2]:
+                continue
+
+            coords = alive[level].nonzero(as_tuple=False)  # [K, 3]
+            if coords.shape[0] == 0:
+                continue
+
+            di, hi, wi = coords[:, 0], coords[:, 1], coords[:, 2]
+            d0, h0, w0 = di * bsd, hi * bsh, wi * bsw
+            d1, h1, w1 = d0 + bsd, h0 + bsh, w0 + bsw
+
+            d_off = torch.arange(bsd, device=device)
+            h_off = torch.arange(bsh, device=device)
+            w_off = torch.arange(bsw, device=device)
+
+            dd = (d0.unsqueeze(1) + d_off.unsqueeze(0)).clamp(0, D)  # [K, bsd]
+            hh = (h0.unsqueeze(1) + h_off.unsqueeze(0)).clamp(0, H)  # [K, bsh]
+            ww = (w0.unsqueeze(1) + w_off.unsqueeze(0)).clamp(0, W)  # [K, bsw]
+
+            # front/back faces (perpendicular to D): fixed d, spans (h,w)
+            hh_hw = hh.unsqueeze(2).expand(-1, -1, bsw).reshape(-1)
+            ww_hw = ww.unsqueeze(1).expand(-1, bsh, -1).reshape(-1)
+            d0_hw = d0.view(-1, 1, 1).expand(-1, bsh, bsw).reshape(-1)
+            d1_hw = d1.view(-1, 1, 1).expand(-1, bsh, bsw).reshape(-1)
+            out[d0_hw, hh_hw, ww_hw] = True
+            out[d1_hw, hh_hw, ww_hw] = True
+
+            # top/bottom faces (perpendicular to H): fixed h, spans (d,w)
+            dd_dw = dd.unsqueeze(2).expand(-1, -1, bsw).reshape(-1)
+            ww_dw = ww.unsqueeze(1).expand(-1, bsd, -1).reshape(-1)
+            h0_dw = h0.view(-1, 1, 1).expand(-1, bsd, bsw).reshape(-1)
+            h1_dw = h1.view(-1, 1, 1).expand(-1, bsd, bsw).reshape(-1)
+            out[dd_dw, h0_dw, ww_dw] = True
+            out[dd_dw, h1_dw, ww_dw] = True
+
+            # left/right faces (perpendicular to W): fixed w, spans (d,h)
+            dd_dh = dd.unsqueeze(2).expand(-1, -1, bsh).reshape(-1)
+            hh_dh = hh.unsqueeze(1).expand(-1, bsd, -1).reshape(-1)
+            w0_dh = w0.view(-1, 1, 1).expand(-1, bsd, bsh).reshape(-1)
+            w1_dh = w1.view(-1, 1, 1).expand(-1, bsd, bsh).reshape(-1)
+            out[dd_dh, hh_dh, w0_dh] = True
+            out[dd_dh, hh_dh, w1_dh] = True
+
+        return out[:D, :H, :W]
+
+    def _labeled_to_region_tensors(self, labeled, num_features):
+        """Vectorized bounding-box extraction for every labeled region at once.
+
+        3D analog of `GPUPatchify2D`'s own method -- `x`/`y`/`z` map to
+        `W`/`H`/`D` respectively (extending `GPUPatchify2D`'s own `x=W,
+        y=H` convention), matching `F.grid_sample`'s own confirmed 5D grid
+        axis order (`(x,y,z)` -> `(W,H,D)`) so `_serialize_batch` can use
+        these bounds directly with no axis reordering.
+
+        Args:
+            labeled: `[D, H, W]` long tensor, 0 = background.
+            num_features: Number of non-zero labels.
+
+        Returns:
+            `RegionTensors3D`, all `[N]` fields on `labeled`'s device.
+        """
+        device = labeled.device
+        D, H, W = labeled.shape
+
+        if num_features == 0:
+            empty = torch.zeros(0, device=device, dtype=torch.float32)
+            empty_long = torch.zeros(0, device=device, dtype=torch.long)
+            return self.RegionTensors3D(
+                empty, empty, empty, empty, empty, empty,
+                empty_long, empty_long, empty_long,
+                empty, empty, empty, 0,
+            )
+
+        flat = labeled.reshape(-1)
+        label_ids = torch.arange(1, num_features + 1, dtype=torch.long, device=device)
+        membership = (flat.unsqueeze(0) == label_ids.unsqueeze(1))  # [K, D*H*W]
+
+        depth_idx = torch.arange(D, device=device).repeat_interleave(H * W)
+        row_idx = torch.arange(H, device=device).repeat_interleave(W).repeat(D)
+        col_idx = torch.arange(W, device=device).repeat(D * H)
+        INF = max(D, H, W) + 1
+
+        def bounds(idx):
+            lo = torch.where(membership, idx.unsqueeze(0), torch.full_like(idx.unsqueeze(0), INF)).min(dim=1).values
+            hi = torch.where(membership, idx.unsqueeze(0), torch.zeros_like(idx.unsqueeze(0))).max(dim=1).values
+            return lo, hi
+
+        depth_min, depth_max = bounds(depth_idx)
+        rows_min, rows_max = bounds(row_idx)
+        cols_min, cols_max = bounds(col_idx)
+
+        x0s = torch.where(cols_min != 0, cols_min - 1, cols_min).float()
+        x1s = cols_max.float()
+        y0s = torch.where(rows_min != 0, rows_min - 1, rows_min).float()
+        y1s = rows_max.float()
+        z0s = torch.where(depth_min != 0, depth_min - 1, depth_min).float()
+        z1s = depth_max.float()
+
+        phs = (y1s - y0s + 1).long()
+        pws = (x1s - x0s + 1).long()
+        pds = (z1s - z0s + 1).long()
+        cxs = (x0s + x1s) / 2.0
+        cys = (y0s + y1s) / 2.0
+        czs = (z0s + z1s) / 2.0
+
+        return self.RegionTensors3D(x0s, x1s, y0s, y1s, z0s, z1s, phs, pws, pds, cxs, cys, czs, num_features)
+
+    def _detect_regions(self, face_mask):
+        """Connected components of `face_mask`'s interior -> `RegionTensors3D`.
+
+        Delegates to the shared `_label_regions` (module-level) -- see
+        `GPUPatchify2D._detect_regions`'s identical docstring.
+        """
+        labeled, num_features = _label_regions(face_mask, self.region_backend)
+        return self._labeled_to_region_tensors(labeled, num_features)
+
+    def run_merge_batch(self, batch_merge_costs, level_shapes, padded_dhwc):
+        """Merges every volume in the batch down to exactly `fixed_length` leaves, in lockstep.
+
+        3D analog of `GPUPatchify2D`'s own method -- identical level-
+        parallel design (see that method's own docstring), 8-way children
+        (not 4-way): each merge removes exactly 7 leaves, so budget/
+        leaves-remaining bookkeeping divides by 7 (not 3).
+
+        Args:
+            batch_merge_costs: `merge_costs` from `_compute_all_levels_batch`.
+            level_shapes: `level_shapes` from `_compute_all_levels_batch`.
+            padded_dhwc: `[B, D', H', W', C]`, only used for per-image shape
+                in the final region-detection step.
+
+        Returns:
+            `list[RegionTensors3D]`, length B.
+        """
+        B = padded_dhwc.shape[0]
+        device = padded_dhwc.device
+
+        alive = [torch.zeros(B, *shape, dtype=torch.bool, device=device) for shape in level_shapes]
+        alive[0][:] = True
+
+        leaves_remaining = torch.full((B,), alive[0][0].numel(), dtype=torch.long, device=device)
+        end_leaves = self.fixed_length
+
+        batch_ratio = 0.15
+        min_batch = 4096
+        max_batch = 500_000
+
+        while (leaves_remaining > end_leaves).any():
+            cand_costs, cand_img, cand_level, cand_d, cand_h, cand_w = [], [], [], [], [], []
+
+            for level in range(1, self.max_level + 1):
+                Dp, Hp, Wp = level_shapes[level]
+                child_view = alive[level - 1].reshape(B, Dp, 2, Hp, 2, Wp, 2)
+                can_merge = child_view.all(dim=(2, 4, 6))  # [B, Dp, Hp, Wp]
+
+                needs_merge = (leaves_remaining > end_leaves)
+                can_merge = can_merge & needs_merge[:, None, None, None]
+                if not can_merge.any():
+                    continue
+
+                b_idx, d_idx, h_idx, w_idx = can_merge.nonzero(as_tuple=True)
+                costs = batch_merge_costs[level][b_idx, d_idx, h_idx, w_idx]
+
+                cand_costs.append(costs)
+                cand_img.append(b_idx)
+                cand_level.append(torch.full_like(b_idx, level))
+                cand_d.append(d_idx)
+                cand_h.append(h_idx)
+                cand_w.append(w_idx)
+
+            if not cand_costs:
+                break
+
+            all_costs = torch.cat(cand_costs)
+            all_img = torch.cat(cand_img)
+            all_level = torch.cat(cand_level)
+            all_d = torch.cat(cand_d)
+            all_h = torch.cat(cand_h)
+            all_w = torch.cat(cand_w)
+
+            max_needed = int((leaves_remaining - end_leaves).clamp(min=0).sum() // 7) + B
+            k = int(min(max(min_batch, min(int(all_costs.shape[0] * batch_ratio), max_batch)), all_costs.shape[0]))
+            k = max(k, max_needed)
+            k = min(k, all_costs.shape[0])
+
+            top_idx = torch.topk(all_costs, k, largest=False).indices
+            sorted_idx = top_idx[all_costs[top_idx].argsort()]
+
+            sel_img = all_img[sorted_idx]
+            sel_level = all_level[sorted_idx]
+            sel_d = all_d[sorted_idx]
+            sel_h = all_h[sorted_idx]
+            sel_w = all_w[sorted_idx]
+
+            indicator = (sel_img.unsqueeze(0) == torch.arange(B, device=device).unsqueeze(1))  # [B, k]
+            cum_merges = indicator.long().cumsum(dim=1)
+            budget = ((leaves_remaining - end_leaves) // 7).clamp(min=0).unsqueeze(1)  # [B, 1]
+            valid_mask = (cum_merges <= budget) & indicator  # [B, k]
+
+            apply_mask = valid_mask.any(dim=0)  # [k]
+
+            for lvl in range(1, self.max_level + 1):
+                lvl_mask = apply_mask & (sel_level == lvl)
+                if not lvl_mask.any():
+                    continue
+
+                b_sel, d_sel, h_sel, w_sel = sel_img[lvl_mask], sel_d[lvl_mask], sel_h[lvl_mask], sel_w[lvl_mask]
+                alive[lvl][b_sel, d_sel, h_sel, w_sel] = True
+
+                d2, h2, w2 = d_sel * 2, h_sel * 2, w_sel * 2
+                tgt = alive[lvl - 1]
+                for dd_ in (0, 1):
+                    for dh_ in (0, 1):
+                        for dw_ in (0, 1):
+                            tgt[b_sel, d2 + dd_, h2 + dh_, w2 + dw_] = False
+
+            merges_per_img = valid_mask.sum(dim=1).long()
+            leaves_remaining -= 7 * merges_per_img
+
+        all_regions = []
+        for b in range(B):
+            alive_b = [alive[l][b] for l in range(len(alive))]
+            face_mask = self._face_mask(alive_b, padded_dhwc[b])
+            all_regions.append(self._detect_regions(face_mask))
+        return all_regions
+
+    def _serialize_batch(self, all_regions, imgs_batch):
+        """Extracts and resizes every region across the whole batch in one 5D `grid_sample` call.
+
+        3D analog of `GPUPatchify2D`'s own method -- assumes every volume
+        in the batch has the same region count `N` (see that method's own
+        docstring for why).
+
+        Args:
+            all_regions: `list[RegionTensors3D]`, length B.
+            imgs_batch: `[B, C, D, H, W]` (padded).
+
+        Returns:
+            `[B, C, N, interp_size**3]`.
+        """
+        B, C, D, H, W = imgs_batch.shape
+        N = all_regions[0].N
+        P = self.interp_size
+        device = imgs_batch.device
+
+        # x0s/x1s: W-axis bounds; y0s/y1s: H-axis bounds; z0s/z1s: D-axis
+        # bounds -- matches F.grid_sample's own confirmed 5D grid axis
+        # order ((x,y,z) -> (W,H,D)), see _labeled_to_region_tensors's own
+        # docstring. Getting this wrong is exactly the axis-transpose bug
+        # GPUPatchify2D's own _serialize_batch already found and fixed once.
+        x0 = torch.stack([rt.x0s for rt in all_regions]).reshape(B * N)
+        x1 = torch.stack([rt.x1s for rt in all_regions]).reshape(B * N)
+        y0 = torch.stack([rt.y0s for rt in all_regions]).reshape(B * N)
+        y1 = torch.stack([rt.y1s for rt in all_regions]).reshape(B * N)
+        z0 = torch.stack([rt.z0s for rt in all_regions]).reshape(B * N)
+        z1 = torch.stack([rt.z1s for rt in all_regions]).reshape(B * N)
+
+        x0n, x1n = 2 * x0 / (W - 1) - 1, 2 * x1 / (W - 1) - 1
+        y0n, y1n = 2 * y0 / (H - 1) - 1, 2 * y1 / (H - 1) - 1
+        z0n, z1n = 2 * z0 / (D - 1) - 1, 2 * z1 / (D - 1) - 1
+
+        t = torch.linspace(0, 1, P, device=device).unsqueeze(0)  # [1, P]
+        xs = x0n.unsqueeze(1) + (x1n - x0n).unsqueeze(1) * t  # [B*N, P]
+        ys = y0n.unsqueeze(1) + (y1n - y0n).unsqueeze(1) * t
+        zs = z0n.unsqueeze(1) + (z1n - z0n).unsqueeze(1) * t
+
+        grid_x = xs.view(-1, 1, 1, P).expand(-1, P, P, P)
+        grid_y = ys.view(-1, 1, P, 1).expand(-1, P, P, P)
+        grid_z = zs.view(-1, P, 1, 1).expand(-1, P, P, P)
+        grids = torch.stack([grid_x, grid_y, grid_z], dim=-1).float()  # [B*N, P, P, P, 3]
+
+        imgs_rep = imgs_batch.float().repeat_interleave(N, dim=0)  # [B*N, C, D, H, W]
+        patches = F.grid_sample(imgs_rep, grids, mode="bilinear", padding_mode="border", align_corners=True)
+        patches = patches.reshape(B, N, C, P * P * P)
+
+        return patches.permute(0, 2, 1, 3)
+
+    def forward(self, img):
+        """Adaptively patchifies `img` into a fixed-length sequence, entirely on `img`'s own device.
+
+        Args:
+            img: `[B, C, D, H, W]`.
+
+        Returns:
+            `(seq_img, seq_size, seq_pos)`: `seq_img` is `[B, C,
+            fixed_length, interp_size**3]`. `seq_size` is `[B,
+            fixed_length]` (each region's side length along the `D` axis
+            -- the shortest, unscaled reference axis, matching
+            `GPUPatchify2D`'s own choice of the analogous unscaled axis).
+            `seq_pos` is `[B, fixed_length, 3]` (`x, y, z` center
+            coordinates, matching `GPUPatchify2D`'s own `(x, y)`
+            convention extended with `z` = depth center).
+        """
+        padded_img, _ = self._pad_tensor(img)
+        merge_costs, level_shapes = self._compute_all_levels_batch(padded_img.float())
+        padded_dhwc = padded_img.permute(0, 2, 3, 4, 1)
+
+        all_regions = self.run_merge_batch(merge_costs, level_shapes, padded_dhwc)
+        seq_img = self._serialize_batch(all_regions, padded_img.float()).to(img.dtype)
+
+        seq_size = torch.stack([rt.pds for rt in all_regions]).float()  # [B, N]
+        seq_pos = torch.stack([torch.stack([rt.cxs, rt.cys, rt.czs], dim=-1) for rt in all_regions])  # [B, N, 3]
 
         return seq_img, seq_size, seq_pos

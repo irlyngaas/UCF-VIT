@@ -5478,3 +5478,123 @@ confirming the patch layout concentrates around the genuinely
 higher-variance region in both 2D and 3D. A real shipped config
 (`SAP_CONFIG`) parsed through `parse_config` end to end confirms the
 backward-compatible default.
+
+## Added GPUPatchify3D and a cupyx.scipy.ndimage.label region-detection upgrade
+
+Two remaining items from `GPUPatchify2D`'s original deferred list, done
+together since the region-detection backend swap is dimension-agnostic
+(both `scipy.ndimage.label` and `cupyx.scipy.ndimage.label` already work
+on N-D arrays unchanged) -- naturally shared code between `GPUPatchify2D`
+and the new `GPUPatchify3D`. Two design questions resolved with the user
+before writing code: 3D Canny non-max suppression uses the full
+13-direction generalization (not a cheaper 6-direction or no-NMS
+approximation), and the region-detection backend is an **explicit opt-in**
+constructor param (`region_backend="scipy"` default, `"cupyx"` opt-in --
+not auto-detected), since the `"cupyx"` path can't be verified on real GPU
+hardware in this dev environment (no CUDA/ROCm device, `cupy` not
+installed) and silent, environment-dependent behavior differences would be
+worse than an explicit choice.
+
+Three concrete technical risks were checked empirically before writing any
+3D code, not assumed: `F.pad` (`reflect`/`replicate`), `F.conv3d`, `F.
+max_pool3d`, and `F.grid_sample` all confirmed working on 5D (volumetric)
+tensors in this environment's torch build; `grid_sample`'s 5D grid
+last-dim `(x,y,z)` confirmed via a direct probe (not documentation-reading
+alone) to map to `(W,H,D)` respectively -- the natural extension of the
+2D `(x,y)=(W,H)` convention `_serialize_batch` already relies on.
+
+**`GPUPatchify3D`** (same file, `gpu_adaptive_patching.py`) mirrors
+`UCF_VIT.dataloaders.transform`'s own `Patchify`/`Patchify_3D` convention
+-- a separate class per dimensionality, not a unified N-D class, so
+`GPUPatchify2D` itself is untouched. Every method generalizes mechanically
+except two:
+- **Non-max suppression** discretizes gradient direction into the 13
+  canonical directions of a 3x3x3 voxel neighborhood (the antipodal pairs
+  among its 26 non-zero integer offsets), picked via cosine-similarity
+  argmax against the gradient vector (`abs()` of the cosine removes sign
+  ambiguity, the 3D analog of 2D's `angle_deg % 180`), then compared
+  against that direction's own antipodal voxel-shift pair -- direct
+  generalization of 2D's 4-entry `neighbor_shifts` dict to 13 entries.
+- **`_face_mask`** (3D analog of `_border_mask`) stamps all 6 faces of
+  each alive block (2D planes, not 1D lines) onto a `[D+1,H+1,W+1]`
+  boundary volume, via the same vectorized-indexing style (`arange` +
+  `expand` + advanced indexing, no Python loop over blocks) extended to a
+  third axis.
+
+Everything else follows the same 4-way-to-8-way generalization
+mechanically: `run_merge_batch`'s children view/merge/clear (8 children,
+not 4; `-7` leaves per merge, not `-3`), `_compute_all_levels_batch`'s
+variance/canny dispatch and merge-cost formulas (identical reasoning, one
+more block-size axis), `_labeled_to_region_tensors`'s bounding-box
+extraction (adds a depth index to the existing INF-masked min/max trick),
+and `_serialize_batch`'s one batched 5D `grid_sample` call. `__init__`
+requires `img_size` sorted `D <= H <= W` (extends `GPUPatchify2D`'s own
+`H <= W` requirement to two ratios, `H/D` and `W/D`, each truncated to
+`int` exactly like the 2D case already is); the `fixed_length` congruence
+becomes `% 7` (8 children merge into 1 parent, matching `FixedOctTree`'s
+own modulus) instead of `% 3`.
+
+**A real bug found and fixed while hand-verifying the merge-cost formula**
+(not a 3D-specific bug -- an instance of the same documented `torch.var`
+unbiased-correction property `GPUPatchify2D`'s own tests already flagged,
+caught here by a naive first manual check): a step-cube fixture placed at
+`img[0,0,2:6,2:6,2:6]` (straddling the level-1 block boundary at index 4
+in all three axes) produced a *negative* merge cost -- mathematically
+impossible for a correctly-computed between-group SSE (law of total
+variance guarantees non-negativity), immediately suspicious. Root cause
+confirmed by direct brute-force comparison against a manual per-child SSE
+sum (both computed the *same*, correct `sum_children` value -- the
+reshape/permute logic itself was right): the fixture itself straddled a
+block boundary, letting `torch.var`'s `n-1` correction inflate the small
+children's SSE (fewer voxels, larger `n/(n-1)` factor) past the parent's
+own -- exactly the phenomenon `GPUPatchify2D`'s own tests already
+documented and deliberately avoid with boundary-aligned fixtures. Not a
+code defect; every test in the new 3D file uses boundary-aligned "detail"
+regions for this exact reason, confirmed correct (positive, and exactly
+zero everywhere else) once re-tested with a properly aligned fixture.
+
+**Shared `_label_regions`** (new module-level helper, used by both
+classes' own `_detect_regions`): `region_backend="scipy"` (default,
+today's exact behavior, a CPU round-trip); `"cupyx"` converts `~border_
+mask` to/from `cupy` via the modern DLPack protocol (`cupy.from_dlpack`/
+`torch.from_dlpack`, both already implement `__dlpack__` directly --
+confirmed `torch.from_dlpack` accepts a plain `torch.Tensor` unchanged, no
+manual `to_dlpack`/`toDlpack` dance needed), calling `cupyx.scipy.ndimage.
+label` (same `(labeled, num_features)` signature as `scipy.ndimage.
+label`), never leaving the GPU. Raises clearly if `cupy` isn't importable
+or the tensor isn't on a CUDA device, rather than silently falling back.
+`GPUPatchify2D` gains the same `region_backend` param, wired into its own
+already-existing `_detect_regions`.
+
+**Tier 1 coverage:** new `tests/model/test_gpu_adaptive_patching_3d.py`
+(19 tests), mirroring `test_gpu_adaptive_patching.py`'s structure exactly
+(padding, the `% 7` congruence assertion, the padding-induced-hang
+regression test's 3D analog, non-cuboid-ordering rejection, merge cost
+zero/positive with boundary-aligned fixtures, per-image-independent
+convergence, an 8-octant content-correctness test -- the same class of
+test that already caught a real axis-transpose bug in `GPUPatchify2D`'s
+own `_serialize_batch` -- a non-cuboid-volume variant of that test,
+multi-channel channel-scrambling checks, and the Canny-specific tests).
+`test_gpu_adaptive_patching.py` gains 4 `region_backend` tests: `"cupyx"`
+without `cupy` installed raises a real (not simulated) `ImportError` in
+this environment; `"cupyx"` on a CPU tensor raises clearly even with
+`cupy`/`cupyx` faked as installed (isolating that specific check); a fully
+mocked-`cupy` dispatch test confirming the `"cupyx"` branch is actually
+reached and its result wrapped back into `RegionTensors` correctly --
+honestly scoped as dispatch-logic verification, not real-numerics
+verification. `test_gpu_adaptive_patching_3d.py` gains the `ImportError`
+version of the same check for `GPUPatchify3D`.
+
+**Verification:** full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 414 passed / 4 skipped (23 new tests, no
+regressions). Direct manual checks (matching this module's established
+practice) of the 3D edge map on flat/step-plane fixtures, real
+forward+backward-free forward-only runs on an 8-octant synthetic volume
+confirming exact per-octant content, and a non-cuboid-volume run
+confirming no axis transposition.
+
+**Explicitly not done yet:** wiring `GPUPatchify3D` into `arch.py`'s
+`ap.do_gpu_ap` (currently asserts `twoD` by construction) -- a separate
+follow-up, matching how `GPUPatchify2D` itself was staged; randomized 3D
+Canny parameters; real GPU-hardware verification of the `"cupyx"` path
+(not possible in this session's environment).
