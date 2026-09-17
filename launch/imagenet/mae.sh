@@ -17,7 +17,7 @@
 #ulimit -n 65536
 
 
-eval "$(/lustre/orion/stf006/proj-shared/irl1/miniforge3/bin/conda shell.bash hook)"
+eval "$(/lustre/orion/stf006/proj-shared/irl1/MINI_CLEAN/bin/conda shell.bash hook)"
 conda activate UCF-rocm7.13
 
 module load PrgEnv-gnu
