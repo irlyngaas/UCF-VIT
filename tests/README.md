@@ -5988,3 +5988,38 @@ conditional, not unconditional noise on every `do_ap:True` config.
 
 **Verification:** full local suite (`pytest tests/ --ignore=tests/
 distributed`) passes, 441 passed / 5 skipped, no regressions.
+
+## Fixed a real Frontier regression: removed `building_blocks.py`'s dead `xformers.components` import
+
+A long-standing gap, flagged repeatedly earlier in this file (see the
+"Verification note" above the `test_arch.py` coverage, and the
+`get_kwargs`/`Block_diffusion` fix above that) as a *dev-environment*
+problem -- `building_blocks.py`'s unconditional `from xformers.components.
+attention.core import scaled_dot_product_attention as xformers_sdpa`
+importing a deprecated `xformers` submodule this session's own sandbox
+didn't have a matching build for, worked around at the test level
+(`importorskip`) rather than fixed at the source, since it never actually
+broke a real run. It just did, for real, on Frontier's `run_distributed_
+tests.sh` job 5498539 (`ModuleNotFoundError: No module named "xformers.
+components"`, 5 test modules under `tests/distributed/` failing to import)
+-- the newly-rebuilt `xformers` (installed from the `rocm7.1` wheel index
+against the new `rocm/7.13` environment) dropped the module entirely, not
+just changed its API.
+
+Checked directly (`grep -rn xformers_sdpa`) before touching anything:
+`xformers_sdpa` is imported and never referenced anywhere else in
+`building_blocks.py` or the rest of the codebase -- genuinely dead code,
+not a real dependency masked by a bad import path. Deleted the one import
+line; `import xformers` itself stays (real, used lines below for
+`xformers.ops.memory_efficient_attention`). No behavior change, since
+nothing ever called the removed name.
+
+**Verification:** `python -m py_compile` on the changed file, plus a full
+local suite run (`pytest tests/ --ignore=tests/distributed`) -- passes,
+490 passed / 2 skipped here (this sandbox's own counts differ from the
+441/5 baseline logged throughout this file; `tests/model/*` and other
+xformers-touching tests that used to report an environment-mismatch skip
+now import and run for real in whatever session environment this fix
+happened to land in -- not evidence of anything to do with this change
+itself). Not yet confirmed on Frontier with a real rerun of `run_
+distributed_tests.sh` -- that's the natural next step to close this out.

@@ -30,7 +30,6 @@ from UCF_VIT.utils.fused_attn import FusedAttn
 from UCF_VIT.utils.time_embed import SinusoidalEmbeddings
 
 import xformers
-from xformers.components.attention.core import scaled_dot_product_attention as xformers_sdpa
 
 
 class PatchEmbed(nn.Module):
