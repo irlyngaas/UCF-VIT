@@ -30,6 +30,12 @@ export MIOPEN_DISABLE_CACHE=1
 export MIOPEN_USER_DB_PATH=/tmp/$JOBID
 mkdir -p $MIOPEN_USER_DB_PATH
 
+# cupy defaults its JIT kernel cache to $HOME/.cupy/kernel_cache, which blows
+# past $HOME's disk quota on Frontier -- redirect it to the same node-local
+# /tmp/$JOBID scratch space MIOPEN_USER_DB_PATH already uses above.
+export CUPY_CACHE_DIR=/tmp/$JOBID/cupy_kernel_cache
+mkdir -p $CUPY_CACHE_DIR
+
 
 export PYTHONPATH=$PWD:$PYTHONPATH
 
