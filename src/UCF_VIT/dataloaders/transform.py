@@ -10,6 +10,41 @@ from skimage.feature import canny as skimage_canny
 from torch.utils.data import get_worker_info
 from .quadtree import FixedQuadTree
 from .octree import FixedOctTree
+from UCF_VIT.utils.misc import next_power_of_two
+
+
+def _pad_to_power_of_two(img, ndim):
+    """Edge-replication-pads `img`'s leading `ndim` (spatial) axes up to the next power of two.
+
+    `FixedQuadTree`/`FixedOctTree`'s split (an integer midpoint, used for
+    both children) only ever produces equal-sized children when repeatedly
+    halving stays clean all the way down -- true for a power-of-two size,
+    not guaranteed for any other. Padding up to the next power of two per
+    axis (independently -- unlike `UCF_VIT.model.gpu_adaptive_patching.
+    GPUPatchify2D`/`GPUPatchify3D`, this class's root is always a single
+    node covering the whole image, not a fixed grid, so there's no cross-
+    axis block-count-ratio constraint to satisfy) removes the restriction
+    that `data.tile_size` be a power of two for this (CPU) path -- the same
+    edge-replication `F.pad(..., mode="replicate")` `GPUPatchify2D`'s own
+    `_pad_tensor` already uses for its GPU-side equivalent, via `numpy`'s
+    `mode="edge"` (identical semantics, `img` here is a real `numpy` array,
+    not a `torch.Tensor`). A no-op (returns `img` unchanged, not a copy)
+    when every axis is already a power of two.
+
+    Args:
+        img: Array whose first `ndim` axes are spatial, e.g. `(H, W[, C])`
+            or `(D, H, W[, C])`.
+        ndim: Number of leading spatial axes (`2` for `Patchify`, `3` for
+            `Patchify_3D`).
+
+    Returns:
+        The (possibly) padded array, same number of dims as `img`.
+    """
+    pad_width = [(0, next_power_of_two(img.shape[i]) - img.shape[i]) for i in range(ndim)]
+    pad_width += [(0, 0)] * (img.ndim - ndim)
+    if not any(p[1] for p in pad_width):
+        return img
+    return np.pad(img, pad_width, mode="edge")
 
 class Patchify(torch.nn.Module):
     """Adaptive (quadtree-based) patchification transform for 2D images.
@@ -87,12 +122,14 @@ class Patchify(torch.nn.Module):
         """Computes an edge map (or, in variance mode, uses `img` directly) and adaptively patchifies it via a quadtree.
 
         Args:
-            img: Input 2D image array, shape (H, W[, C]). For `score_fn=
-                "canny"` and any `dataset` other than `imagenet`/`catsdogs`,
-                `C` (if present) must be 1 -- `skimage.feature.canny` only
-                accepts single-channel input (see this class's own
-                docstring). `score_fn="variance"` has no such restriction
-                (any `C`, any `dataset`).
+            img: Input 2D image array, shape (H, W[, C]) -- any `H`/`W`, not
+                just a power of two (see `_pad_to_power_of_two`; a no-op
+                when both already are). For `score_fn="canny"` and any
+                `dataset` other than `imagenet`/`catsdogs`, `C` (if present)
+                must be 1 -- `skimage.feature.canny` only accepts single-
+                channel input (see this class's own docstring).
+                `score_fn="variance"` has no such restriction (any `C`, any
+                `dataset`).
 
         Returns:
             If `self.return_edges` is False: `(seq_img, seq_size, seq_pos, qdt)`.
@@ -100,8 +137,13 @@ class Patchify(torch.nn.Module):
             flattened patch sequence, `seq_size` the per-patch side length,
             `seq_pos` the per-patch center position, `qdt` the `FixedQuadTree`
             instance, and `edges` the computed edge map (`img` itself, under
-            `score_fn="variance"`).
+            `score_fn="variance"`) -- both already reflect any padding above,
+            so a leaf near the padded edge may cover some replicated (not
+            real) content, exactly like `GPUPatchify2D`'s own equivalent
+            tradeoff.
         """
+        img = _pad_to_power_of_two(img, ndim=2)
+
         if self.score_fn == "variance":
             edges = img
             qdt = FixedQuadTree(domain=edges, fixed_length=self.fixed_length, score_fn=self.score_fn, min_size=self.min_size)
@@ -267,7 +309,9 @@ class Patchify_3D(torch.nn.Module):
         """Computes a 3D edge volume for `img` (or, in variance mode, uses `img` directly) and adaptively patchifies it via an octree.
 
         Args:
-            img: Input 3D volume array, shape (D, H, W, C).
+            img: Input 3D volume array, shape (D, H, W, C) -- any D/H/W, not
+                just a power of two (see `_pad_to_power_of_two`; a no-op
+                when all three already are).
 
         Returns:
             If `self.return_edges` is False: `(seq_img, seq_size, seq_pos,
@@ -275,8 +319,13 @@ class Patchify_3D(torch.nn.Module):
             `seq_img` is the flattened patch sequence, `seq_size` the per-patch side
             length, `seq_pos` the per-patch center position, `octtree` the
             `FixedOctTree` instance, and `edges` the computed edge volume
-            (`img` itself, under `score_fn="variance"`).
+            (`img` itself, under `score_fn="variance"`) -- both already
+            reflect any padding above, so a leaf near the padded edge may
+            cover some replicated (not real) content, exactly like
+            `GPUPatchify3D`'s own equivalent tradeoff.
         """
+        img = _pad_to_power_of_two(img, ndim=3)
+
         if self.score_fn == "variance":
             edges = img
             if self.profile:

@@ -929,12 +929,22 @@ def parse_config(args, load_balance_offline=False):
 
     #If using adaptive patching check if fixed length is compatible with tile_size
     if ap_conf['do_ap']:
-        checkDims = 2 if twoD else 3
-        for i in range(checkDims):
-            p2 = is_power_of_two(tile_size[i])
-            assert p2, f"Tile Size in the {i} dimension must be a power of 2"
-
         if ap_conf["do_gpu_ap"]:
+            # Only the GPU path (GPUPatchify2D/GPUPatchify3D) still needs this:
+            # its fixed grid of min_size blocks needs tile_size to be a clean
+            # multiple of the coarsest block size, and while _pad_tensor
+            # already handles that case too, this check is left as-is for
+            # do_gpu_ap since relaxing it wasn't asked for. The CPU path
+            # (Patchify/Patchify_3D) no longer needs this -- it now pads any
+            # tile_size up to the next power of two internally (see
+            # UCF_VIT.dataloaders.transform._pad_to_power_of_two), so
+            # FixedQuadTree/FixedOctTree's integer-midpoint split always
+            # halves cleanly regardless of the real tile_size.
+            checkDims = 2 if twoD else 3
+            for i in range(checkDims):
+                p2 = is_power_of_two(tile_size[i])
+                assert p2, f"Tile Size in the {i} dimension must be a power of 2"
+
             # Mirrors GPUPatchify2D/GPUPatchify3D.__init__'s own identical
             # computation (dispatched on twoD, matching arch.py's own
             # GPUPatchify2D/GPUPatchify3D dispatch): the real level-0 grid

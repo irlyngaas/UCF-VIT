@@ -692,3 +692,55 @@ def test_sst_plain_string_variables_default_time_offsets_to_zero():
     assert parsed["data"]["time_offsets"] == [0]
     assert all(isinstance(e, str) for e in parsed["data"]["dict_in_variables"]["P1F4R32"])
     assert all(isinstance(e, str) for e in parsed["data"]["dict_out_variables"]["P1F4R32"])
+
+
+# ---------------------------------------------------------------------------
+# ap.tile_size power-of-2 check -- now only enforced for do_gpu_ap:True
+# (GPUPatchify2D/GPUPatchify3D's fixed block grid still needs it). The
+# do_gpu_ap:False path (Patchify/Patchify_3D) no longer needs it: it pads
+# any tile_size up to the next power of two internally (see
+# UCF_VIT.dataloaders.transform._pad_to_power_of_two).
+# ---------------------------------------------------------------------------
+
+
+def _sap_conf_with_non_power_of_two_img_size():
+    with open(SAP_CONFIG) as f:
+        conf = yaml.load(f, Loader=yaml.FullLoader)
+    # div:1, tile_overlap:0 (this config's own tiling block) -- tile_size
+    # derives straight from img_size, so this is a direct, non-power-of-2
+    # tile_size (256 -> 200 on every axis).
+    conf["data"]["img_size"] = [200, 200, 200]
+    return conf
+
+
+def test_do_gpu_ap_false_no_longer_requires_power_of_two_tile_size():
+    conf = _sap_conf_with_non_power_of_two_img_size()
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    os.close(fd)
+    try:
+        with open(path, "w") as f:
+            yaml.dump(conf, f)
+        args = argparse.Namespace(config=path, pretrained_config="")
+        parsed = parse_config(args, load_balance_offline=True)
+        assert parsed["ap"]["do_gpu_ap"] is False
+        assert parsed["data"]["tile_size"] == (200, 200, 200)
+    finally:
+        os.remove(path)
+
+
+def test_do_gpu_ap_true_still_requires_power_of_two_tile_size():
+    conf = _sap_conf_with_non_power_of_two_img_size()
+    conf["ap"]["do_gpu_ap"] = True
+    conf["parallelism"]["simple_ddp_size"] = 1  # sidestep needing a live process group, same as _sst_adaptive_conf_for_do_gpu_ap
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    os.close(fd)
+    try:
+        with open(path, "w") as f:
+            yaml.dump(conf, f)
+        args = argparse.Namespace(config=path, pretrained_config="")
+        with pytest.raises(AssertionError, match="must be a power of 2"):
+            parse_config(args, load_balance_offline=True)
+    finally:
+        os.remove(path)

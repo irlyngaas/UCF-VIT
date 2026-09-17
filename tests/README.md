@@ -5837,3 +5837,88 @@ distributed`) passes, 421 passed / 5 skipped (5 new tests, no
 regressions). Direct manual checks confirm `Patchify`'s real end-to-end
 output respects a custom `min_size` (only padding-zero entries in
 `seq_size` fall below it, real leaf sizes never do).
+
+## Removed the CPU adaptive-patching `data.tile_size`-must-be-a-power-of-2 restriction
+
+Follow-up ask, prompted by asking why the CPU path (`Patchify`/
+`Patchify_3D`, backed by `FixedQuadTree`/`FixedOctTree`) needed
+`data.tile_size` to be a power of two when the GPU path
+(`GPUPatchify2D`/`GPUPatchify3D`) already accepts any size via padding.
+The restriction exists because `_build_tree` splits a node using one
+integer midpoint (`int((x1+x2)/2)`) applied to both children --
+repeatedly halving a power-of-two size always stays exact, but starting
+from any other size eventually hits an odd intermediate value, and
+truncating division there produces *unequal* children (e.g. `3 -> 1, 2`),
+silently violating the tree's own quad/oct-split assumption rather than
+raising. `parse.py`'s `is_power_of_two(tile_size[i])` assertion was the
+simplest sufficient (not tightest necessary) guard against this.
+
+**The fix**: pad the input up to the next power of two per spatial axis,
+independently, before building the tree -- mirroring `GPUPatchify2D`/
+`GPUPatchify3D`'s own already-shipped `_pad_tensor`, but via `numpy.pad(
+..., mode="edge")` instead of `F.pad(..., mode="replicate")`, since
+`Patchify`/`Patchify_3D.forward` operate on real `numpy` arrays, not
+`torch.Tensor`s (same edge-replication semantics either way). Unlike
+`GPUPatchify2D`/`GPUPatchify3D` -- which build a *fixed* grid of
+`min_size` blocks and so need `H<=W`/an integer axis ratio to pad
+correctly -- `Patchify`/`Patchify_3D`'s root is always a single node
+covering the whole image, no fixed grid, so each axis can be padded to
+its own next power of two with no cross-axis constraint at all.
+
+**Edge-replication, not zero-padding, was a deliberate choice**:
+zero-padding would create a hard discontinuity exactly at the real image
+boundary -- a false edge for `score_fn="canny"`, and spuriously high
+variance for `score_fn="variance"` on any block straddling that boundary
+-- both would waste patches on a meaningless boundary instead of staying
+coarse there. Edge-replication keeps the border flat/continuous with real
+content, so it scores low and stays coarse, matching intent.
+
+**No clipping/trimming machinery was added**: a leaf near the padded edge
+may cover some replicated (not real) content, exactly like
+`GPUPatchify2D`/`GPUPatchify3D`'s own identical tradeoff -- intersecting
+each leaf's bounding box with the real image bounds before extracting
+content was considered and deliberately not built, since it wasn't asked
+for and the GPU path already accepts this same tradeoff.
+
+**New shared utility**: `UCF_VIT.utils.misc.next_power_of_two(n)` (`1 <<
+(n - 1).bit_length()`) -- smallest power of two `>= n`, already-a-power-
+of-two `n` maps to itself. `UCF_VIT.dataloaders.transform._pad_to_power_
+of_two(img, ndim)` uses it to pad `img`'s first `ndim` axes (`2` for
+`Patchify`, `3` for `Patchify_3D`) via `numpy.pad(..., mode="edge")`; a
+no-op (returns `img` unchanged, not a copy) when every axis is already a
+power of two. Called as the very first line of both classes' `forward()`
+-- every branch below (canny's imagenet/catsdogs/skimage-canny/random-
+noise sub-branches, and variance) operates on the already-padded array
+with no other code changes needed.
+
+**`parse.py`**: the `is_power_of_two(tile_size[i])` loop is now gated
+behind `ap_conf["do_gpu_ap"]` -- still enforced for the GPU path (its
+fixed block grid still needs it, and relaxing it wasn't asked for here),
+removed entirely for the CPU path (`do_gpu_ap:False`), which now pads
+internally regardless of `tile_size`.
+
+**A real regression caught by actually running the suite** (not assumed
+safe): `test_transform.py`'s existing `test_patchify_3d_shape_and_dtype`
+used `D=H=W=24` -- not a power of two, previously allowed only because
+that test constructs `Patchify_3D` directly, bypassing `parse.py`'s
+assertion entirely -- and asserted `edges.shape == (24, 24, 24)`. With
+padding now wired in, 24 pads up to 32, so the assertion needed updating
+to `(32, 32, 32)`; this is the real, expected consequence of the new
+behavior, not a bug.
+
+**Tier 1 coverage**: `test_transform.py` gains direct unit tests on
+`_pad_to_power_of_two` (no-op when already a power of two, returning the
+same object; independent per-axis padding e.g. `(12, 20) -> (16, 32)`;
+edge-replication confirmed pixel-exact, not zero, including the
+replicated-corner case; trailing non-spatial axes like a channel
+dimension left untouched), plus one end-to-end test per class
+(`Patchify`/`Patchify_3D`) confirming a non-power-of-2 input no longer
+needs rejecting upstream and the returned `edges` reflect the padded
+(not original) size. `test_config_validation.py` gains two tests: a
+non-power-of-2 `data.img_size` (so `tile_size` derives to the same)
+parses cleanly under `do_gpu_ap:False`, and still raises with "must be a
+power of 2" under `do_gpu_ap:True`.
+
+**Verification:** full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 439 passed / 5 skipped (10 new tests, one existing
+test updated for the real shape change above, no other regressions).

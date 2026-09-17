@@ -35,7 +35,7 @@ import random
 import numpy as np
 import pytest
 
-from UCF_VIT.dataloaders.transform import Patchify, Patchify_3D
+from UCF_VIT.dataloaders.transform import Patchify, Patchify_3D, _pad_to_power_of_two
 
 
 def _box_image(H=64, W=64, low=0.0, high=1.0):
@@ -139,6 +139,66 @@ def test_patchify_variance_mode_allows_multi_channel_on_non_photo_dataset():
     p = Patchify(fixed_length=16, interp_size=8, num_channels=3, dataset="basic_ct", score_fn="variance")
 
     p(img)  # does not raise
+
+
+# ---------------------------------------------------------------------------
+# _pad_to_power_of_two -- removes the old data.tile_size-must-be-a-power-of-2
+# restriction for this (CPU) path: FixedQuadTree/FixedOctTree's split (one
+# integer midpoint, used for both children) only ever produces equal-sized
+# children when repeatedly halving stays clean all the way down, which a
+# power-of-two size guarantees and any other size doesn't. Padding is
+# edge-replication (numpy's mode="edge", the numpy equivalent of
+# GPUPatchify2D/3D's own F.pad(..., mode="replicate")), not zero-padding --
+# zero-padding would create a hard discontinuity exactly at the real image
+# boundary, a false edge for score_fn="canny" and spuriously high variance
+# for score_fn="variance" on any block straddling it.
+# ---------------------------------------------------------------------------
+
+
+def test_pad_to_power_of_two_is_noop_when_already_power_of_two():
+    img = np.arange(16 * 16 * 3, dtype=np.float32).reshape(16, 16, 3)
+    out = _pad_to_power_of_two(img, ndim=2)
+    assert out is img  # no-op returns the same object, not a copy
+
+
+def test_pad_to_power_of_two_pads_up_to_next_power_of_two_per_axis():
+    img = np.zeros((12, 20, 3), dtype=np.float32)  # 12 -> 16, 20 -> 32, independently
+    out = _pad_to_power_of_two(img, ndim=2)
+    assert out.shape == (16, 32, 3)
+
+
+def test_pad_to_power_of_two_uses_edge_replication_not_zero():
+    img = np.zeros((3, 3), dtype=np.float32)
+    img[:, -1] = 5.0  # distinct value on the edge that gets replicated
+    out = _pad_to_power_of_two(img, ndim=2)
+
+    assert out.shape == (4, 4)
+    assert np.all(out[:3, :3] == img[:3, :3])  # real content untouched
+    assert np.all(out[:3, 3] == 5.0)  # replicated from the last real column, not 0
+    assert np.all(out[3, :] == out[2, :])  # replicated row equals the last real row
+
+
+def test_pad_to_power_of_two_leaves_trailing_non_spatial_axes_alone():
+    # ndim=2 means only the first 2 axes are spatial -- a trailing channel
+    # axis of any size must never be padded.
+    img = np.zeros((3, 16, 5), dtype=np.float32)
+    out = _pad_to_power_of_two(img, ndim=2)
+    assert out.shape == (4, 16, 5)
+
+
+def test_patchify_handles_non_power_of_two_image_size():
+    """End to end through Patchify itself (not just the helper): a
+    non-power-of-2 size no longer needs to be rejected upstream (parse.py's
+    do_gpu_ap:False path no longer asserts this) -- forward() pads
+    internally instead, and the return value reflects the padded (not
+    original) size."""
+    img = np.full((24, 24), 5.0, dtype=np.float32)[:, :, None]
+
+    p = Patchify(fixed_length=7, interp_size=4, num_channels=1, dataset="basic_ct", score_fn="variance", return_edges=True)
+    _, _, _, qdt, edges = p(img)
+
+    assert edges.shape == (32, 32, 1)  # 24 -> next_power_of_two(24) == 32
+    assert qdt.count_patches() == 7
 
 
 def test_patchify_3d_detects_edge_purely_along_depth():
@@ -295,7 +355,21 @@ def test_patchify_3d_multi_channel_reshape_does_not_scramble_channels():
             assert np.allclose(seq_img[c, idx], expected), f"channel {c} patch {idx} contaminated"
 
 
+def test_patchify_3d_handles_non_power_of_two_volume_size():
+    """End to end through Patchify_3D itself (not just the helper) --
+    direct 3D analog of test_patchify_handles_non_power_of_two_image_size."""
+    vol = np.full((12, 12, 12), 5.0, dtype=np.float32)[:, :, :, None]
+
+    p = Patchify_3D(fixed_length=8, interp_size=4, num_channels=1, dataset="basic_ct", score_fn="variance", return_edges=True)
+    _, _, _, octtree, edges = p(vol)
+
+    assert edges.shape == (16, 16, 16, 1)  # 12 -> next_power_of_two(12) == 16
+    assert len(octtree.nodes) == 8
+
+
 def test_patchify_3d_shape_and_dtype():
+    # 24 isn't a power of two, so forward() pads it up to 32 internally
+    # (see _pad_to_power_of_two) before computing edges.
     D = H = W = 24
     vol = np.zeros((D, H, W, 2), dtype=np.float32)
     vol[8:16, 8:16, 8:16, :] = 1.0
@@ -303,7 +377,7 @@ def test_patchify_3d_shape_and_dtype():
     p = Patchify_3D(sths=[1.0], fixed_length=8, canny_thresholds=(0.05, 0.15), interp_size=4, num_channels=2, dataset="basic_ct", return_edges=True)
     _, _, _, _, edges = p(vol)
 
-    assert edges.shape == (D, H, W)
+    assert edges.shape == (32, 32, 32)
     assert edges.dtype == np.uint8
     assert edges.sum() > 0
 

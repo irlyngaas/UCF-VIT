@@ -1071,6 +1071,25 @@ def is_power_of_two(n):
     return (n != 0) and (n & (n-1) == 0)
 
 
+def next_power_of_two(n):
+    """Smallest power of two that is `>= n`.
+
+    Used to pad an image/volume up to a size `FixedQuadTree`/`FixedOctTree`
+    can always split cleanly all the way down to any leaf size: repeatedly
+    halving a power of two (via integer-midpoint truncation, `Rect`/`Cube`'s
+    own splitting) never produces an odd intermediate size, so it never
+    produces unequal-sized children -- any other starting size eventually
+    does. Already-a-power-of-two `n` maps to itself (no padding needed).
+
+    Args:
+        n: Positive integer.
+
+    Returns:
+        Smallest power of two `>= n`.
+    """
+    return 1 << (n - 1).bit_length()
+
+
 def calculate_tile_overlap(overlap):
     """Splits a total per-dimension overlap into start/end padding amounts.
 

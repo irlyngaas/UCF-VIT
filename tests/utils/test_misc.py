@@ -16,6 +16,7 @@ from UCF_VIT.utils.misc import (
     find_repo_root,
     get_test_data,
     is_power_of_two,
+    next_power_of_two,
     patchify,
     process_root_dirs,
     shard_attention_state_dict,
@@ -32,6 +33,14 @@ from UCF_VIT.utils.misc import (
 )
 def test_is_power_of_two(n, expected):
     assert is_power_of_two(n) is expected
+
+
+@pytest.mark.parametrize(
+    "n,expected",
+    [(1, 1), (2, 2), (3, 4), (4, 4), (5, 8), (12, 16), (16, 16), (17, 32), (1023, 1024), (1024, 1024)],
+)
+def test_next_power_of_two(n, expected):
+    assert next_power_of_two(n) == expected
 
 
 def test_slice_file_list_matches_fixed_length_reader_formula():
