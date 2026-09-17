@@ -54,4 +54,8 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 # ROCM_HOME must be set at runtime too (not just at install time), which is
 # why it's exported above, before this script ever gets here. The test
 # skips cleanly (not a failure) if cupy isn't actually installed here yet.
-time python -m pytest ../../tests/model/test_gpu_adaptive_patching_cupyx_real.py -v
+# -rs (not just -v) is what actually prints the skip reason here -- this
+# file's skip conditions fire at collection time (module-level, "collected 0
+# items / 1 skipped"), and -v alone doesn't surface why for a collection-time
+# skip the way it does for a skip raised from inside a test function.
+time python -m pytest ../../tests/model/test_gpu_adaptive_patching_cupyx_real.py -v -rs
