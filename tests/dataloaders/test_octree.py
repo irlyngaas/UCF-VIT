@@ -80,6 +80,18 @@ def test_fixedocttree_splits_into_fixed_length_nodes():
     assert _total_volume(tree) == 16 ** 3
 
 
+def test_fixedocttree_min_size_limits_smallest_leaf():
+    domain = np.zeros((16, 16, 16))
+    domain[0:4, 0:4, 0:4] = 255  # dense in a small region, plenty of room to keep splitting
+
+    tree_default = FixedOctTree(domain=domain, fixed_length=50)
+    assert min(c.get_size()[0] for c, _ in tree_default.nodes) == 2  # default min_size=2, unchanged
+
+    tree_min4 = FixedOctTree(domain=domain, fixed_length=50, min_size=4)
+    assert min(c.get_size()[0] for c, _ in tree_min4.nodes) == 4
+    assert len(tree_min4.nodes) < 50  # stops early -- can't reach fixed_length without going below min_size
+
+
 def test_fixedocttree_prioritizes_highest_density_region():
     domain = np.zeros((16, 16, 16))
     domain[0:8, 0:8, 0:8] = 255

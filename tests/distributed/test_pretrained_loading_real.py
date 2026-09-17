@@ -99,7 +99,7 @@ def _base_config(img_size, checkpoint_path, model_type="VIT", extra_model=None, 
             "drop_path": 0.0, "drop_rate": 0.0, "use_channel_aggregation": False,
         },
         "tiling": {"do_tiling": False, "div": 1, "tile_overlap": 0, "use_all_data": False},
-        "ap": {"do_ap": False, "fixed_length": 196, "separate_channels": False, "use_adaptive_pos_emb": False, "interp_size": 16, "do_gpu_ap": False, "gpu_ap_min_size": None, "score_fn": "variance", "canny_sigma": None, "canny_low_threshold": None, "canny_high_threshold": None, "canny_hysteresis_iters": None},
+        "ap": {"do_ap": False, "fixed_length": 196, "separate_channels": False, "use_adaptive_pos_emb": False, "interp_size": 16, "do_gpu_ap": False, "min_size": None, "score_fn": "variance", "canny_sigma": None, "canny_low_threshold": None, "canny_high_threshold": None, "canny_hysteresis_iters": None},
         "data": {
             "dataset": dataset,
             "img_size": img_size,

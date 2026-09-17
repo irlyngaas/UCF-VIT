@@ -173,6 +173,10 @@ class NativePytorchDataModule(torch.nn.Module):
             forwarded to `Patchify`/`Patchify_3D`, when `adaptive_patching`
             is True. See their own `score_fn` docstring entries for what
             each means.
+        min_size (int, optional): Smallest leaf side length the adaptive-
+            patching transform will ever produce -- forwarded to
+            `Patchify`/`Patchify_3D`'s own `min_size`, when
+            `adaptive_patching` is True.
         data_par_size (int, optional): the size of the data parallelism
         dataset (str, optional): Dataset name, e.g. "imagenet" or "basic_ct"; determines how
             files are listed and how samples are processed/collated.
@@ -274,6 +278,7 @@ class NativePytorchDataModule(torch.nn.Module):
         time_offsets: Optional[list] = None,
         profile_dataloader: bool = False,
         score_fn: str = "canny",
+        min_size: int = 2,
     ):
         """Initializes the data module and builds the per-dataset file listings.
 
@@ -315,6 +320,7 @@ class NativePytorchDataModule(torch.nn.Module):
         self.fixed_length = fixed_length
         self.separate_channels = separate_channels
         self.score_fn = score_fn
+        self.min_size = min_size
         self.data_par_size = data_par_size
         self.ddp_group = ddp_group
         self.dataset = dataset
@@ -491,6 +497,7 @@ class NativePytorchDataModule(torch.nn.Module):
                 self.return_qdt,
                 profile=self.profile_dataloader,
                 score_fn=self.score_fn,
+                min_size=self.min_size,
             )
         else:
             dict_data_train[k] = ProcessChannels(
@@ -533,6 +540,7 @@ class NativePytorchDataModule(torch.nn.Module):
                 self.return_qdt,
                 profile=self.profile_dataloader,
                 score_fn=self.score_fn,
+                min_size=self.min_size,
             )
         return dict_data_train
         

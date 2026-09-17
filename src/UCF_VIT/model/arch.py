@@ -181,7 +181,7 @@ class VIT(nn.Module):
             adaptive_patching: Optional[bool] = False,
             fixed_length: Optional[int] = 4096,
             do_gpu_ap: bool = False,
-            gpu_ap_min_size: int = 2,
+            min_size: int = 2,
             gpu_ap_score_fn: str = "variance",
             gpu_ap_canny_sigma: float = 1.0,
             gpu_ap_canny_low_threshold: float = 0.1,
@@ -252,8 +252,14 @@ class VIT(nn.Module):
                 *where* the patchify computation happens changes. `False`
                 (the default, and every config without this) leaves the
                 existing CPU/dataloader-side path completely unaffected.
-            gpu_ap_min_size: `GPUPatchify2D`/`GPUPatchify3D`'s finest block
-                side length. Only used when `do_gpu_ap` is True.
+            min_size: `GPUPatchify2D`/`GPUPatchify3D`'s finest starting
+                block side length -- the same shared `ap.min_size` config
+                key also used by the CPU path's `FixedQuadTree`/
+                `FixedOctTree` (their own splitting floor), just not
+                consumed here (only this class's own GPU construction
+                needs it; the CPU path is threaded through `dataset.py`/
+                `datamodule.py`/`catsdogs.py` instead). Only used when
+                `do_gpu_ap` is True.
             gpu_ap_score_fn: `GPUPatchify2D`/`GPUPatchify3D`'s merge-cost
                 scoring measure -- `"variance"` (default) or `"canny"`
                 (edge-density). Only used when `do_gpu_ap` is True; see
@@ -350,7 +356,7 @@ class VIT(nn.Module):
             gpu_patchify_cls = GPUPatchify2D if self.twoD else GPUPatchify3D
             self.gpu_patchify = gpu_patchify_cls(
                 img_size=img_size, fixed_length=self.fixed_length,
-                interp_size=self.interp_size, min_size=gpu_ap_min_size,
+                interp_size=self.interp_size, min_size=min_size,
                 score_fn=gpu_ap_score_fn, canny_sigma=gpu_ap_canny_sigma,
                 canny_low_threshold=gpu_ap_canny_low_threshold,
                 canny_high_threshold=gpu_ap_canny_high_threshold,

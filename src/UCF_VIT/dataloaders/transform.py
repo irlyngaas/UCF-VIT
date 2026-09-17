@@ -29,7 +29,7 @@ class Patchify(torch.nn.Module):
     (real multi-channel photos) keep `cv2.Canny`.
     """
 
-    def __init__(self, sths=[0,1,3,5], fixed_length=196, cannys=[50, 100], canny_quantiles=(0.7, 0.9), interp_size=16, num_channels=3, dataset="imagenet", return_edges=False, score_fn="canny") -> None:
+    def __init__(self, sths=[0,1,3,5], fixed_length=196, cannys=[50, 100], canny_quantiles=(0.7, 0.9), interp_size=16, num_channels=3, dataset="imagenet", return_edges=False, score_fn="canny", min_size=2) -> None:
         """Initializes the randomization ranges and patch parameters for the transform.
 
         Args:
@@ -65,6 +65,10 @@ class Patchify(torch.nn.Module):
                 is used as `FixedQuadTree`'s domain, deterministically, no
                 smoothing/thresholds -- see `UCF_VIT.dataloaders.quadtree.
                 Rect.contains`'s own docstring for what that scores).
+            min_size: Smallest leaf side length `FixedQuadTree` will ever
+                produce -- forwarded to its own `min_size`, the same shared
+                floor `UCF_VIT.model.gpu_adaptive_patching.GPUPatchify2D`
+                uses for its GPU-side equivalent.
         """
         super().__init__()
 
@@ -77,6 +81,7 @@ class Patchify(torch.nn.Module):
         self.dataset = dataset
         self.return_edges = return_edges
         self.score_fn = score_fn
+        self.min_size = min_size
 
     def forward(self, img):  # we assume inputs are always structured like this
         """Computes an edge map (or, in variance mode, uses `img` directly) and adaptively patchifies it via a quadtree.
@@ -99,7 +104,7 @@ class Patchify(torch.nn.Module):
         """
         if self.score_fn == "variance":
             edges = img
-            qdt = FixedQuadTree(domain=edges, fixed_length=self.fixed_length, score_fn=self.score_fn)
+            qdt = FixedQuadTree(domain=edges, fixed_length=self.fixed_length, score_fn=self.score_fn, min_size=self.min_size)
             return self._serialize(img, qdt, edges)
 
         # Do some transformations. Here, we're just passing though the input
@@ -139,7 +144,7 @@ class Patchify(torch.nn.Module):
                 # consistent scale works; boolean-as-uint8 is fine as-is.
                 edges = edges.astype(np.uint8)
 
-        qdt = FixedQuadTree(domain=edges, fixed_length=self.fixed_length, score_fn=self.score_fn)
+        qdt = FixedQuadTree(domain=edges, fixed_length=self.fixed_length, score_fn=self.score_fn, min_size=self.min_size)
         return self._serialize(img, qdt, edges)
 
     def _serialize(self, img, qdt, edges):
@@ -188,7 +193,7 @@ class Patchify_3D(torch.nn.Module):
     by the weighting above rather than in a single multi-channel call.
     """
 
-    def __init__(self, sths=[0.5,1.0,2.0], fixed_length=196, canny_thresholds=(0.05, 0.15), interp_size=16, num_channels=3, dataset="basic_ct", return_edges=False, profile=False, score_fn="canny") -> None:
+    def __init__(self, sths=[0.5,1.0,2.0], fixed_length=196, canny_thresholds=(0.05, 0.15), interp_size=16, num_channels=3, dataset="basic_ct", return_edges=False, profile=False, score_fn="canny", min_size=2) -> None:
         """Initializes the randomization ranges and patch parameters for the transform.
 
         Args:
@@ -240,6 +245,10 @@ class Patchify_3D(torch.nn.Module):
                 multi-channel input at query time instead; see `UCF_VIT.
                 dataloaders.octree.Cube.contains`'s own docstring for what
                 that scores).
+            min_size: Smallest leaf side length `FixedOctTree` will ever
+                produce -- forwarded to its own `min_size`, the same shared
+                floor `UCF_VIT.model.gpu_adaptive_patching.GPUPatchify3D`
+                uses for its GPU-side equivalent.
         """
         super().__init__()
 
@@ -252,6 +261,7 @@ class Patchify_3D(torch.nn.Module):
         self.return_edges = return_edges
         self.profile = profile
         self.score_fn = score_fn
+        self.min_size = min_size
 
     def forward(self, img):  # we assume inputs are always structured like this
         """Computes a 3D edge volume for `img` (or, in variance mode, uses `img` directly) and adaptively patchifies it via an octree.
@@ -271,7 +281,7 @@ class Patchify_3D(torch.nn.Module):
             edges = img
             if self.profile:
                 t_octree_start = time.time()
-            octtree = FixedOctTree(domain=edges, fixed_length=self.fixed_length, score_fn=self.score_fn)
+            octtree = FixedOctTree(domain=edges, fixed_length=self.fixed_length, score_fn=self.score_fn, min_size=self.min_size)
             if self.profile:
                 t_serialize_start = time.time()
                 octree_time = t_serialize_start - t_octree_start
@@ -330,7 +340,7 @@ class Patchify_3D(torch.nn.Module):
             t_octree_start = time.time()
             edge_time = t_octree_start - t_edge_start
 
-        octtree = FixedOctTree(domain=edges, fixed_length=self.fixed_length, score_fn=self.score_fn)
+        octtree = FixedOctTree(domain=edges, fixed_length=self.fixed_length, score_fn=self.score_fn, min_size=self.min_size)
 
         if self.profile:
             t_serialize_start = time.time()

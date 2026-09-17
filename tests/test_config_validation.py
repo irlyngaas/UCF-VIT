@@ -215,6 +215,30 @@ def test_score_fn_defaults_to_canny_when_do_gpu_ap_false():
     assert parsed["ap"]["score_fn"] == "canny"
 
 
+def test_min_size_threads_through_for_both_paths():
+    # ap.min_size (renamed from the GPU-only ap.gpu_ap_min_size -- now the
+    # shared floor for both FixedQuadTree/FixedOctTree's own splitting and
+    # GPUPatchify2D/GPUPatchify3D's finest starting block size) parses with
+    # its default and an explicit override, regardless of do_gpu_ap.
+    parsed = validate_config(SAP_CONFIG)
+    assert parsed["ap"]["min_size"] == 2  # SAP_CONFIG's own explicit ap.min_size:2
+
+    with open(SAP_CONFIG) as f:
+        conf = yaml.load(f, Loader=yaml.FullLoader)
+    conf["ap"]["min_size"] = 4
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    os.close(fd)
+    try:
+        with open(path, "w") as f:
+            yaml.dump(conf, f)
+        args = argparse.Namespace(config=path, pretrained_config="")
+        parsed = parse_config(args, load_balance_offline=True)
+        assert parsed["ap"]["min_size"] == 4
+    finally:
+        os.remove(path)
+
+
 def test_score_fn_variance_explicit_with_do_gpu_ap_false_now_parses():
     with open(SAP_CONFIG) as f:
         conf = yaml.load(f, Loader=yaml.FullLoader)
@@ -274,7 +298,7 @@ def _sst_adaptive_conf_for_do_gpu_ap():
 
 def test_do_gpu_ap_works_on_a_real_3d_config():
     # img_size=(256,256,256), tile_size derives to the same (div:1, no
-    # overlap) -- gpu_ap_min_size defaults to 2, giving real_max_blocks=128,
+    # overlap) -- this config's own ap.min_size:2 gives real_max_blocks=128,
     # 128**3 leaves; fixed_length=729 (this config's own do_ap:True default)
     # satisfies (128**3 - 729) % 7 == 0 already, so no fixed_length override
     # needed here.

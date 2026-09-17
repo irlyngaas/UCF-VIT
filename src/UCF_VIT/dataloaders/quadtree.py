@@ -207,7 +207,7 @@ class FixedQuadTree:
     regions.
     """
 
-    def __init__(self, domain, fixed_length=128, build_from_info=False, meta_info=None, score_fn="canny") -> None:
+    def __init__(self, domain, fixed_length=128, build_from_info=False, meta_info=None, score_fn="canny", min_size=2) -> None:
         """Builds the quadtree over `domain`, or reconstructs it from saved metadata.
 
         Args:
@@ -221,10 +221,18 @@ class FixedQuadTree:
                 only when `build_from_info` is True.
             score_fn: `"canny"` (default) or `"variance"` -- see `Rect.
                 contains`'s own docstring for what each means.
+            min_size: Smallest leaf side length `_build_tree` will ever
+                produce -- a node this size (or smaller) is never split
+                further, even if it's still the highest-scoring candidate
+                (matches `UCF_VIT.model.gpu_adaptive_patching.
+                GPUPatchify2D`'s own `min_size`'s role -- the shared
+                floor on adaptive-patch granularity for both the CPU
+                (this class) and GPU path).
         """
         self.domain = domain
         self.fixed_length = fixed_length
         self.score_fn = score_fn
+        self.min_size = min_size
         if build_from_info:
             self.nodes = self.decoder_nodes(meta_info=meta_info)
         else:
@@ -277,8 +285,9 @@ class FixedQuadTree:
         """Iteratively splits the highest edge-density node into 4 quadrants until `fixed_length` nodes exist.
 
         Populates `self.nodes` as a list of `[Rect, edge_density_score]` pairs.
-        Stops early if the highest-scoring node's side length has shrunk to 2 (it
-        can't be evenly halved further).
+        Stops early if the highest-scoring node's side length has shrunk to
+        `self.min_size` -- it's never split smaller than that, regardless of
+        how much it still dominates every other candidate's score.
 
         Uses a heap (keyed on the negated score, so the max is always
         `heap[0]`) to pick which node to split each iteration -- see
@@ -295,7 +304,7 @@ class FixedQuadTree:
         count = 1
         while count < self.fixed_length:
             neg_value, _, bbox = heap[0]
-            if bbox.get_size()[0] == 2:
+            if bbox.get_size()[0] <= self.min_size:
                 break
             heapq.heappop(heap)
 

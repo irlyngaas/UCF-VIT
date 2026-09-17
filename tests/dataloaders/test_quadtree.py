@@ -75,6 +75,22 @@ def test_fixedquadtree_splits_into_fixed_length_nodes():
     assert _total_area(qdt) == 16 * 16
 
 
+def test_fixedquadtree_min_size_limits_smallest_leaf():
+    """min_size is the shared floor with GPUPatchify2D's own min_size --
+    a node this size (or smaller) is never split further, even if a much
+    larger fixed_length is requested and it's still the highest-scoring
+    candidate."""
+    domain = np.zeros((16, 16))
+    domain[0:4, 0:4] = 255  # dense in a small region, plenty of room to keep splitting
+
+    qdt_default = FixedQuadTree(domain=domain, fixed_length=50)
+    assert min(r.get_size()[0] for r, _ in qdt_default.nodes) == 2  # default min_size=2, unchanged
+
+    qdt_min4 = FixedQuadTree(domain=domain, fixed_length=50, min_size=4)
+    assert min(r.get_size()[0] for r, _ in qdt_min4.nodes) == 4
+    assert qdt_min4.count_patches() < 50  # stops early -- can't reach fixed_length without going below min_size
+
+
 def test_fixedquadtree_prioritizes_highest_density_region():
     domain = np.zeros((16, 16))
     domain[0:8, 0:8] = 255  # dense in the low-y/low-x quadrant

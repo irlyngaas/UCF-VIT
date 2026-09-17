@@ -113,6 +113,23 @@ def test_patchify_variance_mode_favors_higher_variance_region():
     assert sorted(seq_size) == [4] * 4 + [8] * 3
 
 
+def test_patchify_min_size_limits_smallest_leaf():
+    """min_size is the shared floor with GPUPatchify2D's own min_size --
+    forwarded through to FixedQuadTree, confirmed end to end through the
+    full Patchify pipeline (not just at the tree level, already covered by
+    test_quadtree.py's own test_fixedquadtree_min_size_limits_smallest_leaf)."""
+    img = np.full((16, 16), 5.0, dtype=np.float32)
+    img[0:4, 0:4] = 100.0  # dense in a small region, plenty of room to keep splitting
+    img = img[:, :, None]
+
+    p = Patchify(fixed_length=50, interp_size=4, num_channels=1, dataset="basic_ct", score_fn="variance", min_size=4)
+    _, seq_size, _, qdt = p(img)
+
+    real_sizes = [s for s in seq_size if s > 0]
+    assert min(real_sizes) == 4
+    assert qdt.count_patches() < 50  # stops early -- can't reach fixed_length without going below min_size
+
+
 def test_patchify_variance_mode_allows_multi_channel_on_non_photo_dataset():
     """score_fn="variance" has no equivalent to score_fn="canny"'s C == 1
     restriction on non-imagenet/catsdogs datasets (skimage.feature.canny
@@ -206,6 +223,22 @@ def test_patchify_3d_variance_mode_favors_higher_variance_region():
 
     assert len(octtree.nodes) == 15
     assert sorted(seq_size) == [4] * 8 + [8] * 7
+
+
+def test_patchify_3d_min_size_limits_smallest_leaf():
+    # fixed_length=100 is deliberately above (16//4)**3=64 -- the most
+    # 4x4x4 leaves a 16-cube volume could ever be split into -- so this
+    # can only stop early, never reach fixed_length, without min_size.
+    vol = np.full((16, 16, 16), 5.0, dtype=np.float32)
+    vol[0:4, 0:4, 0:4] = 100.0  # dense in a small region, plenty of room to keep splitting
+    vol = vol[:, :, :, None]
+
+    p = Patchify_3D(fixed_length=100, interp_size=4, num_channels=1, dataset="basic_ct", score_fn="variance", min_size=4)
+    _, seq_size, _, octtree = p(vol)
+
+    real_sizes = [s for s in seq_size if s > 0]
+    assert min(real_sizes) == 4
+    assert len(octtree.nodes) < 100  # stops early -- can't reach fixed_length without going below min_size
 
 
 def test_patchify_multi_channel_reshape_does_not_scramble_channels():

@@ -58,7 +58,7 @@ class CatsDogsDataset(Dataset):
     image.
     """
 
-    def __init__(self, file_list, variables, tile_size, twoD = True, adaptive_patching = False, fixed_length=196, interp_size=16, num_channels=3, dataset="catsdogs", resize=None, div=1, tile_overlap=(0, 0), score_fn="canny"):
+    def __init__(self, file_list, variables, tile_size, twoD = True, adaptive_patching = False, fixed_length=196, interp_size=16, num_channels=3, dataset="catsdogs", resize=None, div=1, tile_overlap=(0, 0), score_fn="canny", min_size=2):
         """Initializes the dataset over a list of image file paths.
 
         Args:
@@ -91,6 +91,10 @@ class CatsDogsDataset(Dataset):
                 adjacent tiles per axis, only used when `div > 1`.
             score_fn: `"canny"` (default) or `"variance"` -- forwarded to
                 `Patchify`/`Patchify_3D`, when `adaptive_patching` is True.
+            min_size: Smallest leaf side length the adaptive-patching
+                transform will ever produce -- forwarded to `Patchify`/
+                `Patchify_3D`'s own `min_size`, when `adaptive_patching` is
+                True.
         """
         self.file_list = file_list
         self.variables = variables
@@ -104,6 +108,7 @@ class CatsDogsDataset(Dataset):
         self.resize = resize
         self.div = div
         self.score_fn = score_fn
+        self.min_size = min_size
 
         # start_overlap/end_overlap and tile_size_no_overlap use the same
         # [height, width]-ordered convention as tile_size/tile_overlap
@@ -117,9 +122,9 @@ class CatsDogsDataset(Dataset):
 
         if self.adaptive_patching:
             if self.twoD:
-                self.patchify = Patchify(fixed_length=fixed_length, interp_size=interp_size, num_channels=num_channels, dataset=self.dataset, score_fn=self.score_fn)
+                self.patchify = Patchify(fixed_length=fixed_length, interp_size=interp_size, num_channels=num_channels, dataset=self.dataset, score_fn=self.score_fn, min_size=self.min_size)
             else:
-                self.patchify = Patchify_3D(fixed_length=fixed_length, interp_size=interp_size, num_channels=num_channels, dataset=self.dataset, score_fn=self.score_fn)
+                self.patchify = Patchify_3D(fixed_length=fixed_length, interp_size=interp_size, num_channels=num_channels, dataset=self.dataset, score_fn=self.score_fn, min_size=self.min_size)
 
     def __len__(self):
         """Returns the number of (file, tile) samples in the dataset.

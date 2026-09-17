@@ -254,7 +254,7 @@ def get_model(conf, p_conf, device, local_rank, fsdp_group, simple_ddp_group, te
         # False (default) for every config without this leaves the
         # existing CPU/dataloader-side adaptive-patching path unaffected.
         do_gpu_ap=conf["ap"]["do_gpu_ap"],
-        gpu_ap_min_size=conf["ap"]["gpu_ap_min_size"] or 2,
+        min_size=conf["ap"]["min_size"] or 2,
         gpu_ap_score_fn=conf["ap"]["score_fn"],
         gpu_ap_canny_sigma=conf["ap"]["canny_sigma"] or 1.0,
         gpu_ap_canny_low_threshold=conf["ap"]["canny_low_threshold"] if conf["ap"]["canny_low_threshold"] is not None else 0.1,

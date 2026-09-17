@@ -677,7 +677,15 @@ def parse_config(args, load_balance_offline=False):
             "separate_channels": conf['ap']['separate_channels'] if do_ap else False,
             "use_adaptive_pos_emb": conf['ap']['use_adaptive_pos_emb'] if do_ap else False,
             "do_gpu_ap": do_gpu_ap,
-            "gpu_ap_min_size": conf['ap'].get('gpu_ap_min_size', 2) if do_gpu_ap else None,
+            # min_size: smallest leaf/patch side length either adaptive-
+            # patching path will ever produce -- shared by the CPU
+            # (FixedQuadTree/FixedOctTree's own min_size, a floor on
+            # _build_tree's splitting) and GPU (GPUPatchify2D/3D's own
+            # min_size, the finest starting block size for run_merge_batch)
+            # paths, same "not path-specific" reasoning as fixed_length/
+            # score_fn above. Not called gpu_ap_min_size any more -- that
+            # name predates this being usable on the CPU side too.
+            "min_size": conf['ap'].get('min_size', 2) if do_ap else None,
             "score_fn": score_fn,
             "canny_sigma": conf['ap'].get('canny_sigma', 1.0) if use_canny else None,
             "canny_low_threshold": conf['ap'].get('canny_low_threshold', 0.1) if use_canny else None,
@@ -689,7 +697,7 @@ def parse_config(args, load_balance_offline=False):
             print("Since no ap_conf was given in the config file, this is defaulting to be ran with standard patching")
         ap_conf = {
             "do_ap": False, "fixed_length": None, "separate_channels": False, "use_adaptive_pos_emb": False,
-            "do_gpu_ap": False, "gpu_ap_min_size": None, "score_fn": "variance", "canny_sigma": None,
+            "do_gpu_ap": False, "min_size": None, "score_fn": "variance", "canny_sigma": None,
             "canny_low_threshold": None, "canny_high_threshold": None, "canny_hysteresis_iters": None,
         }
 
@@ -931,22 +939,22 @@ def parse_config(args, load_balance_offline=False):
             # computation (dispatched on twoD, matching arch.py's own
             # GPUPatchify2D/GPUPatchify3D dispatch): the real level-0 grid
             # run_merge_batch operates on is the *padded* grid, not
-            # tile_size[0] // gpu_ap_min_size directly -- whenever tile_size
-            # isn't already a multiple of the coarsest block size, padding
-            # grows the real block count (this is normally a no-op since
-            # tile_size and the default gpu_ap_min_size=2 are both powers of
-            # 2, but a non-power-of-2 gpu_ap_min_size would otherwise make
-            # this check silently disagree with the real module and either
-            # wrongly reject or wrongly allow a config). tile_size[0] is
-            # always the reference axis (GPUPatchify2D/3D's own shortest-
-            # axis convention -- tile_size must already be sorted ascending
-            # for do_gpu_ap, same as GPUPatchify3D's own D <= H <= W
+            # tile_size[0] // min_size directly -- whenever tile_size isn't
+            # already a multiple of the coarsest block size, padding grows
+            # the real block count (this is normally a no-op since
+            # tile_size and the default min_size=2 are both powers of 2,
+            # but a non-power-of-2 min_size would otherwise make this check
+            # silently disagree with the real module and either wrongly
+            # reject or wrongly allow a config). tile_size[0] is always the
+            # reference axis (GPUPatchify2D/3D's own shortest-axis
+            # convention -- tile_size must already be sorted ascending for
+            # do_gpu_ap, same as GPUPatchify3D's own D <= H <= W
             # requirement).
-            max_blocks = tile_size[0] // ap_conf["gpu_ap_min_size"]
+            max_blocks = tile_size[0] // ap_conf["min_size"]
             max_level = int(math.floor(math.log2(max_blocks))) if max_blocks >= 1 else 0
-            pad_b = ap_conf["gpu_ap_min_size"] * (2 ** max_level)
+            pad_b = ap_conf["min_size"] * (2 ** max_level)
             padded_ref = -(-tile_size[0] // pad_b) * pad_b
-            real_max_blocks = padded_ref // ap_conf["gpu_ap_min_size"]
+            real_max_blocks = padded_ref // ap_conf["min_size"]
             exponent = 2 if twoD else 3
             modulus = 3 if twoD else 7
             gpu_patchify_name = "GPUPatchify2D" if twoD else "GPUPatchify3D"
@@ -956,7 +964,7 @@ def parse_config(args, load_balance_offline=False):
                 f"(real_max_blocks**{exponent} - fixed_length) % {modulus} == 0 for "
                 f"{gpu_patchify_name}'s bottom-up merge -- real_max_blocks**{exponent} is "
                 f"{initial_leaves} here (tile_size[0] {tile_size[0]} padded to a multiple of "
-                f"{pad_b}, ap.gpu_ap_min_size {ap_conf['gpu_ap_min_size']}). See "
+                f"{pad_b}, ap.min_size {ap_conf['min_size']}). See "
                 f"{gpu_patchify_name}.__init__'s own identical assertion for why."
             )
         elif twoD:

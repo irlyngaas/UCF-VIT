@@ -5759,3 +5759,81 @@ the new distributed test isn't part of this count at all, excluded by
 `--ignore=tests/distributed`). Neither new test's real pass/fail behavior
 has been observed -- that requires an actual Frontier `sbatch` run, the
 natural next step whenever convenient.
+
+## Renamed gpu_ap_min_size to min_size and made it a shared CPU/GPU floor
+
+Follow-up ask: `FixedQuadTree`/`FixedOctTree._build_tree` (`quadtree.py`
+line ~298, `octree.py`'s identical line) hardcoded `2` as the smallest leaf
+side length they'd ever split down to -- the exact same concept
+`GPUPatchify2D`/`GPUPatchify3D`'s own `min_size` already covers for the GPU
+path, just not exposed as a parameter on the CPU side, and not shared
+under one name. `ap.gpu_ap_min_size` (GPU-only until now) is renamed to
+`ap.min_size` and threaded through both paths.
+
+**The actual new capability**, in `quadtree.py`/`octree.py`:
+`FixedQuadTree`/`FixedOctTree.__init__` gain a `min_size=2` parameter
+(default preserves today's exact behavior); `_build_tree`'s stopping
+condition changes from `bbox.get_size()[0] == 2` to `bbox.get_size()[0] <=
+self.min_size` -- a node this size (or smaller) is never split further,
+regardless of how much it still dominates every other candidate's score.
+`<=` rather than `==` for robustness (defensive against any node size
+ever landing strictly below `min_size` in one step, though in practice
+sizes only ever halve cleanly from a power-of-two starting point).
+
+**A real, if narrow, thing found while testing this** (not a code bug --
+a wrong test assumption caught by actually running it): a first attempt at
+a 3D `Patchify_3D` test used `fixed_length=100, min_size=4` on a 16-cube
+volume and asserted the tree "stops early" (can't reach `fixed_length`
+without violating `min_size`) -- but `(16//4)**3 = 64` distinct 4x4x4
+leaves are actually reachable from that volume, and with `score_fn=
+"variance"`'s particular score distribution on this fixture, the tree
+legitimately reached exactly the target count without ever violating
+`min_size`. Not a bug: `FixedOctTree`'s own analogous canny-scored test
+(same volume, same `fixed_length`/`min_size`) genuinely stops much earlier
+(15 nodes) purely from a different tie-breaking pattern in a very
+score-dependent greedy algorithm -- confirming a "stops early" assertion
+needs a `fixed_length` provably *above* the true achievable ceiling
+((`img_size`/`min_size`)`**ndim`) to be a robust regression check
+regardless of `score_fn`/tie-breaking specifics, not just intuitively
+"large." Fixed by choosing `fixed_length=100` specifically because it's
+above that 64-leaf ceiling for *any* score distribution, not by relaxing
+the assertion.
+
+**Threading**: `Patchify`/`Patchify_3D.__init__` (`transform.py`) gain
+`min_size=2`, forwarded to `FixedQuadTree`/`FixedOctTree` in every branch
+(canny and variance). From there, threaded through the same five
+construction sites `score_fn` already flows through: `dataset.py`'s
+`ProcessChannels`, `datamodule.py`'s `NativePytorchDataModule`,
+`catsdogs.py`'s `CatsDogsDataset`, and both construction patterns in each
+of `train.py`/`val.py`/`test.py`. `parse.py`'s `ap_conf` entry is now
+available whenever `do_ap:True` (not just `do_gpu_ap:True` as
+`gpu_ap_min_size` was), defaulting to `2`; the `do_gpu_ap` fixed_length
+congruence check's own reference to it is renamed to match, no logic
+change. `arch.py`'s `VIT.__init__` parameter is renamed `gpu_ap_min_size`
+-> `min_size` too (still only consumed there for constructing `self.
+gpu_patchify` -- `arch.py` has no CPU-side `Patchify` construction of its
+own); `model/utils.py`'s `get_model` call site renamed to match.
+
+Two real, pre-existing test fixtures needed the same rename applied
+(`tests/distributed/test_eval_real_pipeline.py`, `tests/distributed/
+test_pretrained_loading_real.py` -- both call `get_model` directly with a
+hand-built `conf["ap"]` dict, which now needs `"min_size"` instead of
+`"gpu_ap_min_size"` or `get_model` would `KeyError` immediately). All 23
+shipped configs' `ap.gpu_ap_min_size: 2` lines (added two stages ago) are
+renamed to `ap.min_size: 2` with an updated comment describing the shared
+meaning.
+
+**Tier 1 coverage**: `test_quadtree.py`/`test_octree.py` gain a
+`min_size` test each (default `min_size=2` behavior unchanged; an explicit
+`min_size=4` both limits the smallest leaf produced and correctly stops
+short of a `fixed_length` chosen above the true achievable ceiling).
+`test_transform.py` gains the same two tests through the full `Patchify`/
+`Patchify_3D` pipeline (not just at the tree level). `test_config_
+validation.py` gains a real-config test confirming `ap.min_size` parses
+with its default and an explicit override, regardless of `do_gpu_ap`.
+
+**Verification:** full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 421 passed / 5 skipped (5 new tests, no
+regressions). Direct manual checks confirm `Patchify`'s real end-to-end
+output respects a custom `min_size` (only padding-zero entries in
+`seq_size` fall below it, real leaf sizes never do).
