@@ -71,17 +71,40 @@ pip install -e .
 needed if you want `UCF_VIT.model.gpu_adaptive_patching.GPUPatchify2D`/
 `GPUPatchify3D`'s `region_backend="cupyx"` option (GPU-native connected-
 components labeling, vs. the default `"scipy"`, which round-trips through
-the CPU). AMD hosts ROCm-matched `cupy` wheels (`amd-cupy`) at
-`pypi.amd.com`, versioned per ROCm release:
+the CPU; currently test-only -- not wired into any config, see
+`launch/tests/run_cupyx_smoke.sh`). AMD hosts prebuilt ROCm-matched `cupy`
+wheels (`amd-cupy`) at `pypi.amd.com`, but only for specific ROCm releases
+(confirmed `rocm-7.0.2` has one, `rocm-7.13.0` does not -- `pip` silently
+falls back to an unrelated, non-functional `amd-cupy` package on regular
+PyPI if you point `--extra-index-url` at a release path that doesn't
+exist there, rather than erroring). Building from source against the
+exact `rocm/7.13` install avoids both that trap and a real toolchain
+mismatch hit when trying the `rocm-7.0.2` wheel anyway (its bundled HIPRTC
+picked up an incompatible system GCC's headers) -- confirmed working here:
 ```
+conda activate UCF-rocm7.13
+module load PrgEnv-gnu
+module load gcc/12.2.0
 module load rocm/7.13
 export ROCM_HOME=${ROCM_PATH}
-pip install amd-cupy --extra-index-url https://pypi.amd.com/rocm-7.13.0/simple
+
+export CUPY_INSTALL_USE_HIP=1
+export HCC_AMDGPU_TARGET=gfx90a   # MI250X's ISA
+
+pip install cupy --no-cache-dir -v 2>&1 | tee /tmp/cupy_build.log
 ```
 `ROCM_HOME` needs to be set both at install time and at runtime (i.e.
 `module load rocm/7.13; export ROCM_HOME=${ROCM_PATH}` again in any job
 script before running code that imports `cupy`) -- not just once during
-this install.
+this install. At runtime, also redirect `cupy`'s JIT kernel cache off
+`$HOME` (it defaults to `$HOME/.cupy/kernel_cache`, which hit a real disk
+quota error on Frontier) to node-local scratch instead:
+```
+export CUPY_CACHE_DIR=/tmp/$JOBID/cupy_kernel_cache
+mkdir -p $CUPY_CACHE_DIR
+```
+See `launch/tests/run_cupyx_smoke.sh` for both of these wired into a
+working example job.
 
 ### Apptainer (on Frontier)
 Use Apptainer container definition files (Only use this on Frontier)

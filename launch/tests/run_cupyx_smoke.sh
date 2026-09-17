@@ -50,13 +50,19 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 # Requires a real cupy install matching this environment's ROCm build, in
 # the UCF-rocm7.13 conda env activated above -- not a project dependency
 # (see gpu_adaptive_patching.py's own _label_regions docstring for why
-# it's opt-in). CuPy no longer ships prebuilt ROCm wheels itself (dropped
-# after v13.4.0) -- AMD hosts a ROCm-matched build instead, versioned per
-# ROCm release, installed via (confirmed working against this exact
-# rocm/7.13 build, README.md's own "Optional: cupy for
-# region_backend=cupyx" section has the same steps):
-#   module load rocm/7.13; export ROCM_HOME=${ROCM_PATH}
-#   pip install amd-cupy --extra-index-url https://pypi.amd.com/rocm-7.13.0/simple
+# it's opt-in). AMD's prebuilt amd-cupy wheels don't cover rocm-7.13.0 (and
+# the closest one, rocm-7.0.2, hits a real HIPRTC/system-GCC toolchain
+# mismatch on this environment) -- built from source against this exact
+# rocm/7.13 install instead, confirmed working (2 passed here, jobs
+# 5499848 -> 5500276 for the full trail: broken index fallback, toolchain
+# mismatch, $HOME disk quota, then a clean pass). README.md's own
+# "Optional: cupy for region_backend=cupyx" section has the full install
+# steps:
+#   conda activate UCF-rocm7.13
+#   module load PrgEnv-gnu; module load gcc/12.2.0; module load rocm/7.13
+#   export ROCM_HOME=${ROCM_PATH}
+#   export CUPY_INSTALL_USE_HIP=1; export HCC_AMDGPU_TARGET=gfx90a
+#   pip install cupy --no-cache-dir -v 2>&1 | tee /tmp/cupy_build.log
 # ROCM_HOME must be set at runtime too (not just at install time), which is
 # why it's exported above, before this script ever gets here. The test
 # skips cleanly (not a failure) if cupy isn't actually installed here yet.

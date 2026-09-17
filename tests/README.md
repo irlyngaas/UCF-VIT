@@ -5781,6 +5781,58 @@ hasn't been run yet (that's the natural next step now that the
 environment exists) -- only the `cupy` install itself has been confirmed
 so far.
 
+#### Follow-up: the `amd-cupy`/`rocm-7.13.0` install above was *also* wrong -- the real fix is a source build, now confirmed by an actual passing run
+
+Running `test_gpu_adaptive_patching_cupyx_real.py` for real (job 5498540)
+immediately exposed that the previous entry's "confirmed this actually
+installs and works" was premature -- `import cupy` failed with
+`ModuleNotFoundError` inside the batch job despite `pip install` reporting
+success. Root cause, found by checking `pypi.amd.com` directly: AMD's
+index has no `rocm-7.13.0` path at all (`AccessDenied` browsing it, vs. a
+real wheel listing at `rocm-7.0.2`) -- `pip install --extra-index-url
+<url that 404s/denies>` doesn't error, it silently falls through to
+regular PyPI, where an unrelated placeholder package also happens to be
+named `amd-cupy` (version `0.0.2`, no dependencies, no real content).
+`pip show`/`pip list` looked completely normal; only `import cupy`
+actually surfaced the gap.
+
+Trying the real `rocm-7.0.2` wheel (`amd_cupy==13.5.1`, pinned so pip
+couldn't repeat the silent-fallback trick) got further -- it imports
+cleanly, which is *not* sufficient evidence it works (only proves the
+dynamic loader found matching symbols, not that GPU kernels compiled
+against a different ROCm's HIPRTC/`comgr` actually execute correctly) --
+and indeed the real smoke test (job 5499091) failed during
+`cupyx.scipy.ndimage.label`'s runtime kernel JIT compile:
+`fatal error: 'stddef.h' file not found`, `comgr` picking up an unrelated,
+incomplete system GCC 14 install rather than the `module load gcc/12.2.0`
+toolchain the job actually loads. Diagnosed by checking `which g++`/
+`g++ --version` (SUSE gcc 7.5.0) against the failing trace's actual header
+path (gcc 14) -- confirmed a real mismatch, not a guess.
+
+**The actual fix**: build `cupy` from source against the real `rocm/7.13`
+install (`CUPY_INSTALL_USE_HIP=1`, `ROCM_HOME=${ROCM_PATH}`,
+`HCC_AMDGPU_TARGET=gfx90a` for MI250X, `pip install cupy` -- plain
+upstream `cupy`, not `amd-cupy`), so the JIT compiler dynamically links
+against this environment's own complete, self-consistent ROCm toolchain
+instead of a wheel's vendored one built for a different release. One more
+real issue surfaced immediately after (job 5499848): `cupy`'s JIT kernel
+cache defaults to `$HOME/.cupy/kernel_cache`, which blew Frontier's
+`$HOME` disk quota (`OSError: [Errno 122] Disk quota exceeded`) --
+`CUPY_CACHE_DIR` redirects it, set in `run_cupyx_smoke.sh` to the same
+node-local `/tmp/$JOBID` scratch `MIOPEN_USER_DB_PATH` already uses.
+
+**Verification:** job 5500276 -- `test_gpu_patchify_2d_cupyx_matches_scipy`
+and `test_gpu_patchify_3d_cupyx_matches_scipy` both **passed** for real,
+`region_backend="cupyx"`'s output exactly matching `region_backend=
+"scipy"`'s on identical input, on real MI250X hardware. This is the first
+real confirmation (not a mocked dispatch test) that the `cupyx.scipy.
+ndimage.label` region-detection upgrade actually works. `README.md` and
+`run_cupyx_smoke.sh` are updated to the source-build steps above,
+replacing the wrong `amd-cupy`/`pypi.amd.com` instructions entirely.
+`region_backend` stays test-only for now (not wired into `parse.py`/any
+config) -- the user wants to do further testing with it before deciding
+whether to expose it as a real, config-driven option.
+
 **Verification:** both new files compile and collect cleanly; both
 correctly skip (not error) in this session's environment (no SLURM launch,
 no CUDA, no `cupy`) -- confirmed directly, not assumed. Full local suite
