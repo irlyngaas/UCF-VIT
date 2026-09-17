@@ -929,22 +929,30 @@ def parse_config(args, load_balance_offline=False):
 
     #If using adaptive patching check if fixed length is compatible with tile_size
     if ap_conf['do_ap']:
-        if ap_conf["do_gpu_ap"]:
-            # Only the GPU path (GPUPatchify2D/GPUPatchify3D) still needs this:
-            # its fixed grid of min_size blocks needs tile_size to be a clean
-            # multiple of the coarsest block size, and while _pad_tensor
-            # already handles that case too, this check is left as-is for
-            # do_gpu_ap since relaxing it wasn't asked for. The CPU path
-            # (Patchify/Patchify_3D) no longer needs this -- it now pads any
-            # tile_size up to the next power of two internally (see
-            # UCF_VIT.dataloaders.transform._pad_to_power_of_two), so
-            # FixedQuadTree/FixedOctTree's integer-midpoint split always
-            # halves cleanly regardless of the real tile_size.
-            checkDims = 2 if twoD else 3
-            for i in range(checkDims):
-                p2 = is_power_of_two(tile_size[i])
-                assert p2, f"Tile Size in the {i} dimension must be a power of 2"
+        # Neither adaptive-patching path actually requires data.tile_size to be
+        # a power of 2 anymore -- both pad the input up to a clean size via
+        # edge-replication before running: Patchify/Patchify_3D (do_gpu_ap:
+        # False) pad up to the next power of two per axis (see UCF_VIT.
+        # dataloaders.transform._pad_to_power_of_two), so FixedQuadTree/
+        # FixedOctTree's integer-midpoint split always halves evenly regardless
+        # of the real tile_size; GPUPatchify2D/GPUPatchify3D (do_gpu_ap:True)
+        # pad up to the next multiple of their coarsest min_size block via
+        # their own _pad_tensor. Warn (don't reject) when this padding will
+        # actually kick in, since it does change the output: patches/blocks
+        # near the padded edge may cover some replicated (not real) content.
+        checkDims = 2 if twoD else 3
+        non_power_of_two_dims = [i for i in range(checkDims) if not is_power_of_two(tile_size[i])]
+        if non_power_of_two_dims:
+            patchify_name = "GPUPatchify2D/GPUPatchify3D" if ap_conf["do_gpu_ap"] else "Patchify/Patchify_3D"
+            print(
+                f"Warning: data.tile_size {tuple(tile_size[:checkDims])} is not a power of 2 "
+                f"in dimension(s) {non_power_of_two_dims} -- {patchify_name} will pad the "
+                f"input up to a clean size via edge-replication before adaptive patching runs, "
+                f"so patches/blocks near the padded edge may include replicated (not real) "
+                f"content instead of real image data."
+            )
 
+        if ap_conf["do_gpu_ap"]:
             # Mirrors GPUPatchify2D/GPUPatchify3D.__init__'s own identical
             # computation (dispatched on twoD, matching arch.py's own
             # GPUPatchify2D/GPUPatchify3D dispatch): the real level-0 grid

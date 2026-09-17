@@ -5895,7 +5895,8 @@ with no other code changes needed.
 behind `ap_conf["do_gpu_ap"]` -- still enforced for the GPU path (its
 fixed block grid still needs it, and relaxing it wasn't asked for here),
 removed entirely for the CPU path (`do_gpu_ap:False`), which now pads
-internally regardless of `tile_size`.
+internally regardless of `tile_size`. (Follow-up below removes it for
+the GPU path too.)
 
 **A real regression caught by actually running the suite** (not assumed
 safe): `test_transform.py`'s existing `test_patchify_3d_shape_and_dtype`
@@ -5922,3 +5923,37 @@ power of 2" under `do_gpu_ap:True`.
 **Verification:** full local suite (`pytest tests/ --ignore=tests/
 distributed`) passes, 439 passed / 5 skipped (10 new tests, one existing
 test updated for the real shape change above, no other regressions).
+
+#### Follow-up: removed the power-of-2 restriction for `do_gpu_ap:True` too, replaced the assertion with a warning
+
+Immediate follow-up ask: the GPU path's own `is_power_of_two` assertion,
+left in place above, isn't actually necessary either --
+`GPUPatchify2D`/`GPUPatchify3D`'s `_pad_tensor` already pads up to the
+next multiple of the coarsest `min_size` block regardless, and the
+`fixed_length` congruence check right below it already computes against
+`real_max_blocks` (derived from the *padded* reference size, `padded_
+ref`), not the raw `tile_size` -- so the congruence math was already
+correct for a non-power-of-2 `tile_size` even while the assertion above
+it was needlessly rejecting one.
+
+**The change**: removed the `is_power_of_two` assertion for both paths
+entirely. In its place, `parse.py` now prints a warning (matching the
+existing `print(f"Warning: ...")` convention already used for UNETR's
+token-capacity check) whenever any checked dimension of `tile_size`
+isn't a power of two, naming the actual `Patchify`/`Patchify_3D` or
+`GPUPatchify2D`/`GPUPatchify3D` class that will pad it and explaining
+why this isn't a no-op: patches/blocks near the padded edge may cover
+replicated (not real) content. A warning, not a rejection -- padding is
+real, correct behavior now for both paths, just worth surfacing since it
+does change the output.
+
+**Tier 1 coverage**: `test_config_validation.py`'s two tests from above
+are replaced with: a non-power-of-2 `tile_size` no longer rejected under
+either `do_gpu_ap:False` or `do_gpu_ap:True` (both now parse cleanly,
+confirmed via `capsys`); the warning actually fires and names the right
+class for each path; a power-of-2 `tile_size` (`SAP_CONFIG`'s own
+shipped `img_size:256`) prints no such warning, confirming it's
+conditional, not unconditional noise on every `do_ap:True` config.
+
+**Verification:** full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 441 passed / 5 skipped, no regressions.

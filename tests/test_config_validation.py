@@ -695,11 +695,15 @@ def test_sst_plain_string_variables_default_time_offsets_to_zero():
 
 
 # ---------------------------------------------------------------------------
-# ap.tile_size power-of-2 check -- now only enforced for do_gpu_ap:True
-# (GPUPatchify2D/GPUPatchify3D's fixed block grid still needs it). The
-# do_gpu_ap:False path (Patchify/Patchify_3D) no longer needs it: it pads
-# any tile_size up to the next power of two internally (see
-# UCF_VIT.dataloaders.transform._pad_to_power_of_two).
+# ap.tile_size power-of-2 check -- removed entirely for both paths.
+# Patchify/Patchify_3D (do_gpu_ap:False) pad any tile_size up to the next
+# power of two internally (UCF_VIT.dataloaders.transform._pad_to_power_
+# of_two); GPUPatchify2D/GPUPatchify3D (do_gpu_ap:True) pad up to the next
+# multiple of their coarsest min_size block via their own _pad_tensor.
+# Neither rejects a non-power-of-2 tile_size anymore -- parse.py instead
+# prints a warning that edge-replication padding will happen and why,
+# since it does change the output (patches/blocks near the padded edge
+# may cover replicated, not real, content).
 # ---------------------------------------------------------------------------
 
 
@@ -713,7 +717,7 @@ def _sap_conf_with_non_power_of_two_img_size():
     return conf
 
 
-def test_do_gpu_ap_false_no_longer_requires_power_of_two_tile_size():
+def test_non_power_of_two_tile_size_no_longer_rejected_under_do_gpu_ap_false():
     conf = _sap_conf_with_non_power_of_two_img_size()
 
     fd, path = tempfile.mkstemp(suffix=".yaml")
@@ -729,7 +733,12 @@ def test_do_gpu_ap_false_no_longer_requires_power_of_two_tile_size():
         os.remove(path)
 
 
-def test_do_gpu_ap_true_still_requires_power_of_two_tile_size():
+def test_non_power_of_two_tile_size_no_longer_rejected_under_do_gpu_ap_true():
+    # 200 padded up to a multiple of its coarsest min_size:2 block (256,
+    # same padded_ref this config's own real_max_blocks=128 -- unchanged
+    # from tile_size=256 -- already relies on) keeps fixed_length:512's
+    # existing (real_max_blocks**3 - fixed_length) % 7 == 0 congruence
+    # satisfied, so no other ap.* override is needed here.
     conf = _sap_conf_with_non_power_of_two_img_size()
     conf["ap"]["do_gpu_ap"] = True
     conf["parallelism"]["simple_ddp_size"] = 1  # sidestep needing a live process group, same as _sst_adaptive_conf_for_do_gpu_ap
@@ -740,7 +749,44 @@ def test_do_gpu_ap_true_still_requires_power_of_two_tile_size():
         with open(path, "w") as f:
             yaml.dump(conf, f)
         args = argparse.Namespace(config=path, pretrained_config="")
-        with pytest.raises(AssertionError, match="must be a power of 2"):
-            parse_config(args, load_balance_offline=True)
+        parsed = parse_config(args, load_balance_offline=True)
+        assert parsed["ap"]["do_gpu_ap"] is True
+        assert parsed["data"]["tile_size"] == (200, 200, 200)
     finally:
         os.remove(path)
+
+
+def test_non_power_of_two_tile_size_warns_about_replication_padding(capsys):
+    conf = _sap_conf_with_non_power_of_two_img_size()
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    os.close(fd)
+    try:
+        with open(path, "w") as f:
+            yaml.dump(conf, f)
+        args = argparse.Namespace(config=path, pretrained_config="")
+
+        parse_config(args, load_balance_offline=True)
+        out = capsys.readouterr().out
+        assert "not a power of 2" in out
+        assert "Patchify/Patchify_3D" in out
+        assert "replicated" in out
+
+        conf["ap"]["do_gpu_ap"] = True
+        conf["parallelism"]["simple_ddp_size"] = 1
+        with open(path, "w") as f:
+            yaml.dump(conf, f)
+        parse_config(args, load_balance_offline=True)
+        out = capsys.readouterr().out
+        assert "not a power of 2" in out
+        assert "GPUPatchify2D/GPUPatchify3D" in out
+    finally:
+        os.remove(path)
+
+
+def test_power_of_two_tile_size_prints_no_replication_warning(capsys):
+    # SAP_CONFIG's own shipped img_size (256, a power of 2 on every axis) --
+    # confirms the warning is conditional, not unconditional noise on every
+    # do_ap:True config.
+    parse_config(argparse.Namespace(config=SAP_CONFIG, pretrained_config=""), load_balance_offline=True)
+    assert "not a power of 2" not in capsys.readouterr().out
