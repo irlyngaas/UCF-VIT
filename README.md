@@ -45,16 +45,14 @@ There are two options available for creating software environments for systems w
 Create Conda Environment from Scratch. Example below uses similar options from the corresponding Apptainer definition files
 ```
 PYTHON_VERSION=3.11
-conda create -n vit python=${PYTHON_VERSION} -y
-conda activate vit 
-ROCM_VERSION=6.2.4
-TORCH_URL="https://download.pytorch.org/whl/rocm${ROCM_VERSION}"
-TORCH_VERSION=2.7.0+rocm6.2.4
-TORCHVISION_VERSION=0.22.0
-TORCHAUDIO_VERSION=2.7.0
+conda create -n UCF-rocm7.13 python=${PYTHON_VERSION} -y
+conda activate UCF-rocm7.13
 
-pip install torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} torchaudio==${TORCHAUDIO_VERSION} --index-url ${TORCH_URL}
-pip install xformers==0.0.30 --extra-index-url=https://download.pytorch.org/whl/rocm${ROCM_VERSION}
+python -m pip install --index-url https://repo.amd.com/rocm/whl/gfx90a/ \
+  "torch==2.10.0+rocm7.13.0" \
+  "torchvision==0.25.0+rocm7.13.0" \
+  "torchaudio==2.10.0+rocm7.13.0"
+pip3 install -U xformers --index-url https://download.pytorch.org/whl/rocm7.1
 
 #If your system has an existing MPI installed use the proper mpi4py installation for your sytsem
 #Default install mpi4py 
@@ -67,6 +65,23 @@ MPICC="cc -shared" pip install --no-cache-dir --no-binary=mpi4py mpi4py
 cd UCF-VIT
 pip install -e .
 ```
+
+#### Optional: `cupy` for `region_backend="cupyx"`
+`cupy` is not installed by the steps above -- it's an opt-in dependency, only
+needed if you want `UCF_VIT.model.gpu_adaptive_patching.GPUPatchify2D`/
+`GPUPatchify3D`'s `region_backend="cupyx"` option (GPU-native connected-
+components labeling, vs. the default `"scipy"`, which round-trips through
+the CPU). AMD hosts ROCm-matched `cupy` wheels (`amd-cupy`) at
+`pypi.amd.com`, versioned per ROCm release:
+```
+module load rocm/7.13
+export ROCM_HOME=${ROCM_PATH}
+pip install amd-cupy --extra-index-url https://pypi.amd.com/rocm-7.13.0/simple
+```
+`ROCM_HOME` needs to be set both at install time and at runtime (i.e.
+`module load rocm/7.13; export ROCM_HOME=${ROCM_PATH}` again in any job
+script before running code that imports `cupy`) -- not just once during
+this install.
 
 ### Apptainer (on Frontier)
 Use Apptainer container definition files (Only use this on Frontier)

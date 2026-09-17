@@ -5750,6 +5750,37 @@ which `cupy` package matches the `rocm/6.2.4` module already loaded there,
 since `cupy` isn't a project dependency and needs installing once in the
 `forge-vit` conda env before this can run for real.
 
+#### Follow-up: the `cupy` install note above was wrong -- corrected against a real Frontier install on a newer ROCm build
+
+The `pip install cupy-rocm-6-2` guess above was never verified against
+real hardware in this session (no GPU, no `cupy`, stated explicitly at the
+time) -- and it turns out that package doesn't actually exist. Real
+current state, confirmed via `docs.cupy.dev` and OLCF's own Frontier docs:
+CuPy dropped prebuilt ROCm wheels entirely after v13.4.0; AMD now hosts a
+ROCm-matched build (`amd-cupy`) at `pypi.amd.com` instead, versioned per
+ROCm release path (`/rocm-X.Y.Z/simple`).
+
+The user built a new Frontier environment on a newer ROCm release
+(`rocm/7.13`, `UCF-rocm7.13` conda env -- also picking up matching AMD-
+hosted `torch`/`torchvision`/`torchaudio` wheels from `repo.amd.com`,
+since the standard `download.pytorch.org` ROCm wheel builds don't cover
+this release yet) and confirmed this actually installs and works:
+```
+module load rocm/7.13
+export ROCM_HOME=${ROCM_PATH}
+pip install amd-cupy --extra-index-url https://pypi.amd.com/rocm-7.13.0/simple
+```
+`ROCM_HOME` must be exported at runtime too, not just at install time --
+`run_cupyx_smoke.sh` now does this before its `python -m pytest` line.
+`README.md`'s AMD/Conda install section and `run_cupyx_smoke.sh` (env name
+`forge-vit` -> `UCF-rocm7.13`, `module load rocm/6.2.4` -> `rocm/7.13`) are
+both updated to match -- this is the first real, hardware-confirmed
+install path for `region_backend="cupyx"` in this project, replacing an
+unverified guess. `test_gpu_adaptive_patching_cupyx_real.py` itself
+hasn't been run yet (that's the natural next step now that the
+environment exists) -- only the `cupy` install itself has been confirmed
+so far.
+
 **Verification:** both new files compile and collect cleanly; both
 correctly skip (not error) in this session's environment (no SLURM launch,
 no CUDA, no `cupy`) -- confirmed directly, not assumed. Full local suite

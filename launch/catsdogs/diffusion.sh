@@ -18,12 +18,12 @@
 
 
 eval "$(/lustre/orion/stf006/proj-shared/irl1/miniforge3/bin/conda shell.bash hook)"
-conda activate forge-vit
+conda activate UCF-rocm7.13
 
 module load PrgEnv-gnu
 module load gcc/12.2.0
 
-module load rocm/6.2.4
+module load rocm/7.13
 
 export MIOPEN_DISABLE_CACHE=1
 export NCCL_PROTO=Simple
