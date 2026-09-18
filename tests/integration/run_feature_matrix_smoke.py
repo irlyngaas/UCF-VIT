@@ -125,6 +125,33 @@ FEATURE_MATRIX = [
         # no override needed.
     ),
 
+    # --- ap.do_gpu_ap:True -- adaptive patching runs on-device inside the
+    # model's own forward() (GPUPatchify2D/GPUPatchify3D, dispatched on
+    # data.twoD) instead of in the dataloader (Patchify/Patchify_3D, the
+    # do_ap cell above). Already has real unit coverage (test_gpu_adaptive_
+    # patching.py/_3d.py) and real cross-rank determinism coverage (tests/
+    # distributed/test_do_gpu_ap_real_pipeline.py) -- but neither of those
+    # goes through a real model/train.py end to end (forward+backward+
+    # optimizer step+checkpoint save/resume, process_batch's own broadcast-
+    # then-redundantly-patchify design all working together for real), which
+    # this cell closes. One representative cell is enough here: unlike
+    # do_ap, do_gpu_ap has no hard model-type restriction in parse.py/
+    # arch.py (no SAP-requires/DiffusionVIT-forbids equivalent), so this
+    # isn't proving a free choice per model type, just that the on-device
+    # path itself works end to end.
+    FeatureMatrixCell(
+        "basic_ct/unetr/base_config.yaml", "basic_ct-unetr+do_gpu_ap",
+        # interp_size:32, same reasoning as the do_ap cell above. score_fn
+        # stays this config's own explicit "canny" (parse.py: an explicit
+        # ap.score_fn always wins over do_gpu_ap's own path-dependent
+        # default of "variance") -- also exercises GPUPatchify3D's Canny
+        # path specifically, not just its (simpler) variance path.
+        # fixed_length:512 already valid for do_gpu_ap too (real_max_blocks
+        # ends up 128 here, same as the do_ap congruence check above; (128**3
+        # - 512) % 7 == 0) -- no override needed.
+        {"ap": {"do_ap": True, "do_gpu_ap": True, "interp_size": 32}},
+    ),
+
     # --- model.token_selection -- UNETR._adaptive_token_grid_index/_weights/
     # _cross_attention_query_and_mask's 4 real reconstruction methods (see
     # arch.py's own docstrings). "area_weighted" (alpha=0) is already proven

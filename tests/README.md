@@ -6196,3 +6196,53 @@ skipped (one fewer than the prior 492 -- the removed cell's own
 parametrized `test_feature_matrix_smoke_helpers.py` case, not a
 regression). Not yet confirmed with a real Frontier rerun of `run_
 feature_matrix_smoke.py` -- that's the natural next step.
+
+## Added a new Tier 3b cell: `ap.do_gpu_ap:True`'s first real end-to-end training coverage
+
+Asked directly: does it make sense to add `do_gpu_ap` coverage to Tier
+3/3b? `do_gpu_ap` (adaptive patching running on-device inside the model's
+own `forward()`, `GPUPatchify2D`/`GPUPatchify3D`, instead of in the
+dataloader) already had two kinds of real coverage -- unit-level (`test_
+gpu_adaptive_patching.py`/`_3d.py`) and, since this session's own real-
+hardware runs, cross-rank determinism (`tests/distributed/test_do_gpu_ap_
+real_pipeline.py`, which deliberately constructs `GPUPatchify2D` directly,
+no model or `train.py` involved, by design, to isolate that one property)
+-- but nothing had ever run it through a real model end to end: forward,
+backward, optimizer step, checkpoint save/resume, `process_batch`'s own
+broadcast-then-redundantly-patchify design all working together for
+real. `training-smoke` (Tier 3) doesn't fit -- it proves the 10 shipped
+baseline configs work unmodified, and none of them ship `do_gpu_ap:True`.
+`feature-matrix-smoke` (Tier 3b) is exactly the right venue -- the same
+"flip one advanced feature on for a representative config" role `do_ap`
+(the CPU-side path) already has cells for.
+
+**New cell**: `basic_ct-unetr+do_gpu_ap` (`{"ap": {"do_ap": True,
+"do_gpu_ap": True, "interp_size": 32}}`, right after the existing
+`basic_ct-unetr+do_ap` cell). Unlike `do_ap`, `do_gpu_ap` has no hard
+model-type restriction in `parse.py`/`arch.py` (no SAP-requires/
+DiffusionVIT-forbids equivalent) -- so one representative cell is enough;
+this isn't proving a free choice per model type, just that the on-device
+path itself works end to end. `score_fn` is left at this config's own
+explicit `"canny"` (not overridden to `do_gpu_ap`'s own path-dependent
+default of `"variance"` -- `parse.py`: an explicit `ap.score_fn` always
+wins) specifically so this cell also exercises `GPUPatchify3D`'s Canny
+path, not just its simpler variance path. `fixed_length:512` (this
+config's own existing value) already satisfies `do_gpu_ap`'s own
+`fixed_length` congruence check for this `tile_size`/`min_size` (verified
+directly: `real_max_blocks` comes out to `128` here, same as the `do_ap`
+cell's own congruence check, `(128**3 - 512) % 7 == 0`) -- no override
+needed.
+
+**Verification:** the new cell's merged config confirmed to actually
+parse cleanly through the real `parse.py`/`validate_config` (not just
+constructed and assumed valid) -- `do_gpu_ap: True`, `score_fn: "canny"`,
+`fixed_length: 512` all come back as expected. `make_smoke_config` (Tier
+3b's own config-generation step) confirmed to run cleanly all the way to
+this sandbox's expected `NoRealDataFoundError` (no real Frontier data
+mount here) -- the same "gets exactly as far as it can without real
+hardware/data, then fails for the right, already-handled reason" bar used
+throughout this session. Full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 492 passed / 2 skipped (one more than the prior
+491 -- this cell's own new parametrized `test_feature_matrix_smoke_
+helpers.py` case). Not yet confirmed with a real Frontier rerun of `run_
+feature_matrix_smoke.py` -- that's the natural next step.
