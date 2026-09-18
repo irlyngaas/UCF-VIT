@@ -444,3 +444,31 @@ def test_labeled_to_region_tensors_scales_to_many_regions():
         assert result.y1s[idx].item() == h_hi
         assert result.x0s[idx].item() == expected_x0
         assert result.x1s[idx].item() == w_hi
+
+
+def test_serialize_batch_chunking_does_not_mix_up_images_or_regions():
+    """2D analog of GPUPatchify3D's own identically-named regression test
+    -- forces `serialize_chunk_size` (3) smaller than a single image's own
+    region count (N=4), so chunk boundaries fall mid-image and at least
+    one chunk straddles the boundary between image 0's regions and image
+    1's. Two images, each with 4 distinctly-valued quadrants, using
+    *different* value ranges per image (1-4 vs 101-104) so any cross-image
+    bleed from a wrong `img_idx` lookup is immediately visible.
+    """
+    p = GPUPatchify2D(img_size=(16, 16), fixed_length=4, interp_size=4, min_size=2, serialize_chunk_size=3)
+    img = torch.zeros(2, 1, 16, 16)
+    for b, base in enumerate((1.0, 101.0)):
+        img[b, 0, 0:8, 0:8] = base
+        img[b, 0, 0:8, 8:16] = base + 1.0
+        img[b, 0, 8:16, 0:8] = base + 2.0
+        img[b, 0, 8:16, 8:16] = base + 3.0
+
+    seq_img, seq_size, seq_pos = p(img)
+
+    assert seq_img.shape == (2, 1, 4, 16)
+    for b, base in enumerate((1.0, 101.0)):
+        for i in range(4):
+            x, y = seq_pos[b, i].tolist()
+            expected = base + (0.0 if (x < 8 and y < 8) else 1.0 if (x >= 8 and y < 8) else 2.0 if (x < 8 and y >= 8) else 3.0)
+            patch = seq_img[b, 0, i]
+            assert torch.allclose(patch, torch.full_like(patch, expected), atol=1e-4)

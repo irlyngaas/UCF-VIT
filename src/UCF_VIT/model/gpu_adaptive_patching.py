@@ -139,7 +139,7 @@ class GPUPatchify2D(torch.nn.Module):
             self, img_size, fixed_length=196, interp_size=16, min_size=2,
             score_fn="variance", canny_sigma=1.0, canny_low_threshold=0.1,
             canny_high_threshold=0.2, canny_hysteresis_iters=2,
-            region_backend="scipy",
+            region_backend="scipy", serialize_chunk_size=16,
     ):
         """Precomputes the level structure this image size implies.
 
@@ -183,10 +183,23 @@ class GPUPatchify2D(torch.nn.Module):
                 `score_fn == "canny"`.
             region_backend: `"scipy"` (default) or `"cupyx"` -- see
                 `_label_regions`'s own docstring for what each means.
+            serialize_chunk_size: `_serialize_batch`'s own chunk size over
+                the flattened `B*N` region dimension -- bounds peak memory
+                to `O(B * serialize_chunk_size * H * W)` regardless of how
+                large `N` (`fixed_length`) is, rather than replicating the
+                whole `imgs_batch` `N` times at once (a real `torch.
+                OutOfMemoryError` on Frontier for this class's own 3D
+                analog at real volume scale -- see `_serialize_batch`'s
+                own docstring). `16` is a conservative default (leaves
+                ample headroom under a typical 64 GiB GPU even at large
+                image sizes); tune down for very large images/channel
+                counts, up for small ones where the extra `grid_sample`
+                calls' overhead isn't worth it.
         """
         super().__init__()
         self.interp_size = interp_size
         self.fixed_length = fixed_length
+        self.serialize_chunk_size = serialize_chunk_size
 
         assert score_fn in ("variance", "canny"), f"score_fn must be 'variance' or 'canny', got {score_fn!r}"
         self.score_fn = score_fn
@@ -713,11 +726,28 @@ class GPUPatchify2D(torch.nn.Module):
         return all_regions
 
     def _serialize_batch(self, all_regions, imgs_batch):
-        """Extracts and resizes every region across the whole batch in one `grid_sample` call.
+        """Extracts and resizes every region across the whole batch, chunked over regions.
 
         Assumes every image in the batch has the same region count `N`
         (`all_regions[0].N`) -- guaranteed by `__init__`'s congruence
         assertion given every image shares `img_size`.
+
+        `F.grid_sample` requires its input's batch dimension to match the
+        grid's, but there's one real image per batch item and `N` separate
+        sampling grids per image -- satisfied by replicating each image
+        `N` times. Replicating the *entire* `imgs_batch` all at once (`.
+        repeat_interleave(N, dim=0)`, this method's original approach) is
+        `O(B * N * H * W)` memory: harmless at this class's own small test
+        scale, but a real `torch.OutOfMemoryError` on Frontier for
+        `GPUPatchify3D`'s identical pattern at real volume scale (see that
+        class's own docstring) -- `GPUPatchify2D` never observed to OOM
+        yet only because 2D images are far smaller than 3D volumes at the
+        same side length. Fixed by chunking over the flattened `B*N`
+        region dimension instead: each chunk indexes (not replicates) only
+        `self.serialize_chunk_size` images via `imgs_batch[img_idx[start:
+        end]]`, so peak memory is `O(B * serialize_chunk_size * H * W)`
+        regardless of how large `N` (`fixed_length`) is. Produces exactly
+        the same values as one giant call, just computed in smaller pieces.
 
         Args:
             all_regions: `list[RegionTensors]`, length B.
@@ -760,8 +790,14 @@ class GPUPatchify2D(torch.nn.Module):
         grid_x = xs.unsqueeze(1).expand(-1, P, -1)
         grids = torch.stack([grid_x, grid_y], dim=-1).float()  # [B*N, P, P, 2]
 
-        imgs_rep = imgs_batch.float().repeat_interleave(N, dim=0)  # [B*N, C, H, W]
-        patches = F.grid_sample(imgs_rep, grids, mode="bilinear", padding_mode="border", align_corners=True)
+        imgs_f = imgs_batch.float()
+        img_idx = torch.arange(B, device=device).repeat_interleave(N)  # [B*N] -- which real image each flattened position replicates
+        patches_chunks = []
+        for start in range(0, B * N, self.serialize_chunk_size):
+            end = min(start + self.serialize_chunk_size, B * N)
+            imgs_chunk = imgs_f[img_idx[start:end]]  # [chunk_len, C, H, W] -- indexes, doesn't pre-replicate the whole B*N
+            patches_chunks.append(F.grid_sample(imgs_chunk, grids[start:end], mode="bilinear", padding_mode="border", align_corners=True))
+        patches = torch.cat(patches_chunks, dim=0)
         patches = patches.reshape(B, N, C, P * P)
 
         return patches.permute(0, 2, 1, 3)
@@ -842,7 +878,7 @@ class GPUPatchify3D(torch.nn.Module):
             self, img_size, fixed_length=344, interp_size=16, min_size=2,
             score_fn="variance", canny_sigma=1.0, canny_low_threshold=0.1,
             canny_high_threshold=0.2, canny_hysteresis_iters=2,
-            region_backend="scipy",
+            region_backend="scipy", serialize_chunk_size=16,
     ):
         """Precomputes the level structure this volume size implies.
 
@@ -878,10 +914,23 @@ class GPUPatchify3D(torch.nn.Module):
                 `score_fn == "canny"`.
             region_backend: `"scipy"` (default) or `"cupyx"` -- see
                 `_label_regions`'s own docstring for what each means.
+            serialize_chunk_size: `_serialize_batch`'s own chunk size over
+                the flattened `B*N` region dimension -- bounds peak memory
+                to `O(B * serialize_chunk_size * D*H*W)` regardless of how
+                large `N` (`fixed_length`) is, rather than replicating the
+                whole `imgs_batch` `N` times at once (a real `torch.
+                OutOfMemoryError` on Frontier, `basic_ct/unetr`'s do_gpu_
+                ap:True cell -- see `_serialize_batch`'s own docstring).
+                `16` is a conservative default (leaves ample headroom
+                under a typical 64 GiB GPU even at real 256^3 volume
+                scale); tune down for very large volumes/channel counts,
+                up for small ones where the extra `grid_sample` calls'
+                overhead isn't worth it.
         """
         super().__init__()
         self.interp_size = interp_size
         self.fixed_length = fixed_length
+        self.serialize_chunk_size = serialize_chunk_size
 
         assert score_fn in ("variance", "canny"), f"score_fn must be 'variance' or 'canny', got {score_fn!r}"
         self.score_fn = score_fn
@@ -1436,11 +1485,23 @@ class GPUPatchify3D(torch.nn.Module):
         return all_regions
 
     def _serialize_batch(self, all_regions, imgs_batch):
-        """Extracts and resizes every region across the whole batch in one 5D `grid_sample` call.
+        """Extracts and resizes every region across the whole batch, chunked over regions.
 
         3D analog of `GPUPatchify2D`'s own method -- assumes every volume
         in the batch has the same region count `N` (see that method's own
-        docstring for why).
+        docstring for why), chunked over the flattened `B*N` region
+        dimension the same way and for the same reason: replicating the
+        *entire* `imgs_batch` `N` times at once (`.repeat_interleave(N,
+        dim=0)`, this method's original approach) is `O(B * N * D*H*W)`
+        memory -- a real `torch.OutOfMemoryError` (`Tried to allocate
+        64.00 GiB`, later `128.00 GiB` once a separate bug upstream of
+        this one was also fixed) on a real Frontier run of `basic_ct/
+        unetr`'s `do_gpu_ap:True` cell, at real 256^3 volume scale. Fixed
+        by indexing (not replicating) only `self.serialize_chunk_size`
+        volumes per chunk via `imgs_batch[img_idx[start:end]]` -- see
+        `GPUPatchify2D._serialize_batch`'s own docstring for the identical
+        2D version of this fix. Produces exactly the same values as one
+        giant call, just computed in smaller pieces.
 
         Args:
             all_regions: `list[RegionTensors3D]`, length B.
@@ -1480,8 +1541,14 @@ class GPUPatchify3D(torch.nn.Module):
         grid_z = zs.view(-1, P, 1, 1).expand(-1, P, P, P)
         grids = torch.stack([grid_x, grid_y, grid_z], dim=-1).float()  # [B*N, P, P, P, 3]
 
-        imgs_rep = imgs_batch.float().repeat_interleave(N, dim=0)  # [B*N, C, D, H, W]
-        patches = F.grid_sample(imgs_rep, grids, mode="bilinear", padding_mode="border", align_corners=True)
+        imgs_f = imgs_batch.float()
+        img_idx = torch.arange(B, device=device).repeat_interleave(N)  # [B*N] -- which real volume each flattened position replicates
+        patches_chunks = []
+        for start in range(0, B * N, self.serialize_chunk_size):
+            end = min(start + self.serialize_chunk_size, B * N)
+            imgs_chunk = imgs_f[img_idx[start:end]]  # [chunk_len, C, D, H, W] -- indexes, doesn't pre-replicate the whole B*N
+            patches_chunks.append(F.grid_sample(imgs_chunk, grids[start:end], mode="bilinear", padding_mode="border", align_corners=True))
+        patches = torch.cat(patches_chunks, dim=0)
         patches = patches.reshape(B, N, C, P * P * P)
 
         return patches.permute(0, 2, 1, 3)

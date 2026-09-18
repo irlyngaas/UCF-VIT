@@ -6534,3 +6534,59 @@ distributed`) passes, 502 passed / 2 skipped (2 more than the prior 500 --
 the two new tests), no regressions. Not yet re-confirmed with a real
 Frontier rerun of the `basic_ct-unetr+do_gpu_ap` cell -- that's the
 natural next step.
+
+#### Follow-up: the region-tensors fix above surfaced a second, previously-masked OOM in `_serialize_batch`
+
+Rerunning `basic_ct-unetr+do_gpu_ap` (job 5505572) after the fix above
+got past `_labeled_to_region_tensors` cleanly, but crashed further along
+with a different `torch.OutOfMemoryError` (`Tried to allocate 128.00
+GiB`, a different rank) -- a second, real, previously-masked bug in
+`_serialize_batch`, the same shape of problem as the one just fixed:
+something scaling with the full data size times the region count,
+instead of just the small patch size.
+
+**Root cause**: `F.grid_sample` requires its input tensor's batch
+dimension to match the sampling grid's -- there's one real image per
+batch item, but `N` (`fixed_length`) separate sampling grids per image.
+The old code satisfied this by replicating the *entire* `imgs_batch`
+`N` times up front (`.repeat_interleave(N, dim=0)`) before ever calling
+`grid_sample` -- `O(B * N * D*H*W)` memory. Trivial at every existing
+test's tiny scale; for `basic_ct/unetr`'s real `fixed_length=512` at
+real `256^3` volume scale, tens of GB even for a small batch size.
+`GPUPatchify2D` has the identical pattern (confirmed by inspection) --
+never observed to OOM yet only because 2D images are far smaller than 3D
+volumes at the same side length (`256^2` vs `256^3`, a 256x difference).
+
+**The fix**: chunk the flattened `B*N` region dimension instead of
+processing it all in one `grid_sample` call. Each chunk *indexes* (via
+`imgs_batch[img_idx[start:end]]`, `img_idx` precomputed once as `torch.
+arange(B).repeat_interleave(N)`) only `serialize_chunk_size` images,
+rather than pre-replicating all `B*N` up front -- peak memory becomes
+`O(B * serialize_chunk_size * D*H*W)`, independent of how large `N`
+gets. New `serialize_chunk_size=16` constructor parameter on both
+classes (a conservative default, not threaded through `parse.py`/config
+-- an internal performance knob, not something asked for as a user-
+facing feature). Produces exactly the same values as the original single
+call, just computed across `N / serialize_chunk_size` smaller ones.
+
+**A real gap in the existing tests, closed deliberately**: every existing
+`_serialize_batch` test uses a `fixed_length` smaller than the new
+default `serialize_chunk_size` (16), so the chunking loop only ever ran
+one iteration in any of them -- none actually exercised chunk boundaries
+at all. Added `test_serialize_batch_chunking_does_not_mix_up_images_or_
+regions` to both test files, forcing `serialize_chunk_size=3` against a
+2-image batch (2D: `fixed_length=4`, chunk boundaries fall mid-image;
+3D: `fixed_length=8`, same) so at least one chunk straddles the boundary
+between one image's own regions and the next image's -- exactly the case
+that would silently swap which image a region's patch comes from if
+`img_idx`'s indexing were wrong. Each image uses a disjoint value range
+(1-4/1-8 vs 101-104/101-108) so any cross-image bleed is immediately
+visible, not coincidentally correct. Every pre-existing test in both
+files still passes unchanged.
+
+**Verification:** full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 504 passed / 2 skipped (2 more than the prior 502),
+no regressions. Not yet re-confirmed with a real Frontier rerun of
+`basic_ct-unetr+do_gpu_ap` -- that's the natural next step, and the
+reason to suspect (not yet confirm) this closes the cell out: two
+independent OOM sources, both now fixed with the same class of change.

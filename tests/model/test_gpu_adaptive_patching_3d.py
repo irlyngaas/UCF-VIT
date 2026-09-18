@@ -354,3 +354,38 @@ def test_labeled_to_region_tensors_scales_to_many_regions():
         assert result.y1s[idx].item() == h_hi
         assert result.x0s[idx].item() == expected_x0
         assert result.x1s[idx].item() == w_hi
+
+
+def test_serialize_batch_chunking_does_not_mix_up_images_or_regions():
+    """Real regression test for the OOM fix's own chunking loop: with
+    `serialize_chunk_size` forced smaller than a single image's own region
+    count, chunk boundaries fall mid-image (chunk_size=3 doesn't evenly
+    divide either N=8 or B*N=16) and at least one chunk straddles the
+    boundary between image 0's regions and image 1's -- exactly the case
+    that would silently mix up which image a region's patch comes from if
+    `img_idx`'s indexing (not `imgs_batch`'s own repeat_interleave
+    ordering) were wrong. Two images, each with 8 distinctly-valued
+    octants, using *different* value ranges per image (1-8 vs 101-108) so
+    any cross-image bleed is immediately visible, not coincidentally
+    correct.
+    """
+    p = GPUPatchify3D(img_size=(16, 16, 16), fixed_length=8, interp_size=4, min_size=2, serialize_chunk_size=3)
+    img = torch.zeros(2, 1, 16, 16, 16)
+    for b, base in enumerate((1.0, 101.0)):
+        val = base
+        for dd in (0, 1):
+            for hh in (0, 1):
+                for ww in (0, 1):
+                    img[b, 0, dd*8:dd*8+8, hh*8:hh*8+8, ww*8:ww*8+8] = val
+                    val += 1.0
+
+    seq_img, seq_size, seq_pos = p(img)
+
+    assert seq_img.shape == (2, 1, 8, 64)
+    for b, base in enumerate((1.0, 101.0)):
+        for i in range(8):
+            x, y, z = seq_pos[b, i].tolist()
+            dd, hh, ww = (1 if z >= 8 else 0), (1 if y >= 8 else 0), (1 if x >= 8 else 0)
+            expected = base + dd * 4 + hh * 2 + ww
+            patch = seq_img[b, 0, i]
+            assert torch.allclose(patch, torch.full_like(patch, expected), atol=1e-4)
