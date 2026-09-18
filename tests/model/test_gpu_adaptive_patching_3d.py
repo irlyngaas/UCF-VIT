@@ -389,3 +389,25 @@ def test_serialize_batch_chunking_does_not_mix_up_images_or_regions():
             expected = base + dd * 4 + hh * 2 + ww
             patch = seq_img[b, 0, i]
             assert torch.allclose(patch, torch.full_like(patch, expected), atol=1e-4)
+
+
+def test_region_backend_defaults_to_scipy_with_no_env_var(monkeypatch):
+    monkeypatch.delenv("UCF_VIT_GPU_AP_REGION_BACKEND", raising=False)
+    p = GPUPatchify3D(img_size=(16, 16, 16), fixed_length=1, interp_size=4, min_size=2)
+    assert p.region_backend == "scipy"
+
+
+def test_region_backend_reads_env_var_when_not_passed_explicitly(monkeypatch):
+    # Same mechanism as GPUPatchify2D's own identical test -- see that
+    # class's own region_backend docstring for why (real production path
+    # never passes region_backend at all; this env var lets a real
+    # training job try "cupyx" with no code or config change).
+    monkeypatch.setenv("UCF_VIT_GPU_AP_REGION_BACKEND", "cupyx")
+    p = GPUPatchify3D(img_size=(16, 16, 16), fixed_length=1, interp_size=4, min_size=2)
+    assert p.region_backend == "cupyx"
+
+
+def test_region_backend_explicit_value_wins_over_env_var(monkeypatch):
+    monkeypatch.setenv("UCF_VIT_GPU_AP_REGION_BACKEND", "cupyx")
+    p = GPUPatchify3D(img_size=(16, 16, 16), fixed_length=1, interp_size=4, min_size=2, region_backend="scipy")
+    assert p.region_backend == "scipy"

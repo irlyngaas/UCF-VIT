@@ -24,11 +24,22 @@ module load PrgEnv-gnu
 module load gcc/12.2.0
 
 module load rocm/7.13
+export ROCM_HOME=${ROCM_PATH}
 
 export MIOPEN_DISABLE_CACHE=1
 export NCCL_PROTO=Simple
 export MIOPEN_USER_DB_PATH=/tmp/$JOBID
 mkdir -p $MIOPEN_USER_DB_PATH
+
+# cupy (only actually imported if UCF_VIT_GPU_AP_REGION_BACKEND=cupyx is
+# exported before this script's own `sbatch` call -- see UCF_VIT.model.
+# gpu_adaptive_patching.GPUPatchify2D/GPUPatchify3D's own region_backend
+# docstring) defaults its JIT kernel cache to $HOME/.cupy/kernel_cache,
+# which blows past $HOME's disk quota on Frontier -- redirect it to the
+# same node-local /tmp/$JOBID scratch space MIOPEN_USER_DB_PATH already
+# uses above, same as launch/tests/run_cupyx_smoke.sh already does.
+export CUPY_CACHE_DIR=/tmp/$JOBID/cupy_kernel_cache
+mkdir -p $CUPY_CACHE_DIR
 
 
 export OMP_NUM_THREADS=7

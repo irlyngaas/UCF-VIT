@@ -1,4 +1,5 @@
 import math
+import os
 from collections import namedtuple
 
 import numpy as np
@@ -139,7 +140,7 @@ class GPUPatchify2D(torch.nn.Module):
             self, img_size, fixed_length=196, interp_size=16, min_size=2,
             score_fn="variance", canny_sigma=1.0, canny_low_threshold=0.1,
             canny_high_threshold=0.2, canny_hysteresis_iters=2,
-            region_backend="scipy", serialize_chunk_size=16,
+            region_backend=None, serialize_chunk_size=16,
     ):
         """Precomputes the level structure this image size implies.
 
@@ -183,6 +184,16 @@ class GPUPatchify2D(torch.nn.Module):
                 `score_fn == "canny"`.
             region_backend: `"scipy"` (default) or `"cupyx"` -- see
                 `_label_regions`'s own docstring for what each means.
+                `None` (the real default) resolves to the `UCF_VIT_GPU_AP_
+                REGION_BACKEND` environment variable if set, else
+                `"scipy"` -- lets a real training job try `"cupyx"`
+                (e.g. `export UCF_VIT_GPU_AP_REGION_BACKEND=cupyx` in its
+                launch script) with no code or config change, since this
+                isn't wired into `parse.py`/config YAML at all yet (kept
+                test-only on purpose -- see this module's own tests/
+                README.md entry for why). Passing a real value here
+                explicitly (as every existing test does) always wins over
+                the environment variable.
             serialize_chunk_size: `_serialize_batch`'s own chunk size over
                 the flattened `B*N` region dimension -- bounds peak memory
                 to `O(B * serialize_chunk_size * H * W)` regardless of how
@@ -207,7 +218,7 @@ class GPUPatchify2D(torch.nn.Module):
         self.canny_low_threshold = canny_low_threshold
         self.canny_high_threshold = canny_high_threshold
         self.canny_hysteresis_iters = canny_hysteresis_iters
-        self.region_backend = region_backend
+        self.region_backend = region_backend if region_backend is not None else os.environ.get("UCF_VIT_GPU_AP_REGION_BACKEND", "scipy")
 
         if img_size[0] == img_size[1]:
             max_blocks = img_size[0] // min_size
@@ -878,7 +889,7 @@ class GPUPatchify3D(torch.nn.Module):
             self, img_size, fixed_length=344, interp_size=16, min_size=2,
             score_fn="variance", canny_sigma=1.0, canny_low_threshold=0.1,
             canny_high_threshold=0.2, canny_hysteresis_iters=2,
-            region_backend="scipy", serialize_chunk_size=16,
+            region_backend=None, serialize_chunk_size=16,
     ):
         """Precomputes the level structure this volume size implies.
 
@@ -914,6 +925,12 @@ class GPUPatchify3D(torch.nn.Module):
                 `score_fn == "canny"`.
             region_backend: `"scipy"` (default) or `"cupyx"` -- see
                 `_label_regions`'s own docstring for what each means.
+                `None` (the real default) resolves to the `UCF_VIT_GPU_AP_
+                REGION_BACKEND` environment variable if set, else
+                `"scipy"` -- see `GPUPatchify2D`'s own identical `region_
+                backend` docstring entry for why (test-only, not wired
+                into `parse.py`/config YAML yet). Passing a real value
+                here explicitly always wins over the environment variable.
             serialize_chunk_size: `_serialize_batch`'s own chunk size over
                 the flattened `B*N` region dimension -- bounds peak memory
                 to `O(B * serialize_chunk_size * D*H*W)` regardless of how
@@ -938,7 +955,7 @@ class GPUPatchify3D(torch.nn.Module):
         self.canny_low_threshold = canny_low_threshold
         self.canny_high_threshold = canny_high_threshold
         self.canny_hysteresis_iters = canny_hysteresis_iters
-        self.region_backend = region_backend
+        self.region_backend = region_backend if region_backend is not None else os.environ.get("UCF_VIT_GPU_AP_REGION_BACKEND", "scipy")
 
         D, H, W = img_size
         if not (D <= H <= W):

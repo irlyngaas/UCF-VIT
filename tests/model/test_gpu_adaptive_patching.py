@@ -82,6 +82,29 @@ def test_region_backend_invalid_value_raises_clearly():
         _label_regions(border_mask, region_backend="bogus")
 
 
+def test_region_backend_defaults_to_scipy_with_no_env_var(monkeypatch):
+    monkeypatch.delenv("UCF_VIT_GPU_AP_REGION_BACKEND", raising=False)
+    p = GPUPatchify2D(img_size=(16, 16), fixed_length=1, interp_size=4, min_size=2)
+    assert p.region_backend == "scipy"
+
+
+def test_region_backend_reads_env_var_when_not_passed_explicitly(monkeypatch):
+    # Real production path (arch.py's do_gpu_ap dispatch) never passes
+    # region_backend at all -- this env var is how a real training job can
+    # try "cupyx" with no code or config change (see this class's own
+    # region_backend docstring for why: kept test-only, not wired into
+    # parse.py/config YAML yet).
+    monkeypatch.setenv("UCF_VIT_GPU_AP_REGION_BACKEND", "cupyx")
+    p = GPUPatchify2D(img_size=(16, 16), fixed_length=1, interp_size=4, min_size=2)
+    assert p.region_backend == "cupyx"
+
+
+def test_region_backend_explicit_value_wins_over_env_var(monkeypatch):
+    monkeypatch.setenv("UCF_VIT_GPU_AP_REGION_BACKEND", "cupyx")
+    p = GPUPatchify2D(img_size=(16, 16), fixed_length=1, interp_size=4, min_size=2, region_backend="scipy")
+    assert p.region_backend == "scipy"
+
+
 def test_region_backend_cupyx_without_cupy_installed_raises_import_error():
     # A real, meaningful assertion in *this* environment: cupy genuinely
     # isn't installed here, so this exercises the actual (not simulated)

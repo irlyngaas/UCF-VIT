@@ -6627,3 +6627,56 @@ expected `NoRealDataFoundError`. Full local suite (`pytest tests/
 regressions. Neither `do_gpu_ap` cell has a confirmed real Frontier pass
 yet -- the 3D cell's timeout above and this new 2D cell are both
 pending real runs.
+
+#### Follow-up: `basic_ct-unetr+do_gpu_ap` passed for real (851s) -- added a `region_backend` environment-variable override to test `"cupyx"` against it
+
+A real Frontier rerun (with a bumped `--timeout 1800`) confirmed `basic_
+ct-unetr+do_gpu_ap` **passes**, in 851s -- the first-ever real end-to-end
+confirmation of `do_gpu_ap:True` working through an actual model,
+following the two OOM fixes above. Genuinely slow, not hung, consistent
+with the `region_backend="scipy"` hypothesis above (a CPU round-trip for
+connected-components labeling, once per merge level, against a real
+`256^3` volume).
+
+To let the user test whether `region_backend="cupyx"` (GPU-native
+labeling, avoiding that CPU round-trip) is meaningfully faster on this
+exact cell -- without committing to a real `parse.py`/config feature
+before knowing whether it's worth it -- `GPUPatchify2D`/`GPUPatchify3D`'s
+own `region_backend` constructor parameter now defaults to `None`,
+resolving to the `UCF_VIT_GPU_AP_REGION_BACKEND` environment variable if
+set, else `"scipy"` (today's exact behavior, unchanged when the env var
+isn't set). Explicitly passing `region_backend=` (every existing test
+already does) always wins over the environment variable -- confirmed by
+a new dedicated test per class. This is deliberately *less* commitment
+than a real config key: no `parse.py` wiring, no shipped-config decision,
+nothing that changes what any real config file says -- exactly matching
+the "test-only for now" scope this option has had since it was added.
+
+`launch/tests/run_feature_matrix_smoke.sh`/`run_feature_matrix_smoke_
+single.sh` gain the same `ROCM_HOME`/`CUPY_CACHE_DIR` runtime exports
+`run_cupyx_smoke.sh` already has -- needed the moment `cupy` actually
+gets imported from these scripts for the first time (via the new env
+var), not just from the dedicated `cupyx` smoke test. `run_feature_
+matrix_smoke_single.sh`'s own "Known labels" usage comment updated to
+include the two `do_gpu_ap` cells added in the entries above (previously
+went stale when those cells were added).
+
+**Tier 1 coverage**: `test_region_backend_defaults_to_scipy_with_no_env_
+var`/`test_region_backend_reads_env_var_when_not_passed_explicitly`/
+`test_region_backend_explicit_value_wins_over_env_var` added to both
+`test_gpu_adaptive_patching.py` and `test_gpu_adaptive_patching_3d.py`
+(via `monkeypatch.setenv`/`delenv`, no real environment pollution across
+tests).
+
+**Verification:** full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 511 passed / 2 skipped (6 more than the prior 505
+-- the six new tests), no regressions. To actually try `"cupyx"` on this
+cell:
+```
+cd launch/tests
+UCF_VIT_GPU_AP_REGION_BACKEND=cupyx sbatch run_feature_matrix_smoke_single.sh basic_ct-unetr+do_gpu_ap --timeout 1800
+```
+Not yet run for real -- whether `"cupyx"` is actually faster here is
+still an open, real question, exactly what this mechanism exists to let
+the user answer empirically before deciding whether it's worth becoming
+a real default/config option.
