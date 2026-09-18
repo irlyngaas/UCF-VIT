@@ -9,6 +9,8 @@ from einops import rearrange
 import torch.distributed as dist
 import math
 import re
+import csv
+import json
 ## plots
 def plotLoss(lossVec, save_path='./', epochs=None, yscale='linear'):
     """Plot finite epoch losses with sensible bounds for short histories."""
@@ -227,6 +229,227 @@ def sample_images(model, var, device, res, precision_dt, patch_size, epoch=0,
     else:
         plot_2D_array_slices(images, filename=os.path.join(save_path, '2D_gen_%s_%i_%i_%i_rank%i%s.png' %(var, epoch, res[1], res[2], dist.get_rank(), tag_suffix)))
         # np.savez(os.path.join(save_path,'Output_gen_%s_%i_%i_%i_rank%i.npz' %(var, epoch, res[1], res[2], dist.get_rank())),images)
+
+
+def diffusion_reverse_step(x_t, predicted_noise, timestep, scheduler,
+                           variance_mode="current", noise=None):
+    """Apply one epsilon-prediction reverse step with an explicit variance."""
+    timestep = int(timestep)
+    if variance_mode not in ("current", "posterior", "ddim"):
+        raise ValueError(f"Unknown variance mode: {variance_mode}")
+
+    dtype = x_t.dtype
+    device = x_t.device
+    beta_t = scheduler.beta[timestep].to(device=device, dtype=dtype)
+    alpha_bar_t = scheduler.alpha[timestep].to(device=device, dtype=dtype)
+    alpha_t = 1.0 - beta_t
+    alpha_bar_prev = (
+        scheduler.alpha[timestep - 1].to(device=device, dtype=dtype)
+        if timestep > 0 else torch.ones((), device=device, dtype=dtype)
+    )
+    eps = torch.finfo(dtype).eps
+
+    if variance_mode == "ddim":
+        x0_prediction = (
+            x_t - torch.sqrt(torch.clamp(1.0 - alpha_bar_t, min=eps))
+            * predicted_noise
+        ) / torch.sqrt(torch.clamp(alpha_bar_t, min=eps))
+        if timestep == 0:
+            return x0_prediction
+        return (
+            torch.sqrt(alpha_bar_prev) * x0_prediction
+            + torch.sqrt(torch.clamp(1.0 - alpha_bar_prev, min=eps))
+            * predicted_noise
+        )
+
+    mean = (
+        x_t
+        - beta_t
+        / torch.sqrt(torch.clamp(1.0 - alpha_bar_t, min=eps))
+        * predicted_noise
+    ) / torch.sqrt(torch.clamp(alpha_t, min=eps))
+    if timestep == 0:
+        return mean
+    if noise is None:
+        raise ValueError("A noise tensor is required for stochastic DDPM")
+
+    if variance_mode == "current":
+        variance = beta_t
+    else:
+        variance = (
+            beta_t
+            * (1.0 - alpha_bar_prev)
+            / torch.clamp(1.0 - alpha_bar_t, min=eps)
+        )
+    return mean + torch.sqrt(torch.clamp(variance, min=0.0)) * noise
+
+
+def audit_noise_prediction_by_timestep(
+    model, reference_volume, var, device, precision_dt, patch_size, save_path,
+    num_time_steps=1000, seed=1234,
+):
+    """Measure epsilon prediction quality across the reverse-diffusion chain."""
+    if reference_volume.ndim != 5:
+        raise ValueError("The 3D sampling audit requires [B,C,D,H,W] data")
+    os.makedirs(save_path, exist_ok=True)
+    scheduler = DDPM_Scheduler(num_time_steps=num_time_steps)
+    requested_times = (0, 1, 5, 10, 25, 50, 100, 200, 400, 700,
+                       num_time_steps - 1)
+    times = sorted(set(t for t in requested_times if t < num_time_steps))
+    generator = torch.Generator(device='cpu').manual_seed(int(seed))
+    clean = reference_volume[:1].detach().float().cpu()
+    rows = []
+
+    with torch.no_grad():
+        for timestep in times:
+            noise = torch.randn(clean.shape, generator=generator)
+            alpha_bar = scheduler.alpha[timestep]
+            noisy = (
+                torch.sqrt(alpha_bar) * clean
+                + torch.sqrt(1.0 - alpha_bar) * noise
+            )
+            time_batch = torch.full(
+                (clean.shape[0],), timestep, dtype=torch.long, device=device
+            )
+            predicted = model(
+                noisy.to(device=device, dtype=precision_dt), time_batch, [var]
+            )
+            predicted = unpatchify(
+                predicted, noisy.to(device=device, dtype=precision_dt),
+                patch_size, False,
+            ).detach().float().cpu()
+            error = predicted - noise
+            mse = error.square().mean().item()
+            centered = noise - noise.mean()
+            r2 = 1.0 - (
+                error.square().sum() / centered.square().sum().clamp_min(1e-12)
+            ).item()
+            x0_prediction = (
+                noisy - torch.sqrt(1.0 - alpha_bar) * predicted
+            ) / torch.sqrt(alpha_bar.clamp_min(1e-12))
+            rows.append({
+                'timestep': timestep,
+                'alpha_bar': alpha_bar.item(),
+                'epsilon_mse': mse,
+                'epsilon_r2': r2,
+                'target_epsilon_std': noise.std().item(),
+                'predicted_epsilon_std': predicted.std().item(),
+                'predicted_epsilon_mean': predicted.mean().item(),
+                'x0_mse': (x0_prediction - clean).square().mean().item(),
+            })
+
+    csv_path = os.path.join(save_path, f'3D_sampling_audit_{var}_timesteps.csv')
+    with open(csv_path, 'w', newline='') as output_file:
+        writer = csv.DictWriter(output_file, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+    return rows, csv_path
+
+
+def audit_sample_images(
+    model, reference_volume, var, device, res, precision_dt, patch_size,
+    save_path, num_time_steps=1000, seed=1234, num_samples=1,
+):
+    """Compare 3D samplers and persist raw outputs plus fixed-scale slices."""
+    if reference_volume.ndim != 5:
+        raise ValueError("The 3D sampling audit requires [B,C,D,H,W] data")
+    os.makedirs(save_path, exist_ok=True)
+    scheduler = DDPM_Scheduler(num_time_steps=num_time_steps)
+    shape = (num_samples, 1, int(res[0]), int(res[1]), int(res[2]))
+    modes = ('current', 'posterior', 'ddim')
+    outputs = {}
+    summaries = {}
+
+    with torch.no_grad():
+        for mode in modes:
+            generator = torch.Generator(device='cpu').manual_seed(int(seed))
+            sample = torch.randn(shape, generator=generator)
+            for timestep in reversed(range(num_time_steps)):
+                time_batch = torch.full(
+                    (num_samples,), timestep, dtype=torch.long, device=device
+                )
+                predicted = model(
+                    sample.to(device=device, dtype=precision_dt),
+                    time_batch,
+                    [var],
+                )
+                predicted = unpatchify(
+                    predicted,
+                    sample.to(device=device, dtype=precision_dt),
+                    patch_size,
+                    False,
+                ).detach().float().cpu()
+                step_noise = (
+                    torch.randn(shape, generator=generator)
+                    if timestep > 0 and mode != 'ddim' else None
+                )
+                sample = diffusion_reverse_step(
+                    sample, predicted, timestep, scheduler,
+                    variance_mode=mode, noise=step_noise,
+                )
+            array = sample.detach().float().cpu().numpy()
+            outputs[mode] = array
+            summaries[mode] = {
+                'mean': float(array.mean()),
+                'std': float(array.std()),
+                'min': float(array.min()),
+                'max': float(array.max()),
+                'p01': float(np.percentile(array, 1)),
+                'p50': float(np.percentile(array, 50)),
+                'p99': float(np.percentile(array, 99)),
+                'finite_fraction': float(np.isfinite(array).mean()),
+            }
+
+    reference = reference_volume[:1].detach().float().cpu().numpy()
+    summaries['reference'] = {
+        'mean': float(reference.mean()),
+        'std': float(reference.std()),
+        'min': float(reference.min()),
+        'max': float(reference.max()),
+        'p01': float(np.percentile(reference, 1)),
+        'p50': float(np.percentile(reference, 50)),
+        'p99': float(np.percentile(reference, 99)),
+        'finite_fraction': float(np.isfinite(reference).mean()),
+    }
+    raw_path = os.path.join(save_path, f'3D_sampling_audit_{var}_raw.npz')
+    np.savez_compressed(raw_path, reference=reference, **outputs)
+    stats_path = os.path.join(save_path, f'3D_sampling_audit_{var}_stats.json')
+    with open(stats_path, 'w') as output_file:
+        json.dump(summaries, output_file, indent=2, sort_keys=True)
+
+    display_min = float(np.percentile(reference, 1))
+    display_max = float(np.percentile(reference, 99))
+    rows = [('reference', reference)] + list(outputs.items())
+    fig, axes = plt.subplots(
+        len(rows), 3, figsize=(9, 3 * len(rows)), facecolor='white'
+    )
+    plane_names = ('axial', 'coronal', 'sagittal')
+    for row_index, (name, array) in enumerate(rows):
+        volume = array[0, 0]
+        slices = (
+            volume[volume.shape[0] // 2, :, :],
+            volume[:, volume.shape[1] // 2, :],
+            volume[:, :, volume.shape[2] // 2],
+        )
+        for column_index, image_slice in enumerate(slices):
+            axes[row_index, column_index].imshow(
+                image_slice, cmap='gray', interpolation='nearest',
+                vmin=display_min, vmax=display_max,
+            )
+            axes[row_index, column_index].set_title(
+                f'{name}: {plane_names[column_index]}'
+            )
+            axes[row_index, column_index].axis('off')
+    fig.suptitle(
+        f'Fixed display range [{display_min:.3g}, {display_max:.3g}]'
+    )
+    fig.tight_layout()
+    figure_path = os.path.join(
+        save_path, f'3D_sampling_audit_{var}_orthogonal.png'
+    )
+    fig.savefig(figure_path, dpi=180)
+    plt.close(fig)
+    return summaries, raw_path, stats_path, figure_path
 
 # ## correct sample images (supposedly!)
 # def sample_images(

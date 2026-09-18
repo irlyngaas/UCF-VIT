@@ -1121,6 +1121,24 @@ class DiffusionVIT(VIT):
 
     def __init__(self, *args, **kwargs):
         self.linear_decoder = kwargs.pop('linear_decoder', '')
+        self.residual_mlp_decoder = kwargs.pop(
+            'residual_mlp_decoder', False
+        )
+        self.residual_mlp_ratio = float(kwargs.pop(
+            'residual_mlp_ratio', 2.0
+        ))
+        self.residual_conv3d_decoder = kwargs.pop(
+            'residual_conv3d_decoder', False
+        )
+        self.residual_conv3d_channels = int(kwargs.pop(
+            'residual_conv3d_channels', 16
+        ))
+        self.residual_feature_conv3d_decoder = kwargs.pop(
+            'residual_feature_conv3d_decoder', False
+        )
+        self.residual_feature_conv3d_channels = int(kwargs.pop(
+            'residual_feature_conv3d_channels', 8
+        ))
         self.decoder_depth = kwargs.pop('decoder_depth', '')
         self.decoder_embed_dim = kwargs.pop('decoder_embed_dim', '')
         self.decoder_num_heads = kwargs.pop('decoder_num_heads', '')
@@ -1129,6 +1147,45 @@ class DiffusionVIT(VIT):
         super().__init__(*args, **kwargs)
         #Remove decoder from VIT
         self.head = None 
+
+        residual_decoder_count = sum((
+            bool(self.residual_mlp_decoder),
+            bool(self.residual_conv3d_decoder),
+            bool(self.residual_feature_conv3d_decoder),
+        ))
+        if residual_decoder_count > 1:
+            raise ValueError(
+                "Select only one residual decoder: MLP, prediction Conv3D, "
+                "or feature Conv3D"
+            )
+        if self.residual_conv3d_decoder:
+            if not self.linear_decoder:
+                raise ValueError(
+                    "residual_conv3d_decoder currently refines the linear "
+                    "diffusion decoder and requires linear_decoder=True"
+                )
+            if self.twoD:
+                raise ValueError(
+                    "residual_conv3d_decoder requires a 3D model"
+                )
+            if self.residual_conv3d_channels <= 0:
+                raise ValueError(
+                    "residual_conv3d_channels must be positive"
+                )
+        if self.residual_feature_conv3d_decoder:
+            if not self.linear_decoder:
+                raise ValueError(
+                    "residual_feature_conv3d_decoder refines the linear "
+                    "diffusion decoder and requires linear_decoder=True"
+                )
+            if self.twoD:
+                raise ValueError(
+                    "residual_feature_conv3d_decoder requires a 3D model"
+                )
+            if self.residual_feature_conv3d_channels <= 0:
+                raise ValueError(
+                    "residual_feature_conv3d_channels must be positive"
+                )
 
         # self.temporalEmbeddings = SinusoidalEmbeddings(time_steps=self.time_steps, embed_dim=self.embed_dim)
         # self.timeEmbeddingMap = EmbeddingDenseLayer(self.embed_dim, self.embed_dim, 0.5) # dropout_prob = 0.5
@@ -1144,6 +1201,82 @@ class DiffusionVIT(VIT):
 
         if self.linear_decoder:
             self.decoder_pred = nn.Linear(self.embed_dim, self.patch_dim)
+            if self.residual_mlp_decoder:
+                residual_hidden_dim = int(
+                    self.embed_dim * self.residual_mlp_ratio
+                )
+                if residual_hidden_dim <= 0:
+                    raise ValueError(
+                        "residual_mlp_ratio must produce a positive hidden "
+                        "dimension"
+                    )
+                self.decoder_residual = nn.Sequential(
+                    nn.LayerNorm(self.embed_dim),
+                    nn.Linear(self.embed_dim, residual_hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(residual_hidden_dim, self.patch_dim),
+                )
+            if self.residual_conv3d_decoder:
+                self.decoder_residual_conv3d = nn.Sequential(
+                    nn.Conv3d(
+                        self.in_chans,
+                        self.residual_conv3d_channels,
+                        kernel_size=3,
+                        padding=1,
+                        padding_mode='replicate',
+                    ),
+                    nn.SiLU(),
+                    nn.Conv3d(
+                        self.residual_conv3d_channels,
+                        self.residual_conv3d_channels,
+                        kernel_size=3,
+                        padding=1,
+                        padding_mode='replicate',
+                    ),
+                    nn.SiLU(),
+                    nn.Conv3d(
+                        self.residual_conv3d_channels,
+                        self.in_chans,
+                        kernel_size=3,
+                        padding=1,
+                        padding_mode='replicate',
+                    ),
+                )
+            if self.residual_feature_conv3d_decoder:
+                feature_patch_dim = (
+                    int(self.patch_size) ** 3
+                    * self.residual_feature_conv3d_channels
+                )
+                self.decoder_residual_feature_proj = nn.Sequential(
+                    nn.LayerNorm(self.embed_dim),
+                    nn.Linear(self.embed_dim, feature_patch_dim),
+                    nn.SiLU(),
+                )
+                self.decoder_residual_feature_conv3d = nn.Sequential(
+                    nn.Conv3d(
+                        self.residual_feature_conv3d_channels,
+                        self.residual_feature_conv3d_channels,
+                        kernel_size=3,
+                        padding=1,
+                        padding_mode='replicate',
+                    ),
+                    nn.SiLU(),
+                    nn.Conv3d(
+                        self.residual_feature_conv3d_channels,
+                        self.residual_feature_conv3d_channels,
+                        kernel_size=3,
+                        padding=1,
+                        padding_mode='replicate',
+                    ),
+                    nn.SiLU(),
+                    nn.Conv3d(
+                        self.residual_feature_conv3d_channels,
+                        self.in_chans,
+                        kernel_size=3,
+                        padding=1,
+                        padding_mode='replicate',
+                    ),
+                )
         else:
             self.decoder_pred = nn.Linear(self.decoder_embed_dim, self.patch_dim)
 
@@ -1177,6 +1310,80 @@ class DiffusionVIT(VIT):
             self.decoder_pos_embed = None
 
         self.init_weights('')
+        if self.linear_decoder and self.residual_mlp_decoder:
+            # Preserve an imported linear-decoder checkpoint exactly at step
+            # zero. The new nonlinear branch begins learning only a residual
+            # correction to the established noise prediction.
+            nn.init.zeros_(self.decoder_residual[-1].weight)
+            nn.init.zeros_(self.decoder_residual[-1].bias)
+        if self.linear_decoder and self.residual_conv3d_decoder:
+            # This makes an imported linear-decoder checkpoint exactly
+            # equivalent at initialization while allowing spatial corrections
+            # to be learned across patch boundaries.
+            nn.init.zeros_(self.decoder_residual_conv3d[-1].weight)
+            nn.init.zeros_(self.decoder_residual_conv3d[-1].bias)
+        if self.linear_decoder and self.residual_feature_conv3d_decoder:
+            # The feature branch sees the full transformer representation, but
+            # begins as an exact no-op for legacy linear-head checkpoints.
+            nn.init.zeros_(self.decoder_residual_feature_conv3d[-1].weight)
+            nn.init.zeros_(self.decoder_residual_feature_conv3d[-1].bias)
+
+    def _tokens_to_3d_volume(
+        self, tokens: torch.Tensor, num_channels: Optional[int] = None
+    ) -> torch.Tensor:
+        """Invert patchification using the repository's established layout."""
+        batch_size = tokens.shape[0]
+        patch_size = int(self.patch_size)
+        if num_channels is None:
+            num_channels = self.in_chans
+        expected_patch_dim = patch_size ** 3 * num_channels
+        if tokens.shape[-1] != expected_patch_dim:
+            raise ValueError(
+                f"Expected token dimension {expected_patch_dim} for "
+                f"{num_channels} channels, got {tokens.shape[-1]}"
+            )
+        grid_x, grid_y, grid_z = self.grid_size
+        volume = tokens.reshape(
+            batch_size,
+            grid_x,
+            grid_y,
+            grid_z,
+            patch_size,
+            patch_size,
+            patch_size,
+            num_channels,
+        )
+        volume = torch.einsum('nhwdpqrc->nchpwqdr', volume)
+        return volume.reshape(
+            batch_size,
+            num_channels,
+            grid_x * patch_size,
+            grid_y * patch_size,
+            grid_z * patch_size,
+        )
+
+    def _volume_to_3d_tokens(self, volume: torch.Tensor) -> torch.Tensor:
+        """Patchify a voxel volume using the inverse established layout."""
+        batch_size = volume.shape[0]
+        num_channels = volume.shape[1]
+        patch_size = int(self.patch_size)
+        grid_x, grid_y, grid_z = self.grid_size
+        tokens = volume.reshape(
+            batch_size,
+            num_channels,
+            grid_x,
+            patch_size,
+            grid_y,
+            patch_size,
+            grid_z,
+            patch_size,
+        )
+        tokens = torch.einsum('nchpwqdr->nhwdpqrc', tokens)
+        return tokens.reshape(
+            batch_size,
+            self.num_patches,
+            patch_size ** 3 * num_channels,
+        )
 
     def init_weights(self, mode: str = '') -> None:
         head_bias = 0.
@@ -1310,7 +1517,29 @@ class DiffusionVIT(VIT):
             if self.tensor_par_size > 1:
                 x = F_Identity_B_Broadcast(x, src_rank, group=self.tensor_par_group)
 
-        return self.decoder_pred(x)
+        prediction = self.decoder_pred(x)
+        if self.linear_decoder and self.residual_mlp_decoder:
+            prediction = prediction + self.decoder_residual(x)
+        if self.linear_decoder and self.residual_conv3d_decoder:
+            prediction_volume = self._tokens_to_3d_volume(prediction)
+            prediction_volume = (
+                prediction_volume
+                + self.decoder_residual_conv3d(prediction_volume)
+            )
+            prediction = self._volume_to_3d_tokens(prediction_volume)
+        if self.linear_decoder and self.residual_feature_conv3d_decoder:
+            feature_tokens = self.decoder_residual_feature_proj(x)
+            feature_volume = self._tokens_to_3d_volume(
+                feature_tokens,
+                num_channels=self.residual_feature_conv3d_channels,
+            )
+            residual_volume = self.decoder_residual_feature_conv3d(
+                feature_volume
+            )
+            prediction = (
+                prediction + self._volume_to_3d_tokens(residual_volume)
+            )
+        return prediction
 
     def forward(self, x: torch.Tensor, t, variables) -> torch.Tensor:
         t = t.to('cpu')

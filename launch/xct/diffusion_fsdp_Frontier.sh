@@ -152,7 +152,7 @@ if (( TRAINING_STATUS == 0 )) && [[ -f "$RECOVERY_MARKER" ]]; then
             --job-name="${JOB_NAME:-diffusion_fsdp}" \
             --output="${LOG_DIR}/%x-%j.out" \
             --error="${LOG_DIR}/%x-%j.out" \
-            --export=ALL,AUTO_RESUBMIT=1,RESUME_FROM_CHECKPOINT=True,RESUME_CHECKPOINT_NAME="$RECOVERY_CHECKPOINT",RESUME_LR="$RECOVERY_LR",RECOVERY_ATTEMPT="$NEXT_RECOVERY_ATTEMPT" \
+            --export=ALL,AUTO_RESUBMIT=1,RESUME_FROM_CHECKPOINT=True,RESUME_CHECKPOINT_NAME="$RECOVERY_CHECKPOINT",RESUME_LR="$RECOVERY_LR",RECOVERY_ATTEMPT="$NEXT_RECOVERY_ATTEMPT",RESUME_CHECKPOINT_PATH=,RESET_SCHEDULER_ON_RESUME=False,RESET_OPTIMIZER_ON_RESUME=False \
             "$BATCH_SCRIPT" "$CONFIG_FILE"
         exit 0
     fi
@@ -175,7 +175,7 @@ if (( TRAINING_STATUS == 0 )) && [[ -f "$CONTINUATION_MARKER" ]]; then
             --job-name="${JOB_NAME:-diffusion_fsdp}" \
             --output="${LOG_DIR}/%x-%j.out" \
             --error="${LOG_DIR}/%x-%j.out" \
-            --export=ALL,AUTO_RESUBMIT=1,RESUME_FROM_CHECKPOINT=True,RESUME_CHECKPOINT_NAME= \
+            --export=ALL,AUTO_RESUBMIT=1,RESUME_FROM_CHECKPOINT=True,RESUME_CHECKPOINT_NAME=,RESUME_CHECKPOINT_PATH=,RESET_SCHEDULER_ON_RESUME=False,RESET_OPTIMIZER_ON_RESUME=False \
             "$BATCH_SCRIPT" "$CONFIG_FILE"
         exit 0
     fi

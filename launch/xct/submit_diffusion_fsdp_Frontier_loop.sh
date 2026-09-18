@@ -20,6 +20,8 @@
 #   ./submit_diffusion_fsdp_Frontier_loop.sh \
 #       [nodes] [config_file] [training_script] \
 #       [resume_checkpoint_name] [resume_lr] [recovery_attempt]
+#       [resume_checkpoint_path] [reset_scheduler_on_resume]
+#       [reset_optimizer_on_resume]
 
 # Stop immediately if this submission script has an error.
 set -euo pipefail
@@ -32,6 +34,9 @@ TRAINING_SCRIPT="${3:-}"
 RESUME_CHECKPOINT_NAME="${4:-}"
 RESUME_LR="${5:-}"
 RECOVERY_ATTEMPT="${6:-0}"
+RESUME_CHECKPOINT_PATH="${7:-}"
+RESET_SCHEDULER_ON_RESUME="${8:-False}"
+RESET_OPTIMIZER_ON_RESUME="${9:-False}"
 
 # --- Locate the batch launcher and default config ----------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -58,6 +63,15 @@ fi
 
 if [[ ! "$RECOVERY_ATTEMPT" =~ ^[0-9]+$ ]]; then
     echo "Recovery attempt must be a non-negative integer: $RECOVERY_ATTEMPT" >&2
+    exit 2
+fi
+
+if [[ ! "$RESET_SCHEDULER_ON_RESUME" =~ ^(0|1|[Ff]alse|[Tt]rue)$ ]]; then
+    echo "reset_scheduler_on_resume must be true/false or 1/0" >&2
+    exit 2
+fi
+if [[ ! "$RESET_OPTIMIZER_ON_RESUME" =~ ^(0|1|[Ff]alse|[Tt]rue)$ ]]; then
+    echo "reset_optimizer_on_resume must be true/false or 1/0" >&2
     exit 2
 fi
 
@@ -91,6 +105,7 @@ FSDP_SIZE="$(config_value parallelism fsdp_size)"
 TENSOR_PAR_SIZE="$(config_value parallelism tensor_par_size)"
 SEQ_PAR_SIZE="$(config_value parallelism seq_par_size)"
 LR="$(config_value model lr)"
+LR_NAME="$(awk -v value="$LR" 'BEGIN { printf "%.12g", value + 0 }')"
 PATCH_SIZE="$(config_value model patch_size)"
 BATCH_SIZE="$(config_value data batch_size)"
 EMBED_DIM="$(config_value model embed_dim)"
@@ -105,7 +120,7 @@ if (( WORLD_SIZE % PARALLEL_FACTOR != 0 )); then
     exit 2
 fi
 SIMPLE_DDP_SIZE=$((WORLD_SIZE / PARALLEL_FACTOR))
-RUN_NAME="N${NODES}_G${WORLD_SIZE}_DDP${SIMPLE_DDP_SIZE}_FSDP${FSDP_SIZE}_TP${TENSOR_PAR_SIZE}_lr${LR}_PS${PATCH_SIZE}_BS${BATCH_SIZE}_ED${EMBED_DIM}_${DATA_TYPE}"
+RUN_NAME="N${NODES}_G${WORLD_SIZE}_DDP${SIMPLE_DDP_SIZE}_FSDP${FSDP_SIZE}_TP${TENSOR_PAR_SIZE}_lr${LR_NAME}_PS${PATCH_SIZE}_BS${BATCH_SIZE}_ED${EMBED_DIM}_${DATA_TYPE}"
 LOG_DIR="${CHECKPOINT_ROOT}/${RUN_NAME}/logs"
 mkdir -p "$LOG_DIR"
 export LOG_DIR
@@ -117,8 +132,9 @@ if [[ -n "$RESUME_CHECKPOINT_NAME" ]]; then
         echo "A resume LR is required with a resume checkpoint name" >&2
         exit 2
     fi
+    CHECKPOINT_LOAD_DIR="${RESUME_CHECKPOINT_PATH:-${CHECKPOINT_ROOT}/${RUN_NAME}}"
     for ((rank = 0; rank < TENSOR_PAR_SIZE; rank++)); do
-        CHECKPOINT_FILE="${CHECKPOINT_ROOT}/${RUN_NAME}/${RESUME_CHECKPOINT_NAME}_rank_${rank}.ckpt"
+        CHECKPOINT_FILE="${CHECKPOINT_LOAD_DIR}/${RESUME_CHECKPOINT_NAME}_rank_${rank}.ckpt"
         if [[ ! -f "$CHECKPOINT_FILE" ]]; then
             echo "Resume checkpoint not found: $CHECKPOINT_FILE" >&2
             exit 2
@@ -137,11 +153,14 @@ if [[ "$RESUME_FROM_CHECKPOINT" == True ]]; then
     echo "Resume checkpoint: ${RESUME_CHECKPOINT_NAME}"
     echo "Rebased learning rate: ${RESUME_LR}"
     echo "Recovery attempt: ${RECOVERY_ATTEMPT}"
+    echo "Checkpoint source: ${CHECKPOINT_LOAD_DIR}"
+    echo "Reset scheduler on resume: ${RESET_SCHEDULER_ON_RESUME}"
+    echo "Reset optimizer on resume: ${RESET_OPTIMIZER_ON_RESUME}"
 fi
 sbatch \
     --nodes="$NODES" \
     --job-name="$JOB_NAME" \
     --output="${LOG_DIR}/%x-%j.out" \
     --error="${LOG_DIR}/%x-%j.out" \
-    --export=ALL,AUTO_RESUBMIT=1,RESUME_FROM_CHECKPOINT="$RESUME_FROM_CHECKPOINT",RESUME_CHECKPOINT_NAME="$RESUME_CHECKPOINT_NAME",RESUME_LR="$RESUME_LR",RECOVERY_ATTEMPT="$RECOVERY_ATTEMPT" \
+    --export=ALL,AUTO_RESUBMIT=1,RESUME_FROM_CHECKPOINT="$RESUME_FROM_CHECKPOINT",RESUME_CHECKPOINT_NAME="$RESUME_CHECKPOINT_NAME",RESUME_LR="$RESUME_LR",RECOVERY_ATTEMPT="$RECOVERY_ATTEMPT",RESUME_CHECKPOINT_PATH="$RESUME_CHECKPOINT_PATH",RESET_SCHEDULER_ON_RESUME="$RESET_SCHEDULER_ON_RESUME",RESET_OPTIMIZER_ON_RESUME="$RESET_OPTIMIZER_ON_RESUME" \
     "$LAUNCHER" "$CONFIG_FILE"

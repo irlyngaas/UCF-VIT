@@ -3,6 +3,7 @@ import os
 import sys
 import copy
 import random
+from contextlib import contextmanager
 from datetime import timedelta
 import numpy as np
 import torch
@@ -81,22 +82,198 @@ def clip_and_require_finite_gradients(model, max_grad_norm, epoch, batch):
 
 
 def rebase_optimizer_and_scheduler_lr(optimizer, scheduler, resume_lr):
-    """Rebase a restored optimizer and its scheduler to a lower peak LR."""
+    """Rebase a restored schedule while preserving parameter-group ratios."""
     resume_lr = float(resume_lr)
     if resume_lr <= 0:
         raise ValueError(f"RESUME_LR must be positive, got {resume_lr}")
 
-    scheduler.base_lrs = [resume_lr] * len(optimizer.param_groups)
+    previous_base_lrs = list(scheduler.base_lrs)
+    previous_peak_lr = max(previous_base_lrs)
+    scheduler.base_lrs = [
+        resume_lr * base_lr / previous_peak_lr
+        for base_lr in previous_base_lrs
+    ]
     if hasattr(scheduler, '_get_closed_form_lr'):
         current_lrs = scheduler._get_closed_form_lr()
     else:
         current_lrs = [resume_lr] * len(optimizer.param_groups)
 
-    for param_group, current_lr in zip(optimizer.param_groups, current_lrs):
+    for param_group, current_lr, base_lr in zip(
+        optimizer.param_groups, current_lrs, scheduler.base_lrs
+    ):
         param_group['lr'] = current_lr
-        param_group['initial_lr'] = resume_lr
+        param_group['initial_lr'] = base_lr
     scheduler._last_lr = current_lrs
     return current_lrs
+
+
+def restart_optimizer_and_scheduler_lr(optimizer, scheduler, resume_lr,
+                                       max_steps, eta_min):
+    """Start a fresh cosine fine-tuning schedule at ``resume_lr``."""
+    resume_lr = float(resume_lr)
+    max_steps = int(max_steps)
+    eta_min = float(eta_min)
+    if resume_lr <= 0:
+        raise ValueError(f"RESUME_LR must be positive, got {resume_lr}")
+    if max_steps <= 1:
+        raise ValueError(f"max_steps must be greater than 1, got {max_steps}")
+
+    restarted_lrs = [
+        resume_lr * float(param_group.get('lr_scale', 1.0))
+        for param_group in optimizer.param_groups
+    ]
+    for param_group, restarted_lr in zip(
+        optimizer.param_groups, restarted_lrs
+    ):
+        param_group['lr'] = restarted_lr
+        param_group['initial_lr'] = restarted_lr
+    scheduler.base_lrs = list(restarted_lrs)
+    scheduler.warmup_epochs = 1
+    scheduler.warmup_start_lr = resume_lr
+    scheduler.max_epochs = max_steps
+    scheduler.eta_min = eta_min
+    scheduler.last_epoch = 1
+    scheduler._step_count = 1
+    scheduler._last_lr = list(restarted_lrs)
+    return list(scheduler._last_lr)
+
+
+def configure_optimizer_with_residual_lr(
+    model, base_lr, residual_lr, beta_1, beta_2, weight_decay
+):
+    """Use a higher LR only for the newly added residual decoder."""
+    if base_lr <= 0 or residual_lr <= 0:
+        raise ValueError("Optimizer learning rates must be positive")
+
+    buckets = {
+        'backbone_decay': [],
+        'backbone_no_decay': [],
+        'residual_decay': [],
+        'residual_no_decay': [],
+    }
+    counts = {key: 0 for key in buckets}
+    for name, parameter in model.named_parameters():
+        is_residual = 'decoder_residual' in name
+        no_decay = any(token in name for token in (
+            'var_embed', 'pos_embed', 'time_pos_embed'
+        ))
+        family = 'residual' if is_residual else 'backbone'
+        decay_kind = 'no_decay' if no_decay else 'decay'
+        key = f'{family}_{decay_kind}'
+        buckets[key].append(parameter)
+        counts[key] += parameter.numel()
+
+    residual_count = counts['residual_decay'] + counts['residual_no_decay']
+    if residual_count == 0:
+        raise ValueError(
+            "model.residual_decoder_lr was set but no decoder_residual "
+            "parameters were found after model wrapping"
+        )
+
+    lr_scale = residual_lr / base_lr
+    group_specs = (
+        ('backbone_decay', base_lr, weight_decay, 1.0),
+        ('backbone_no_decay', base_lr, 0.0, 1.0),
+        ('residual_decay', residual_lr, weight_decay, lr_scale),
+        ('residual_no_decay', residual_lr, 0.0, lr_scale),
+    )
+    groups = []
+    for key, group_lr, group_weight_decay, group_scale in group_specs:
+        if buckets[key]:
+            groups.append({
+                'params': buckets[key],
+                'lr': group_lr,
+                'initial_lr': group_lr,
+                'lr_scale': group_scale,
+                'betas': (beta_1, beta_2),
+                'weight_decay': group_weight_decay,
+                'group_name': key,
+            })
+    return torch.optim.AdamW(groups), counts
+
+
+def load_model_checkpoint(model, state_dict, allow_residual_decoder_init=False):
+    """Load a checkpoint, optionally allowing only a new residual head."""
+    incompatible = model.load_state_dict(
+        state_dict, strict=not allow_residual_decoder_init
+    )
+    if not allow_residual_decoder_init:
+        return [], []
+
+    allowed_missing_prefixes = (
+        'decoder_residual.',
+        'decoder_residual_conv3d.',
+        'decoder_residual_feature_proj.',
+        'decoder_residual_feature_conv3d.',
+    )
+    invalid_missing = [
+        key for key in incompatible.missing_keys
+        if not key.startswith(allowed_missing_prefixes)
+    ]
+    if invalid_missing or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "Partial resume may initialize only configured residual decoder "
+            "parameters; "
+            f"invalid missing={invalid_missing}, "
+            f"unexpected={incompatible.unexpected_keys}"
+        )
+    return incompatible.missing_keys, incompatible.unexpected_keys
+
+
+def initialize_ema_parameters(model, restored_parameters=None):
+    """Create an EMA parameter copy, optionally restoring a saved copy."""
+    parameters = list(model.parameters())
+    if restored_parameters is not None:
+        if len(parameters) != len(restored_parameters):
+            raise ValueError(
+                "Saved EMA parameter count does not match the model: "
+                f"{len(restored_parameters)} != {len(parameters)}"
+            )
+        ema_parameters = []
+        for index, (parameter, restored) in enumerate(zip(
+            parameters, restored_parameters
+        )):
+            if parameter.shape != restored.shape:
+                raise ValueError(
+                    f"Saved EMA parameter {index} has shape "
+                    f"{tuple(restored.shape)}, expected {tuple(parameter.shape)}"
+                )
+            ema_parameters.append(
+                restored.detach().to(
+                    device=parameter.device, dtype=parameter.dtype
+                ).clone()
+            )
+        return ema_parameters
+    return [parameter.detach().clone() for parameter in parameters]
+
+
+@torch.no_grad()
+def update_ema_parameters(model, ema_parameters, decay):
+    """Update an in-memory EMA copy without invoking FSDP state-dict hooks."""
+    one_minus_decay = 1.0 - decay
+    for parameter, ema_parameter in zip(model.parameters(), ema_parameters):
+        ema_parameter.mul_(decay).add_(
+            parameter.detach(), alpha=one_minus_decay
+        )
+
+
+@contextmanager
+def use_ema_parameters(model, ema_parameters):
+    """Temporarily swap model parameters to EMA values for sampling."""
+    if ema_parameters is None:
+        yield
+        return
+    parameters = list(model.parameters())
+    backups = [parameter.detach().clone() for parameter in parameters]
+    try:
+        with torch.no_grad():
+            for parameter, ema_parameter in zip(parameters, ema_parameters):
+                parameter.copy_(ema_parameter)
+        yield
+    finally:
+        with torch.no_grad():
+            for parameter, backup in zip(parameters, backups):
+                parameter.copy_(backup)
 
 
 def latest_complete_best_checkpoint(checkpoint_path, checkpoint_filename,
@@ -159,14 +336,24 @@ def completed_epoch_improves_best(epoch_completed, current_loss, best_loss):
 
 
 def should_generate_preview(epoch, epoch_start, epoch_completed, period,
-                            generate_on_allocation_start=True):
-    """Choose previews independently of checkpoint/best-state availability."""
+                            generate_on_allocation_start=True,
+                            epoch_improved=False):
+    """Generate after a new best or at the configured epoch cadence.
+
+    ``epoch_start`` and ``generate_on_allocation_start`` remain in the
+    signature for compatibility with callers/tests from the older behavior.
+    Allocation-start previews now run before training and are handled by
+    ``should_generate_resume_preview`` below.
+    """
     if not epoch_completed or epoch <= 0:
         return False
-    first_preview_epoch = epoch_start if epoch_start > 0 else 1
-    return (
-        generate_on_allocation_start and epoch == first_preview_epoch
-    ) or epoch % period == 0
+    return bool(epoch_improved) or epoch % period == 0
+
+
+def should_generate_resume_preview(resume_loaded_best_state,
+                                   generate_on_allocation_start):
+    """Preview a restored best state before taking another optimizer step."""
+    return bool(resume_loaded_best_state and generate_on_allocation_start)
 
 
 def should_save_periodic_checkpoint(epoch, epoch_completed, period):
@@ -294,6 +481,32 @@ def main(device):
 
     inference_path = conf['trainer'].get('inference_path')
 
+    resume_checkpoint_path = conf['trainer'].get('resume_checkpoint_path')
+
+    reset_scheduler_on_resume = conf['trainer'].get(
+        'reset_scheduler_on_resume', False
+    )
+
+    reset_optimizer_on_resume = conf['trainer'].get(
+        'reset_optimizer_on_resume', False
+    )
+
+    reset_best_metrics_on_resume = conf['trainer'].get(
+        'reset_best_metrics_on_resume', False
+    )
+
+    allow_residual_decoder_init = bool(conf['trainer'].get(
+        'allow_residual_decoder_init_on_resume', False
+    ))
+
+    preview_only = conf['trainer'].get('preview_only', False)
+    sampling_audit = bool(conf['trainer'].get('sampling_audit', False))
+    audit_num_samples = int(conf['trainer'].get('audit_num_samples', 1))
+    if sampling_audit and not preview_only:
+        raise ValueError("trainer.sampling_audit requires preview_only=True")
+    if audit_num_samples <= 0:
+        raise ValueError("trainer.audit_num_samples must be positive")
+
     resume_from_checkpoint = conf['trainer']['resume_from_checkpoint']
     resume_override = os.environ.get('RESUME_FROM_CHECKPOINT')
     if resume_override is not None:
@@ -303,6 +516,25 @@ def main(device):
                 os.environ.get('RESUME_CHECKPOINT_NAME')
                 or f"{checkpoint_filename}_latest"
             )
+    if 'RESUME_CHECKPOINT_PATH' in os.environ:
+        resume_checkpoint_path = (
+            os.environ.get('RESUME_CHECKPOINT_PATH') or None
+        )
+    # Dataset-change metric resets apply only to the explicit imported source
+    # checkpoint. Automatic latest/recovery continuations clear this path.
+    reset_best_metrics_on_resume = bool(
+        reset_best_metrics_on_resume and resume_checkpoint_path
+    )
+    reset_scheduler_override = os.environ.get('RESET_SCHEDULER_ON_RESUME')
+    if reset_scheduler_override is not None:
+        reset_scheduler_on_resume = reset_scheduler_override.lower() in (
+            '1', 'true', 'yes'
+        )
+    reset_optimizer_override = os.environ.get('RESET_OPTIMIZER_ON_RESUME')
+    if reset_optimizer_override is not None:
+        reset_optimizer_on_resume = reset_optimizer_override.lower() in (
+            '1', 'true', 'yes'
+        )
 
     recovery_conf = conf.get('numerical_recovery', {})
     numerical_recovery_enabled = recovery_conf.get('enabled', False)
@@ -324,7 +556,17 @@ def main(device):
     recovery_modality_degradation_patience = int(
         recovery_conf.get('modality_degradation_patience', 3)
     )
+    recovery_plateau_patience = int(
+        recovery_conf.get('plateau_patience', 0)
+    )
+    recovery_stop_after_max_retries = bool(
+        recovery_conf.get('stop_after_max_retries', False)
+    )
     recovery_attempt = int(os.environ.get('RECOVERY_ATTEMPT', '0'))
+
+    ema_decay = float(conf['model'].get('ema_decay', 0.0))
+    if ema_decay < 0.0 or ema_decay >= 1.0:
+        raise ValueError("model.ema_decay must be in [0, 1)")
 
     if not 0.0 < recovery_lr_decay_factor < 1.0:
         raise ValueError("numerical_recovery.lr_decay_factor must be in (0, 1)")
@@ -350,6 +592,10 @@ def main(device):
         raise ValueError(
             "numerical_recovery.modality_degradation_patience must be positive"
         )
+    if recovery_plateau_patience < 0:
+        raise ValueError(
+            "numerical_recovery.plateau_patience cannot be negative"
+        )
 
     fsdp_size = conf['parallelism']['fsdp_size']
 
@@ -362,6 +608,12 @@ def main(device):
     cpu_offload_flag = conf['parallelism']['cpu_offloading']
  
     lr = float(conf['model']['lr'])
+
+    residual_decoder_lr_value = conf['model'].get('residual_decoder_lr')
+    residual_decoder_lr = (
+        float(residual_decoder_lr_value)
+        if residual_decoder_lr_value is not None else None
+    )
 
     beta_1 = float(conf['model']['beta_1'])
 
@@ -404,6 +656,33 @@ def main(device):
     drop_path = conf['model']['net']['init_args']['drop_path']
 
     linear_decoder = conf['model']['net']['init_args']['linear_decoder'] 
+
+    residual_mlp_decoder = bool(
+        conf['model']['net']['init_args'].get('residual_mlp_decoder', False)
+    )
+    residual_mlp_ratio = float(
+        conf['model']['net']['init_args'].get('residual_mlp_ratio', 2.0)
+    )
+    residual_conv3d_decoder = bool(
+        conf['model']['net']['init_args'].get(
+            'residual_conv3d_decoder', False
+        )
+    )
+    residual_conv3d_channels = int(
+        conf['model']['net']['init_args'].get(
+            'residual_conv3d_channels', 16
+        )
+    )
+    residual_feature_conv3d_decoder = bool(
+        conf['model']['net']['init_args'].get(
+            'residual_feature_conv3d_decoder', False
+        )
+    )
+    residual_feature_conv3d_channels = int(
+        conf['model']['net']['init_args'].get(
+            'residual_feature_conv3d_channels', 8
+        )
+    )
 
     twoD = conf['model']['net']['init_args']['twoD']
 
@@ -602,6 +881,12 @@ def main(device):
         mlp_ratio=mlp_ratio,
         drop_path_rate=drop_path,
         linear_decoder=linear_decoder,
+        residual_mlp_decoder=residual_mlp_decoder,
+        residual_mlp_ratio=residual_mlp_ratio,
+        residual_conv3d_decoder=residual_conv3d_decoder,
+        residual_conv3d_channels=residual_conv3d_channels,
+        residual_feature_conv3d_decoder=residual_feature_conv3d_decoder,
+        residual_feature_conv3d_channels=residual_feature_conv3d_channels,
         twoD=twoD,
         mlp_ratio_decoder=mlp_ratio_decoder,
         default_vars=default_vars,
@@ -662,9 +947,10 @@ def main(device):
            #map_location = 'cuda:'+str(device)
            model.load_state_dict(torch.load(checkpoint_path+'/initial_'+str(0)+'.pth',map_location=map_location),strict=False)
 
-    else:  
+    else:
+        checkpoint_load_path = resume_checkpoint_path or checkpoint_path
         if world_rank< tensor_par_size:
-            if os.path.exists(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(world_rank)+".ckpt"):
+            if os.path.exists(checkpoint_load_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(world_rank)+".ckpt"):
                 print("resume from checkpoint was set to True. Checkpoint path found.",flush=True)
 
                 print("rank",dist.get_rank(),"src_rank",world_rank,flush=True)
@@ -672,8 +958,18 @@ def main(device):
                 #map_location = 'cuda:'+str(device)
                 map_location = 'cpu'
 
-                checkpoint = torch.load(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(world_rank)+".ckpt",map_location=map_location)
-                model.load_state_dict(checkpoint['model_state_dict'])
+                checkpoint = torch.load(checkpoint_load_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(world_rank)+".ckpt",map_location=map_location)
+                missing_keys, _ = load_model_checkpoint(
+                    model,
+                    checkpoint['model_state_dict'],
+                    allow_residual_decoder_init,
+                )
+                if missing_keys:
+                    print(
+                        "Initialized new zero-residual decoder parameters: "
+                        f"{missing_keys}",
+                        flush=True,
+                    )
                 epoch_start = checkpoint.get('next_epoch', checkpoint['epoch'] + 1)
                 del checkpoint
 
@@ -740,13 +1036,40 @@ def main(device):
         model, checkpoint_wrapper_fn=checkpoint_wrapper, check_fn=check_fn
     )
 
-    optimizer = configure_optimizer(model,lr,beta_1,beta_2,weight_decay)
+    if residual_decoder_lr is None:
+        optimizer = configure_optimizer(
+            model, lr, beta_1, beta_2, weight_decay
+        )
+    else:
+        if not (
+            residual_mlp_decoder
+            or residual_conv3d_decoder
+            or residual_feature_conv3d_decoder
+        ):
+            raise ValueError(
+                "model.residual_decoder_lr requires a residual decoder"
+            )
+        optimizer, optimizer_group_counts = (
+            configure_optimizer_with_residual_lr(
+                model, lr, residual_decoder_lr,
+                beta_1, beta_2, weight_decay,
+            )
+        )
+        if world_rank == 0:
+            print(
+                "Configured residual decoder LR groups: "
+                f"base_lr={lr}, residual_lr={residual_decoder_lr}, "
+                f"parameter_counts={optimizer_group_counts}",
+                flush=True,
+            )
     scheduler = configure_scheduler(optimizer,warmup_steps,max_steps,warmup_start_lr,eta_min)
 
     resume_best_loss = None
     resume_best_epoch = -1
     resume_loaded_best_state = False
     resume_monitor_state = {}
+    resume_epochs_without_improvement = 0
+    resume_ema_parameters = None
 
     if resume_from_checkpoint:
 
@@ -757,9 +1080,16 @@ def main(device):
         #map_location = 'cuda:'+str(device)
         map_location = 'cpu'
 
-        checkpoint = torch.load(checkpoint_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(src_rank)+".ckpt",map_location=map_location)
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        checkpoint = torch.load(checkpoint_load_path+"/"+checkpoint_filename_for_loading+"_rank_"+str(src_rank)+".ckpt",map_location=map_location)
+        if not reset_optimizer_on_resume:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        elif world_rank == 0:
+            print(
+                "Resetting optimizer state instead of restoring checkpoint "
+                "moments",
+                flush=True,
+            )
         loss_list = checkpoint['loss_list']
         saved_modality_history = checkpoint.get('modality_loss_history', {})
         modality_loss_history = {
@@ -775,6 +1105,10 @@ def main(device):
             or checkpoint_filename_for_loading.endswith('_RECOVERY'),
         )
         resume_monitor_state = checkpoint.get('loss_monitor_state', {})
+        resume_epochs_without_improvement = int(
+            checkpoint.get('epochs_without_improvement', 0)
+        )
+        resume_ema_parameters = checkpoint.get('ema_parameters')
         if world_rank == 0:
             print(
                 "Restored checkpoint: "
@@ -799,12 +1133,20 @@ def main(device):
         resume_lr_override = os.environ.get('RESUME_LR')
         if resume_lr_override:
             previous_lrs = [group['lr'] for group in optimizer.param_groups]
-            rebased_lrs = rebase_optimizer_and_scheduler_lr(
-                optimizer, scheduler, float(resume_lr_override)
-            )
+            if reset_scheduler_on_resume:
+                rebased_lrs = restart_optimizer_and_scheduler_lr(
+                    optimizer, scheduler, float(resume_lr_override),
+                    max_steps, eta_min,
+                )
+                lr_action = "Restarted"
+            else:
+                rebased_lrs = rebase_optimizer_and_scheduler_lr(
+                    optimizer, scheduler, float(resume_lr_override)
+                )
+                lr_action = "Rebased"
             if world_rank == 0:
                 print(
-                    "Rebased restored optimizer/scheduler learning rates "
+                    f"{lr_action} restored optimizer/scheduler learning rates "
                     f"from {previous_lrs} to base={resume_lr_override}, "
                     f"current={rebased_lrs}",
                     flush=True,
@@ -850,6 +1192,25 @@ def main(device):
 
         train_dataloader = data_module.train_dataloader()
 
+    audit_reference_volume = None
+    if sampling_audit:
+        if twoD:
+            raise ValueError("The current sampling audit is specifically 3D")
+        if world_rank < tensor_par_size:
+            audit_batch = next(iter(train_dataloader))
+            audit_reference_volume = audit_batch[0][
+                :audit_num_samples
+            ].detach().float().cpu()
+            print(
+                "Sampling audit reference: "
+                f"shape={tuple(audit_reference_volume.shape)}, "
+                f"mean={audit_reference_volume.mean().item():.6g}, "
+                f"std={audit_reference_volume.std().item():.6g}, "
+                f"min={audit_reference_volume.min().item():.6g}, "
+                f"max={audit_reference_volume.max().item():.6g}",
+                flush=True,
+            )
+
 #4. Training Loop
 ##############################################################################################################
 
@@ -875,16 +1236,33 @@ def main(device):
     # baseline while continuing from the latest model/optimizer state.
     best_loss = (
         float(resume_best_loss)
-        if resume_best_loss is not None
+        if resume_best_loss is not None and not reset_best_metrics_on_resume
         else float("inf")
     )
-    best_epoch = resume_best_epoch if resume_best_loss is not None else -1
-    epochs_without_improvement = 0
+    best_epoch = resume_best_epoch if resume_loaded_best_state else -1
+    epochs_without_improvement = (
+        0 if resume_loaded_best_state
+        else resume_epochs_without_improvement
+    )
     max_patience = 50000
     patience = 2000
     lr_decay_count = 0
     decay_factor = 0.9
     patience_inc_rate = 1.25 
+
+    ema_parameters = None
+    if ema_decay > 0.0:
+        ema_parameters = initialize_ema_parameters(
+            model, resume_ema_parameters
+        )
+        if world_rank == 0:
+            ema_source = 'checkpoint' if resume_ema_parameters else 'model'
+            print(
+                f"EMA enabled: decay={ema_decay}, initialized from "
+                f"{ema_source}",
+                flush=True,
+            )
+    del resume_ema_parameters
         
     best_model_state = (
         copy.deepcopy(model.state_dict())
@@ -897,6 +1275,11 @@ def main(device):
     best_scheduler_state = (
         copy.deepcopy(scheduler.state_dict())
         if resume_loaded_best_state and save_checkpoints else None
+    )
+    best_ema_parameters = (
+        [parameter.detach().clone() for parameter in ema_parameters]
+        if resume_loaded_best_state and ema_parameters is not None
+        else None
     )
     # A deliberate best-state recovery starts a fresh monitoring phase. An
     # ordinary latest-state continuation carries its EMA and streaks forward.
@@ -938,6 +1321,124 @@ def main(device):
             'modality_streak': dict(modality_degradation_streaks),
         }
 
+    def generate_preview_images(epoch, filename_suffix):
+        """Generate one coordinated preview per tensor-parallel replica."""
+        if world_rank < tensor_par_size:
+            with use_ema_parameters(model, ema_parameters):
+                for var in default_vars:
+                    model.eval()
+                    if sampling_audit:
+                        timestep_rows, timestep_path = (
+                            audit_noise_prediction_by_timestep(
+                                model, audit_reference_volume, var, device,
+                                precision_dt, patch_size, inference_path,
+                                num_time_steps=num_time_steps,
+                                seed=preview_seed,
+                            )
+                        )
+                        summaries, raw_path, stats_path, figure_path = (
+                            audit_sample_images(
+                                model, audit_reference_volume, var, device,
+                                tile_size, precision_dt, patch_size,
+                                inference_path,
+                                num_time_steps=num_time_steps,
+                                seed=preview_seed,
+                                num_samples=audit_num_samples,
+                            )
+                        )
+                        print(
+                            f"Sampling audit timestep metrics: {timestep_rows}",
+                            flush=True,
+                        )
+                        print(
+                            "Sampling audit outputs: "
+                            f"timestep_csv={timestep_path}, raw={raw_path}, "
+                            f"stats={stats_path}, figure={figure_path}, "
+                            f"summaries={summaries}",
+                            flush=True,
+                        )
+                    else:
+                        sample_images(
+                            model, var, device, tile_size, precision_dt,
+                            patch_size, epoch=epoch, num_samples=5, twoD=twoD,
+                            save_path=inference_path,
+                            num_time_steps=num_time_steps,
+                            seed=preview_seed,
+                            filename_tag=(
+                                f"{preview_job_tag}_{filename_suffix}"
+                            ),
+                        )
+                    model.train()
+        dist.barrier()
+
+    # A BEST checkpoint imported from another run directory/prefix must also
+    # exist in this run's namespace. Otherwise a later walltime continuation
+    # retains only the latest state and numerical recovery cannot find the
+    # original safe rollback point if fine-tuning has not improved yet.
+    imported_best_needs_materialization = (
+        resume_loaded_best_state
+        and save_checkpoints
+        and (
+            checkpoint_load_path != checkpoint_path
+            or checkpoint_filename_for_loading
+            != f"{checkpoint_filename}_BEST"
+        )
+    )
+    if imported_best_needs_materialization:
+        if world_rank < tensor_par_size:
+            imported_best_file = os.path.join(
+                checkpoint_path,
+                f"{checkpoint_filename}_BEST_rank_{world_rank}.ckpt",
+            )
+            imported_best_temporary_file = (
+                f"{imported_best_file}.tmp-"
+                f"{os.environ.get('SLURM_JOB_ID', 'local')}"
+            )
+            torch.save({
+                'epoch': best_epoch,
+                'next_epoch': best_epoch + 1,
+                'model_state_dict': best_model_state,
+                'optimizer_state_dict': best_optimizer_state,
+                'scheduler_state_dict': best_scheduler_state,
+                'ema_parameters': best_ema_parameters,
+                'loss_list': loss_list,
+                'modality_loss_history': modality_loss_history,
+                'loss_monitor_state': loss_monitor_state_dict(),
+                'epochs_without_improvement': 0,
+                'best_epoch': best_epoch,
+                'best_loss': best_loss,
+                'is_best_state': True,
+                'checkpoint_type': 'imported_best',
+            }, imported_best_temporary_file)
+            os.replace(imported_best_temporary_file, imported_best_file)
+        dist.barrier()
+        if world_rank == 0:
+            print(
+                "Materialized imported BEST checkpoint in the new run "
+                "directory",
+                flush=True,
+            )
+
+    if should_generate_resume_preview(
+        resume_loaded_best_state, generate_on_allocation_start
+    ):
+        if world_rank == 0:
+            print(
+                f"Generating immediate preview from restored best epoch "
+                f"{best_epoch}",
+                flush=True,
+            )
+        generate_preview_images(best_epoch, "resume_best")
+
+    if preview_only:
+        if not resume_loaded_best_state:
+            raise ValueError(
+                "trainer.preview_only requires a restored BEST checkpoint"
+            )
+        if world_rank == 0:
+            print("Preview-only run complete; skipping training.", flush=True)
+        return False
+
     if world_rank == 0 and resume_loaded_best_state:
         print(
             f"Restored persistent best state: epoch={best_epoch}, "
@@ -953,6 +1454,20 @@ def main(device):
                 f"Non-finite {failure_kind} at epoch={epoch}, batch={batch}"
             )
         if recovery_attempt >= recovery_max_retries:
+            if recovery_stop_after_max_retries:
+                if world_rank == 0:
+                    print(
+                        "Early stopping: numerical recovery retry limit "
+                        f"{recovery_max_retries} reached after "
+                        f"{failure_kind}",
+                        flush=True,
+                    )
+                return {
+                    'kind': 'early_stop',
+                    'failure_kind': failure_kind,
+                    'epoch': epoch,
+                    'batch': batch,
+                }
             raise FloatingPointError(
                 f"Non-finite {failure_kind} at epoch={epoch}, batch={batch}; "
                 f"recovery retry limit {recovery_max_retries} reached"
@@ -983,9 +1498,11 @@ def main(device):
                     'model_state_dict': best_model_state,
                     'optimizer_state_dict': best_optimizer_state,
                     'scheduler_state_dict': best_scheduler_state,
+                    'ema_parameters': best_ema_parameters,
                     'loss_list': loss_list,
                     'modality_loss_history': modality_loss_history,
                     'loss_monitor_state': loss_monitor_state_dict(),
+                    'epochs_without_improvement': 0,
                     'best_epoch': best_epoch,
                     'best_loss': best_loss,
                     'is_best_state': True,
@@ -1188,6 +1705,9 @@ def main(device):
                     optimizer.step()
                 rank_phase("after_optimizer", epoch, counter, synchronize=True)
 
+                if ema_parameters is not None:
+                    update_ema_parameters(model, ema_parameters, ema_decay)
+
                 scheduler.step()
                 optimizer.zero_grad()
                 rank_phase("batch_complete", epoch, counter)
@@ -1321,6 +1841,11 @@ def main(device):
                 best_model_state = copy.deepcopy(model.state_dict())
                 best_optimizer_state = copy.deepcopy(optimizer.state_dict())
                 best_scheduler_state = copy.deepcopy(scheduler.state_dict())
+                best_ema_parameters = (
+                    [parameter.detach().clone()
+                     for parameter in ema_parameters]
+                    if ema_parameters is not None else None
+                )
                 if world_rank < tensor_par_size:
                     best_checkpoint_file = os.path.join(
                         checkpoint_path,
@@ -1336,9 +1861,11 @@ def main(device):
                         'model_state_dict': best_model_state,
                         'optimizer_state_dict': best_optimizer_state,
                         'scheduler_state_dict': best_scheduler_state,
+                        'ema_parameters': best_ema_parameters,
                         'loss_list': loss_list,
                         'modality_loss_history': modality_loss_history,
                         'loss_monitor_state': loss_monitor_state_dict(),
+                        'epochs_without_improvement': 0,
                         'best_epoch': best_epoch,
                         'best_loss': best_loss,
                         'is_best_state': True,
@@ -1346,6 +1873,10 @@ def main(device):
                     }, best_temporary_file)
                     os.replace(best_temporary_file, best_checkpoint_file)
             dist.barrier()
+        elif epoch_completed:
+            # Update this before the wall-time checkpoint so the plateau count
+            # survives an allocation boundary that lands after this epoch.
+            epochs_without_improvement += 1
 
         # Also check at the epoch boundary in case it did not land on a
         # multiple of ten batches.
@@ -1394,9 +1925,11 @@ def main(device):
                     'model_state_dict': restart_model_state,
                     'optimizer_state_dict': restart_optimizer_state,
                     'scheduler_state_dict': restart_scheduler_state,
+                    'ema_parameters': ema_parameters,
                     'loss_list': loss_list,
                     'modality_loss_history': modality_loss_history,
                     'loss_monitor_state': loss_monitor_state_dict(),
+                    'epochs_without_improvement': epochs_without_improvement,
                     'best_epoch': best_epoch,
                     'best_loss': best_loss,
                     'is_best_state': False,
@@ -1497,32 +2030,16 @@ def main(device):
 
         dist.barrier()
             
-        if not epoch_improved:
-            epochs_without_improvement += 1
-
-            # Reduce LR if no improvement for `patience` epochs
-            if epochs_without_improvement >= patience:
-                
-                # model.load_state_dict(best_model_state)
-                # optimizer.load_state_dict(best_optimizer_state)
-                # scheduler.load_state_dict(best_scheduler_state)
-                # if world_rank == 0:
-                #     print(f"[Epoch {epoch}] Reloading best model from epoch {best_epoch} after LR decay.")
-                    
-                lr_decay_count += 1
-                for i, param_group in enumerate(optimizer.param_groups):
-                    if world_rank == 0:
-                        print(f"LR for param group {i} was: {param_group['lr']:.2e}")
-                    param_group['lr'] *= decay_factor
-                    if world_rank == 0:
-                        print(f"LR for param group {i} updated to: {param_group['lr']:.2e}")
-                    # Log patience change (optional)
-                    if world_rank == 0:
-                        print(f"Increasing patience: old={patience}", flush=True)
-
-                    # Update patience
-                    patience = min(int(patience * patience_inc_rate),max_patience)
-                epochs_without_improvement = 0
+        if (
+            numerical_recovery_enabled
+            and recovery_plateau_patience > 0
+            and epochs_without_improvement >= recovery_plateau_patience
+        ):
+            return prepare_numerical_recovery(
+                f"loss plateau for {epochs_without_improvement} epochs",
+                epoch,
+                counter,
+            )
 
         dist.barrier()
 
@@ -1551,9 +2068,11 @@ def main(device):
                     'model_state_dict': periodic_model_state,
                     'optimizer_state_dict': periodic_optimizer_state,
                     'scheduler_state_dict': periodic_scheduler_state,
+                    'ema_parameters': ema_parameters,
                     'loss_list': loss_list,
                     'modality_loss_history': modality_loss_history,
                     'loss_monitor_state': loss_monitor_state_dict(),
+                    'epochs_without_improvement': epochs_without_improvement,
                     'best_epoch': best_epoch,
                     'best_loss': best_loss,
                     'is_best_state': False,
@@ -1575,21 +2094,16 @@ def main(device):
             epoch_completed,
             generation_period,
             generate_on_allocation_start,
+            epoch_improved,
         )
-        if generation_due and world_rank < tensor_par_size:
+        if generation_due:
             # Always sample the current training state. Do not replace its
             # weights with an older best state or couple previews to best-state
             # availability.
-            for var in default_vars:
-                model.eval()
-                sample_images(model, var, device, tile_size, precision_dt, patch_size,
-                            epoch=epoch, num_samples=5, twoD=twoD, save_path=inference_path,
-                            num_time_steps=num_time_steps, seed=preview_seed,
-                            filename_tag=f"{preview_job_tag}_preview")
-                model.train()
-
-
-        dist.barrier()
+            preview_reason = "new_best" if epoch_improved else "periodic"
+            generate_preview_images(epoch, preview_reason)
+        else:
+            dist.barrier()
 
     # Final save of best model
     if world_rank == 0:
@@ -1602,9 +2116,11 @@ def main(device):
             'model_state_dict': best_model_state,
             'optimizer_state_dict': best_optimizer_state,
             'scheduler_state_dict': best_scheduler_state,
+            'ema_parameters': best_ema_parameters,
             'loss_list': loss_list,
             'modality_loss_history': modality_loss_history,
             'loss_monitor_state': loss_monitor_state_dict(),
+            'epochs_without_improvement': 0,
             'best_epoch': best_epoch,
             'best_loss': best_loss,
             'is_best_state': True,
@@ -1613,13 +2129,17 @@ def main(device):
 
         model.load_state_dict(best_model_state)
 
-        for var in default_vars:
-            model.eval()
-            sample_images(model, var, device, tile_size, precision_dt, patch_size,
-                                epoch=best_epoch, num_samples=10, twoD=twoD, save_path=inference_path,
-                                num_time_steps=num_time_steps, seed=preview_seed,
-                                filename_tag=f"{preview_job_tag}_finalbest")
-            model.train()
+        with use_ema_parameters(model, best_ema_parameters):
+            for var in default_vars:
+                model.eval()
+                sample_images(
+                    model, var, device, tile_size, precision_dt, patch_size,
+                    epoch=best_epoch, num_samples=10, twoD=twoD,
+                    save_path=inference_path,
+                    num_time_steps=num_time_steps, seed=preview_seed,
+                    filename_tag=f"{preview_job_tag}_finalbest",
+                )
+                model.train()
             # save_intermediate_data(model, var, device, tile_size, precision_dt, patch_size,
             #                     epoch=best_epoch, num_samples=2, twoD=twoD, save_path=inference_path,
             #                     num_time_steps=num_time_steps)

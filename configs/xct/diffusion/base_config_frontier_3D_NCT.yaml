@@ -20,10 +20,10 @@ trainer:
   enable_performance_plots: False
   loss_plot_period: 1
   checkpoint_period: 10
-  generation_period: 20
-  # Full 3D reverse-diffusion previews are expensive. Generate at epochs 20
-  # and 40, rather than at the beginning of every one-hour allocation.
-  generate_on_allocation_start: False
+  # Preview immediately when deliberately resuming a BEST checkpoint, after
+  # every newly improved epoch, and at least once every five completed epochs.
+  generation_period: 5
+  generate_on_allocation_start: True
   preview_seed: 1234
   save_checkpoints: True
   auto_checkpoint_path: True
