@@ -369,13 +369,14 @@ def create_narrow_catsdogs_dir(conf, scratch_dir, min_files):
     return dkey_train, narrowed_dir
 
 
-def make_smoke_config(base_config_path, scratch_dir, min_files=DEFAULT_MIN_FILES, extra_overrides=None):
+def make_smoke_config(base_config_path, scratch_dir, min_files=DEFAULT_MIN_FILES, extra_overrides=None, ntasks=8):
     """Loads a real config and writes a tiny/fast, freshly-training smoke-test variant.
 
     Only overrides model size, epoch count, checkpoint location,
     resume_from_checkpoint, (see compute_narrow_dict_idx /
     create_narrow_catsdogs_dir) the real-data-narrowing fields appropriate to
-    this config's dataloader type, and (if given) `extra_overrides`.
+    this config's dataloader type, `parallelism.simple_ddp_size: "auto"`
+    (resolved to a real int, see below), and (if given) `extra_overrides`.
     Everything else -- data paths (beyond narrowing), tiling, adaptive
     patching, batch size, load-balancing settings -- is left exactly as in
     the real config.
@@ -395,6 +396,12 @@ def make_smoke_config(base_config_path, scratch_dir, min_files=DEFAULT_MIN_FILES
             run_feature_matrix_smoke.py to flip individual advanced-feature
             flags on top of a real shipped config; run_training_smoke.py's
             own main() never passes this (None).
+        ntasks: The real `srun -n <ntasks>` task count this config will
+            actually be launched with (see `run_training`) -- used to
+            resolve `parallelism.simple_ddp_size: "auto"` into a real
+            integer below, the same way `parse.py` resolves it for a real
+            run (from a live process group's `world_size`, which is
+            `ntasks` here, since that's what `srun -n ntasks` launches).
 
     Returns:
         Path to the written smoke-test config file.
@@ -408,6 +415,27 @@ def make_smoke_config(base_config_path, scratch_dir, min_files=DEFAULT_MIN_FILES
 
     if extra_overrides:
         deep_merge_config_overrides(conf, extra_overrides)
+
+    # simple_ddp_size may be the literal string "auto" (see parse.py's own
+    # resolution) rather than a real integer at this point -- conf here is a
+    # raw yaml.load, parse_config never runs. Resolved in place, immediately,
+    # the same way parse.py resolves it for a real run (world_size //
+    # (fsdp_size * tensor_par_size)), using ntasks as world_size since
+    # that's what the real `srun -n ntasks` subprocess launches with --
+    # every downstream read of conf["parallelism"]["simple_ddp_size"] below
+    # (the min_files cap here, and compute_narrow_dict_idx's own independent
+    # read of it) needs a real int, not "auto" (a real Frontier crash,
+    # TypeError: '<' not supported between instances of 'str' and 'int',
+    # from multiplying an unresolved "auto" string into the cap's arithmetic
+    # -- compute_narrow_dict_idx has the identical unresolved-"auto" gap,
+    # already known and worked around by hardcoding an int in tests/
+    # distributed/test_sst_real_pipeline.py's own docstring, not fixed at
+    # the source until now). Baking in the resolved int (rather than writing
+    # "auto" back out) is exactly equivalent to what "auto" would resolve to
+    # for this specific job anyway, since ntasks IS the real world_size the
+    # written-out smoke config actually trains under.
+    if conf["parallelism"]["simple_ddp_size"] == "auto":
+        conf["parallelism"]["simple_ddp_size"] = ntasks // (conf["parallelism"]["fsdp_size"] * conf["parallelism"]["tensor_par_size"])
 
     # DEFAULT_MIN_FILES (or an explicit --min-files) is a ceiling, not a
     # target: it's sized for the shared batch_size=32 most configs use, but
@@ -620,7 +648,7 @@ def main():
         timeout = args.timeout
 
         try:
-            smoke_config = make_smoke_config(config_path, scratch_dir, min_files=min_files)
+            smoke_config = make_smoke_config(config_path, scratch_dir, min_files=min_files, ntasks=args.ntasks)
         except NoRealDataFoundError as e:
             # Fail fast, before ever spending GPU allocation time on a run
             # that's guaranteed to crash confusingly deep inside

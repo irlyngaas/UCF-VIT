@@ -6075,3 +6075,88 @@ now import and run for real in whatever session environment this fix
 happened to land in -- not evidence of anything to do with this change
 itself). Not yet confirmed on Frontier with a real rerun of `run_
 distributed_tests.sh` -- that's the natural next step to close this out.
+
+## Fixed a second real Frontier regression: `make_smoke_config` crashed on `parallelism.simple_ddp_size: "auto"`
+
+Job 5500491 (Tier 3, `run_training_smoke.py`) crashed for real on
+`sst-mae` (`configs/sst/mae/base_config.yaml`, the first `sst` config
+`discover_configs()` reaches alphabetically) with `TypeError: '<' not
+supported between instances of 'str' and 'int'`, inside `make_smoke_
+config`'s `min_files = min(min_files, conf["dataloader"]["batch_size"] *
+data_par_size)`. Root cause: `conf` here is a raw `yaml.load` -- `parse_
+config` (which resolves `parallelism.simple_ddp_size: "auto"` into a real
+integer from a live process group's `world_size`) never runs on it -- so
+`data_par_size = conf["parallelism"]["fsdp_size"] * conf["parallelism"]
+["simple_ddp_size"]` silently computed `1 * "auto"` (Python string
+repetition, not an error) instead of raising immediately; the real crash
+only surfaced one line later, comparing that string against an int in
+`min()`.
+
+Tracing further (before writing any fix) found this was actually two
+latent bugs sharing one root cause, not one: `compute_narrow_dict_idx`,
+called right after inside the same function, independently reads
+`conf["parallelism"]["simple_ddp_size"]` off the same raw config for its
+own `data_par_size` -- fixing only the `min_files` cap line would have
+just moved the crash one step later. This second occurrence was already
+known and documented, just never fixed at the source: `tests/distributed/
+test_sst_real_pipeline.py`'s own docstring explains hardcoding `conf
+["parallelism"]["simple_ddp_size"] = 8` specifically because `compute_
+narrow_dict_idx` "can't itself resolve `"auto"` the way `parse_config`
+does" -- a real, working workaround for that one Tier 2 test, but not a
+fix for the shared function every other caller (Tier 3's `make_smoke_
+config`, several Tier 2 real-pipeline tests) still has to route around
+too.
+
+**The fix**: `make_smoke_config` now resolves `conf["parallelism"]
+["simple_ddp_size"]` from `"auto"` to a real int *in place*, immediately
+after loading the config (before anything else reads it) -- `ntasks //
+(fsdp_size * tensor_par_size)`, the identical formula `parse.py` itself
+uses, with `ntasks` (a new parameter, threaded through from both `run_
+training_smoke.py`'s and `run_feature_matrix_smoke.py`'s own `args.
+ntasks`) standing in for the live process group's `world_size`, since
+that's exactly what the real `srun -n ntasks python train.py` subprocess
+this config gets handed to will use. Baking in the resolved int (rather
+than trying to write `"auto"` back out unresolved) is exactly equivalent
+to what `"auto"` would resolve to for this specific job anyway -- and
+fixes both crash sites in one place, since every downstream read
+(`compute_narrow_dict_idx` included) now sees a real int from the start.
+An explicit integer `simple_ddp_size` (every non-`sst`/non-experimental
+shipped config) is left completely untouched.
+
+**Tier 1 coverage**: `tests/integration/test_run_training_smoke_helpers.py`
+gains two direct tests against `make_smoke_config` itself (previously only
+its narrowing/merge helpers were unit-tested, not this function) --
+`simple_ddp_size:"auto"` resolves to the expected int (`ntasks //
+(fsdp_size * tensor_par_size)`, using a real fake-`imagesTr` fixture,
+same style as `test_compute_narrow_dict_idx_real_data_found`), and an
+explicit int is left untouched.
+
+**Verification:** full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 492 passed / 2 skipped, no regressions. Directly
+reproduced the original crash against the real `configs/sst/mae/base_
+config.yaml` file before the fix (confirmed the exact `TypeError`), and
+confirmed after the fix `make_smoke_config` runs cleanly past both
+former crash sites, now failing only on this sandbox's expected
+`NoRealDataFoundError` (no Frontier data mount here) -- not yet
+confirmed with a real Frontier rerun of `run_training_smoke.py`, the
+natural next step.
+
+## A real, unresolved Tier 3b finding: `basic_ct-unetr+do_ap`'s default `token_selection` (`"point"`) timed out at 600s
+
+Job 5500492 (Tier 3b, `run_feature_matrix_smoke.py`) found `basic_ct-
+unetr+do_ap` -- the plain `do_ap:True` cell, default `model.token_
+selection` (`"point"`), no `min_files_override` -- hit `TIMEOUT (600s)`
+for the first time recorded in this file. Its 4 sibling cells (identical
+config, only `token_selection` differs) behaved very differently on the
+same run: `+smallest_overlap` `PASS (352s)` (close to the same timeout,
+but under it), `+area_weighted`/`+area_weighted_alpha`/`+cross_attention`
+all `PASS (~70s)`. `arch.py`'s `_adaptive_token_grid_index` (backing both
+`"point"` and `"smallest_overlap"`) is fully vectorized -- broadcasts a
+`(B, G, S)` boolean tensor via `ndims` (2 or 3) Python-level iterations,
+no loop over batch/tokens/grid-cells -- so there's no obvious O(N^2)-style
+algorithmic reason `"point"`/`"smallest_overlap"` should be ~5-8x slower
+than `"area_weighted"`/`"cross_attention"` on the same input size; not
+diagnosed further here (would need real GPU profiling on Frontier itself,
+which this session's dev sandbox can't do). Not investigated deeper
+per the user's own direction -- flagged as an open, unresolved finding
+rather than guessed at. No code changed for this one.

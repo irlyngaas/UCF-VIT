@@ -468,7 +468,7 @@ def main():
         print(f"\n{'='*80}\n{cell.label} ({cell.base_config_relpath}, overrides={cell.overrides})\n{'='*80}", flush=True)
 
         try:
-            smoke_config = make_smoke_config(base_config, scratch_dir, min_files=min_files, extra_overrides=cell.overrides)
+            smoke_config = make_smoke_config(base_config, scratch_dir, min_files=min_files, extra_overrides=cell.overrides, ntasks=args.ntasks)
         except NoRealDataFoundError as e:
             # Fail fast, before ever spending GPU allocation time on a run
             # that's guaranteed to crash confusingly deep inside
