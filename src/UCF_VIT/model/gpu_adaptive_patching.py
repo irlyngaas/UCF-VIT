@@ -92,6 +92,40 @@ class GPUPatchify2D(torch.nn.Module):
     `"canny"` (edge-density, via `_canny_edge_map_batch`) -- see this
     module's own tests/README.md entry for the scope still left out (3D,
     and a fully-GPU connected-components backend) and why.
+
+    Neither `score_fn` is numerically identical to its CPU-side
+    (`UCF_VIT.dataloaders.transform.Patchify`) counterpart -- expect
+    similar, not identical, scores/splits from the same input:
+
+    - `"canny"`: a separate, from-scratch torch/GPU reimplementation of the
+      Canny pipeline (blur -> Sobel gradients -> non-max suppression ->
+      double threshold -> hysteresis), not a call into `Patchify`'s own 2D
+      Canny (`cv2.Canny` for `imagenet`/`catsdogs`, `skimage.feature.canny`
+      for every other dataset) -- both CPU-only, non-batched library calls
+      that can't run inside this on-device `forward()`. Differs in
+      smoothing (an explicit Gaussian sigma here vs. each library's own
+      internal smoothing) and, most significantly, in hysteresis: this
+      class approximates it with `canny_hysteresis_iters` binary-dilation
+      passes rather than the true flood-fill connectivity both `cv2.Canny`
+      and `skimage.feature.canny` use (see `_canny_edge_map_batch`'s own
+      docstring) -- an approximation, not an exact match, by design.
+    - `"variance"`: same SSE formula in spirit as `Rect.contains`'s own
+      `"variance"` scoring (`quadtree.py`) -- per-channel variance, summed
+      across channels, scaled by block area -- but computed via
+      `torch.var`, whose default (`correction=1`, Bessel's correction, a
+      `n-1` denominator) differs from `np.var`'s default (`ddof=0`, a
+      plain `n` denominator) used on the CPU side. The gap is largest for
+      small blocks (near `min_size`) and shrinks as block size grows; it's
+      also the source of this class's own well-verified "a small, detailed
+      block's own SSE can come out below its children's summed SSE" merge-
+      cost property (see this module's tests/README.md entries for both
+      the 2D and 3D real bugs this property was mistaken for and then
+      root-caused). Structurally different from the CPU side regardless of
+      this: `Patchify`/`FixedQuadTree` use this SSE as a single node's
+      top-down split-priority score, while this class uses `errors[level]
+      - sum_children` (the between-group variance component) to decide
+      whether merging is cheap -- a different consumer of a similar
+      quantity, not the same computation.
     """
 
     # Bounding-box + scalar fields describing each detected leaf region,
@@ -770,6 +804,20 @@ class GPUPatchify3D(torch.nn.Module):
     Not yet wired into any model (`ap.do_gpu_ap` currently asserts `twoD`
     by construction in `arch.py`) -- see this module's own tests/README.md
     entry for what's deferred.
+
+    Same "expect similar, not identical" caveat `GPUPatchify2D`'s own
+    docstring gives against `Patchify`, here against `UCF_VIT.dataloaders.
+    transform.Patchify_3D`: `"canny"` is a from-scratch torch/GPU
+    reimplementation, not a call into `Patchify_3D`'s own
+    `SimpleITK.CannyEdgeDetection` (a CPU-only, non-batched library call
+    that can't run inside this on-device `forward()`) -- differs in
+    smoothing (an explicit Gaussian sigma here vs. SimpleITK's internal
+    `variance` parameter, not numerically equivalent) and in hysteresis
+    (`canny_hysteresis_iters` binary-dilation passes here vs. SimpleITK's
+    own true connectivity-based hysteresis). `"variance"` uses the same
+    `torch.var` (`n-1`/Bessel-corrected) vs. `np.var` (`n`, the CPU side's
+    default) denominator difference `GPUPatchify2D`'s docstring describes,
+    largest for small (near-`min_size`) blocks.
     """
 
     RegionTensors3D = namedtuple(
