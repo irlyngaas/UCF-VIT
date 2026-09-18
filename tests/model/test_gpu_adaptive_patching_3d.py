@@ -298,3 +298,59 @@ def test_region_backend_cupyx_without_cupy_installed_raises_import_error():
 
     with pytest.raises(ImportError, match="cupy"):
         p(img)
+
+
+def test_labeled_to_region_tensors_scales_to_many_regions():
+    """Real Frontier regression test: a real basic_ct/unetr do_gpu_ap:True
+    run hit `torch.OutOfMemoryError: HIP out of memory. Tried to allocate
+    64.00 GiB` inside the old implementation's `[num_features, D*H*W]`
+    one-hot membership matrix -- fine for every existing test's small
+    (fixed_length <= 15) region count, catastrophic at real image scale
+    where both factors are large. Every existing test in this file only
+    ever exercises a handful of regions (bounded by `fixed_length`); this
+    calls `_labeled_to_region_tensors` directly with 512 distinct regions
+    (8x8x8 grid of 4x4x4 blocks in a 32-cube volume) -- still tiny next to
+    a real 256-cube volume's finest level, but the largest region count
+    any test here uses, specifically to catch a regression back to an
+    O(num_features * D*H*W) approach. Correctness checked against an
+    independent, brute-force per-label min/max (not the class's own
+    formula reused, so this can't trivially pass by construction).
+    """
+    p = GPUPatchify3D(img_size=(32, 32, 32), fixed_length=8, interp_size=4, min_size=2)
+
+    D = H = W = 32
+    bs = 4
+    n_per_axis = 8
+    labeled = torch.zeros(D, H, W, dtype=torch.long)
+    label = 1
+    label_to_block = {}
+    for di in range(n_per_axis):
+        for hi in range(n_per_axis):
+            for wi in range(n_per_axis):
+                labeled[di*bs:(di+1)*bs, hi*bs:(hi+1)*bs, wi*bs:(wi+1)*bs] = label
+                label_to_block[label] = (di, hi, wi)
+                label += 1
+    num_features = label - 1
+    assert num_features == n_per_axis ** 3  # 512
+
+    result = p._labeled_to_region_tensors(labeled, num_features)
+
+    for lbl, (di, hi, wi) in label_to_block.items():
+        idx = lbl - 1
+        # Independent brute-force reference -- true min/max coords for this
+        # label, not the class's own bounds() formula.
+        coords = (labeled == lbl).nonzero(as_tuple=False)
+        d_lo, d_hi = coords[:, 0].min().item(), coords[:, 0].max().item()
+        h_lo, h_hi = coords[:, 1].min().item(), coords[:, 1].max().item()
+        w_lo, w_hi = coords[:, 2].min().item(), coords[:, 2].max().item()
+
+        expected_z0 = d_lo - 1 if d_lo != 0 else d_lo
+        expected_y0 = h_lo - 1 if h_lo != 0 else h_lo
+        expected_x0 = w_lo - 1 if w_lo != 0 else w_lo
+
+        assert result.z0s[idx].item() == expected_z0
+        assert result.z1s[idx].item() == d_hi
+        assert result.y0s[idx].item() == expected_y0
+        assert result.y1s[idx].item() == h_hi
+        assert result.x0s[idx].item() == expected_x0
+        assert result.x1s[idx].item() == w_hi

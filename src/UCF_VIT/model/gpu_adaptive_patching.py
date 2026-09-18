@@ -536,6 +536,15 @@ class GPUPatchify2D(torch.nn.Module):
     def _labeled_to_region_tensors(self, labeled, num_features):
         """Vectorized bounding-box extraction for every labeled region at once.
 
+        Per-label min/max coordinates via `scatter_reduce_` (segmented
+        reduction, `O(H*W + num_features)` memory) -- not a `[num_
+        features, H*W]` one-hot membership matrix (`GPUPatchify3D`'s own
+        3D analog hit a real `torch.OutOfMemoryError` from exactly this
+        pattern, `O(num_features * D*H*W)` memory exploding at real image
+        scale -- silently fine on the small synthetic images every prior
+        test used; this 2D version has the identical latent issue, fixed
+        here too even though it hadn't yet been observed to OOM for real).
+
         Args:
             labeled: `[H, W]` long tensor, 0 = background.
             num_features: Number of non-zero labels.
@@ -556,17 +565,21 @@ class GPUPatchify2D(torch.nn.Module):
             )
 
         flat = labeled.reshape(-1)
-        label_ids = torch.arange(1, num_features + 1, dtype=torch.long, device=device)
-        membership = (flat.unsqueeze(0) == label_ids.unsqueeze(1))  # [K, H*W]
 
         row_idx = torch.arange(H, device=device).repeat_interleave(W)
         col_idx = torch.arange(W, device=device).repeat(H)
         INF = max(H, W) + 1
 
-        rows_min = torch.where(membership, row_idx.unsqueeze(0), torch.full_like(row_idx.unsqueeze(0), INF)).min(dim=1).values
-        rows_max = torch.where(membership, row_idx.unsqueeze(0), torch.zeros_like(row_idx.unsqueeze(0))).max(dim=1).values
-        cols_min = torch.where(membership, col_idx.unsqueeze(0), torch.full_like(col_idx.unsqueeze(0), INF)).min(dim=1).values
-        cols_max = torch.where(membership, col_idx.unsqueeze(0), torch.zeros_like(col_idx.unsqueeze(0))).max(dim=1).values
+        def bounds(idx):
+            idx_f = idx.float()
+            lo = torch.full((num_features + 1,), float(INF), device=device, dtype=torch.float32)
+            hi = torch.zeros(num_features + 1, device=device, dtype=torch.float32)
+            lo.scatter_reduce_(0, flat, idx_f, reduce="amin", include_self=True)
+            hi.scatter_reduce_(0, flat, idx_f, reduce="amax", include_self=True)
+            return lo[1:], hi[1:]  # drop index 0 (background)
+
+        rows_min, rows_max = bounds(row_idx)
+        cols_min, cols_max = bounds(col_idx)
 
         x0s = torch.where(cols_min != 0, cols_min - 1, cols_min).float()
         x1s = cols_max.float()
@@ -1240,6 +1253,16 @@ class GPUPatchify3D(torch.nn.Module):
         axis order (`(x,y,z)` -> `(W,H,D)`) so `_serialize_batch` can use
         these bounds directly with no axis reordering.
 
+        Per-label min/max coordinates via `scatter_reduce_` (segmented
+        reduction, `O(D*H*W + num_features)` memory) -- not a `[num_
+        features, D*H*W]` one-hot membership matrix (a real bug this
+        replaced: `torch.OutOfMemoryError: HIP out of memory. Tried to
+        allocate 64.00 GiB`, hit on a real Frontier run of `basic_ct/
+        unetr`'s do_gpu_ap:True cell, `O(num_features * D*H*W)` memory
+        exploding at real image scale -- silently fine on the small
+        synthetic volumes every prior test used, catastrophic on a real
+        256^3 volume's finest level, where both factors are large).
+
         Args:
             labeled: `[D, H, W]` long tensor, 0 = background.
             num_features: Number of non-zero labels.
@@ -1260,8 +1283,6 @@ class GPUPatchify3D(torch.nn.Module):
             )
 
         flat = labeled.reshape(-1)
-        label_ids = torch.arange(1, num_features + 1, dtype=torch.long, device=device)
-        membership = (flat.unsqueeze(0) == label_ids.unsqueeze(1))  # [K, D*H*W]
 
         depth_idx = torch.arange(D, device=device).repeat_interleave(H * W)
         row_idx = torch.arange(H, device=device).repeat_interleave(W).repeat(D)
@@ -1269,9 +1290,12 @@ class GPUPatchify3D(torch.nn.Module):
         INF = max(D, H, W) + 1
 
         def bounds(idx):
-            lo = torch.where(membership, idx.unsqueeze(0), torch.full_like(idx.unsqueeze(0), INF)).min(dim=1).values
-            hi = torch.where(membership, idx.unsqueeze(0), torch.zeros_like(idx.unsqueeze(0))).max(dim=1).values
-            return lo, hi
+            idx_f = idx.float()
+            lo = torch.full((num_features + 1,), float(INF), device=device, dtype=torch.float32)
+            hi = torch.zeros(num_features + 1, device=device, dtype=torch.float32)
+            lo.scatter_reduce_(0, flat, idx_f, reduce="amin", include_self=True)
+            hi.scatter_reduce_(0, flat, idx_f, reduce="amax", include_self=True)
+            return lo[1:], hi[1:]  # drop index 0 (background)
 
         depth_min, depth_max = bounds(depth_idx)
         rows_min, rows_max = bounds(row_idx)

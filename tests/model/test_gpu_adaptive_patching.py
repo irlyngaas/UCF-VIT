@@ -398,3 +398,49 @@ def test_serialize_batch_multi_channel_does_not_scramble_channels():
         ch0_expected = 10.0 if (x < 8 and y < 8) else 20.0 if (x >= 8 and y < 8) else 30.0 if (x < 8 and y >= 8) else 40.0
         assert torch.allclose(seq_img[0, 0, i], torch.full_like(seq_img[0, 0, i], ch0_expected), atol=1e-4)
         assert torch.allclose(seq_img[0, 1, i], torch.full_like(seq_img[0, 1, i], ch0_expected * 10), atol=1e-4)
+
+
+def test_labeled_to_region_tensors_scales_to_many_regions():
+    """2D analog of GPUPatchify3D's own identically-named regression test
+    -- that class's own `_labeled_to_region_tensors` hit a real `torch.
+    OutOfMemoryError` on Frontier from an `[num_features, D*H*W]` one-hot
+    membership matrix; this class had the identical latent `[num_features,
+    H*W]` pattern, fixed here too even though it hadn't yet been observed
+    to OOM for real. Calls `_labeled_to_region_tensors` directly with 256
+    distinct regions (16x16 grid of 4x4 blocks in a 64-square image) --
+    the largest region count any test in this file uses, specifically to
+    catch a regression back to an O(num_features * H*W) approach.
+    Correctness checked against an independent, brute-force per-label
+    min/max (not the class's own formula reused).
+    """
+    p = GPUPatchify2D(img_size=(64, 64), fixed_length=4, interp_size=4, min_size=2)
+
+    H = W = 64
+    bs = 4
+    n_per_axis = 16
+    labeled = torch.zeros(H, W, dtype=torch.long)
+    label = 1
+    label_to_block = {}
+    for hi in range(n_per_axis):
+        for wi in range(n_per_axis):
+            labeled[hi*bs:(hi+1)*bs, wi*bs:(wi+1)*bs] = label
+            label_to_block[label] = (hi, wi)
+            label += 1
+    num_features = label - 1
+    assert num_features == n_per_axis ** 2  # 256
+
+    result = p._labeled_to_region_tensors(labeled, num_features)
+
+    for lbl, (hi, wi) in label_to_block.items():
+        idx = lbl - 1
+        coords = (labeled == lbl).nonzero(as_tuple=False)
+        h_lo, h_hi = coords[:, 0].min().item(), coords[:, 0].max().item()
+        w_lo, w_hi = coords[:, 1].min().item(), coords[:, 1].max().item()
+
+        expected_y0 = h_lo - 1 if h_lo != 0 else h_lo
+        expected_x0 = w_lo - 1 if w_lo != 0 else w_lo
+
+        assert result.y0s[idx].item() == expected_y0
+        assert result.y1s[idx].item() == h_hi
+        assert result.x0s[idx].item() == expected_x0
+        assert result.x1s[idx].item() == w_hi

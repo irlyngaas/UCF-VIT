@@ -6475,3 +6475,62 @@ nothing).
 
 **Verification:** full local suite (`pytest tests/ --ignore=tests/
 distributed`) passes, 500 passed / 2 skipped, no regressions.
+
+## Fixed a real Frontier `OutOfMemoryError` in `GPUPatchify2D`/`GPUPatchify3D`'s own region-detection code
+
+Job 5505235 (Tier 3b, `run_feature_matrix_smoke.py`) ran the `basic_ct-
+unetr+do_gpu_ap` cell added earlier this session for the first time ever
+on real hardware, and it crashed: `torch.OutOfMemoryError: HIP out of
+memory. Tried to allocate 64.00 GiB`, inside `GPUPatchify3D.
+_labeled_to_region_tensors`'s `bounds()` helper.
+
+**Root cause, traced directly (not guessed):** `_labeled_to_region_
+tensors` (both `GPUPatchify2D` and `GPUPatchify3D` -- the identical
+pattern existed in both) built a `[num_features, D*H*W]` (or `[num_
+features, H*W]` for 2D) one-hot **membership matrix** -- `flat.
+unsqueeze(0) == label_ids.unsqueeze(1)` -- to find each labeled region's
+min/max coordinate via `torch.where(membership, ...).min/max(dim=1)`.
+Memory cost is `O(num_features * num_voxels)`, which is trivial for every
+existing test's tiny synthetic volumes (a handful of regions, a 16-cube
+image) but explodes at real `basic_ct` scale (a 256-cube volume's finest
+`min_size`-scaled grid level, with correspondingly many regions) --
+exactly the kind of bug only a real end-to-end run at production scale
+could ever surface, which is the whole reason the new Tier 3b cell was
+worth adding.
+
+**The fix**: replaced the one-hot membership matrix with `torch.
+scatter_reduce_` (`reduce="amin"`/`"amax"`), a proper segmented reduction
+-- `O(num_voxels + num_features)` memory instead of their product. For
+each coordinate axis, scatter that axis's per-voxel index into a
+`[num_features + 1]`-sized accumulator, keyed by each voxel's own label,
+reducing via min/max as collisions land on the same label. Verified
+directly (not assumed) that this produces numerically identical results
+to the old approach on hand-built fixtures with distinctly-bounded
+regions, before touching the real class -- confirmed both value and
+correctness with `scatter_reduce_`'s own `include_self=True` semantics.
+
+**Scope**: fixed both `GPUPatchify2D` and `GPUPatchify3D` -- `GPUPatchify
+2D`'s own `_labeled_to_region_tensors` had the exact same `[num_features,
+H*W]` pattern, just never observed to OOM for real yet (2D images being
+smaller than 3D volumes at the sizes exercised so far). Left unfixed, it
+would have been a ticking time bomb for any future `do_gpu_ap:True` run
+on a large enough 2D image with enough detected regions.
+
+**Tier 1 coverage**: `test_labeled_to_region_tensors_scales_to_many_
+regions` added to both `test_gpu_adaptive_patching.py` (256 regions, a
+16x16 grid of 4x4 blocks in a 64-square image) and `test_gpu_adaptive_
+patching_3d.py` (512 regions, an 8x8x8 grid of 4x4x4 blocks in a 32-cube
+volume) -- the largest region count any test in either file uses,
+specifically to guard against a regression back to the `O(num_features *
+num_voxels)` approach. Correctness checked against an independent,
+brute-force per-label min/max (`(labeled == lbl).nonzero()`), not the
+class's own `bounds()` formula reused, so the test can't trivially pass
+by construction. Every existing test in both files (including the region-
+extraction/no-axis-transpose tests that would most likely catch a
+bounding-box regression) still passes unchanged.
+
+**Verification:** full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 502 passed / 2 skipped (2 more than the prior 500 --
+the two new tests), no regressions. Not yet re-confirmed with a real
+Frontier rerun of the `basic_ct-unetr+do_gpu_ap` cell -- that's the
+natural next step.
