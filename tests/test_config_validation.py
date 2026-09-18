@@ -274,6 +274,57 @@ def test_score_fn_invalid_value_raises_clearly():
 
 
 # ---------------------------------------------------------------------------
+# ap.canny_sigma/canny_low_threshold/canny_high_threshold -- now shared by
+# both adaptive-patching paths (previously only populated for do_gpu_ap:True;
+# always None for do_gpu_ap:False, with no way to tune Patchify/Patchify_3D's
+# own Canny scoring via config at all). canny_hysteresis_iters stays
+# do_gpu_ap:True-only -- GPUPatchify2D/3D's own dilation-based hysteresis
+# approximation has no CPU-side (SimpleITK/skimage real hysteresis) equivalent
+# to share.
+# ---------------------------------------------------------------------------
+
+
+def test_canny_sigma_and_thresholds_now_populate_for_do_gpu_ap_false():
+    # SAP_CONFIG ships do_ap:True, do_gpu_ap:False, score_fn:canny (default)
+    # -- previously ap_conf's canny_sigma/canny_low_threshold/canny_high_
+    # threshold were always None here (use_canny required do_gpu_ap:True).
+    with open(SAP_CONFIG) as f:
+        conf = yaml.load(f, Loader=yaml.FullLoader)
+    conf["ap"]["canny_sigma"] = 1.5
+    conf["ap"]["canny_low_threshold"] = 0.08
+    conf["ap"]["canny_high_threshold"] = 0.18
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    os.close(fd)
+    try:
+        with open(path, "w") as f:
+            yaml.dump(conf, f)
+        args = argparse.Namespace(config=path, pretrained_config="")
+        parsed = parse_config(args, load_balance_offline=True)
+        assert parsed["ap"]["do_gpu_ap"] is False
+        assert parsed["ap"]["canny_sigma"] == 1.5
+        assert parsed["ap"]["canny_low_threshold"] == 0.08
+        assert parsed["ap"]["canny_high_threshold"] == 0.18
+        # GPU-only -- never populated for do_gpu_ap:False, even when score_fn
+        # is "canny" and the shared keys above are explicitly set.
+        assert parsed["ap"]["canny_hysteresis_iters"] is None
+    finally:
+        os.remove(path)
+
+
+def test_canny_sigma_and_thresholds_stay_none_when_unset():
+    # No baked-in numeric default in parse.py itself (unlike ap.min_size) --
+    # omitting these from the config must keep them None, not silently
+    # retune Patchify/Patchify_3D's own already-existing class defaults for
+    # every shipped do_ap:True config that never asked for this.
+    parsed = validate_config(SAP_CONFIG)
+    assert parsed["ap"]["canny_sigma"] is None
+    assert parsed["ap"]["canny_low_threshold"] is None
+    assert parsed["ap"]["canny_high_threshold"] is None
+    assert parsed["ap"]["canny_hysteresis_iters"] is None
+
+
+# ---------------------------------------------------------------------------
 # ap.do_gpu_ap -- now dispatches between GPUPatchify2D and GPUPatchify3D on
 # data.twoD (arch.py's own dispatch), so parse.py's fixed_length congruence
 # check must do the same (mod 3/exponent 2 for 2D, mod 7/exponent 3 for 3D).

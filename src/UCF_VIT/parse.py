@@ -670,7 +670,19 @@ def parse_config(args, load_balance_offline=False):
         # wins over that default, whichever path is active.
         default_score_fn = "variance" if do_gpu_ap else "canny"
         score_fn = conf['ap'].get('score_fn', default_score_fn) if do_ap else "variance"
-        use_canny = do_gpu_ap and score_fn == 'canny'
+        # use_canny: shared by both adaptive-patching paths -- canny_sigma/
+        # canny_low_threshold/canny_high_threshold now control Patchify/
+        # Patchify_3D's own Canny scoring too (do_gpu_ap:False), not just
+        # GPUPatchify2D/3D's (do_gpu_ap:True) -- see Patchify/Patchify_3D's
+        # own canny_sigma/canny_low_threshold/canny_high_threshold docstring
+        # entries for exactly how each is consumed (a real sigma-squared-to-
+        # variance conversion for the SimpleITK-backed branches, direct
+        # pass-through everywhere else). canny_hysteresis_iters stays GPU-
+        # only below -- GPUPatchify2D/3D's own dilation-based hysteresis
+        # approximation has no CPU-side equivalent (SimpleITK/skimage do
+        # real hysteresis internally, no such knob to share).
+        use_canny = score_fn == 'canny'
+        use_gpu_canny = do_gpu_ap and use_canny
         ap_conf = {
             "do_ap": do_ap,
             "fixed_length": conf['ap']['fixed_length'] if do_ap else None,
@@ -687,10 +699,19 @@ def parse_config(args, load_balance_offline=False):
             # name predates this being usable on the CPU side too.
             "min_size": conf['ap'].get('min_size', 2) if do_ap else None,
             "score_fn": score_fn,
-            "canny_sigma": conf['ap'].get('canny_sigma', 1.0) if use_canny else None,
-            "canny_low_threshold": conf['ap'].get('canny_low_threshold', 0.1) if use_canny else None,
-            "canny_high_threshold": conf['ap'].get('canny_high_threshold', 0.2) if use_canny else None,
-            "canny_hysteresis_iters": conf['ap'].get('canny_hysteresis_iters', 2) if use_canny else None,
+            # No baked-in numeric default here (unlike min_size above) --
+            # None (unset) must reach every real consumer (get_model's own
+            # "or 1.0"/"or 0.1"/etc for GPUPatchify2D/3D, Patchify/
+            # Patchify_3D's own None-means-"use my sths/canny_thresholds
+            # default" check) so each path keeps its own already-existing,
+            # independently-tuned default when this isn't set explicitly --
+            # baking a shared default in here would silently retune every
+            # existing shipped do_ap:True config's CPU-side Canny sensitivity
+            # the first time this gate started covering do_gpu_ap:False too.
+            "canny_sigma": conf['ap'].get('canny_sigma') if use_canny else None,
+            "canny_low_threshold": conf['ap'].get('canny_low_threshold') if use_canny else None,
+            "canny_high_threshold": conf['ap'].get('canny_high_threshold') if use_canny else None,
+            "canny_hysteresis_iters": conf['ap'].get('canny_hysteresis_iters') if use_gpu_canny else None,
         }
     except KeyError:
         if dist.get_rank() == 0:
@@ -710,7 +731,17 @@ def parse_config(args, load_balance_offline=False):
         if ap_conf["do_gpu_ap"]:
             assert not ap_conf["separate_channels"], "do_gpu_ap (GPUPatchify2D) does not support separate_channels yet"
             if ap_conf["score_fn"] == "canny":
-                assert ap_conf["canny_low_threshold"] < ap_conf["canny_high_threshold"], (
+                # ap_conf's own canny_low_threshold/canny_high_threshold are
+                # None when unset (see above -- no baked-in default there,
+                # so a do_gpu_ap:False config's Patchify/Patchify_3D can
+                # keep their own defaults instead of silently inheriting
+                # GPU's). This check only fires for do_gpu_ap:True, where
+                # get_model's own "0.1"/"0.2" fallback is what actually
+                # applies when unset -- compare against that same effective
+                # default here too, rather than crashing on None < None.
+                effective_low = ap_conf["canny_low_threshold"] if ap_conf["canny_low_threshold"] is not None else 0.1
+                effective_high = ap_conf["canny_high_threshold"] if ap_conf["canny_high_threshold"] is not None else 0.2
+                assert effective_low < effective_high, (
                     "ap.canny_low_threshold must be less than ap.canny_high_threshold"
                 )
             

@@ -1,17 +1,36 @@
 """Tests for UCF_VIT.dataloaders.transform's Patchify/Patchify_3D edge detection.
 
 Patchify uses two different Canny implementations depending on `dataset`:
-cv2.Canny for "imagenet"/"catsdogs" (real, already-uint8 photos, possibly
-multi-channel -- unchanged by this session's work), and skimage.feature.canny
-for everything else (arbitrary-range float data, e.g. "basic_ct"). The old
-code assumed that float data was already normalized to exactly [0,1] before
-scaling to cv2.Canny's required 8-bit range (`(img*255).astype(np.uint8)`) --
-silently wrong (wastes dynamic range, or clips) whenever that assumption
-doesn't hold. skimage.feature.canny operates on the real float values
-directly, no scaling/casting needed -- but it only accepts single-channel 2D
-input, unlike cv2.Canny, which silently combines multi-channel gradients; a
-regression test below confirms the non-photo path raises a clear error for
-multi-channel input rather than silently mishandling it.
+per-channel SimpleITK.CannyEdgeDetection, summed into a per-pixel edge count,
+for "imagenet"/"catsdogs" (real, possibly multi-channel photos), and
+skimage.feature.canny for everything else (arbitrary-range float data, e.g.
+"basic_ct"). The imagenet/catsdogs path used to call cv2.Canny directly --
+replaced because cv2.Canny's own multi-channel handling is a per-pixel
+"winner take all" across channels (each pixel's edge decision comes from
+whichever single channel has the largest local gradient magnitude there,
+discarding the other channels' gradients at that pixel entirely, confirmed
+by reading cv2's own C++ source, modules/imgproc/src/canny.cpp) -- a real,
+coarse simplification that doesn't generalize well to channels with
+different physical scales/meanings (tolerable for RGB's similarly-scaled
+channels, not for arbitrary multi-channel data). The per-channel-count
+scheme this switched to is the same convention Patchify_3D already uses
+(SimpleITK.CannyEdgeDetection doesn't support multi-channel/vector images
+directly either way, so a per-channel loop was already required there).
+Each channel is independently min-max normalized to [0,1] before Canny runs
+(edge-detection input only, real patch content untouched) so the shared
+canny_thresholds default stays meaningful regardless of a dataset's real
+intensity range (imagenet/catsdogs are uint8 [0,255], not the ~[0,1] scale
+canny_thresholds otherwise assumes) -- test_patchify_imagenet_branch_
+normalizes_input_before_canny below is the direct regression test.
+
+An earlier code version assumed float data was already normalized to
+exactly [0,1] before scaling to cv2.Canny's required 8-bit range
+(`(img*255).astype(np.uint8)`) -- silently wrong (wastes dynamic range, or
+clips) whenever that assumption doesn't hold. skimage.feature.canny operates
+on the real float values directly, no scaling/casting needed -- but it only
+accepts single-channel 2D input; a regression test below confirms the
+non-photo path raises a clear error for multi-channel input rather than
+silently mishandling it.
 
 Patchify_3D was rewritten again since then, replacing its earlier per-slice
 cv2.Sobel/cv2.Canny pipeline (archived at
@@ -28,6 +47,10 @@ voxel flagged as an edge on more channels) is unchanged in spirit --
 test_patchify_3d_weights_by_channel_agreement checks it directly. The old
 pipeline's separate Sobel-direction-consistency gate was dropped entirely
 (not reimplemented in 3D) -- see Patchify_3D's own docstring for why.
+Its own edge-detection-input normalization (originally scoped to "sst"
+only, its raw CFD fields being in arbitrary physical units) now runs
+unconditionally for every dataset, not just "sst" -- see test_patchify_3d_
+normalizes_input_before_canny_for_every_dataset below.
 """
 
 import random
@@ -45,15 +68,104 @@ def _box_image(H=64, W=64, low=0.0, high=1.0):
     return img
 
 
-def test_patchify_imagenet_branch_uses_cv2_canny_unchanged():
-    # Real uint8 photo-like image, possibly multi-channel -- untouched by
-    # this change; sanity-checks it still runs and detects a real edge.
+def test_patchify_imagenet_branch_uses_per_channel_simpleitk_canny():
+    """Real uint8 photo-like image, 3 identical channels -- confirms the
+    per-channel SimpleITK.CannyEdgeDetection loop actually runs (detects a
+    real edge) and that its per-pixel edge *count* behaves as designed:
+    since every channel here is byte-identical, each pixel's count must be
+    either 0 (no channel flags it) or exactly num_channels (every channel
+    agrees) -- never some in-between value, which would mean the per-
+    channel loop isn't summing independent per-channel results correctly.
+    """
     img = np.stack([_box_image(low=0, high=255).astype(np.uint8)] * 3, axis=-1)  # (H, W, 3)
-    p = Patchify(sths=[3], fixed_length=16, cannys=[50, 100], interp_size=8, num_channels=3, dataset="imagenet", return_edges=True)
+    p = Patchify(sths=[3], fixed_length=16, interp_size=8, num_channels=3, dataset="imagenet", return_edges=True)
 
     _, _, _, _, edges = p(img)
 
     assert edges.sum() > 0
+    assert set(np.unique(edges)).issubset({0, 3})
+
+
+def test_patchify_imagenet_branch_normalizes_input_before_canny():
+    """canny_thresholds' default assumes ~[0,1]-scale input -- imagenet/
+    catsdogs images are real uint8 [0,255], so without per-channel min-max
+    normalization (see forward()'s own comment) the default thresholds
+    would be meaningless on this raw scale (gradients ~255x too large,
+    likely degenerately all-edge or no-edge). A real, clean box edge here
+    (low=0, high=255) must still cleanly detect an edge with the unscaled
+    default thresholds, confirming normalization actually ran.
+    """
+    img = _box_image(low=0, high=255).astype(np.uint8)[:, :, None]  # (H, W, 1)
+    p = Patchify(sths=[3], fixed_length=16, interp_size=8, num_channels=1, dataset="catsdogs", return_edges=True)
+
+    _, _, _, _, edges = p(img)
+
+    assert edges.sum() > 0
+
+
+# ---------------------------------------------------------------------------
+# canny_sigma/canny_low_threshold/canny_high_threshold -- the same shared
+# ap.canny_sigma/ap.canny_low_threshold/ap.canny_high_threshold config knobs
+# UCF_VIT.model.gpu_adaptive_patching.GPUPatchify2D/GPUPatchify3D's own Canny
+# scoring already exposes, now also consumed by Patchify/Patchify_3D (see
+# UCF_VIT.parse's own comment for why this is now shared, and why canny_
+# hysteresis_iters deliberately isn't).
+# ---------------------------------------------------------------------------
+
+
+def test_patchify_canny_sigma_squares_for_simpleitk_branch_not_skimage():
+    # imagenet/catsdogs (SimpleITK.CannyEdgeDetection's own "variance", not
+    # sigma) -- canny_sigma must be squared (ITK's own variance-vs-sigma
+    # convention). Every other dataset (skimage.feature.canny's own real
+    # sigma) -- used directly, no conversion.
+    p_photo = Patchify(canny_sigma=2.0, num_channels=1, dataset="imagenet")
+    assert p_photo.sths == [4.0]
+
+    p_other = Patchify(canny_sigma=2.0, num_channels=1, dataset="basic_ct")
+    assert p_other.sths == [2.0]
+
+
+def test_patchify_canny_sigma_none_leaves_sths_untouched():
+    p = Patchify(sths=[7, 9], canny_sigma=None, num_channels=1, dataset="imagenet")
+    assert p.sths == [7, 9]
+
+
+def test_patchify_canny_thresholds_override_requires_both():
+    p_both = Patchify(canny_low_threshold=0.2, canny_high_threshold=0.4, num_channels=1, dataset="imagenet")
+    assert p_both.canny_thresholds == (0.2, 0.4)
+
+    # Only one given -- override doesn't apply, falls back to the class default.
+    p_only_low = Patchify(canny_low_threshold=0.2, canny_thresholds=(0.05, 0.15), num_channels=1, dataset="imagenet")
+    assert p_only_low.canny_thresholds == (0.05, 0.15)
+
+
+def test_patchify_canny_sigma_and_thresholds_actually_used_end_to_end():
+    """Not just attribute-level -- confirms the overridden values actually
+    drive a real forward() call (a fixed, fresh canny_sigma=1.0/thresholds
+    close to Patchify_3D's own class defaults, real edge still detected).
+    """
+    img = _box_image(low=0, high=255).astype(np.uint8)[:, :, None]
+    p = Patchify(fixed_length=16, interp_size=8, num_channels=1, dataset="catsdogs",
+                 canny_sigma=1.0, canny_low_threshold=0.05, canny_high_threshold=0.15, return_edges=True)
+
+    _, _, _, _, edges = p(img)
+
+    assert edges.sum() > 0
+
+
+def test_patchify_3d_canny_sigma_squares_unconditionally():
+    # Patchify_3D is always SimpleITK-backed -- canny_sigma always squares,
+    # regardless of dataset.
+    p = Patchify_3D(canny_sigma=3.0, num_channels=1, dataset="basic_ct")
+    assert p.sths == [9.0]
+
+
+def test_patchify_3d_canny_thresholds_override_requires_both():
+    p_both = Patchify_3D(canny_low_threshold=0.2, canny_high_threshold=0.4, num_channels=1, dataset="basic_ct")
+    assert p_both.canny_thresholds == (0.2, 0.4)
+
+    p_only_high = Patchify_3D(canny_high_threshold=0.4, canny_thresholds=(0.05, 0.15), num_channels=1, dataset="basic_ct")
+    assert p_only_high.canny_thresholds == (0.05, 0.15)
 
 
 def test_patchify_non_photo_branch_handles_arbitrary_float_range():
@@ -323,7 +435,7 @@ def test_patchify_multi_channel_reshape_does_not_scramble_channels():
 
     # sths=[0]: random (image-content-independent) edge map, so the tree still
     # splits into multiple real leaf nodes even though the image itself is flat.
-    p = Patchify(sths=[0], fixed_length=fixed_length, cannys=[50, 100], interp_size=4, num_channels=C, dataset="imagenet")
+    p = Patchify(sths=[0], fixed_length=fixed_length, interp_size=4, num_channels=C, dataset="imagenet")
     seq_img, seq_size, seq_pos, qdt = p(img)
 
     assert seq_img.shape == (C, fixed_length, 4 * 4)
@@ -421,72 +533,53 @@ def test_patchify_3d_profile_defaults_to_false_and_prints_nothing():
     assert p.profile is False
 
 
-def test_patchify_3d_sst_normalizes_only_edge_detection_input_not_real_patch_content():
-    """"sst"'s raw CFD fields are in arbitrary physical units, not the
-    ~[0,1] scale canny_thresholds assumes (true for basic_ct only because
-    it's min-max normalized once at file-read time -- see this class's own
-    docstring). dataset:"sst" must locally, per-channel min-max normalize
-    only the array fed into CannyEdgeDetection -- confirmed here by
-    checking it reproduces the exact same edge map a manually
-    pre-normalized [0,1] volume gets on the default (non-"sst") path --
-    while leaving the real patch content (seq_img, what the model actually
-    trains against) at the real, un-normalized physical values.
+def test_patchify_3d_normalizes_only_edge_detection_input_not_real_patch_content():
+    """canny_thresholds assumes a ~[0,1] scale -- normalization keeps that
+    meaningful regardless of a volume's real intensity range, for any
+    dataset (not just "sst", whose raw CFD fields are in arbitrary
+    physical units, the case this was originally built for). Confirmed
+    here by checking a raw, far-outside-[0,1] volume reproduces the exact
+    same edge map a manually pre-normalized [0,1] copy of it gets --
+    while leaving the real patch content (seq_img, what the model
+    actually trains against) at the real, un-normalized physical values.
     """
     D = H = W = 16
     raw_vol = np.full((D, H, W, 1), 500.0, dtype=np.float32)
     raw_vol[6:10, :, :, 0] = 800.0  # a real step, but far outside [0,1]
     normalized_vol = (raw_vol - raw_vol.min()) / (raw_vol.max() - raw_vol.min())  # same shape, values in {0.0, 1.0}
 
-    kwargs = dict(sths=[0.5], fixed_length=8, canny_thresholds=(0.05, 0.15), interp_size=4, num_channels=1, return_edges=True)
-    seq_img_sst, _, _, _, edges_sst_raw = Patchify_3D(dataset="sst", **kwargs)(raw_vol)
-    _, _, _, _, edges_manually_normalized = Patchify_3D(dataset="basic_ct", **kwargs)(normalized_vol)
+    kwargs = dict(sths=[0.5], fixed_length=8, canny_thresholds=(0.05, 0.15), interp_size=4, num_channels=1, dataset="basic_ct", return_edges=True)
+    seq_img_raw, _, _, _, edges_raw = Patchify_3D(**kwargs)(raw_vol)
+    _, _, _, _, edges_pre_normalized = Patchify_3D(**kwargs)(normalized_vol)
 
-    np.testing.assert_array_equal(edges_sst_raw, edges_manually_normalized)
-    assert edges_sst_raw.sum() > 0  # sanity: the step was actually detected, not just identically absent
+    np.testing.assert_array_equal(edges_raw, edges_pre_normalized)
+    assert edges_raw.sum() > 0  # sanity: the step was actually detected, not just identically absent
     # The real patch content -- what the model actually trains against --
     # must still be the real, un-normalized physical values (500/800), not
     # the [0,1]-rescaled proxy only used internally for edge detection.
-    real_values = set(np.unique(seq_img_sst))
+    real_values = set(np.unique(seq_img_raw))
     assert real_values <= {500.0, 800.0}
     assert not (real_values <= {0.0, 1.0})
 
 
-def test_patchify_3d_non_sst_dataset_unaffected():
-    """Regression test: adding the "sst" branch must not change any other
-    dataset's edge-detection input -- basic_ct (and everything else) keeps
-    operating on the array exactly as given, no local renormalization.
-    """
-    D = H = W = 16
-    vol = np.full((D, H, W, 1), 500.0, dtype=np.float32)
-    vol[6:10, :, :, 0] = 800.0
-
-    kwargs = dict(sths=[0.5], fixed_length=8, canny_thresholds=(0.05, 0.15), interp_size=4, num_channels=1, return_edges=True)
-    _, _, _, _, edges_basic_ct = Patchify_3D(dataset="basic_ct", **kwargs)(vol)
-    _, _, _, _, edges_sst = Patchify_3D(dataset="sst", **kwargs)(vol)
-
-    # Real gradient (300) easily clears canny_thresholds either way, but the
-    # two datasets' *edge maps* still shouldn't be forced identical by
-    # construction -- basic_ct sees the raw 500/800 values, sst sees them
-    # rescaled to 0/1 -- this just confirms basic_ct's own path wasn't
-    # touched by adding the sst-specific branch (still detects the real
-    # step it's always detected).
-    assert edges_basic_ct.sum() > 0
-
-
-def test_patchify_3d_sst_detects_edge_too_small_for_raw_scale():
-    """Direct demonstration of the actual failure mode this fixes: a real
-    physical step whose raw magnitude (0.001) is far below
-    canny_thresholds' own lower bound (0.05) -- undetectable without
-    normalization, easily detectable once rescaled to use the full [0,1]
-    range.
+def test_patchify_3d_normalizes_input_before_canny_for_every_dataset():
+    """Direct demonstration of the actual failure mode normalization
+    fixes, for any dataset, not just "sst": a real step whose raw
+    magnitude (0.001) is far below canny_thresholds' own lower bound
+    (0.05) -- undetectable without normalization, easily detectable once
+    rescaled to use the full [0,1] range. Checked against "basic_ct"
+    specifically (its own edge-detection input was never normalized
+    before this change) and "sst" (already normalized before this change)
+    to confirm both now behave identically -- normalization is no longer
+    scoped by dataset name.
     """
     D = H = W = 16
     vol = np.zeros((D, H, W, 1), dtype=np.float32)
     vol[6:10, :, :, 0] = 0.001  # real step, but ~50x smaller than the lower threshold
 
     kwargs = dict(sths=[0.5], fixed_length=8, canny_thresholds=(0.05, 0.15), interp_size=4, num_channels=1, return_edges=True)
-    _, _, _, _, edges_unnormalized = Patchify_3D(dataset="basic_ct", **kwargs)(vol)
+    _, _, _, _, edges_basic_ct = Patchify_3D(dataset="basic_ct", **kwargs)(vol)
     _, _, _, _, edges_sst = Patchify_3D(dataset="sst", **kwargs)(vol)
 
-    assert edges_unnormalized.sum() == 0  # real edge, missed entirely at raw scale
-    assert edges_sst.sum() > 0  # same real edge, found once rescaled
+    assert edges_basic_ct.sum() > 0  # real edge, now found regardless of dataset
+    assert edges_sst.sum() > 0

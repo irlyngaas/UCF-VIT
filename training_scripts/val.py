@@ -129,6 +129,9 @@ def main():
                 profile_dataloader = val_conf["trainer"]["profile_dataloader"],
                 score_fn = val_conf["ap"]["score_fn"],
                 min_size = val_conf["ap"]["min_size"],
+                canny_sigma = val_conf["ap"]["canny_sigma"],
+                canny_low_threshold = val_conf["ap"]["canny_low_threshold"],
+                canny_high_threshold = val_conf["ap"]["canny_high_threshold"],
             )
 
             data_module.setup()
@@ -160,7 +163,7 @@ def main():
             val_list = sorted(glob.glob(os.path.join(val_conf["data"]["dict_root_dirs"][dkey_val],'*.jpg')))
             val_list = slice_file_list(val_list, val_conf["dataloader"]["dict_start_idx"][dkey_val], val_conf["dataloader"]["dict_end_idx"][dkey_val])
 
-            val_data = val_conf["dataloader"]["dataset_module"](val_list, val_conf["data"]["dict_in_variables"][dkey_val], val_conf["data"]["tile_size"], adaptive_patching=val_conf["ap"]["do_ap"], fixed_length=val_conf["ap"]["fixed_length"], interp_size=val_conf["data"]["interp_size"], num_channels=val_conf["data"]["num_channels"][dkey_val], dataset=val_conf["data"]["dataset"], resize=val_conf["dataset_options"]["resize"].get(val_conf["data"]["dataset"]), div=val_conf["tiling"]["div"], tile_overlap=val_conf["tiling"]["tile_overlap"], score_fn=val_conf["ap"]["score_fn"], min_size=val_conf["ap"]["min_size"])
+            val_data = val_conf["dataloader"]["dataset_module"](val_list, val_conf["data"]["dict_in_variables"][dkey_val], val_conf["data"]["tile_size"], adaptive_patching=val_conf["ap"]["do_ap"], fixed_length=val_conf["ap"]["fixed_length"], interp_size=val_conf["data"]["interp_size"], num_channels=val_conf["data"]["num_channels"][dkey_val], dataset=val_conf["data"]["dataset"], resize=val_conf["dataset_options"]["resize"].get(val_conf["data"]["dataset"]), div=val_conf["tiling"]["div"], tile_overlap=val_conf["tiling"]["tile_overlap"], score_fn=val_conf["ap"]["score_fn"], min_size=val_conf["ap"]["min_size"], canny_sigma=val_conf["ap"]["canny_sigma"], canny_low_threshold=val_conf["ap"]["canny_low_threshold"], canny_high_threshold=val_conf["ap"]["canny_high_threshold"])
 
             # Same reasoning as train.py's own DistributedSampler construction.
             val_sampler = torch.utils.data.distributed.DistributedSampler(val_data, shuffle=False, num_replicas=val_conf["parallelism"]["data_par_size"],rank=dist.get_rank(ddp_group))

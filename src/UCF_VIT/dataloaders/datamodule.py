@@ -177,6 +177,18 @@ class NativePytorchDataModule(torch.nn.Module):
             patching transform will ever produce -- forwarded to
             `Patchify`/`Patchify_3D`'s own `min_size`, when
             `adaptive_patching` is True.
+        canny_sigma (float, optional): Forwarded to `Patchify`/`Patchify_3D`'s
+            own `canny_sigma`, when `adaptive_patching` is True -- the same
+            `ap.canny_sigma` config knob `UCF_VIT.model.gpu_adaptive_
+            patching.GPUPatchify2D`/`GPUPatchify3D`'s own Canny scoring
+            uses, shared here rather than being GPU-only. `None` (default)
+            leaves `Patchify`/`Patchify_3D`'s own smoothing default
+            untouched.
+        canny_low_threshold (float, optional): Forwarded to `Patchify`/
+            `Patchify_3D`'s own `canny_low_threshold`, when
+            `adaptive_patching` is True -- see `canny_sigma` above; must be
+            given together with `canny_high_threshold` to take effect.
+        canny_high_threshold (float, optional): See `canny_low_threshold`.
         data_par_size (int, optional): the size of the data parallelism
         dataset (str, optional): Dataset name, e.g. "imagenet" or "basic_ct"; determines how
             files are listed and how samples are processed/collated.
@@ -279,6 +291,9 @@ class NativePytorchDataModule(torch.nn.Module):
         profile_dataloader: bool = False,
         score_fn: str = "canny",
         min_size: int = 2,
+        canny_sigma: Optional[float] = None,
+        canny_low_threshold: Optional[float] = None,
+        canny_high_threshold: Optional[float] = None,
     ):
         """Initializes the data module and builds the per-dataset file listings.
 
@@ -321,6 +336,9 @@ class NativePytorchDataModule(torch.nn.Module):
         self.separate_channels = separate_channels
         self.score_fn = score_fn
         self.min_size = min_size
+        self.canny_sigma = canny_sigma
+        self.canny_low_threshold = canny_low_threshold
+        self.canny_high_threshold = canny_high_threshold
         self.data_par_size = data_par_size
         self.ddp_group = ddp_group
         self.dataset = dataset
@@ -498,6 +516,9 @@ class NativePytorchDataModule(torch.nn.Module):
                 profile=self.profile_dataloader,
                 score_fn=self.score_fn,
                 min_size=self.min_size,
+                canny_sigma=self.canny_sigma,
+                canny_low_threshold=self.canny_low_threshold,
+                canny_high_threshold=self.canny_high_threshold,
             )
         else:
             dict_data_train[k] = ProcessChannels(
@@ -541,6 +562,9 @@ class NativePytorchDataModule(torch.nn.Module):
                 profile=self.profile_dataloader,
                 score_fn=self.score_fn,
                 min_size=self.min_size,
+                canny_sigma=self.canny_sigma,
+                canny_low_threshold=self.canny_low_threshold,
+                canny_high_threshold=self.canny_high_threshold,
             )
         return dict_data_train
         

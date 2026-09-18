@@ -595,7 +595,7 @@ class ProcessChannels(IterableDataset):
     with the same quadtree/octree used for the image).
     """
 
-    def __init__(self, dataset, num_channels: int, batch_size: int, return_label: bool, adaptive_patching: bool, separate_channels: bool, interp_size: int, fixed_length: int, twoD: bool, _dataset: str, return_qdt: bool, profile: bool = False, score_fn: str = "canny", min_size: int = 2) -> None:
+    def __init__(self, dataset, num_channels: int, batch_size: int, return_label: bool, adaptive_patching: bool, separate_channels: bool, interp_size: int, fixed_length: int, twoD: bool, _dataset: str, return_qdt: bool, profile: bool = False, score_fn: str = "canny", min_size: int = 2, canny_sigma=None, canny_low_threshold=None, canny_high_threshold=None) -> None:
         """Initializes the batching buffer and, if needed, the adaptive-patching transform.
 
         Args:
@@ -627,6 +627,11 @@ class ProcessChannels(IterableDataset):
             min_size: Smallest leaf side length the adaptive-patching
                 transform will ever produce -- forwarded to `Patchify`/
                 `Patchify_3D`'s own `min_size`.
+            canny_sigma: Forwarded to `Patchify`/`Patchify_3D`'s own
+                `canny_sigma` -- see their own docstring entries.
+            canny_low_threshold: Forwarded to `Patchify`/`Patchify_3D`'s own
+                `canny_low_threshold` -- see their own docstring entries.
+            canny_high_threshold: See `canny_low_threshold`.
         """
         super().__init__()
         self.dataset = dataset
@@ -644,14 +649,14 @@ class ProcessChannels(IterableDataset):
         if self.adaptive_patching:
             if self.separate_channels:
                 if self.twoD:
-                    self.patchify = Patchify(fixed_length=fixed_length, interp_size=interp_size, num_channels=1, dataset=self._dataset, score_fn=self.score_fn, min_size=self.min_size)
+                    self.patchify = Patchify(fixed_length=fixed_length, interp_size=interp_size, num_channels=1, dataset=self._dataset, score_fn=self.score_fn, min_size=self.min_size, canny_sigma=canny_sigma, canny_low_threshold=canny_low_threshold, canny_high_threshold=canny_high_threshold)
                 else:
-                    self.patchify = Patchify_3D(fixed_length=fixed_length, interp_size=interp_size, num_channels=1, dataset=self._dataset, profile=profile, score_fn=self.score_fn, min_size=self.min_size)
+                    self.patchify = Patchify_3D(fixed_length=fixed_length, interp_size=interp_size, num_channels=1, dataset=self._dataset, profile=profile, score_fn=self.score_fn, min_size=self.min_size, canny_sigma=canny_sigma, canny_low_threshold=canny_low_threshold, canny_high_threshold=canny_high_threshold)
             else:
                 if self.twoD:
-                    self.patchify = Patchify(fixed_length=fixed_length, interp_size=interp_size, num_channels=num_channels, dataset=self._dataset, score_fn=self.score_fn, min_size=self.min_size)
+                    self.patchify = Patchify(fixed_length=fixed_length, interp_size=interp_size, num_channels=num_channels, dataset=self._dataset, score_fn=self.score_fn, min_size=self.min_size, canny_sigma=canny_sigma, canny_low_threshold=canny_low_threshold, canny_high_threshold=canny_high_threshold)
                 else:
-                    self.patchify = Patchify_3D(fixed_length=fixed_length, interp_size=interp_size, num_channels=num_channels, dataset=self._dataset, profile=profile, score_fn=self.score_fn, min_size=self.min_size)
+                    self.patchify = Patchify_3D(fixed_length=fixed_length, interp_size=interp_size, num_channels=num_channels, dataset=self._dataset, profile=profile, score_fn=self.score_fn, min_size=self.min_size, canny_sigma=canny_sigma, canny_low_threshold=canny_low_threshold, canny_high_threshold=canny_high_threshold)
 
     def __iter__(self):
         """Buffers `self.batch_size` upstream samples, then yields them one by one, patchified if configured.

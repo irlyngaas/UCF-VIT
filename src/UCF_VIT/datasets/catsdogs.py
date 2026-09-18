@@ -58,7 +58,7 @@ class CatsDogsDataset(Dataset):
     image.
     """
 
-    def __init__(self, file_list, variables, tile_size, twoD = True, adaptive_patching = False, fixed_length=196, interp_size=16, num_channels=3, dataset="catsdogs", resize=None, div=1, tile_overlap=(0, 0), score_fn="canny", min_size=2):
+    def __init__(self, file_list, variables, tile_size, twoD = True, adaptive_patching = False, fixed_length=196, interp_size=16, num_channels=3, dataset="catsdogs", resize=None, div=1, tile_overlap=(0, 0), score_fn="canny", min_size=2, canny_sigma=None, canny_low_threshold=None, canny_high_threshold=None):
         """Initializes the dataset over a list of image file paths.
 
         Args:
@@ -95,6 +95,13 @@ class CatsDogsDataset(Dataset):
                 transform will ever produce -- forwarded to `Patchify`/
                 `Patchify_3D`'s own `min_size`, when `adaptive_patching` is
                 True.
+            canny_sigma: Forwarded to `Patchify`/`Patchify_3D`'s own
+                `canny_sigma`, when `adaptive_patching` is True -- see
+                their own docstring entries.
+            canny_low_threshold: Forwarded to `Patchify`/`Patchify_3D`'s own
+                `canny_low_threshold`, when `adaptive_patching` is True --
+                see their own docstring entries.
+            canny_high_threshold: See `canny_low_threshold`.
         """
         self.file_list = file_list
         self.variables = variables
@@ -122,9 +129,9 @@ class CatsDogsDataset(Dataset):
 
         if self.adaptive_patching:
             if self.twoD:
-                self.patchify = Patchify(fixed_length=fixed_length, interp_size=interp_size, num_channels=num_channels, dataset=self.dataset, score_fn=self.score_fn, min_size=self.min_size)
+                self.patchify = Patchify(fixed_length=fixed_length, interp_size=interp_size, num_channels=num_channels, dataset=self.dataset, score_fn=self.score_fn, min_size=self.min_size, canny_sigma=canny_sigma, canny_low_threshold=canny_low_threshold, canny_high_threshold=canny_high_threshold)
             else:
-                self.patchify = Patchify_3D(fixed_length=fixed_length, interp_size=interp_size, num_channels=num_channels, dataset=self.dataset, score_fn=self.score_fn, min_size=self.min_size)
+                self.patchify = Patchify_3D(fixed_length=fixed_length, interp_size=interp_size, num_channels=num_channels, dataset=self.dataset, score_fn=self.score_fn, min_size=self.min_size, canny_sigma=canny_sigma, canny_low_threshold=canny_low_threshold, canny_high_threshold=canny_high_threshold)
 
     def __len__(self):
         """Returns the number of (file, tile) samples in the dataset.

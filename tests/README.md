@@ -6246,3 +6246,188 @@ distributed`) passes, 492 passed / 2 skipped (one more than the prior
 491 -- this cell's own new parametrized `test_feature_matrix_smoke_
 helpers.py` case). Not yet confirmed with a real Frontier rerun of `run_
 feature_matrix_smoke.py` -- that's the natural next step.
+
+## Switched `Patchify`'s `imagenet`/`catsdogs` Canny path off `cv2.Canny`, onto per-channel `SimpleITK.CannyEdgeDetection`
+
+Investigated at the user's own request, after they asked why the CPU
+adaptive-patching path uses `cv2.Canny` for 2D and `SimpleITK.
+CannyEdgeDetection` for 3D, and whether `cv2`'s own multi-channel handling
+had real accuracy tradeoffs. Confirmed directly against OpenCV's real C++
+source (`modules/imgproc/src/canny.cpp`, `parallelCanny::operator()`, two
+independent fetches of the same file): `cv2.Canny`'s multi-channel
+handling is a per-pixel **argmax across channels** -- for each pixel, it
+computes a separate Sobel gradient per channel, then picks whichever
+single channel has the largest magnitude *at that exact pixel* and uses
+only that channel's gradient for every downstream step (NMS, threshold,
+hysteresis), discarding the other channels' gradients entirely there. Not
+a joint/combined gradient -- winner-take-all. Tolerable for RGB (similar
+per-channel scales), not something that generalizes to arbitrary
+multi-channel data with different physical units/scales (which is exactly
+the axis the user cares about beyond RGB photos).
+
+**The fix**: `Patchify`'s `imagenet`/`catsdogs` branch now runs
+`SimpleITK.CannyEdgeDetection` once per channel and sums the results into
+a per-pixel edge *count* -- the same "weight a pixel by how many channels
+independently flag it as an edge" convention `Patchify_3D` already uses
+(forced on it anyway, since `SimpleITK.CannyEdgeDetection` doesn't support
+multi-channel/vector images directly either way). Each channel is
+independently min-max normalized to `[0,1]` before Canny runs (edge-
+detection input only, real patch content untouched) so the shared
+`canny_thresholds` default stays meaningful regardless of a dataset's
+real intensity range (`imagenet`/`catsdogs` are uint8 `[0,255]`, not the
+`~[0,1]` scale `canny_thresholds` otherwise assumes).
+
+**The normalization step itself was generalized, not just added**:
+`Patchify_3D`'s own edge-detection-input normalization used to be scoped
+to `dataset == "sst"` only (its raw CFD fields being in arbitrary physical
+units) -- the same justification applies to *any* dataset whose raw scale
+isn't already near `[0,1]`, so the `if dataset == "sst":` guard was
+removed entirely; normalization now runs unconditionally, for every
+dataset, in both `Patchify` (the new `imagenet`/`catsdogs` branch) and
+`Patchify_3D`. `cv2` remains a real, imported dependency elsewhere in this
+codebase regardless of this change (`cv.resize`, used for real image/patch
+resizing) -- this change couldn't have dropped it as a dependency either
+way.
+
+**A real, measured tradeoff, not hand-waved**: benchmarked directly (not
+assumed) on a synthetic 256x256x3 image, the exact size `imagenet/
+classification`'s shipped config resizes to -- `cv2.Canny` (old): ~0.6ms/
+call; the new per-channel `SimpleITK.CannyEdgeDetection` loop: ~15.5ms/
+call, a ~25x slowdown. That config ships `num_workers:1, batch_size:32`,
+so one worker doing this serially per sample is roughly 20ms -> ~500ms of
+Canny-only cost per batch. Committed anyway at the user's explicit
+direction (the algorithmic correctness gain was judged worth it), with
+this tradeoff documented directly in `Patchify`'s own class docstring:
+`cv2.Canny` remains a real, faster option worth reaching for specifically
+as a last resort if this ever becomes a genuine dataloader-throughput
+bottleneck in practice -- not the default, because of the winner-take-all
+issue above.
+
+**Test impact**: `test_patchify_imagenet_branch_uses_cv2_canny_unchanged`
+rewritten as `test_patchify_imagenet_branch_uses_per_channel_simpleitk_
+canny` (now asserts a real per-channel-count property: 3 byte-identical
+channels must produce a count of exactly 0 or 3 per pixel, never in
+between) plus a new `test_patchify_imagenet_branch_normalizes_input_
+before_canny`. `Patchify_3D`'s own `test_patchify_3d_sst_normalizes_only_
+edge_detection_input_not_real_patch_content`/`test_patchify_3d_non_sst_
+dataset_unaffected`/`test_patchify_3d_sst_detects_edge_too_small_for_raw_
+scale` (all premised on `"sst"` normalizing and `"basic_ct"` not)
+rewritten to reflect every dataset now normalizing identically --
+`test_patchify_3d_non_sst_dataset_unaffected`'s own premise (adding "sst"
+normalization mustn't touch other datasets) is fully obsolete now that
+normalization isn't dataset-scoped at all, so it was replaced rather than
+patched.
+
+**Verification:** full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 492 passed / 2 skipped, no regressions.
+
+## Shared `ap.canny_sigma`/`canny_low_threshold`/`canny_high_threshold` between the CPU and GPU adaptive-patching paths
+
+Follow-up ask, prompted by noticing these three config keys already exist
+in every shipped config (added for `do_gpu_ap:True`'s own `GPUPatchify2D`/
+`GPUPatchify3D` Canny scoring) but had no effect at all on the CPU path
+(`Patchify`/`Patchify_3D`, `do_gpu_ap:False`) -- asked whether the same
+knobs could control both. `canny_hysteresis_iters` was deliberately left
+out of this sharing: it's specific to `GPUPatchify2D`/`GPUPatchify3D`'s
+own dilation-based hysteresis *approximation* -- `SimpleITK`/`skimage` do
+real hysteresis internally on the CPU side, with no equivalent knob to
+share.
+
+**The mechanism**: `Patchify`/`Patchify_3D` gain three new optional
+constructor parameters -- `canny_sigma`, `canny_low_threshold`,
+`canny_high_threshold` -- all `None` by default, meaning "leave my own
+existing `sths`/`canny_thresholds` defaults untouched." When `canny_sigma`
+is given, it overrides `sths` with a *single* fixed value (no more per-
+call randomization) -- for `Patchify_3D` and `Patchify`'s `imagenet`/
+`catsdogs` branch (both `SimpleITK`-backed), converted to `SimpleITK.
+CannyEdgeDetection`'s own `variance` parameter as `canny_sigma ** 2` (ITK's
+real Gaussian variance-vs-sigma convention, confirmed against `Discrete
+GaussianImageFilter`'s own docs before assuming it -- `CannyEdgeDetection
+ImageFilter` reuses that same filter for its smoothing internally); for
+`Patchify`'s `skimage.feature.canny` branch, used directly as `sigma` (no
+conversion needed, already the same meaning `GPUPatchify2D`'s own `canny_
+sigma` uses). When both `canny_low_threshold`/`canny_high_threshold` are
+given, they override `canny_thresholds` directly (`canny_quantiles`,
+`skimage`'s own quantile-based threshold, is deliberately not
+overridable this way -- a genuinely different kind of threshold, no
+shared knob makes sense there).
+
+`parse.py`'s own gate (`use_canny`) changed from `do_gpu_ap and score_fn
+== 'canny'` to just `score_fn == 'canny'` (`score_fn` can only be
+`"canny"` when `do_ap` is already `True`, so no separate `do_ap` check
+needed) -- `canny_hysteresis_iters` keeps its own, narrower `do_gpu_ap`-
+gated check. The three shared keys' *baked-in numeric defaults* were
+removed from `parse.py` entirely (bare `conf['ap'].get(key)`, `None` when
+unset) -- deliberately, so each backend keeps its own already-tuned
+default when a config doesn't set these explicitly, rather than parse.py
+silently imposing one shared default on both. Threaded through the full
+real call chain: `training_scripts/train.py` (both the `NativePytorch
+DataModule` and `dataset_module`/`CatsDogsDataset`-style construction
+sites), `val.py`, `test.py` -> `NativePytorchDataModule` -> `ProcessChannels`
+-> `Patchify`/`Patchify_3D`, and `CatsDogsDataset` -> `Patchify`/
+`Patchify_3D` directly.
+
+**Two real bugs found by actually testing this, not assumed safe:**
+
+1. **10 shipped configs would have been silently retuned.** `configs/
+   basic_ct/sap/base_config.yaml`, `configs/sst/unetr/adaptive_config.
+   yaml`, and 8 files under `configs/unetr_token_selection_experiment/`
+   all have `do_ap:True, do_gpu_ap:False` *and* already carried explicit
+   `canny_sigma: 1.0`/`canny_low_threshold: 0.1`/`canny_high_threshold:
+   0.2` values in their YAML -- written purely for `do_gpu_ap:True`
+   discoverability (a "not used here" comment, shown so it's easy to find
+   if you turn `do_gpu_ap` on), never meant to actually govern these
+   configs' real CPU-side Canny behavior. Once `use_canny` stopped
+   requiring `do_gpu_ap:True`, those previously-inert values would have
+   started silently overriding `Patchify`/`Patchify_3D`'s own randomized-
+   smoothing class defaults with a fixed value, and their own class
+   `canny_thresholds` default (`(0.05, 0.15)`) with `(0.1, 0.2)` -- a real
+   training-behavior change to 10 real configs, caught by a test written
+   against the real `SAP_CONFIG` (`test_canny_sigma_and_thresholds_stay_
+   none_when_unset`), not by inspection. Fixed by removing those 3 keys
+   from all 10 files (confirmed via a script scanning every shipped
+   config for `do_ap:True, do_gpu_ap:False` with a non-`None` `canny_
+   sigma`/`canny_low_threshold`) -- restores their exact original
+   behavior, while leaving the new shared mechanism itself fully
+   available to any config (these 10 included) that deliberately wants to
+   opt in going forward. The remaining 13 configs that still carry these
+   keys are all `do_ap:False` baselines (no behavior risk at all, `use_
+   canny` never fires when `do_ap` is `False`) -- their now-inaccurate
+   "GPU path only" comment text was updated to describe the shared
+   reality instead, purely a documentation fix.
+2. **`parse.py`'s own `do_gpu_ap:True` validation crashed on `None <
+   None`.** Removing `canny_low_threshold`/`canny_high_threshold`'s
+   baked-in parse.py defaults (see above) broke an existing assertion,
+   `assert ap_conf["canny_low_threshold"] < ap_conf["canny_high_
+   threshold"]`, gated behind `do_gpu_ap:True` -- a real `TypeError`
+   (`'<' not supported between instances of 'NoneType' and 'NoneType'`)
+   the moment a `do_gpu_ap:True` config left these unset, caught by the
+   existing `test_do_gpu_ap_works_on_a_real_3d_config`/`test_do_gpu_ap_3d_
+   fixed_length_congruence_uses_modulus_7_not_3` tests actually failing,
+   not by inspection. Fixed by comparing against the same effective
+   defaults (`0.1`/`0.2`) `model/utils.py`'s own `get_model` already
+   applies downstream, computed locally for this one comparison -- `ap_
+   conf` itself still stores `None` when unset, so `Patchify`/`Patchify_
+   3D`'s own independent "unset means use my own default" logic is
+   unaffected.
+
+**Tier 1 coverage**: `test_config_validation.py` gains `test_canny_sigma_
+and_thresholds_now_populate_for_do_gpu_ap_false` (explicit values now
+reach `ap_conf` for a `do_gpu_ap:False` config, `canny_hysteresis_iters`
+stays `None` regardless) and `test_canny_sigma_and_thresholds_stay_none_
+when_unset` (the real regression test against `SAP_CONFIG`, above).
+`test_transform.py` gains direct unit tests on `Patchify`/`Patchify_3D`'s
+new parameters: `canny_sigma` squares for the `SimpleITK`-backed branches,
+passes through unsquared for `skimage`; `None` leaves `sths` untouched;
+`canny_low_threshold`/`canny_high_threshold` only override together, never
+partially; plus one end-to-end `forward()` smoke test per class confirming
+the overridden values actually drive a real Canny call, not just get
+stored as attributes.
+
+**Verification:** full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 500 passed / 2 skipped, no regressions. `test_
+config_validation.py`'s own `test_shipped_config_parses` (parses every
+real config under `configs/`) confirmed green after both the 10-file key
+removal and the 13-file comment update. Not yet confirmed with a real
+Frontier training run exercising an explicit `canny_sigma`/`canny_low_
+threshold` override on either path -- that's the natural next step.

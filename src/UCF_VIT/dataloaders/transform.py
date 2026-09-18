@@ -2,7 +2,6 @@ import os
 import time
 
 import numpy as np
-import cv2 as cv
 import torch
 import random
 import SimpleITK as sitk
@@ -54,39 +53,71 @@ class Patchify(torch.nn.Module):
     variable-sized patches concentrated around detected edges.
 
     Uses two different Canny implementations depending on `dataset`:
-    `imagenet`/`catsdogs` (real, already-uint8 `[0,255]` photos, possibly
-    multi-channel) use `cv2.Canny` directly. Every other dataset (arbitrary-range
-    float data, e.g. `basic_ct`) uses `skimage.feature.canny` instead, which
-    operates on the real float values directly with no `[0,1]`-normalized
-    scaling/casting to `cv2.Canny`'s required 8-bit range needed. The tradeoff:
-    `skimage.feature.canny` only accepts single-channel 2D input (unlike
-    `cv2.Canny`, which combines multi-channel gradients), so `imagenet`/`catsdogs`
-    (real multi-channel photos) keep `cv2.Canny`.
+    `imagenet`/`catsdogs` (real, possibly multi-channel photos) run
+    `SimpleITK.CannyEdgeDetection` once per channel and sum the results into
+    a per-pixel edge count -- the same "weight a pixel by how many channels
+    independently flag it as an edge" convention `Patchify_3D` already uses,
+    since `SimpleITK.CannyEdgeDetection` doesn't support multi-channel/vector
+    images directly either. This deliberately replaces an earlier `cv2.Canny`
+    call: `cv2.Canny`'s own multi-channel handling is a per-pixel "winner
+    take all" (each pixel's edge decision comes from whichever single
+    channel has the largest gradient magnitude there, discarding the other
+    channels' gradients entirely at that pixel) -- a real, coarse
+    simplification that doesn't generalize well to channels with different
+    physical scales/meanings (fine-ish for RGB's similarly-scaled channels,
+    not for arbitrary multi-channel data). Every other dataset
+    (arbitrary-range float data, e.g. `basic_ct`) uses `skimage.feature.canny`
+    instead, which operates on the real float values directly via quantile
+    (not absolute) thresholds, dataset-scale-independent by construction;
+    its own tradeoff is accepting only single-channel 2D input.
+
+    Measured directly (not assumed): the per-channel `SimpleITK.
+    CannyEdgeDetection` loop is roughly 25x slower per call than the old
+    `cv2.Canny` call on a synthetic 256x256x3 image (~15.5ms vs ~0.6ms) --
+    real, worth knowing if this ever becomes a dataloader-throughput
+    bottleneck (`cv2` stays a real, imported dependency elsewhere in this
+    codebase regardless, for `cv.resize`). If that ever becomes a genuine
+    problem in practice, `cv2.Canny` remains a faster option worth
+    reaching for specifically as a last resort -- its own per-pixel
+    "winner take all" multi-channel simplification (see above) is the
+    reason it isn't the default here: fine-ish for RGB, not something that
+    generalizes correctly to arbitrary multi-channel data with differently
+    scaled channels.
     """
 
-    def __init__(self, sths=[0,1,3,5], fixed_length=196, cannys=[50, 100], canny_quantiles=(0.7, 0.9), interp_size=16, num_channels=3, dataset="imagenet", return_edges=False, score_fn="canny", min_size=2) -> None:
+    def __init__(self, sths=[0,1,3,5], fixed_length=196, canny_thresholds=(0.05, 0.15), canny_quantiles=(0.7, 0.9), interp_size=16, num_channels=3, dataset="imagenet", return_edges=False, score_fn="canny", min_size=2, canny_sigma=None, canny_low_threshold=None, canny_high_threshold=None) -> None:
         """Initializes the randomization ranges and patch parameters for the transform.
 
         Args:
             sths: Candidate Gaussian smoothing strengths to randomly choose from
                 before edge detection (0 = no smoothing, use uniform random noise
                 as the edge map instead). For `imagenet`/`catsdogs`
-                (`cv2.GaussianBlur`), a kernel size (odd integer); for every
-                other dataset (`skimage.feature.canny`'s own `sigma`), a
-                standard deviation (float) -- these aren't numerically
-                equivalent, so pass different values for a `dataset` that isn't
-                `imagenet`/`catsdogs`. Unused when `score_fn="variance"`.
+                (`SimpleITK.CannyEdgeDetection`'s own `variance` parameter,
+                replicated across both axes), not numerically equivalent to
+                a standard deviation -- same caveat as `Patchify_3D`'s own
+                `sths`. For every other dataset (`skimage.feature.canny`'s
+                own `sigma`), a real standard deviation (float). Unused when
+                `score_fn="variance"` or `canny_sigma` is given (see below).
             fixed_length: Fixed number of patches the image is serialized into.
-            cannys: `imagenet`/`catsdogs` only (`cv2.Canny`): `[low, high)`
-                range of absolute lower thresholds to randomly choose from; the
-                corresponding upper threshold is `low + 50`. Unused when
-                `score_fn="variance"`.
+            canny_thresholds: `imagenet`/`catsdogs` only
+                (`SimpleITK.CannyEdgeDetection`): `(low, high)` hysteresis
+                thresholds -- absolute values on the (smoothed) gradient-
+                magnitude scale, not quantiles, matching `Patchify_3D`'s own
+                `canny_thresholds`. Meaningful across any dataset's real
+                intensity range because each channel is independently
+                min-max normalized to `[0, 1]` before Canny runs (see
+                `forward`'s own comment) -- starting values, not empirically
+                tuned. Unused when `score_fn="variance"` or `canny_low_
+                threshold`/`canny_high_threshold` are given (see below).
             canny_quantiles: Every other dataset only (`skimage.feature.canny`,
                 `use_quantiles=True`): `(low, high)` hysteresis thresholds, as
                 quantiles of the edge-magnitude distribution in `[0, 1]` --
-                dataset-scale-independent by construction, unlike `cannys`'
-                absolute values. Starting values, not empirically tuned.
-                Unused when `score_fn="variance"`.
+                dataset-scale-independent by construction, unlike
+                `canny_thresholds`' absolute values. Starting values, not
+                empirically tuned. Unused when `score_fn="variance"`. Not
+                overridable by `canny_low_threshold`/`canny_high_threshold`
+                (see below) -- a genuinely different kind of threshold
+                (quantile, not absolute), no shared knob makes sense here.
             interp_size: Side length each (square) leaf patch is interpolated to.
             num_channels: Number of image channels.
             dataset: Dataset name; controls how edges are computed/normalized
@@ -104,12 +135,40 @@ class Patchify(torch.nn.Module):
                 produce -- forwarded to its own `min_size`, the same shared
                 floor `UCF_VIT.model.gpu_adaptive_patching.GPUPatchify2D`
                 uses for its GPU-side equivalent.
+            canny_sigma: If given, overrides `sths` with this single fixed
+                value (no per-call randomization) -- the same `ap.
+                canny_sigma` config knob `UCF_VIT.model.gpu_adaptive_
+                patching.GPUPatchify2D`'s own Canny scoring already exposes,
+                shared here rather than being GPU-only. For `imagenet`/
+                `catsdogs`, converted to `SimpleITK.CannyEdgeDetection`'s own
+                `variance` parameter as `canny_sigma ** 2` (ITK's own
+                Gaussian variance-vs-sigma convention, confirmed against
+                `DiscreteGaussianImageFilter`'s own docs -- `CannyEdge
+                DetectionImageFilter` reuses that same filter for its
+                smoothing) -- for every other dataset, used directly as
+                `skimage.feature.canny`'s own `sigma` (already the same
+                meaning as `GPUPatchify2D`'s `canny_sigma`, no conversion
+                needed). `None` (default) leaves `sths` -- and its per-call
+                randomization -- untouched.
+            canny_low_threshold: If given together with `canny_high_
+                threshold`, overrides `canny_thresholds` with `(canny_low_
+                threshold, canny_high_threshold)` -- the same shared `ap.
+                canny_low_threshold` config knob as `GPUPatchify2D`'s own
+                Canny scoring. Only affects `imagenet`/`catsdogs`
+                (`canny_thresholds`' own consumer) -- `None` (default)
+                leaves `canny_thresholds` untouched. Not numerically
+                guaranteed equivalent across the GPU and CPU Canny
+                implementations even at the same threshold value (different
+                gradient-computation algorithms can produce gradient
+                magnitudes on different absolute scales for the same real
+                edge strength) -- shared as one convenient knob, not a
+                claim of identical sensitivity.
+            canny_high_threshold: See `canny_low_threshold` -- both must be
+                given together to take effect.
         """
         super().__init__()
 
-        self.sths = sths
         self.fixed_length = fixed_length
-        self.cannys = [x for x in range(cannys[0], cannys[1], 1)]
         self.canny_quantiles = canny_quantiles
         self.interp_size = interp_size
         self.num_channels = num_channels
@@ -117,6 +176,17 @@ class Patchify(torch.nn.Module):
         self.return_edges = return_edges
         self.score_fn = score_fn
         self.min_size = min_size
+
+        if canny_sigma is not None:
+            squared = canny_sigma ** 2 if dataset in ("imagenet", "catsdogs") else canny_sigma
+            self.sths = [squared]
+        else:
+            self.sths = sths
+
+        if canny_low_threshold is not None and canny_high_threshold is not None:
+            self.canny_thresholds = (canny_low_threshold, canny_high_threshold)
+        else:
+            self.canny_thresholds = canny_thresholds
 
     def forward(self, img):  # we assume inputs are always structured like this
         """Computes an edge map (or, in variance mode, uses `img` directly) and adaptively patchifies it via a quadtree.
@@ -152,8 +222,6 @@ class Patchify(torch.nn.Module):
         # Do some transformations. Here, we're just passing though the input
 
         self.smooth_factor = random.choice(self.sths)
-        c = random.choice(self.cannys)
-        self.canny = [c, c+50]
         if self.smooth_factor == 0:
             if self.dataset == "imagenet" or self.dataset == "catsdogs":
                 edges = np.random.uniform(low=0,high=1,size=(img.shape[0],img.shape[1]))
@@ -161,16 +229,45 @@ class Patchify(torch.nn.Module):
                 edges = np.random.uniform(low=np.min(img),high=np.max(img),size=(img.shape[0],img.shape[1]))
         else:
             if self.dataset == "imagenet" or self.dataset == "catsdogs":
-                grey_img = cv.GaussianBlur(img, (self.smooth_factor, self.smooth_factor), 0)
-                edges = cv.Canny(grey_img, self.canny[0], self.canny[1])
+                # One real 2D Canny call per channel (SimpleITK.CannyEdgeDetection
+                # doesn't support multi-channel/vector images directly), summed
+                # into a per-pixel count of how many channels independently flag
+                # it as an edge -- Patchify_3D's own convention, replacing an
+                # earlier cv2.Canny call whose own multi-channel handling was a
+                # per-pixel "winner take all" across channels instead (see this
+                # class's own docstring for why that's a real simplification,
+                # not just a style difference).
+                variance = [float(self.smooth_factor)] * 2
+                edges_combined_counter = np.zeros(img.shape[:2], dtype=np.uint8)
+                for j in range(self.num_channels):
+                    channel = img[:, :, j].astype(np.float32)
+                    # Per-channel min-max normalized to [0,1] before Canny --
+                    # keeps canny_thresholds meaningful regardless of this
+                    # image's real intensity range (imagenet/catsdogs are
+                    # uint8 [0,255], not the ~[0,1] scale canny_thresholds
+                    # assumes) -- edge-detection input only, real patch
+                    # content (img, fed to self._serialize below) is
+                    # untouched.
+                    lo, hi = channel.min(), channel.max()
+                    if hi > lo:
+                        channel = (channel - lo) / (hi - lo)
+                    channel_img = sitk.GetImageFromArray(channel)
+                    channel_edges = sitk.CannyEdgeDetection(
+                        channel_img,
+                        lowerThreshold=self.canny_thresholds[0], upperThreshold=self.canny_thresholds[1],
+                        variance=variance,
+                    )
+                    edges_combined_counter += sitk.GetArrayFromImage(channel_edges).astype(np.uint8)
+                edges = edges_combined_counter
             else:
                 if img.ndim == 3:
                     if img.shape[-1] != 1:
                         raise NotImplementedError(
                             f"Patchify's skimage.feature.canny path (dataset={self.dataset!r}) only "
                             f"supports single-channel input, got {img.shape[-1]} channels -- "
-                            "cv2.Canny (used for imagenet/catsdogs) combines multi-channel gradients "
-                            "internally, skimage.feature.canny doesn't."
+                            "the imagenet/catsdogs path (per-channel SimpleITK.CannyEdgeDetection, "
+                            "summed into an edge count) supports any channel count, "
+                            "skimage.feature.canny doesn't."
                         )
                     img_2d = img[:, :, 0]
                 else:
@@ -232,10 +329,14 @@ class Patchify_3D(torch.nn.Module):
 
     `SimpleITK.CannyEdgeDetection` doesn't support multi-channel/vector images
     directly, so edge detection runs per channel and the results are combined
-    by the weighting above rather than in a single multi-channel call.
+    by the weighting above rather than in a single multi-channel call. Each
+    channel is independently min-max normalized to `[0, 1]` before Canny runs
+    (edge-detection input only, real patch content untouched) -- keeps
+    `canny_thresholds` meaningful regardless of this volume's real intensity
+    range, for any dataset.
     """
 
-    def __init__(self, sths=[0.5,1.0,2.0], fixed_length=196, canny_thresholds=(0.05, 0.15), interp_size=16, num_channels=3, dataset="basic_ct", return_edges=False, profile=False, score_fn="canny", min_size=2) -> None:
+    def __init__(self, sths=[0.5,1.0,2.0], fixed_length=196, canny_thresholds=(0.05, 0.15), interp_size=16, num_channels=3, dataset="basic_ct", return_edges=False, profile=False, score_fn="canny", min_size=2, canny_sigma=None, canny_low_threshold=None, canny_high_threshold=None) -> None:
         """Initializes the randomization ranges and patch parameters for the transform.
 
         Args:
@@ -247,27 +348,25 @@ class Patchify_3D(torch.nn.Module):
                 pipeline). Note: `variance`, not standard deviation (sigma)
                 -- not numerically equivalent to this parameter's old
                 meaning, needs its own tuning regardless. Unused when
-                `score_fn="variance"`.
+                `score_fn="variance"` or `canny_sigma` is given (see below).
             fixed_length: Fixed number of patches the volume is serialized into.
             canny_thresholds: `(low, high)` hysteresis thresholds for
                 `SimpleITK.CannyEdgeDetection` -- absolute values on the
                 (smoothed) gradient-magnitude scale, not quantiles (unlike
                 `Patchify`'s `canny_quantiles`) -- SimpleITK has no
-                quantile-threshold option. Starting values, not empirically
-                tuned; assumes roughly `[0,1]`-scale input intensities
-                (matches this repo's own min-max-normalized `basic_ct`
-                loading). Unused when `score_fn="variance"`.
+                quantile-threshold option. Meaningful across any dataset's
+                real intensity range because each channel is independently
+                min-max normalized to `[0, 1]` before Canny runs (see
+                `forward`'s own comment) -- starting values, not empirically
+                tuned. Unused when `score_fn="variance"` or `canny_low_
+                threshold`/`canny_high_threshold` are given (see below).
             interp_size: Side length each (cubic) leaf patch is interpolated to.
             num_channels: Number of volume channels.
-            dataset: Dataset name. Mostly kept for interface compatibility
-                with `Patchify`, except for `"sst"`: its raw CFD fields are
-                in arbitrary physical units, not the ~[0,1] scale
-                `canny_thresholds` assumes (true for `basic_ct` only
-                because it's min-max normalized once at file-read time) --
-                `"sst"` gets its edge-detection input (only -- not the real
-                patch content) locally, per-channel min-max normalized
-                instead. Every other dataset's behavior is unaffected.
-                Unused when `score_fn="variance"`.
+            dataset: Dataset name -- kept for interface parity with
+                `Patchify`'s own constructor, but no longer read anywhere in
+                this class: edge-detection input normalization (see
+                `canny_thresholds` above) now runs unconditionally for every
+                dataset, not just `"sst"` (its own previous special case).
             return_edges: If True, also return the computed edge volume from
                 `forward`. When `score_fn="variance"`, the "edge volume" is
                 `img` itself (see `forward`'s own docstring).
@@ -291,12 +390,32 @@ class Patchify_3D(torch.nn.Module):
                 produce -- forwarded to its own `min_size`, the same shared
                 floor `UCF_VIT.model.gpu_adaptive_patching.GPUPatchify3D`
                 uses for its GPU-side equivalent.
+            canny_sigma: If given, overrides `sths` with this single fixed
+                value (no per-call randomization), converted to `SimpleITK.
+                CannyEdgeDetection`'s own `variance` parameter as `canny_
+                sigma ** 2` (ITK's own Gaussian variance-vs-sigma
+                convention) -- the same `ap.canny_sigma` config knob
+                `UCF_VIT.model.gpu_adaptive_patching.GPUPatchify3D`'s own
+                Canny scoring already exposes, shared here rather than
+                being GPU-only. `None` (default) leaves `sths` -- and its
+                per-call randomization -- untouched.
+            canny_low_threshold: If given together with `canny_high_
+                threshold`, overrides `canny_thresholds` with `(canny_low_
+                threshold, canny_high_threshold)` -- the same shared `ap.
+                canny_low_threshold` config knob as `GPUPatchify3D`'s own
+                Canny scoring. `None` (default) leaves `canny_thresholds`
+                untouched. Not numerically guaranteed equivalent across the
+                GPU and CPU Canny implementations even at the same
+                threshold value (different gradient-computation algorithms
+                can produce gradient magnitudes on different absolute
+                scales for the same real edge strength) -- shared as one
+                convenient knob, not a claim of identical sensitivity.
+            canny_high_threshold: See `canny_low_threshold` -- both must be
+                given together to take effect.
         """
         super().__init__()
 
-        self.sths = sths
         self.fixed_length = fixed_length
-        self.canny_thresholds = canny_thresholds
         self.interp_size = interp_size
         self.num_channels = num_channels
         self.dataset = dataset
@@ -304,6 +423,12 @@ class Patchify_3D(torch.nn.Module):
         self.profile = profile
         self.score_fn = score_fn
         self.min_size = min_size
+
+        self.sths = [canny_sigma ** 2] if canny_sigma is not None else sths
+        if canny_low_threshold is not None and canny_high_threshold is not None:
+            self.canny_thresholds = (canny_low_threshold, canny_high_threshold)
+        else:
+            self.canny_thresholds = canny_thresholds
 
     def forward(self, img):  # we assume inputs are always structured like this
         """Computes a 3D edge volume for `img` (or, in variance mode, uses `img` directly) and adaptively patchifies it via an octree.
@@ -360,21 +485,17 @@ class Patchify_3D(torch.nn.Module):
         edges_combined_counter = np.zeros(img.shape[:3], dtype=np.uint8)
         for j in range(self.num_channels):
             channel = img[:, :, :, j].astype(np.float32)
-            if self.dataset == "sst":
-                # "sst"'s raw CFD fields (density/velocity/pressure) are in
-                # arbitrary physical units, not the ~[0,1] scale
-                # canny_thresholds assumes (see this class's own docstring
-                # -- true for basic_ct because it's min-max normalized once
-                # at file-read time, not true here at all). Normalizing
-                # *only* this edge-detection input, per channel, keeps the
-                # existing thresholds meaningful without touching the real
-                # patch content below (octree.serialize still gets `img`
-                # unmodified, so the model trains on real physical values,
-                # not a renormalized proxy). Scoped to "sst" specifically --
-                # every other dataset's edge-detection input is unchanged.
-                lo, hi = channel.min(), channel.max()
-                if hi > lo:
-                    channel = (channel - lo) / (hi - lo)
+            # Per-channel min-max normalized to [0,1] before Canny -- keeps
+            # canny_thresholds meaningful regardless of this dataset's real
+            # intensity scale (matters most for "sst"'s arbitrary physical
+            # units, a near-no-op for "basic_ct", already close to [0,1]
+            # from its own file-read-time normalization). Edge-detection
+            # input only (octree.serialize below still gets `img` unmodified,
+            # so the model trains on real values, not a renormalized proxy)
+            # -- unconditional across every dataset, not scoped by name.
+            lo, hi = channel.min(), channel.max()
+            if hi > lo:
+                channel = (channel - lo) / (hi - lo)
             channel_img = sitk.GetImageFromArray(channel)
             channel_edges = sitk.CannyEdgeDetection(
                 channel_img,
