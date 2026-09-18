@@ -134,11 +134,15 @@ FEATURE_MATRIX = [
     # goes through a real model/train.py end to end (forward+backward+
     # optimizer step+checkpoint save/resume, process_batch's own broadcast-
     # then-redundantly-patchify design all working together for real), which
-    # this cell closes. One representative cell is enough here: unlike
-    # do_ap, do_gpu_ap has no hard model-type restriction in parse.py/
-    # arch.py (no SAP-requires/DiffusionVIT-forbids equivalent), so this
-    # isn't proving a free choice per model type, just that the on-device
-    # path itself works end to end.
+    # these cells close. One cell per dimensionality (2D and 3D) -- not
+    # "one representative cell overall" the way do_ap's own free-model-type
+    # cells above are scoped: GPUPatchify2D/GPUPatchify3D are genuinely
+    # different classes/code paths (2D grid_sample vs 5D, 4-direction Canny
+    # NMS vs 13-direction, etc.), each worth its own real-hardware exercise.
+    # do_gpu_ap itself has no hard model-type restriction in parse.py/
+    # arch.py (no SAP-requires/DiffusionVIT-forbids equivalent), so within
+    # each dimensionality this isn't proving a free choice per model type
+    # either, just that the on-device path itself works end to end.
     FeatureMatrixCell(
         "basic_ct/unetr/base_config.yaml", "basic_ct-unetr+do_gpu_ap",
         # interp_size:32, same reasoning as the do_ap cell above. score_fn
@@ -150,6 +154,22 @@ FEATURE_MATRIX = [
         # ends up 128 here, same as the do_ap congruence check above; (128**3
         # - 512) % 7 == 0) -- no override needed.
         {"ap": {"do_ap": True, "do_gpu_ap": True, "interp_size": 32}},
+    ),
+    FeatureMatrixCell(
+        "imagenet/classification/base_config.yaml", "imagenet-classification+do_gpu_ap",
+        # interp_size:16 matches this config's own do_ap:True cell above.
+        # score_fn explicitly overridden to "variance" here -- this config's
+        # own explicit score_fn:"canny" would otherwise win regardless of
+        # do_gpu_ap (parse.py: explicit ap.score_fn always wins over the
+        # path-dependent default). basic_ct-unetr+do_gpu_ap above already
+        # exercises GPUPatchify3D's Canny path; this cell instead exercises
+        # GPUPatchify2D's variance path -- complementary coverage across
+        # both score_fn options and both dimensionalities, not a duplicate
+        # of the 3D cell's own Canny exercise.
+        # fixed_length:196 already valid for do_gpu_ap too (real_max_blocks
+        # comes out to 128 here; (128**2 - 196) % 3 == 0) -- no override
+        # needed.
+        {"ap": {"do_ap": True, "do_gpu_ap": True, "interp_size": 16, "score_fn": "variance"}},
     ),
 
     # --- model.token_selection -- UNETR._adaptive_token_grid_index/_weights/

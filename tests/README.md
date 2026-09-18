@@ -6590,3 +6590,40 @@ no regressions. Not yet re-confirmed with a real Frontier rerun of
 `basic_ct-unetr+do_gpu_ap` -- that's the natural next step, and the
 reason to suspect (not yet confirm) this closes the cell out: two
 independent OOM sources, both now fixed with the same class of change.
+
+#### Follow-up: `basic_ct-unetr+do_gpu_ap` rerun no longer OOMs, now times out; added a 2D `do_gpu_ap` cell too
+
+Rerunning `basic_ct-unetr+do_gpu_ap` after both OOM fixes above no
+longer crashes -- it now times out instead (real progress: neither of
+the two fixed OOM sources fires anymore). Not yet root-caused -- could be
+genuinely slow (this cell now does real work no run has reached before:
+level-by-level Canny/variance scoring and `region_backend="scipy"`'s own
+CPU round-trip for connected-components labeling, once per merge level,
+against a real `256^3` volume) or a real hang; distinguishing the two
+needs a real run with a larger timeout budget, not more static analysis.
+
+Also added `imagenet-classification+do_gpu_ap`, a 2D counterpart to the
+existing 3D `basic_ct-unetr+do_gpu_ap` cell -- `GPUPatchify2D`/
+`GPUPatchify3D` are different classes with genuinely different code
+paths (2D `grid_sample` vs 5D, 4-direction Canny NMS vs 13-direction,
+etc.), so one cell per dimensionality is the right scope here, not "one
+representative cell overall" the way `do_ap`'s own free-model-type cells
+are scoped. Deliberately given `score_fn:"variance"` (overriding this
+config's own explicit `score_fn:"canny"`, which would otherwise win
+regardless of `do_gpu_ap`) so the two `do_gpu_ap` cells together cover
+both `score_fn` options across both dimensionalities, rather than
+duplicating the 3D cell's own Canny exercise. `fixed_length:196`
+(`imagenet/classification`'s own existing value) already satisfies
+`do_gpu_ap`'s congruence check for this `tile_size`/`min_size` (verified
+directly: real_max_blocks comes out to 128 here, `(128**2 - 196) % 3 ==
+0`) -- no override needed.
+
+**Verification:** the new cell's merged config confirmed to parse
+cleanly through real `parse.py`/`validate_config` (`do_gpu_ap: True`,
+`score_fn: "variance"`, `fixed_length: 196`, as expected), and `make_
+smoke_config` confirmed to run cleanly through it to this sandbox's
+expected `NoRealDataFoundError`. Full local suite (`pytest tests/
+--ignore=tests/distributed`) passes, 505 passed / 2 skipped, no
+regressions. Neither `do_gpu_ap` cell has a confirmed real Frontier pass
+yet -- the 3D cell's timeout above and this new 2D cell are both
+pending real runs.
