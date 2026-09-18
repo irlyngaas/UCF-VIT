@@ -6160,3 +6160,39 @@ diagnosed further here (would need real GPU profiling on Frontier itself,
 which this session's dev sandbox can't do). Not investigated deeper
 per the user's own direction -- flagged as an open, unresolved finding
 rather than guessed at. No code changed for this one.
+
+#### Follow-up: worked around the timeout by swapping this cell's `token_selection`, profiling left for later
+
+The user asked to change `basic_ct-unetr+do_ap`'s `token_selection` to a
+different (working) value for now, rather than block on the profiling
+work above. Overridden to `"area_weighted"` (alpha left at its default,
+`0`) -- the fastest passing sibling (`~70s`), and the most neutral choice
+(no size bias, no extra trainable parameters) as a stand-in for `"point"`
+specifically.
+
+This made the override byte-identical to the existing `+area_weighted`
+sibling cell (`{"ap": {"do_ap": True, "interp_size": 32}, "model":
+{"token_selection": "area_weighted"}}` on both) -- running both would
+just repeat the exact same training run twice, spending real Frontier
+allocation time for zero additional coverage. Removed the now-redundant
+`+area_weighted` cell rather than leave a silent duplicate; `FEATURE_
+MATRIX` drops from 5 `do_ap`-token_selection cells to 4
+(`basic_ct-unetr+do_ap`, `+smallest_overlap`, `+area_weighted_alpha`,
+`+cross_attention`).
+
+Real consequence, called out directly in both cells' own comments now:
+`"point"` -- the actual shipped default every `do_ap:True` UNETR config
+uses unless overridden -- has **no real-Frontier coverage at all** in
+this file until the profiling work above happens and either fixes its
+slowness or this cell's timeout is bumped back up specifically to cover
+it. Not a regression introduced here (the finding above already
+established `"point"` was broken/marginal on this environment) --
+just making that gap explicit rather than silently papering over it with
+a passing cell that no longer actually exercises `"point"`.
+
+**Verification:** `python -m py_compile` on the changed file; full local
+suite (`pytest tests/ --ignore=tests/distributed`) passes, 491 passed / 2
+skipped (one fewer than the prior 492 -- the removed cell's own
+parametrized `test_feature_matrix_smoke_helpers.py` case, not a
+regression). Not yet confirmed with a real Frontier rerun of `run_
+feature_matrix_smoke.py` -- that's the natural next step.
