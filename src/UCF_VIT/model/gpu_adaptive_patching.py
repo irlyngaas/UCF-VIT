@@ -170,8 +170,8 @@ class GPUPatchify2D(torch.nn.Module):
                 thresholds ("weak" edges) -- unnormalized, on whatever
                 scale `img` itself is in (same "starting values, not
                 empirically tuned" caveat as `UCF_VIT.dataloaders.
-                transform.Patchify_3D`'s own `canny_thresholds`). Only used
-                when `score_fn == "canny"`.
+                transform.Patchify_3D`'s own `canny_low_threshold`). Only
+                used when `score_fn == "canny"`.
             canny_high_threshold: Upper of the two gradient-magnitude
                 thresholds ("strong" edges). Only used when `score_fn ==
                 "canny"`.

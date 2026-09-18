@@ -85,7 +85,7 @@ class Patchify(torch.nn.Module):
     scaled channels.
     """
 
-    def __init__(self, sths=[0,1,3,5], fixed_length=196, canny_thresholds=(0.05, 0.15), canny_quantiles=(0.7, 0.9), interp_size=16, num_channels=3, dataset="imagenet", return_edges=False, score_fn="canny", min_size=2, canny_sigma=None, canny_low_threshold=None, canny_high_threshold=None) -> None:
+    def __init__(self, sths=[0,1,3,5], fixed_length=196, canny_low_threshold=None, canny_high_threshold=None, canny_quantiles=(0.7, 0.9), interp_size=16, num_channels=3, dataset="imagenet", return_edges=False, score_fn="canny", min_size=2, canny_sigma=None) -> None:
         """Initializes the randomization ranges and patch parameters for the transform.
 
         Args:
@@ -99,25 +99,39 @@ class Patchify(torch.nn.Module):
                 own `sigma`), a real standard deviation (float). Unused when
                 `score_fn="variance"` or `canny_sigma` is given (see below).
             fixed_length: Fixed number of patches the image is serialized into.
-            canny_thresholds: `imagenet`/`catsdogs` only
-                (`SimpleITK.CannyEdgeDetection`): `(low, high)` hysteresis
-                thresholds -- absolute values on the (smoothed) gradient-
-                magnitude scale, not quantiles, matching `Patchify_3D`'s own
-                `canny_thresholds`. Meaningful across any dataset's real
-                intensity range because each channel is independently
-                min-max normalized to `[0, 1]` before Canny runs (see
-                `forward`'s own comment) -- starting values, not empirically
-                tuned. Unused when `score_fn="variance"` or `canny_low_
-                threshold`/`canny_high_threshold` are given (see below).
+            canny_low_threshold: `imagenet`/`catsdogs` only
+                (`SimpleITK.CannyEdgeDetection`): lower ("weak" edge)
+                hysteresis threshold -- an absolute value on the (smoothed)
+                gradient-magnitude scale, not a quantile, matching
+                `Patchify_3D`'s own `canny_low_threshold` and the same
+                shared `ap.canny_low_threshold` config knob `UCF_VIT.model.
+                gpu_adaptive_patching.GPUPatchify2D`'s own Canny scoring
+                uses. `None` (default) resolves to `0.05` -- a starting
+                value, not empirically tuned; each of `canny_low_
+                threshold`/`canny_high_threshold` resolves independently,
+                no need to set both together. Meaningful across any
+                dataset's real intensity range because each channel is
+                independently min-max normalized to `[0, 1]` before Canny
+                runs (see `forward`'s own comment). Not numerically
+                guaranteed equivalent to `GPUPatchify2D`'s own sensitivity
+                at the same value (different gradient-computation
+                algorithms can produce gradient magnitudes on different
+                absolute scales for the same real edge strength) -- shared
+                as one convenient knob, not a claim of identical
+                sensitivity. Unused when `score_fn="variance"`.
+            canny_high_threshold: Upper ("strong" edge) hysteresis
+                threshold -- `None` (default) resolves to `0.15`; see
+                `canny_low_threshold` above.
             canny_quantiles: Every other dataset only (`skimage.feature.canny`,
                 `use_quantiles=True`): `(low, high)` hysteresis thresholds, as
                 quantiles of the edge-magnitude distribution in `[0, 1]` --
                 dataset-scale-independent by construction, unlike
-                `canny_thresholds`' absolute values. Starting values, not
-                empirically tuned. Unused when `score_fn="variance"`. Not
-                overridable by `canny_low_threshold`/`canny_high_threshold`
-                (see below) -- a genuinely different kind of threshold
-                (quantile, not absolute), no shared knob makes sense here.
+                `canny_low_threshold`/`canny_high_threshold`'s absolute
+                values. Starting values, not empirically tuned. Unused when
+                `score_fn="variance"`. Deliberately separate from `canny_
+                low_threshold`/`canny_high_threshold` -- a genuinely
+                different kind of threshold (quantile, not absolute), no
+                shared knob makes sense here.
             interp_size: Side length each (square) leaf patch is interpolated to.
             num_channels: Number of image channels.
             dataset: Dataset name; controls how edges are computed/normalized
@@ -149,26 +163,18 @@ class Patchify(torch.nn.Module):
                 `skimage.feature.canny`'s own `sigma` (already the same
                 meaning as `GPUPatchify2D`'s `canny_sigma`, no conversion
                 needed). `None` (default) leaves `sths` -- and its per-call
-                randomization -- untouched.
-            canny_low_threshold: If given together with `canny_high_
-                threshold`, overrides `canny_thresholds` with `(canny_low_
-                threshold, canny_high_threshold)` -- the same shared `ap.
-                canny_low_threshold` config knob as `GPUPatchify2D`'s own
-                Canny scoring. Only affects `imagenet`/`catsdogs`
-                (`canny_thresholds`' own consumer) -- `None` (default)
-                leaves `canny_thresholds` untouched. Not numerically
-                guaranteed equivalent across the GPU and CPU Canny
-                implementations even at the same threshold value (different
-                gradient-computation algorithms can produce gradient
-                magnitudes on different absolute scales for the same real
-                edge strength) -- shared as one convenient knob, not a
-                claim of identical sensitivity.
-            canny_high_threshold: See `canny_low_threshold` -- both must be
-                given together to take effect.
+                randomization -- untouched. No `canny_thresholds`-style
+                tuple equivalent here: unlike the thresholds above,
+                collapsing this into a single `sths`-shaped parameter would
+                lose `sths`' own real capability (a list to randomize
+                across per call), so the two stay separate mechanisms
+                rather than one parameter overriding another.
         """
         super().__init__()
 
         self.fixed_length = fixed_length
+        self.canny_low_threshold = canny_low_threshold if canny_low_threshold is not None else 0.05
+        self.canny_high_threshold = canny_high_threshold if canny_high_threshold is not None else 0.15
         self.canny_quantiles = canny_quantiles
         self.interp_size = interp_size
         self.num_channels = num_channels
@@ -182,11 +188,6 @@ class Patchify(torch.nn.Module):
             self.sths = [squared]
         else:
             self.sths = sths
-
-        if canny_low_threshold is not None and canny_high_threshold is not None:
-            self.canny_thresholds = (canny_low_threshold, canny_high_threshold)
-        else:
-            self.canny_thresholds = canny_thresholds
 
     def forward(self, img):  # we assume inputs are always structured like this
         """Computes an edge map (or, in variance mode, uses `img` directly) and adaptively patchifies it via a quadtree.
@@ -242,19 +243,19 @@ class Patchify(torch.nn.Module):
                 for j in range(self.num_channels):
                     channel = img[:, :, j].astype(np.float32)
                     # Per-channel min-max normalized to [0,1] before Canny --
-                    # keeps canny_thresholds meaningful regardless of this
-                    # image's real intensity range (imagenet/catsdogs are
-                    # uint8 [0,255], not the ~[0,1] scale canny_thresholds
-                    # assumes) -- edge-detection input only, real patch
-                    # content (img, fed to self._serialize below) is
-                    # untouched.
+                    # keeps canny_low_threshold/canny_high_threshold
+                    # meaningful regardless of this image's real intensity
+                    # range (imagenet/catsdogs are uint8 [0,255], not the
+                    # ~[0,1] scale those assume) -- edge-detection input
+                    # only, real patch content (img, fed to self._serialize
+                    # below) is untouched.
                     lo, hi = channel.min(), channel.max()
                     if hi > lo:
                         channel = (channel - lo) / (hi - lo)
                     channel_img = sitk.GetImageFromArray(channel)
                     channel_edges = sitk.CannyEdgeDetection(
                         channel_img,
-                        lowerThreshold=self.canny_thresholds[0], upperThreshold=self.canny_thresholds[1],
+                        lowerThreshold=self.canny_low_threshold, upperThreshold=self.canny_high_threshold,
                         variance=variance,
                     )
                     edges_combined_counter += sitk.GetArrayFromImage(channel_edges).astype(np.uint8)
@@ -332,11 +333,11 @@ class Patchify_3D(torch.nn.Module):
     by the weighting above rather than in a single multi-channel call. Each
     channel is independently min-max normalized to `[0, 1]` before Canny runs
     (edge-detection input only, real patch content untouched) -- keeps
-    `canny_thresholds` meaningful regardless of this volume's real intensity
-    range, for any dataset.
+    `canny_low_threshold`/`canny_high_threshold` meaningful regardless of
+    this volume's real intensity range, for any dataset.
     """
 
-    def __init__(self, sths=[0.5,1.0,2.0], fixed_length=196, canny_thresholds=(0.05, 0.15), interp_size=16, num_channels=3, dataset="basic_ct", return_edges=False, profile=False, score_fn="canny", min_size=2, canny_sigma=None, canny_low_threshold=None, canny_high_threshold=None) -> None:
+    def __init__(self, sths=[0.5,1.0,2.0], fixed_length=196, canny_low_threshold=None, canny_high_threshold=None, interp_size=16, num_channels=3, dataset="basic_ct", return_edges=False, profile=False, score_fn="canny", min_size=2, canny_sigma=None) -> None:
         """Initializes the randomization ranges and patch parameters for the transform.
 
         Args:
@@ -350,23 +351,37 @@ class Patchify_3D(torch.nn.Module):
                 meaning, needs its own tuning regardless. Unused when
                 `score_fn="variance"` or `canny_sigma` is given (see below).
             fixed_length: Fixed number of patches the volume is serialized into.
-            canny_thresholds: `(low, high)` hysteresis thresholds for
-                `SimpleITK.CannyEdgeDetection` -- absolute values on the
-                (smoothed) gradient-magnitude scale, not quantiles (unlike
+            canny_low_threshold: Lower ("weak" edge) hysteresis threshold for
+                `SimpleITK.CannyEdgeDetection` -- an absolute value on the
+                (smoothed) gradient-magnitude scale, not a quantile (unlike
                 `Patchify`'s `canny_quantiles`) -- SimpleITK has no
-                quantile-threshold option. Meaningful across any dataset's
-                real intensity range because each channel is independently
+                quantile-threshold option. The same shared `ap.canny_low_
+                threshold` config knob `UCF_VIT.model.gpu_adaptive_
+                patching.GPUPatchify3D`'s own Canny scoring uses. `None`
+                (default) resolves to `0.05` -- a starting value, not
+                empirically tuned; each of `canny_low_threshold`/`canny_
+                high_threshold` resolves independently, no need to set
+                both together. Meaningful across any dataset's real
+                intensity range because each channel is independently
                 min-max normalized to `[0, 1]` before Canny runs (see
-                `forward`'s own comment) -- starting values, not empirically
-                tuned. Unused when `score_fn="variance"` or `canny_low_
-                threshold`/`canny_high_threshold` are given (see below).
+                `forward`'s own comment). Not numerically guaranteed
+                equivalent to `GPUPatchify3D`'s own sensitivity at the
+                same value (different gradient-computation algorithms can
+                produce gradient magnitudes on different absolute scales
+                for the same real edge strength) -- shared as one
+                convenient knob, not a claim of identical sensitivity.
+                Unused when `score_fn="variance"`.
+            canny_high_threshold: Upper ("strong" edge) hysteresis
+                threshold -- `None` (default) resolves to `0.15`; see
+                `canny_low_threshold` above.
             interp_size: Side length each (cubic) leaf patch is interpolated to.
             num_channels: Number of volume channels.
             dataset: Dataset name -- kept for interface parity with
                 `Patchify`'s own constructor, but no longer read anywhere in
                 this class: edge-detection input normalization (see
-                `canny_thresholds` above) now runs unconditionally for every
-                dataset, not just `"sst"` (its own previous special case).
+                `canny_low_threshold` above) now runs unconditionally for
+                every dataset, not just `"sst"` (its own previous special
+                case).
             return_edges: If True, also return the computed edge volume from
                 `forward`. When `score_fn="variance"`, the "edge volume" is
                 `img` itself (see `forward`'s own docstring).
@@ -398,24 +413,19 @@ class Patchify_3D(torch.nn.Module):
                 `UCF_VIT.model.gpu_adaptive_patching.GPUPatchify3D`'s own
                 Canny scoring already exposes, shared here rather than
                 being GPU-only. `None` (default) leaves `sths` -- and its
-                per-call randomization -- untouched.
-            canny_low_threshold: If given together with `canny_high_
-                threshold`, overrides `canny_thresholds` with `(canny_low_
-                threshold, canny_high_threshold)` -- the same shared `ap.
-                canny_low_threshold` config knob as `GPUPatchify3D`'s own
-                Canny scoring. `None` (default) leaves `canny_thresholds`
-                untouched. Not numerically guaranteed equivalent across the
-                GPU and CPU Canny implementations even at the same
-                threshold value (different gradient-computation algorithms
-                can produce gradient magnitudes on different absolute
-                scales for the same real edge strength) -- shared as one
-                convenient knob, not a claim of identical sensitivity.
-            canny_high_threshold: See `canny_low_threshold` -- both must be
-                given together to take effect.
+                per-call randomization -- untouched. No `canny_low_
+                threshold`-style always-present-parameter equivalent here:
+                unlike the thresholds above, collapsing this into a single
+                `sths`-shaped parameter would lose `sths`' own real
+                capability (a list to randomize across per call), so the
+                two stay separate mechanisms rather than one parameter
+                overriding another.
         """
         super().__init__()
 
         self.fixed_length = fixed_length
+        self.canny_low_threshold = canny_low_threshold if canny_low_threshold is not None else 0.05
+        self.canny_high_threshold = canny_high_threshold if canny_high_threshold is not None else 0.15
         self.interp_size = interp_size
         self.num_channels = num_channels
         self.dataset = dataset
@@ -425,10 +435,6 @@ class Patchify_3D(torch.nn.Module):
         self.min_size = min_size
 
         self.sths = [canny_sigma ** 2] if canny_sigma is not None else sths
-        if canny_low_threshold is not None and canny_high_threshold is not None:
-            self.canny_thresholds = (canny_low_threshold, canny_high_threshold)
-        else:
-            self.canny_thresholds = canny_thresholds
 
     def forward(self, img):  # we assume inputs are always structured like this
         """Computes a 3D edge volume for `img` (or, in variance mode, uses `img` directly) and adaptively patchifies it via an octree.
@@ -486,10 +492,11 @@ class Patchify_3D(torch.nn.Module):
         for j in range(self.num_channels):
             channel = img[:, :, :, j].astype(np.float32)
             # Per-channel min-max normalized to [0,1] before Canny -- keeps
-            # canny_thresholds meaningful regardless of this dataset's real
-            # intensity scale (matters most for "sst"'s arbitrary physical
-            # units, a near-no-op for "basic_ct", already close to [0,1]
-            # from its own file-read-time normalization). Edge-detection
+            # canny_low_threshold/canny_high_threshold meaningful regardless
+            # of this dataset's real intensity scale (matters most for
+            # "sst"'s arbitrary physical units, a near-no-op for
+            # "basic_ct", already close to [0,1] from its own file-read-
+            # time normalization). Edge-detection
             # input only (octree.serialize below still gets `img` unmodified,
             # so the model trains on real values, not a renormalized proxy)
             # -- unconditional across every dataset, not scoped by name.
@@ -499,7 +506,7 @@ class Patchify_3D(torch.nn.Module):
             channel_img = sitk.GetImageFromArray(channel)
             channel_edges = sitk.CannyEdgeDetection(
                 channel_img,
-                lowerThreshold=self.canny_thresholds[0], upperThreshold=self.canny_thresholds[1],
+                lowerThreshold=self.canny_low_threshold, upperThreshold=self.canny_high_threshold,
                 variance=variance,
             )
             edges_combined_counter += sitk.GetArrayFromImage(channel_edges).astype(np.uint8)

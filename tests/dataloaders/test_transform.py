@@ -18,9 +18,10 @@ scheme this switched to is the same convention Patchify_3D already uses
 directly either way, so a per-channel loop was already required there).
 Each channel is independently min-max normalized to [0,1] before Canny runs
 (edge-detection input only, real patch content untouched) so the shared
-canny_thresholds default stays meaningful regardless of a dataset's real
-intensity range (imagenet/catsdogs are uint8 [0,255], not the ~[0,1] scale
-canny_thresholds otherwise assumes) -- test_patchify_imagenet_branch_
+canny_low_threshold/canny_high_threshold defaults stay meaningful
+regardless of a dataset's real intensity range (imagenet/catsdogs are
+uint8 [0,255], not the ~[0,1] scale those otherwise assume) --
+test_patchify_imagenet_branch_
 normalizes_input_before_canny below is the direct regression test.
 
 An earlier code version assumed float data was already normalized to
@@ -87,8 +88,9 @@ def test_patchify_imagenet_branch_uses_per_channel_simpleitk_canny():
 
 
 def test_patchify_imagenet_branch_normalizes_input_before_canny():
-    """canny_thresholds' default assumes ~[0,1]-scale input -- imagenet/
-    catsdogs images are real uint8 [0,255], so without per-channel min-max
+    """canny_low_threshold/canny_high_threshold's own defaults assume
+    ~[0,1]-scale input -- imagenet/catsdogs images are real uint8 [0,255],
+    so without per-channel min-max
     normalization (see forward()'s own comment) the default thresholds
     would be meaningless on this raw scale (gradients ~255x too large,
     likely degenerately all-edge or no-edge). A real, clean box edge here
@@ -130,13 +132,21 @@ def test_patchify_canny_sigma_none_leaves_sths_untouched():
     assert p.sths == [7, 9]
 
 
-def test_patchify_canny_thresholds_override_requires_both():
+def test_patchify_canny_low_and_high_threshold_resolve_independently():
+    # No canny_thresholds tuple parameter -- canny_low_threshold/canny_high_
+    # threshold are each real parameters with their own real default, no
+    # need to set both together.
     p_both = Patchify(canny_low_threshold=0.2, canny_high_threshold=0.4, num_channels=1, dataset="imagenet")
-    assert p_both.canny_thresholds == (0.2, 0.4)
+    assert p_both.canny_low_threshold == 0.2
+    assert p_both.canny_high_threshold == 0.4
 
-    # Only one given -- override doesn't apply, falls back to the class default.
-    p_only_low = Patchify(canny_low_threshold=0.2, canny_thresholds=(0.05, 0.15), num_channels=1, dataset="imagenet")
-    assert p_only_low.canny_thresholds == (0.05, 0.15)
+    p_only_low = Patchify(canny_low_threshold=0.2, num_channels=1, dataset="imagenet")
+    assert p_only_low.canny_low_threshold == 0.2
+    assert p_only_low.canny_high_threshold == 0.15  # its own default, untouched
+
+    p_neither = Patchify(num_channels=1, dataset="imagenet")
+    assert p_neither.canny_low_threshold == 0.05
+    assert p_neither.canny_high_threshold == 0.15
 
 
 def test_patchify_canny_sigma_and_thresholds_actually_used_end_to_end():
@@ -160,12 +170,14 @@ def test_patchify_3d_canny_sigma_squares_unconditionally():
     assert p.sths == [9.0]
 
 
-def test_patchify_3d_canny_thresholds_override_requires_both():
+def test_patchify_3d_canny_low_and_high_threshold_resolve_independently():
     p_both = Patchify_3D(canny_low_threshold=0.2, canny_high_threshold=0.4, num_channels=1, dataset="basic_ct")
-    assert p_both.canny_thresholds == (0.2, 0.4)
+    assert p_both.canny_low_threshold == 0.2
+    assert p_both.canny_high_threshold == 0.4
 
-    p_only_high = Patchify_3D(canny_high_threshold=0.4, canny_thresholds=(0.05, 0.15), num_channels=1, dataset="basic_ct")
-    assert p_only_high.canny_thresholds == (0.05, 0.15)
+    p_only_high = Patchify_3D(canny_high_threshold=0.4, num_channels=1, dataset="basic_ct")
+    assert p_only_high.canny_low_threshold == 0.05  # its own default, untouched
+    assert p_only_high.canny_high_threshold == 0.4
 
 
 def test_patchify_non_photo_branch_handles_arbitrary_float_range():
@@ -325,7 +337,7 @@ def test_patchify_3d_detects_edge_purely_along_depth():
     vol = np.zeros((D, H, W, 1), dtype=np.float32)
     vol[6:10, :, :, 0] = 1.0  # step purely along depth (D), rows 6:10
 
-    p = Patchify_3D(sths=[0.5], fixed_length=8, canny_thresholds=(0.05, 0.15), interp_size=4, num_channels=1, dataset="basic_ct", return_edges=True)
+    p = Patchify_3D(sths=[0.5], fixed_length=8, interp_size=4, num_channels=1, dataset="basic_ct", return_edges=True)
     _, _, _, _, edges = p(vol)
 
     # full-plane edges at the two depth boundaries (z=5, z=10), nothing elsewhere
@@ -346,7 +358,7 @@ def test_patchify_3d_weights_by_channel_agreement():
     vol[8:16, 8:16, 8:16, :] = 1.0  # both channels see this box
     vol[2:6, 2:6, 2:6, 1] = 1.0     # channel 1 only
 
-    p = Patchify_3D(sths=[1.0], fixed_length=8, canny_thresholds=(0.05, 0.15), interp_size=4, num_channels=2, dataset="basic_ct", return_edges=True)
+    p = Patchify_3D(sths=[1.0], fixed_length=8, interp_size=4, num_channels=2, dataset="basic_ct", return_edges=True)
     _, _, _, _, edges = p(vol)
 
     assert set(np.unique(edges)).issubset({0, 1, 2})
@@ -457,7 +469,7 @@ def test_patchify_3d_multi_channel_reshape_does_not_scramble_channels():
     for c in range(C):
         vol[:, :, :, c] = (c + 1) * 5.0  # 5.0, 10.0 -- distinct per channel
 
-    p = Patchify_3D(sths=[0.5], fixed_length=fixed_length, canny_thresholds=(0.05, 0.15), interp_size=4, num_channels=C, dataset="basic_ct")
+    p = Patchify_3D(sths=[0.5], fixed_length=fixed_length, interp_size=4, num_channels=C, dataset="basic_ct")
     seq_img, seq_size, seq_pos, octtree = p(vol)
 
     assert seq_img.shape == (C, fixed_length, 4 * 4 * 4)
@@ -486,7 +498,7 @@ def test_patchify_3d_shape_and_dtype():
     vol = np.zeros((D, H, W, 2), dtype=np.float32)
     vol[8:16, 8:16, 8:16, :] = 1.0
 
-    p = Patchify_3D(sths=[1.0], fixed_length=8, canny_thresholds=(0.05, 0.15), interp_size=4, num_channels=2, dataset="basic_ct", return_edges=True)
+    p = Patchify_3D(sths=[1.0], fixed_length=8, interp_size=4, num_channels=2, dataset="basic_ct", return_edges=True)
     _, _, _, _, edges = p(vol)
 
     assert edges.shape == (32, 32, 32)
@@ -506,7 +518,7 @@ def test_patchify_3d_profile_prints_edge_octree_serialize_timings(capsys):
     vol = np.zeros((D, H, W, 2), dtype=np.float32)
     vol[8:16, 8:16, 8:16, :] = 1.0
 
-    p = Patchify_3D(sths=[1.0], fixed_length=8, canny_thresholds=(0.05, 0.15), interp_size=4, num_channels=2, dataset="basic_ct", profile=True)
+    p = Patchify_3D(sths=[1.0], fixed_length=8, interp_size=4, num_channels=2, dataset="basic_ct", profile=True)
     p(vol)
 
     out = capsys.readouterr().out
@@ -529,13 +541,14 @@ def test_patchify_3d_profile_defaults_to_false_and_prints_nothing():
     vol = np.zeros((D, H, W, 2), dtype=np.float32)
     vol[8:16, 8:16, 8:16, :] = 1.0
 
-    p = Patchify_3D(sths=[1.0], fixed_length=8, canny_thresholds=(0.05, 0.15), interp_size=4, num_channels=2, dataset="basic_ct")
+    p = Patchify_3D(sths=[1.0], fixed_length=8, interp_size=4, num_channels=2, dataset="basic_ct")
     assert p.profile is False
 
 
 def test_patchify_3d_normalizes_only_edge_detection_input_not_real_patch_content():
-    """canny_thresholds assumes a ~[0,1] scale -- normalization keeps that
-    meaningful regardless of a volume's real intensity range, for any
+    """canny_low_threshold/canny_high_threshold assume a ~[0,1] scale --
+    normalization keeps that meaningful regardless of a volume's real
+    intensity range, for any
     dataset (not just "sst", whose raw CFD fields are in arbitrary
     physical units, the case this was originally built for). Confirmed
     here by checking a raw, far-outside-[0,1] volume reproduces the exact
@@ -548,7 +561,7 @@ def test_patchify_3d_normalizes_only_edge_detection_input_not_real_patch_content
     raw_vol[6:10, :, :, 0] = 800.0  # a real step, but far outside [0,1]
     normalized_vol = (raw_vol - raw_vol.min()) / (raw_vol.max() - raw_vol.min())  # same shape, values in {0.0, 1.0}
 
-    kwargs = dict(sths=[0.5], fixed_length=8, canny_thresholds=(0.05, 0.15), interp_size=4, num_channels=1, dataset="basic_ct", return_edges=True)
+    kwargs = dict(sths=[0.5], fixed_length=8, interp_size=4, num_channels=1, dataset="basic_ct", return_edges=True)
     seq_img_raw, _, _, _, edges_raw = Patchify_3D(**kwargs)(raw_vol)
     _, _, _, _, edges_pre_normalized = Patchify_3D(**kwargs)(normalized_vol)
 
@@ -565,7 +578,7 @@ def test_patchify_3d_normalizes_only_edge_detection_input_not_real_patch_content
 def test_patchify_3d_normalizes_input_before_canny_for_every_dataset():
     """Direct demonstration of the actual failure mode normalization
     fixes, for any dataset, not just "sst": a real step whose raw
-    magnitude (0.001) is far below canny_thresholds' own lower bound
+    magnitude (0.001) is far below canny_low_threshold's own default
     (0.05) -- undetectable without normalization, easily detectable once
     rescaled to use the full [0,1] range. Checked against "basic_ct"
     specifically (its own edge-detection input was never normalized
@@ -577,7 +590,7 @@ def test_patchify_3d_normalizes_input_before_canny_for_every_dataset():
     vol = np.zeros((D, H, W, 1), dtype=np.float32)
     vol[6:10, :, :, 0] = 0.001  # real step, but ~50x smaller than the lower threshold
 
-    kwargs = dict(sths=[0.5], fixed_length=8, canny_thresholds=(0.05, 0.15), interp_size=4, num_channels=1, return_edges=True)
+    kwargs = dict(sths=[0.5], fixed_length=8, interp_size=4, num_channels=1, return_edges=True)
     _, _, _, _, edges_basic_ct = Patchify_3D(dataset="basic_ct", **kwargs)(vol)
     _, _, _, _, edges_sst = Patchify_3D(dataset="sst", **kwargs)(vol)
 

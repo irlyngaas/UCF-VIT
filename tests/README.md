@@ -6431,3 +6431,47 @@ real config under `configs/`) confirmed green after both the 10-file key
 removal and the 13-file comment update. Not yet confirmed with a real
 Frontier training run exercising an explicit `canny_sigma`/`canny_low_
 threshold` override on either path -- that's the natural next step.
+
+#### Follow-up: removed the now-redundant `canny_thresholds` tuple parameter, found and fixed a real `None`-propagation bug while doing it
+
+The user noticed `Patchify`/`Patchify_3D` still carried a `canny_
+thresholds` tuple parameter alongside the new `canny_low_threshold`/
+`canny_high_threshold` -- genuinely redundant now (both express the exact
+same "one fixed low/high pair," no capability gap), unlike `sths`/`canny_
+sigma`, which stay separate because `sths` supports real per-call
+randomization a single `canny_sigma` value can't express. Removed `canny_
+thresholds` entirely; `canny_low_threshold`/`canny_high_threshold` are now
+the only threshold parameters.
+
+**A real bug caught by testing the real call chain, not assumed safe**:
+naively giving `canny_low_threshold`/`canny_high_threshold` real numeric
+defaults (`0.05`/`0.15`) directly in `Patchify`/`Patchify_3D`'s own
+signatures would have broken every real caller -- `dataset.py`/
+`catsdogs.py` unconditionally pass `canny_low_threshold=canny_low_
+threshold` through the whole chain from `ap_conf` (which is `None` for
+every existing config, by design -- see the entry above), so a literal
+`None` would have overridden the real default with `None` itself, crashing
+`SimpleITK.CannyEdgeDetection(lowerThreshold=None, ...)` for every real
+`do_ap:True` config. Fixed by keeping `None` as the constructor default
+(matching `canny_sigma`'s own existing pattern) and resolving to the real
+default internally, independently per parameter (no more "only overrides
+when both given together" -- each of `canny_low_threshold`/`canny_high_
+threshold` now resolves on its own, since there's no separate tuple to
+protect). Verified directly against the real call chain, not just
+`Patchify`/`Patchify_3D` in isolation: constructed `ProcessChannels` (both
+2D and 3D) and `CatsDogsDataset` with `canny_low_threshold=None` (matching
+every existing config's real value) and confirmed `self.patchify.canny_
+low_threshold`/`canny_high_threshold` resolve to `0.05`/`0.15`, not `None`.
+
+**Tier 1 coverage**: `test_patchify_canny_thresholds_override_requires_
+both`/`test_patchify_3d_canny_thresholds_override_requires_both` (testing
+behavior that no longer exists) replaced with `test_patchify_canny_low_
+and_high_threshold_resolve_independently`/`test_patchify_3d_canny_low_
+and_high_threshold_resolve_independently` (each threshold resolves to its
+own real default when the other is set, and when neither is set). Every
+other test's now-invalid `canny_thresholds=(0.05, 0.15)` kwarg removed
+(that value was always the default anyway, so removing it changes
+nothing).
+
+**Verification:** full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 500 passed / 2 skipped, no regressions.

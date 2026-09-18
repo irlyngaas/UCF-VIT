@@ -702,8 +702,9 @@ def parse_config(args, load_balance_offline=False):
             # No baked-in numeric default here (unlike min_size above) --
             # None (unset) must reach every real consumer (get_model's own
             # "or 1.0"/"or 0.1"/etc for GPUPatchify2D/3D, Patchify/
-            # Patchify_3D's own None-means-"use my sths/canny_thresholds
-            # default" check) so each path keeps its own already-existing,
+            # Patchify_3D's own None-means-"use my own sths/canny_low_
+            # threshold/canny_high_threshold default" resolution, each
+            # independently) so each path keeps its own already-existing,
             # independently-tuned default when this isn't set explicitly --
             # baking a shared default in here would silently retune every
             # existing shipped do_ap:True config's CPU-side Canny sensitivity
