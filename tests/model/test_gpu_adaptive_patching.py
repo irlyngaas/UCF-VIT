@@ -82,10 +82,13 @@ def test_region_backend_invalid_value_raises_clearly():
         _label_regions(border_mask, region_backend="bogus")
 
 
-def test_region_backend_defaults_to_scipy_with_no_env_var(monkeypatch):
+def test_region_backend_defaults_to_auto_with_no_env_var(monkeypatch):
+    # "auto" (not a hardcoded "scipy") is the stored value -- the real
+    # scipy-vs-cupyx choice is deferred to _label_regions's own per-call
+    # resolution (see _cupyx_available), not decided at construction time.
     monkeypatch.delenv("UCF_VIT_GPU_AP_REGION_BACKEND", raising=False)
     p = GPUPatchify2D(img_size=(16, 16), fixed_length=1, interp_size=4, min_size=2)
-    assert p.region_backend == "scipy"
+    assert p.region_backend == "auto"
 
 
 def test_region_backend_reads_env_var_when_not_passed_explicitly(monkeypatch):
@@ -163,6 +166,59 @@ def test_region_backend_cupyx_dispatch_with_cupy_faked_out(monkeypatch):
     assert len(calls) == 1
     torch.testing.assert_close(calls[0], ~border_mask)
     torch.testing.assert_close(labeled, torch.tensor([[0, 1], [1, 1]], dtype=torch.int32))
+
+
+def test_region_backend_auto_resolves_to_scipy_on_a_cpu_tensor():
+    # Real, not mocked -- a genuine CPU tensor, whatever cupy availability
+    # happens to be in this environment (irrelevant: _cupyx_available's
+    # own is_cuda check short-circuits before ever importing cupy).
+    border_mask = torch.tensor([[True, False], [False, False]])
+    labeled, num_features = _label_regions(border_mask, region_backend="auto")
+    scipy_labeled, scipy_num_features = _label_regions(border_mask, region_backend="scipy")
+    torch.testing.assert_close(labeled, scipy_labeled)
+    assert num_features == scipy_num_features
+
+
+def test_region_backend_auto_resolves_to_scipy_when_cupy_unavailable_even_on_a_cuda_tensor(monkeypatch):
+    # Real, not mocked -- cupy genuinely isn't installed in this
+    # environment. Fakes only is_cuda=True (not cupy) to isolate this
+    # exact case: a real CUDA device, but no real cupy install.
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+    border_mask = torch.tensor([[True, False], [False, False]])
+
+    labeled, num_features = _label_regions(border_mask, region_backend="auto")
+
+    assert num_features == 1
+    torch.testing.assert_close(labeled, torch.tensor([[0, 1], [1, 1]], dtype=torch.int32))
+
+
+def test_region_backend_auto_resolves_to_cupyx_when_both_cuda_and_cupy_are_available(monkeypatch):
+    """Same dispatch-logic fakes as test_region_backend_cupyx_dispatch_
+    with_cupy_faked_out -- confirms "auto" reaches the "cupyx" branch (not
+    just that an explicit "cupyx" does) when both conditions are met.
+    """
+    fake_cupy = types.ModuleType("cupy")
+    fake_cupy.from_dlpack = lambda t: t
+    monkeypatch.setitem(sys.modules, "cupy", fake_cupy)
+
+    calls = []
+
+    def fake_label(interior):
+        calls.append(interior)
+        labeled = torch.zeros_like(interior, dtype=torch.int32)
+        labeled[interior] = 1
+        return labeled, 1
+
+    fake_ndimage = types.ModuleType("cupyx.scipy.ndimage")
+    fake_ndimage.label = fake_label
+    monkeypatch.setitem(sys.modules, "cupyx.scipy.ndimage", fake_ndimage)
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+
+    border_mask = torch.tensor([[True, False], [False, False]])
+    labeled, num_features = _label_regions(border_mask, region_backend="auto")
+
+    assert num_features == 1
+    assert len(calls) == 1  # the fake cupyx label was actually called
 
 
 def test_merge_cost_is_exactly_zero_for_a_flat_region():

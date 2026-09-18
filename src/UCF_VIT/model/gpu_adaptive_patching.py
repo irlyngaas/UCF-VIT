@@ -8,6 +8,37 @@ import torch.nn.functional as F
 from scipy.ndimage import label as scipy_label
 
 
+def _cupyx_available(border_mask):
+    """Whether `region_backend="auto"` should resolve to `"cupyx"` for this call.
+
+    Checked fresh every call (not cached) -- both conditions are cheap
+    (`is_cuda` is a plain attribute; `cupy`/`cupyx` module imports are
+    themselves cached by Python after the first real import) and a single
+    `GPUPatchify2D`/`GPUPatchify3D` instance might reasonably see both
+    CPU tensors (Tier 1 unit tests) and real CUDA/ROCm ones (real
+    training) across its lifetime -- resolving once at construction time
+    would bake in whichever was true first.
+
+    Args:
+        border_mask: The real tensor `_label_regions` was actually called
+            with -- `is_cuda` reflects its real device, not a guess.
+
+    Returns:
+        `True` only if `border_mask` is on a CUDA/ROCm device *and* `cupy`/
+        `cupyx.scipy.ndimage.label` are both importable; `False` otherwise
+        (including on any `ImportError`, e.g. `cupy` installed for a
+        different ROCm/CUDA build than what's actually loaded).
+    """
+    if not border_mask.is_cuda:
+        return False
+    try:
+        import cupy  # noqa: F401
+        from cupyx.scipy.ndimage import label  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def _label_regions(border_mask, region_backend="scipy"):
     """Connected components of `~border_mask` -> `(labeled, num_features)`.
 
@@ -24,20 +55,30 @@ def _label_regions(border_mask, region_backend="scipy"):
             via `cupyx.scipy.ndimage.label`, using the DLPack protocol
             (`cupy`/`torch` both implement `__dlpack__` directly, no
             manual `to_dlpack`/`toDlpack` needed) to move `border_mask`
-            to/from `cupy` with no CPU round-trip. Opt-in and explicit,
-            not auto-detected: raises clearly if `cupy` isn't importable
-            or `border_mask` isn't on a CUDA device, rather than silently
-            falling back to `"scipy"`. Not verified on real GPU hardware
-            in this session (no CUDA/ROCm device, `cupy` not installed
-            here) -- trusts `cupyx`'s documented `scipy.ndimage.label`
-            API compatibility for the real numerics.
+            to/from `cupy` with no CPU round-trip. Explicit `"cupyx"`
+            raises clearly if `cupy` isn't importable or `border_mask`
+            isn't on a CUDA device, rather than silently falling back to
+            `"scipy"`. Confirmed on real GPU hardware to produce identical
+            regions to `"scipy"` (see `test_gpu_adaptive_patching_cupyx_
+            real.py`), and, on a real `basic_ct/unetr` do_gpu_ap:True
+            training run, ~2.15x faster overall (395s vs 851s) -- see this
+            module's own tests/README.md entry. `"auto"` -- resolves to
+            `"cupyx"` only when both `cupy` is importable *and*
+            `border_mask` is actually on a CUDA device (checked fresh each
+            call via `_cupyx_available`, not assumed from how this class
+            was constructed), else `"scipy"` -- the real mechanism behind
+            `GPUPatchify2D`/`GPUPatchify3D`'s own `region_backend=None`
+            default (see their own docstrings).
 
     Returns:
         `(labeled, num_features)`: `labeled` is an integer-dtype tensor on
         `border_mask`'s own device, same shape, `0` = background;
         `num_features` is a plain `int`.
     """
-    assert region_backend in ("scipy", "cupyx"), f"region_backend must be 'scipy' or 'cupyx', got {region_backend!r}"
+    assert region_backend in ("scipy", "cupyx", "auto"), f"region_backend must be 'scipy', 'cupyx', or 'auto', got {region_backend!r}"
+
+    if region_backend == "auto":
+        region_backend = "cupyx" if _cupyx_available(border_mask) else "scipy"
 
     if region_backend == "cupyx":
         try:
@@ -182,18 +223,27 @@ class GPUPatchify2D(torch.nn.Module):
                 this many times) -- not exact flood-fill connectivity, see
                 `_canny_edge_map_batch`'s own docstring. Only used when
                 `score_fn == "canny"`.
-            region_backend: `"scipy"` (default) or `"cupyx"` -- see
+            region_backend: `"scipy"`, `"cupyx"`, or `"auto"` -- see
                 `_label_regions`'s own docstring for what each means.
                 `None` (the real default) resolves to the `UCF_VIT_GPU_AP_
                 REGION_BACKEND` environment variable if set, else
-                `"scipy"` -- lets a real training job try `"cupyx"`
-                (e.g. `export UCF_VIT_GPU_AP_REGION_BACKEND=cupyx` in its
-                launch script) with no code or config change, since this
-                isn't wired into `parse.py`/config YAML at all yet (kept
-                test-only on purpose -- see this module's own tests/
-                README.md entry for why). Passing a real value here
+                `"auto"` -- opportunistically uses `"cupyx"` (confirmed
+                on real hardware ~2.15x faster overall on a real `basic_
+                ct/unetr` do_gpu_ap:True run, see this module's own
+                tests/README.md entry) whenever a real CUDA device and a
+                real `cupy` install are both actually present, with no
+                risk of changing behavior anywhere they aren't (every
+                CPU-only Tier 1 test in this file included) -- silently
+                identical to today's `"scipy"`-only behavior otherwise.
+                `export UCF_VIT_GPU_AP_REGION_BACKEND=scipy` forces the
+                old behavior back (e.g. for a controlled comparison, or
+                if `"cupyx"` is ever suspected of a real problem); `=cupyx`
+                forces it on and raises clearly instead of silently
+                falling back if unavailable. Passing a real value here
                 explicitly (as every existing test does) always wins over
-                the environment variable.
+                the environment variable. Not wired into `parse.py`/
+                config YAML at all yet -- kept test-only on purpose, see
+                this module's own tests/README.md entry for why.
             serialize_chunk_size: `_serialize_batch`'s own chunk size over
                 the flattened `B*N` region dimension -- bounds peak memory
                 to `O(B * serialize_chunk_size * H * W)` regardless of how
@@ -218,7 +268,7 @@ class GPUPatchify2D(torch.nn.Module):
         self.canny_low_threshold = canny_low_threshold
         self.canny_high_threshold = canny_high_threshold
         self.canny_hysteresis_iters = canny_hysteresis_iters
-        self.region_backend = region_backend if region_backend is not None else os.environ.get("UCF_VIT_GPU_AP_REGION_BACKEND", "scipy")
+        self.region_backend = region_backend if region_backend is not None else os.environ.get("UCF_VIT_GPU_AP_REGION_BACKEND", "auto")
 
         if img_size[0] == img_size[1]:
             max_blocks = img_size[0] // min_size
@@ -923,14 +973,16 @@ class GPUPatchify3D(torch.nn.Module):
             canny_hysteresis_iters: Number of binary-dilation passes
                 approximating hysteresis edge-linking. Only used when
                 `score_fn == "canny"`.
-            region_backend: `"scipy"` (default) or `"cupyx"` -- see
+            region_backend: `"scipy"`, `"cupyx"`, or `"auto"` -- see
                 `_label_regions`'s own docstring for what each means.
                 `None` (the real default) resolves to the `UCF_VIT_GPU_AP_
                 REGION_BACKEND` environment variable if set, else
-                `"scipy"` -- see `GPUPatchify2D`'s own identical `region_
-                backend` docstring entry for why (test-only, not wired
-                into `parse.py`/config YAML yet). Passing a real value
-                here explicitly always wins over the environment variable.
+                `"auto"` -- see `GPUPatchify2D`'s own identical `region_
+                backend` docstring entry for the full reasoning (this is
+                the exact class the real `basic_ct/unetr` do_gpu_ap:True
+                run confirming `"cupyx"`'s ~2.15x speedup used). Passing
+                a real value here explicitly always wins over the
+                environment variable.
             serialize_chunk_size: `_serialize_batch`'s own chunk size over
                 the flattened `B*N` region dimension -- bounds peak memory
                 to `O(B * serialize_chunk_size * D*H*W)` regardless of how
@@ -955,7 +1007,7 @@ class GPUPatchify3D(torch.nn.Module):
         self.canny_low_threshold = canny_low_threshold
         self.canny_high_threshold = canny_high_threshold
         self.canny_hysteresis_iters = canny_hysteresis_iters
-        self.region_backend = region_backend if region_backend is not None else os.environ.get("UCF_VIT_GPU_AP_REGION_BACKEND", "scipy")
+        self.region_backend = region_backend if region_backend is not None else os.environ.get("UCF_VIT_GPU_AP_REGION_BACKEND", "auto")
 
         D, H, W = img_size
         if not (D <= H <= W):

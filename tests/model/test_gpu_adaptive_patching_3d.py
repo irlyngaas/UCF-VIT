@@ -391,10 +391,11 @@ def test_serialize_batch_chunking_does_not_mix_up_images_or_regions():
             assert torch.allclose(patch, torch.full_like(patch, expected), atol=1e-4)
 
 
-def test_region_backend_defaults_to_scipy_with_no_env_var(monkeypatch):
+def test_region_backend_defaults_to_auto_with_no_env_var(monkeypatch):
+    # Same reasoning as GPUPatchify2D's own identical test -- see there.
     monkeypatch.delenv("UCF_VIT_GPU_AP_REGION_BACKEND", raising=False)
     p = GPUPatchify3D(img_size=(16, 16, 16), fixed_length=1, interp_size=4, min_size=2)
-    assert p.region_backend == "scipy"
+    assert p.region_backend == "auto"
 
 
 def test_region_backend_reads_env_var_when_not_passed_explicitly(monkeypatch):

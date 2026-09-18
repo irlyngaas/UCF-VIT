@@ -6698,3 +6698,57 @@ isn't, rather than requiring every user to build `cupy` from source
 first). Left as-is (env-var opt-in, `"scipy"` default) pending that
 decision -- this entry just records the real comparison now that it
 exists.
+
+## Added `region_backend="auto"`, made it the real default -- opportunistic `cupyx`, safe everywhere it isn't available
+
+Follow-up: given the real ~2.15x speedup confirmed above, asked to look
+into the auto-detect/fallback design this needed before it could become
+a real default. Implemented and made real, since it's provably safe to
+default on: `region_backend="auto"` resolves to `"cupyx"` only when both
+a real CUDA/ROCm device *and* a real `cupy` install are present for
+*this specific call* (`_cupyx_available(border_mask)`, checked fresh
+every call against the real tensor actually passed in -- not decided
+once at construction time, since a single instance could reasonably see
+both CPU tensors, e.g. every CPU-only Tier 1 test in this file, and real
+CUDA ones across its lifetime), else `"scipy"` -- today's exact
+behavior, byte-identical, whenever either condition isn't met.
+
+`GPUPatchify2D`/`GPUPatchify3D`'s own `region_backend=None` default now
+resolves (via the existing `UCF_VIT_GPU_AP_REGION_BACKEND` environment
+variable mechanism) to `"auto"` instead of a hardcoded `"scipy"` -- the
+real default changed, but provably without behavior risk: `_cupyx_
+available` checks `border_mask.is_cuda` *first*, before ever attempting
+a `cupy` import, so every CPU-only environment (every Tier 1 test in
+this file, any CPU inference/testing use) resolves to `"scipy"`
+unconditionally, regardless of whether `cupy` happens to be importable
+there. Only a real CUDA/ROCm device with a real, working `cupy` install
+actually changes behavior -- exactly the case already confirmed (above)
+to be both correct (identical regions to `"scipy"`) and meaningfully
+faster. `export UCF_VIT_GPU_AP_REGION_BACKEND=scipy` still forces the
+old behavior back (e.g. for a controlled comparison, or if `"cupyx"` is
+ever suspected of a real problem); `=cupyx` still forces it on and
+raises clearly rather than silently falling back if unavailable.
+
+**Tier 1 coverage**: `test_region_backend_auto_resolves_to_scipy_on_a_
+cpu_tensor` (real, not mocked -- confirms identical output to explicit
+`"scipy"` on a genuine CPU tensor), `test_region_backend_auto_resolves_
+to_scipy_when_cupy_unavailable_even_on_a_cuda_tensor` (real, not mocked
+either -- `cupy` genuinely isn't installed in this environment, only
+`is_cuda` is faked, isolating this exact case), and `test_region_
+backend_auto_resolves_to_cupyx_when_both_cuda_and_cupy_are_available`
+(the one case that does need faking both, a dispatch-logic test mirroring
+the existing explicit-`"cupyx"` dispatch test) added to `test_gpu_
+adaptive_patching.py`. The two existing `region_backend_defaults_to_
+scipy_with_no_env_var` tests (one per file) renamed/updated to assert
+`"auto"` (the new real default), not `"scipy"` (the old one).
+
+**Verification:** full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 514 passed / 2 skipped (3 more than the prior 511
+-- three new tests; two others renamed, not added), no regressions.
+`test_gpu_adaptive_patching_cupyx_real.py` (the real-hardware test)
+already passes explicit `region_backend=` at every call site, so it's
+completely unaffected by this default change. Not yet confirmed with a
+real Frontier rerun using the new default (no explicit `region_backend`,
+no environment variable) to confirm "auto" itself -- as opposed to an
+explicit `"cupyx"` -- actually resolves to the faster path on real
+hardware; that's the natural next step.
