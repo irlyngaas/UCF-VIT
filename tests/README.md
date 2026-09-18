@@ -6676,7 +6676,25 @@ cell:
 cd launch/tests
 UCF_VIT_GPU_AP_REGION_BACKEND=cupyx sbatch run_feature_matrix_smoke_single.sh basic_ct-unetr+do_gpu_ap --timeout 1800
 ```
-Not yet run for real -- whether `"cupyx"` is actually faster here is
-still an open, real question, exactly what this mechanism exists to let
-the user answer empirically before deciding whether it's worth becoming
-a real default/config option.
+
+#### Follow-up: `region_backend="cupyx"` really is faster -- 395s vs `"scipy"`'s 851s, ~2.15x, on the exact same cell
+
+Run for real via the env var above: `basic_ct-unetr+do_gpu_ap` passed in
+**395s** with `region_backend="cupyx"`, against the **851s** `"scipy"`
+(the default) took on the identical cell -- confirms the CPU-round-trip
+hypothesis above was a real, significant bottleneck, not just a
+plausible-sounding guess. `"cupyx"` is not a full explanation of the
+remaining 395s either (real level-by-level Canny/variance scoring and
+`_serialize_batch`'s own chunked `grid_sample` calls still run
+regardless of `region_backend`) -- but the connected-components
+labeling step alone accounts for roughly half the total wall time on
+this workload.
+
+Not yet decided whether this should become a real default (`cupy` is
+still not a project dependency -- making `"cupyx"` the *default* rather
+than opt-in would need a real fallback design, e.g. auto-detecting
+whether `cupy` is importable and falling back to `"scipy"` when it
+isn't, rather than requiring every user to build `cupy` from source
+first). Left as-is (env-var opt-in, `"scipy"` default) pending that
+decision -- this entry just records the real comparison now that it
+exists.
