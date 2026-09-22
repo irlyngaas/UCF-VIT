@@ -1090,6 +1090,62 @@ def next_power_of_two(n):
     return 1 << (n - 1).bit_length()
 
 
+def balanced_2factor(n):
+    """Splits `n` into two positive integer factors as close to each other as possible.
+
+    Searches downward from `floor(sqrt(n))` for the first exact divisor --
+    provably the most balanced split possible: the largest divisor `<=
+    sqrt(n)` is always paired with the smallest divisor `>= sqrt(n)`, which
+    minimizes `p1 - p2` over every valid factor pair. Always terminates
+    (worst case `p1 == 1`, e.g. `n` prime).
+
+    Args:
+        n: Positive integer.
+
+    Returns:
+        `(p1, p2)`, `p1 <= p2`, `p1 * p2 == n`.
+    """
+    p1 = int(math.isqrt(n))
+    while n % p1 != 0:
+        p1 -= 1
+    return p1, n // p1
+
+
+def balanced_3factor(n):
+    """Splits `n` into three positive integer factors, each as close as possible to `n ** (1/3)`.
+
+    Peels off the divisor of `n` closest to `round(n ** (1/3))` (searching
+    outward in both directions), then applies `balanced_2factor` to what's
+    left. Not provably optimal the way `balanced_2factor` is -- a bad first
+    pick can trap the remaining pair into a worse split -- but simple,
+    deterministic, and good enough for the purely cosmetic purpose this is
+    used for (see `UCF_VIT.model.arch.SAP`'s own docstring: any correct
+    factorization produces identical output, since its `mask_head` round
+    trip has no cross-token receptive field -- this just keeps intermediate
+    shapes readable when a `fixed_length` isn't a perfect cube).
+
+    Args:
+        n: Positive integer.
+
+    Returns:
+        `(p1, p2, p3)`, `p1 * p2 * p3 == n`.
+    """
+    target = round(n ** (1 / 3))
+    p1 = next(d for d in _closest_divisors(n, target) if n % d == 0)
+    p2, p3 = balanced_2factor(n // p1)
+    return p1, p2, p3
+
+
+def _closest_divisors(n, target):
+    """Yields every integer in `[1, n]`, ordered by distance from `target` (ties favor the smaller value)."""
+    for offset in range(max(target, n - target) + 1):
+        lo, hi = target - offset, target + offset
+        if lo >= 1:
+            yield lo
+        if hi != lo and hi <= n:
+            yield hi
+
+
 def calculate_tile_overlap(overlap):
     """Splits a total per-dimension overlap into start/end padding amounts.
 

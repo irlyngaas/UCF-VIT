@@ -121,8 +121,11 @@ def test_parse_pretrained_config_sap_source():
     p_conf = _parse_as_pretrained_source(pretrained_conf, downstream_conf)
 
     assert p_conf["model_type"] == "SAP"
-    # fixed_length=4 (2D quadtree, twoD:True) -> sqrt_len=2.
-    assert p_conf["kwargs"]["sqrt_len"] == 2
+    # get_kwargs no longer computes a sqrt_len/grid-shape kwarg for SAP at
+    # all -- SAP.__init__ derives its own (functionally arbitrary) grid
+    # factorization from fixed_length directly, so there's nothing analogous
+    # to assert here anymore.
+    assert "sqrt_len" not in p_conf["kwargs"]
 
 
 def test_parse_pretrained_config_unetr_source():

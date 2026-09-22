@@ -26,6 +26,7 @@ import torch.distributed as dist
 
 from UCF_VIT.utils.dist_functions import F_Identity_B_Broadcast,F_Broadcast_B_Identity, F_Identity_B_AllReduce
 from UCF_VIT.utils.fused_attn import FusedAttn
+from UCF_VIT.utils.misc import balanced_2factor, balanced_3factor
 from UCF_VIT.model.gpu_adaptive_patching import GPUPatchify2D, GPUPatchify3D
 
 from einops import rearrange
@@ -967,14 +968,22 @@ class SAP(VIT):
 
         Args:
             *args: Positional arguments forwarded to `VIT.__init__`.
-            **kwargs: Keyword arguments forwarded to `VIT.__init__`; must include
-                `sqrt_len`, the grid side length the flat adaptive-patch sequence
-                is reshaped to.
+            **kwargs: Keyword arguments forwarded to `VIT.__init__`.
         """
-        self.sqrt_len = kwargs.pop('sqrt_len', '')
         super().__init__(*args, **kwargs)
         #Remove decoder from VIT
-        self.head = None 
+        self.head = None
+
+        # mask_head's grid reshape has no cross-token receptive field (see
+        # its own docstring), so the specific factorization of fixed_length
+        # used here is functionally arbitrary -- self.fixed_length no
+        # longer needs to be a perfect square/cube, unlike before commit
+        # 8808570. balanced_2factor/balanced_3factor just keep the
+        # intermediate shape reasonable-looking when it isn't one.
+        if self.twoD:
+            self.grid_shape = balanced_2factor(self.fixed_length)
+        else:
+            self.grid_shape = balanced_3factor(self.fixed_length)
 
         if self.twoD:
             self.neck = nn.Sequential(
@@ -1013,7 +1022,8 @@ class SAP(VIT):
 
         Args:
             x: Pooled encoder output, flat patch sequence of length
-                `sqrt_len**2` (2D) or `sqrt_len**3` (3D).
+                `self.fixed_length` (`grid_shape[0] * grid_shape[1][ *
+                grid_shape[2]]`).
 
         Returns:
             Per-token segmentation logits, shape (Batch, Seq_Length,
@@ -1021,15 +1031,17 @@ class SAP(VIT):
             effective_patch_size]).
         """
         if self.twoD:
-            x = rearrange(x, 'b (p1 p2) c -> b p1 p2 c', p1=self.sqrt_len, p2=self.sqrt_len)
+            p1, p2 = self.grid_shape
+            x = rearrange(x, 'b (p1 p2) c -> b p1 p2 c', p1=p1, p2=p2)
             x = self.neck(x.permute(0,3,1,2))
             x = self.mask_header(x)
-            x = rearrange(x, 'b c (p1 ph) (p2 pw) -> b (p1 p2) c ph pw', p1=self.sqrt_len, p2=self.sqrt_len)
+            x = rearrange(x, 'b c (p1 ph) (p2 pw) -> b (p1 p2) c ph pw', p1=p1, p2=p2)
         else:
-            x = rearrange(x, 'b (p1 p2 p3) c -> b p1 p2 p3 c', p1=self.sqrt_len, p2=self.sqrt_len, p3=self.sqrt_len)
+            p1, p2, p3 = self.grid_shape
+            x = rearrange(x, 'b (p1 p2 p3) c -> b p1 p2 p3 c', p1=p1, p2=p2, p3=p3)
             x = self.neck(x.permute(0,4,1,2,3))
             x = self.mask_header(x)
-            x = rearrange(x, 'b c (p1 ph) (p2 pw) (p3 pd) -> b (p1 p2 p3) c ph pw pd', p1=self.sqrt_len, p2=self.sqrt_len, p3=self.sqrt_len)
+            x = rearrange(x, 'b c (p1 ph) (p2 pw) (p3 pd) -> b (p1 p2 p3) c ph pw pd', p1=p1, p2=p2, p3=p3)
 
         return x
 

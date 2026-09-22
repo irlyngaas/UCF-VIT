@@ -61,12 +61,6 @@ def get_kwargs(model_type, conf):
 
         assert conf["ap"]["do_ap"], "SAP requires adaptive patching to be turned on"
 
-        if conf["data"]["twoD"]:
-            sqrt_len = int(math.sqrt(conf["ap"]["fixed_length"]))
-        else:
-            sqrt_len=int(np.rint(math.pow(conf["ap"]["fixed_length"],1/3)))
-        kwargs.update({"sqrt_len": sqrt_len})
-
     elif model_type == "MAE":
         try:
             mask_ratio = conf["model"]["mask_ratio"]
@@ -1021,20 +1015,10 @@ def parse_config(args, load_balance_offline=False):
             assert ap_conf["fixed_length"] % 3 == 1 % 3, "Quadtree fixed length needs to be 3n+1, where n is some integer"
         else:
             assert ap_conf["fixed_length"] % 7 == 1 % 7, "Octtree fixed length needs to be 7n+1, where n is some integer"
-
-        # Only SAP's mask_head needs fixed_length to be an exact square/cube (UNETR's proj_feat doesn't).
-        if model_type == "SAP":
-            if twoD:
-                sqrt_len = math.sqrt(ap_conf["fixed_length"])
-                assert sqrt_len.is_integer(), "Square root of fixed length needs to be a whole number"
-                sqrt_len = int(sqrt_len)
-            else:
-                sqrt_len=int(np.rint(math.pow(conf["ap"]["fixed_length"],1/3)))
-                assert np.abs(np.rint(math.pow(conf["ap"]["fixed_length"],1/3)) - math.pow(conf["ap"]["fixed_length"], 1/3)) < 0.0001, "cube root of fixed length needs to be a whole number"
-        else:
-            sqrt_len = None
-    else:
-        sqrt_len = None
+        # SAP's mask_head no longer needs fixed_length to be an exact
+        # square/cube -- see UCF_VIT.model.arch.SAP's own docstring: it
+        # computes its own (balanced, but functionally arbitrary) grid
+        # factorization from fixed_length directly.
             
         
     # Resolves per-dataset-key train/val/test root dirs and start/end idx ratios --

@@ -247,7 +247,7 @@ def test_extract_encoder_state_dict_strips_real_sap_decoder():
     model = SAP(
         img_size=(16, 16), patch_size=4, interp_size=4, twoD=True,
         num_classes=2, class_token=False, pos_embed="learn",
-        adaptive_patching=True, fixed_length=4, sqrt_len=2,
+        adaptive_patching=True, fixed_length=4,
         weight_init="skip", embed_dim=8, depth=1, num_heads=1, mlp_ratio=1.0, in_chans=1,
     )
 
@@ -476,8 +476,8 @@ def test_pretrained_loading_sap_fixed_length_mismatch_drops_pos_embed():
         class_token=False, pos_embed="learn", adaptive_patching=True,
         embed_dim=8, depth=1, num_heads=1, mlp_ratio=1.0, in_chans=1,
     )
-    pretrained = SAP(fixed_length=4, sqrt_len=2, **kwargs)
-    new_model = SAP(fixed_length=16, sqrt_len=4, **kwargs)
+    pretrained = SAP(fixed_length=4, **kwargs)
+    new_model = SAP(fixed_length=16, **kwargs)
     assert not hasattr(pretrained, "grid_size") and not hasattr(new_model, "grid_size")
     fresh_new_pos_embed = new_model.pos_embed.clone()
 

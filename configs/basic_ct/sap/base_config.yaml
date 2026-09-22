@@ -62,7 +62,7 @@ tiling:
 
 ap:
   do_ap: True # SAP requires adaptive patching; this is the one exception to the basic_ct baseline's do_ap:False
-  fixed_length: 512 # cube root must be a whole number and fixed_length % 7 == 1 (octree, since twoD:False) -- 8**3
+  fixed_length: 512 # must satisfy fixed_length % 7 == 1 (octree, since twoD:False) -- 8**3, chosen for round numbers, not required to be a perfect cube (SAP.mask_head factors fixed_length itself, any factorization works)
   separate_channels: False
   use_adaptive_pos_emb: True
   interp_size: 4 # SAP exception: its neck is a single ConvTranspose3d(kernel=stride=interp_size), memory scales as interp_size**3 -- interp_size:32 OOM'd requesting 512x (exactly (32/4)**3) more memory than this reverted value

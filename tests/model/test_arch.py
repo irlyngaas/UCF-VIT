@@ -231,7 +231,6 @@ def _make_sap(**overrides):
         fixed_length=4,
         class_token=False,
         pos_embed="none",
-        sqrt_len=2,
     )
     kwargs.update(overrides)
     return SAP(**kwargs)
@@ -245,13 +244,61 @@ def test_sap_mask_head_returns_per_token_predictions_2d():
 
 
 def test_sap_mask_head_returns_per_token_predictions_3d():
-    model = _make_sap(twoD=False, img_size=8, sqrt_len=2, fixed_length=8)
+    model = _make_sap(twoD=False, img_size=8, fixed_length=8)
     pooled = torch.randn(2, model.fixed_length, model.embed_dim)
     out = model.mask_head(pooled)
     assert out.shape == (
         2, model.fixed_length, model.num_classes,
         model.effective_patch_size, model.effective_patch_size, model.effective_patch_size,
     )
+
+
+def test_sap_mask_head_works_with_non_square_fixed_length_2d():
+    """Regression test: fixed_length no longer needs to be a perfect square
+    (2D) -- mask_head's grid reshape has no cross-token receptive field
+    (stride == kernel_size), so any factorization of fixed_length works.
+    fixed_length=12 has no integer square root, which used to be rejected.
+    """
+    model = _make_sap(fixed_length=12)
+    assert model.grid_shape[0] * model.grid_shape[1] == 12
+    pooled = torch.randn(2, model.fixed_length, model.embed_dim)
+    out = model.mask_head(pooled)
+    assert out.shape == (2, 12, model.num_classes, model.effective_patch_size, model.effective_patch_size)
+
+
+def test_sap_mask_head_works_with_non_cube_fixed_length_3d():
+    """3D analog of test_sap_mask_head_works_with_non_square_fixed_length_2d
+    -- fixed_length=12 has no integer cube root either."""
+    model = _make_sap(twoD=False, img_size=8, fixed_length=12)
+    assert model.grid_shape[0] * model.grid_shape[1] * model.grid_shape[2] == 12
+    pooled = torch.randn(2, model.fixed_length, model.embed_dim)
+    out = model.mask_head(pooled)
+    assert out.shape == (
+        2, 12, model.num_classes,
+        model.effective_patch_size, model.effective_patch_size, model.effective_patch_size,
+    )
+
+
+def test_sap_mask_head_output_independent_of_grid_factorization():
+    """The core claim behind removing the perfect-square/cube requirement:
+    mask_head's output must not depend on *which* valid factorization of
+    fixed_length is used, only that grid_shape[0]*grid_shape[1] ==
+    fixed_length -- since neck/mask_header have stride == kernel_size (no
+    cross-token receptive field), any factorization must give bit-identical
+    output for the same input tokens.
+    """
+    model = _make_sap(fixed_length=12)
+    pooled = torch.randn(2, model.fixed_length, model.embed_dim)
+
+    model.grid_shape = (2, 6)
+    out_a = model.mask_head(pooled)
+    model.grid_shape = (3, 4)
+    out_b = model.mask_head(pooled)
+    model.grid_shape = (12, 1)
+    out_c = model.mask_head(pooled)
+
+    assert torch.equal(out_a, out_b)
+    assert torch.equal(out_a, out_c)
 
 
 # ---------------------------------------------------------------------------
