@@ -140,3 +140,30 @@ def test_fixedquadtree_encode_decode_roundtrip():
 
     qdt2 = FixedQuadTree(domain=domain, fixed_length=4, build_from_info=True, meta_info=meta)
     assert [r.get_coord() for r, _ in qdt.nodes] == [r.get_coord() for r, _ in qdt2.nodes]
+
+
+def test_fixedquadtree_serialize_handles_non_square_domain():
+    """`serialize` used to hard-assert every leaf's native patch was square
+    (`h1==w1`) before resizing it -- not actually required: every split
+    bisects both axes together, so a non-square (H != W) domain just makes
+    every leaf inherit that same non-square aspect ratio (verified directly
+    via `get_size` below), and `cv.resize` already handles resizing an
+    arbitrary source shape to a fixed target `size` regardless. Regression
+    test for that assert's removal.
+    """
+    H, W = 32, 64
+    domain = np.random.RandomState(0).rand(H, W).astype(np.float32)
+    img = np.stack([domain, domain * 2, domain * 3], axis=-1)  # (H, W, 3)
+
+    # fixed_length must be reachable: count starts at 1 and grows by +3 per
+    # split (pop 1 parent, push 4 children), so only count == 1 (mod 3)
+    # values are ever hit exactly -- see FixedOctTree's analogous %7 case.
+    qdt = FixedQuadTree(domain=domain, fixed_length=10, score_fn="variance", min_size=4)
+    for bbox, _ in qdt.nodes:
+        w, h = bbox.get_size()
+        assert w == 2 * h  # every leaf inherits the root's 64:32 == 2:1 aspect ratio
+
+    seq_patch, seq_size, seq_pos = qdt.serialize(img, size=(16, 16, 3))
+    assert len(seq_patch) == 10
+    for patch in seq_patch:
+        assert patch.shape == (16, 16, 3)

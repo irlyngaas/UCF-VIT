@@ -92,7 +92,6 @@ class Cube:
         # pdb.set_trace()
         patch_size = self.get_size()
         h1, w1, d1, c1 = patch.shape
-        assert h1==w1==d1, "Need squared input."
 
         h1_ = np.linspace(0,h1,h1)
         w1_ = np.linspace(0,w1,w1)
@@ -195,7 +194,14 @@ class FixedOctTree:
         #channel, height, width, depth = self.domain.shape
         h, w, d = self.domain.shape[:3]  # domain may carry a trailing channel axis under score_fn="variance"
         assert h>0 and w >0 and d>0, "Wrong img size."
-        root = Cube(0,h,0,w,0,d)
+        # Cube's own indexing (contains/get_area: domain[z1:z2, y1:y2, x1:x2],
+        # matching this class's own (Z, Y, X) docstring convention) requires
+        # z <-> axis0 (h), y <-> axis1 (w), x <-> axis2 (d) -- the full
+        # reverse of the (h, w, d) unpack order above, not the same order.
+        # Getting this wrong silently truncates/misindexes non-cuboid
+        # domains (h != d) without ever raising -- see
+        # tests/dataloaders/test_octree.py's own non-cuboid regression test.
+        root = Cube(0,d,0,w,0,h)
         tiebreak = itertools.count()
         heap = [(-root.contains(self.domain, self.score_fn), next(tiebreak), root)]
         count = 1
@@ -224,9 +230,14 @@ class FixedOctTree:
     def serialize(self, img, size=(8,8,8,1)):
         """Extracts and resizes each leaf node's patch from `img` into a fixed-length sequence.
 
-        Each node's variable-sized cubic region is extracted from `img` and
-        resized (multilinear interpolation) to `size`. Pads with zero patches if
-        the tree has fewer than `fixed_length` nodes.
+        Each node's variable-sized region is extracted from `img` and resized
+        (multilinear interpolation) to `size`. Pads with zero patches if the
+        tree has fewer than `fixed_length` nodes. The native region need not
+        be cubic -- `RegularGridInterpolator` handles any source grid shape
+        -- e.g. a non-cuboid `domain`/`img` (axes of different sizes) makes
+        every leaf inherit that same aspect ratio (every split bisects all
+        three axes together), which resizes to `size` exactly the same as a
+        cubic leaf would.
 
         Args:
             img: Image volume to extract patches from, shape (Z, Y, X, Channel).
@@ -250,7 +261,6 @@ class FixedOctTree:
         
         for i in range(len(seq_patch)):
             h1, w1, d1, c1 = seq_patch[i].shape
-            assert h1==w1==d1, "Need squared input."
             h1_ = np.linspace(0,h1,h1)
             w1_ = np.linspace(0,w1,w1)
             d1_ = np.linspace(0,d1,d1)

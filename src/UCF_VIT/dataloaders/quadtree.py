@@ -333,9 +333,13 @@ class FixedQuadTree:
     def serialize(self, img, size=(8,8,3)):
         """Extracts and resizes each leaf node's patch from `img` into a fixed-length sequence.
 
-        Each node's variable-sized square region is extracted from `img` and
-        resized (bicubic interpolation) to `size`. Pads with zero patches if the
-        tree has fewer than `fixed_length` nodes.
+        Each node's variable-sized region is extracted from `img` and resized
+        (bicubic interpolation) to `size`. Pads with zero patches if the tree
+        has fewer than `fixed_length` nodes. The native region need not be
+        square -- `cv.resize` handles any source shape -- e.g. a non-square
+        `domain`/`img` (H != W) makes every leaf inherit that same aspect
+        ratio (every split bisects both axes together), which resizes to
+        `size` exactly the same as a square leaf would.
 
         Args:
             img: Image to extract patches from, shape (H, W, Channel).
@@ -358,8 +362,6 @@ class FixedQuadTree:
             
         h2,w2,c2 = size
         for i in range(len(seq_patch)):
-            h1, w1, c1 = seq_patch[i].shape
-            assert h1==w1, "Need squared input."
             seq_patch[i] = cv.resize(seq_patch[i], (h2, w2), interpolation=cv.INTER_CUBIC)
             # assert seq_patch[i].shape == (h2,w2,c2), "Wrong shape {} get, need {}".format(seq_patch[i].shape, (h2,w2,c2))
         if len(seq_patch)<self.fixed_length:

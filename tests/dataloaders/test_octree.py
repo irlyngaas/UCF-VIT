@@ -125,3 +125,60 @@ def test_fixedocttree_variance_further_subdivides_high_variance_region():
     assert _total_volume(tree) == 16 ** 3
     sizes = sorted(c.get_size() for c, _ in tree.nodes)
     assert sizes == [(4, 4, 4)] * 8 + [(8, 8, 8)] * 7
+
+
+def test_fixedocttree_root_covers_whole_non_cuboid_domain_does_not_transpose_axes():
+    """Regression test for a real axis-permutation bug: `_build_tree`'s root
+    used to be built as `Cube(0, h, 0, w, 0, d)` (the raw `(h, w, d) =
+    domain.shape[:3]` unpack order), but `Cube`'s own indexing (`contains`/
+    `get_area`: `domain[z1:z2, y1:y2, x1:x2]`) requires the full reverse,
+    `z <-> axis0, y <-> axis1, x <-> axis2` -- i.e. `Cube(0, d, 0, w, 0, h)`.
+    Reusing the unpack order silently swapped axis0/axis2 (axis1 happens to
+    land correctly either way, since it's the middle element of a 3-tuple
+    reversal), which is undetectable on a cubic domain (h == w == d, where
+    both calls are identical) -- every other test in this file uses one.
+    `_total_volume`-style checks also can't catch this: bounding-box volume
+    is a product of the three extents, unaffected by which axis each extent
+    is assigned to. Only the actual extracted content, on a domain whose
+    axis0 and axis2 sizes differ, reveals it.
+    """
+    Z, Y, X = 8, 4, 2  # axis0, axis1, axis2 -- all distinct, none square/cubic
+    domain = np.arange(Z * Y * X).reshape(Z, Y, X).astype(np.float64)
+
+    tree = FixedOctTree(domain=domain, fixed_length=1)
+    assert len(tree.nodes) == 1
+    root, _ = tree.nodes[0]
+
+    img = domain[..., np.newaxis]  # (Z, Y, X, C), matching get_area's own expected shape
+    area = root.get_area(img)
+    assert area.shape == img.shape
+    np.testing.assert_array_equal(area, img)
+
+
+def test_fixedocttree_serialize_handles_non_cuboid_domain():
+    """`serialize`/`Cube.set_area` used to hard-assert every leaf's native
+    patch was cubic (`h1==w1==d1`) before resizing it via
+    `RegularGridInterpolator` -- not actually required: every split bisects
+    all three axes together, so a non-cuboid domain just makes every leaf
+    inherit that same aspect ratio (verified directly via `get_size` below),
+    and `RegularGridInterpolator` already handles an arbitrary source grid
+    shape regardless. Regression test for that assert's removal (2D analog:
+    test_quadtree.py's test_fixedquadtree_serialize_handles_non_square_domain).
+    """
+    Z, Y, X = 32, 16, 8
+    domain = np.random.RandomState(0).rand(Z, Y, X).astype(np.float32)
+    img = np.stack([domain, domain * 2], axis=-1)  # (Z, Y, X, 2)
+
+    # fixed_length must be reachable: count starts at 1 and grows by +7 per
+    # split (pop 1 parent, push 8 children) -- see FixedQuadTree's analogous
+    # +3-per-split case. fixed_length=8 is exactly the first split.
+    tree = FixedOctTree(domain=domain, fixed_length=8, score_fn="variance", min_size=4)
+    assert len(tree.nodes) == 8
+    for bbox, _ in tree.nodes:
+        x, y, z = bbox.get_size()
+        assert (x, y, z) == (4, 8, 16)  # every leaf inherits the root's 8:16:32 == 1:2:4 aspect ratio
+
+    seq_patch, seq_size, seq_pos = tree.serialize(img, size=(8, 8, 8, 2))
+    assert len(seq_patch) == 8
+    for patch in seq_patch:
+        assert patch.shape == (8, 8, 8, 2)
