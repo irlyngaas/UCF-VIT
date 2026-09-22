@@ -3,8 +3,10 @@ import os
 import numpy as np
 import nibabel as nib
 
+from UCF_VIT.utils.normalize import zscore_denormalize
 
-def save_inference_batch(output_dir, batch, output, batch_idx, rank, regression):
+
+def save_inference_batch(output_dir, batch, output, batch_idx, rank, regression, conf=None):
     """Saves one UNETR batch's input/label/prediction volumes as NIfTI files.
 
     Intended for visual inspection (e.g. in 3D Slicer/ITK-SNAP) of a UNETR
@@ -27,16 +29,30 @@ def save_inference_batch(output_dir, batch, output, batch_idx, rank, regression)
     *discrete* Labelmap -- exactly wrong for a continuous field, which
     should render as an ordinary Scalar Volume).
 
+    Training loss is computed entirely in normalized space (see `UCF_VIT.
+    utils.normalize`'s own module docstring), so `batch["data"]` (always)
+    and `output`/`batch["label"]` (only for `regression`, since
+    classification labels/predictions are discrete class indices, never
+    normalized in the first place) arrive here still normalized --
+    denormalized (via `conf["data"]["normalize_stats"]`) right before
+    writing, so the saved NIfTI files are in real physical units, not
+    z-scores. `conf=None` (e.g. no caller has it handy, or normalization
+    isn't configured for this run) skips denormalization entirely rather
+    than raising -- the saved files are then in whatever space `batch`/
+    `output` already are.
+
     Args:
         output_dir: Directory to write into; created if it doesn't exist.
         batch: Dict as returned by `training.process_batch` -- uses
-            `batch["data"]` (raw input volume, shape (B, C, H, W[, D])) and
+            `batch["data"]` (raw input volume, shape (B, C, H, W[, D])),
             `batch["label"]` (ground-truth class-index labels for
             classification, or the real continuous target for regression;
-            shape (B, 1, H, W[, D]) either way). Only `batch["data"][:, 0]`/
-            `batch["label"][:, 0]` (the first channel) is saved -- for
-            multi-channel regression input/output (e.g. "sst"'s r/u/v/w/p),
-            only the first channel is currently dumped.
+            shape (B, 1, H, W[, D]) either way), and (when `regression` is
+            True) `batch["dict_key"]` (which dataset key this batch came
+            from, to resolve the right variable/stats). Only `batch["data"]
+            [:, 0]`/`batch["label"][:, 0]` (the first channel) is saved --
+            for multi-channel regression input/output (e.g. "sst"'s
+            r/u/v/w/p), only the first channel is currently dumped.
         output: Model's raw output, shape (B, num_classes, H, W[, D]) --
             per-class logits for classification, or the raw continuous
             prediction for regression.
@@ -49,13 +65,37 @@ def save_inference_batch(output_dir, batch, output, batch_idx, rank, regression)
         regression: Whether `output`/`batch["label"]` are a continuous
             regression target (True, e.g. `conf["model"]["loss_fn"] ==
             "MSE"`) or discrete class labels (False).
+        conf: The full parsed config, used to resolve `dict_in_variables`/
+            `dict_out_variables`/`normalize_stats` for `batch["dict_key"]`
+            and denormalize before writing. `None` skips denormalization.
     """
     os.makedirs(output_dir, exist_ok=True)
 
+    dict_key = batch["dict_key"] if conf else None
+    stats = conf["data"]["normalize_stats"].get(dict_key, {}) if conf else {}
+    in_var = [conf["data"]["dict_in_variables"][dict_key][0]] if conf else None
+
+    # batch["data"] is z-score normalized at load time regardless of task
+    # (UCF_VIT.utils.normalize's own module docstring) -- denormalized here
+    # either way, not just for regression, so the saved "_input" NIfTI is in
+    # real physical units.
     data = batch["data"][:, 0].cpu().numpy().astype(np.float32)  # (B, H, W[, D])
+    if conf:
+        data = zscore_denormalize(data[:, None], in_var, stats, channel_axis=1)[:, 0]
+
     if regression:
         pred = output[:, 0].cpu().numpy().astype(np.float32)  # (B, H, W[, D])
         label = batch["label"][:, 0].cpu().numpy().astype(np.float32)  # (B, H, W[, D])
+
+        if conf:
+            # dict_out_variables can be unset for a dataset with no distinct
+            # output-variable concept (see parse.py's own docstring comment
+            # on it) -- falls back to the input variable's own stats, same
+            # variable either way for a task like MAE reconstruction.
+            out_vars = conf["data"]["dict_out_variables"]
+            out_var = [out_vars[dict_key][0]] if out_vars and dict_key in out_vars else in_var
+            pred = zscore_denormalize(pred[:, None], out_var, stats, channel_axis=1)[:, 0]
+            label = zscore_denormalize(label[:, None], out_var, stats, channel_axis=1)[:, 0]
     else:
         pred = output.argmax(dim=1).cpu().numpy().astype(np.int16)  # (B, H, W[, D])
         label = batch["label"][:, 0].cpu().numpy().astype(np.int16)  # (B, H, W[, D])

@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from UCF_VIT.dataloaders.transform import Patchify, Patchify_3D
 from UCF_VIT.utils.misc import calculate_tile_bounds, calculate_tile_overlap
+from UCF_VIT.utils.normalize import zscore_normalize
 
 def CatsDogsCollate(batch, adaptive_patching, return_label):
     """Collate function for `CatsDogsDataset`, stacking per-sample numpy arrays into batched tensors.
@@ -58,7 +59,7 @@ class CatsDogsDataset(Dataset):
     image.
     """
 
-    def __init__(self, file_list, variables, tile_size, twoD = True, adaptive_patching = False, fixed_length=196, interp_size=16, num_channels=3, dataset="catsdogs", resize=None, div=1, tile_overlap=(0, 0), score_fn="canny", min_size=2, canny_sigma=None, canny_low_threshold=None, canny_high_threshold=None):
+    def __init__(self, file_list, variables, tile_size, twoD = True, adaptive_patching = False, fixed_length=196, interp_size=16, num_channels=3, dataset="catsdogs", resize=None, div=1, tile_overlap=(0, 0), score_fn="canny", min_size=2, canny_sigma=None, canny_low_threshold=None, canny_high_threshold=None, normalize_stats=None):
         """Initializes the dataset over a list of image file paths.
 
         Args:
@@ -102,6 +103,10 @@ class CatsDogsDataset(Dataset):
                 `canny_low_threshold`, when `adaptive_patching` is True --
                 see their own docstring entries.
             canny_high_threshold: See `canny_low_threshold`.
+            normalize_stats: `{variable_name: {"mean":..., "std":...}}` --
+                see `UCF_VIT.utils.normalize.zscore_normalize`'s own
+                docstring. `None` (default) or a variable missing from it
+                means that channel is returned unnormalized.
         """
         self.file_list = file_list
         self.variables = variables
@@ -116,6 +121,7 @@ class CatsDogsDataset(Dataset):
         self.div = div
         self.score_fn = score_fn
         self.min_size = min_size
+        self.normalize_stats = normalize_stats or {}
 
         # start_overlap/end_overlap and tile_size_no_overlap use the same
         # [height, width]-ordered convention as tile_size/tile_overlap
@@ -183,6 +189,14 @@ class CatsDogsDataset(Dataset):
             start_h, end_h = calculate_tile_bounds(h_idx, self.div, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
             start_w, end_w = calculate_tile_bounds(w_idx, self.div, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
             img = img[start_h:end_h, start_w:end_w]
+
+        # Normalized before self.patchify (if any) runs below, so the
+        # model-visible data (both the raw image and, for adaptive
+        # patching, seq_img's own resized leaf patches, built from this
+        # same array) is actually normalized -- matches FileReader.read_
+        # process_file's own convention (UCF_VIT.dataloaders.dataset).
+        # channel_axis=-1: img is still channel-last (H, W, C) here.
+        img = zscore_normalize(img, self.variables, self.normalize_stats, channel_axis=-1)
 
         label = img_path.split("/")[-1].split(".")[0]
         label = 1 if label == "dog" else 0

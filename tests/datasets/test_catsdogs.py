@@ -86,7 +86,10 @@ def test_catsdogs_dataset_non_adaptive_shape_and_passthrough(tmp_path):
     )
     image, label, returned_variables, dataset_name = ds[0]
     assert image.shape == (NUM_CHANNELS, TILE_SIZE[0], TILE_SIZE[1])  # channel-first, resized
-    assert image.dtype == np.uint8
+    # zscore_normalize always casts to float32 (even with no normalize_stats
+    # configured, as here -- a real passthrough numerically, just no longer
+    # uint8) -- see its own docstring.
+    assert image.dtype == np.float32
     assert label == 1
     assert returned_variables == variables
     assert dataset_name == "catsdogs"
@@ -250,3 +253,26 @@ def test_catsdogs_collate_adaptive_no_label(tmp_path):
     assert inp.shape == (2, NUM_CHANNELS, TILE_SIZE[0], TILE_SIZE[1])
     assert seq.shape == (2, NUM_CHANNELS, FIXED_LENGTH, PATCH_SIZE * PATCH_SIZE)
     assert dict_key == "catsdogs"
+
+
+def test_catsdogs_dataset_applies_normalize_stats(tmp_path):
+    # Deterministic (not the shared random helper's) image so exact
+    # normalized values can be checked.
+    # .png (lossless), not the shared helper's .jpg -- exact values matter
+    # here; label parsing only looks at the filename's first token anyway.
+    raw = np.arange(TILE_SIZE[0] * TILE_SIZE[1] * NUM_CHANNELS, dtype=np.uint8).reshape(TILE_SIZE[0], TILE_SIZE[1], NUM_CHANNELS)
+    path = tmp_path / "dog.0.png"
+    Image.fromarray(raw).save(str(path))
+
+    variables = ("red", "green", "blue")
+    stats = {"red": {"mean": 100.0, "std": 20.0}}  # only "red" configured
+    ds = CatsDogsDataset(
+        [str(path)], variables=variables, tile_size=TILE_SIZE, adaptive_patching=False,
+        num_channels=NUM_CHANNELS, dataset="catsdogs", normalize_stats=stats,
+    )
+    image, label, returned_variables, dataset_name = ds[0]
+
+    raw_chw = np.moveaxis(raw, -1, 0).astype(np.float32)
+    np.testing.assert_allclose(image[0], (raw_chw[0] - 100.0) / 20.0)
+    np.testing.assert_allclose(image[1], raw_chw[1])  # "green"/"blue" untouched -- no stats configured
+    np.testing.assert_allclose(image[2], raw_chw[2])

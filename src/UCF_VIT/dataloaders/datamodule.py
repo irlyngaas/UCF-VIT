@@ -251,6 +251,11 @@ class NativePytorchDataModule(torch.nn.Module):
             docstring entry, and `UCF_VIT.training.train_epoch`'s
             `profile_dataloader` handling for the complementary main-process
             timing this is meant to be compared against.
+        normalize_stats (Dict, optional): `{dataset_key: {variable_name:
+            {"mean":..., "std":...}}}`, forwarded per-key to `FileReader`'s
+            own `normalize_stats` -- see its docstring entry. `None`
+            (default) or a key/variable missing from it means that data
+            stays unnormalized.
     """
 
     def __init__(
@@ -294,6 +299,7 @@ class NativePytorchDataModule(torch.nn.Module):
         canny_sigma: Optional[float] = None,
         canny_low_threshold: Optional[float] = None,
         canny_high_threshold: Optional[float] = None,
+        normalize_stats: Optional[Dict] = None,
     ):
         """Initializes the data module and builds the per-dataset file listings.
 
@@ -376,6 +382,7 @@ class NativePytorchDataModule(torch.nn.Module):
             #in_variables[k] = [ x for x in in_variables[k] if x in DEFAULT_VARIABLE_LIST ]
             in_variables[k] = [ x for x in in_variables[k] ]
         self.dict_in_variables = in_variables
+        self.normalize_stats = normalize_stats or {}
 
         self.dict_lister_trains = self.process_root_dirs()
 
@@ -493,6 +500,7 @@ class NativePytorchDataModule(torch.nn.Module):
                                 resize=resize,
                                 allow_file_reuse=self.allow_file_reuse,
                                 epoch_shuffle_seed=self.epoch_shuffle_seed,
+                                normalize_stats=self.normalize_stats.get(k, {}),
                             ),
                         self.tile_size,
                         self.twoD,
@@ -540,6 +548,7 @@ class NativePytorchDataModule(torch.nn.Module):
                                 variables_out=variables_out,
                                 chunk_size=chunk_size,
                                 full_domain_size=full_domain_size,
+                                normalize_stats=self.normalize_stats.get(k, {}),
                             ),
                         self.tile_size,
                         self.twoD,

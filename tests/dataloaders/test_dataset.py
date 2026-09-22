@@ -21,8 +21,10 @@ bugs have been found and fixed this session (see tests/README.md):
 
 import itertools
 
+import nibabel as nib
 import numpy as np
 import pytest
+from PIL import Image
 from torch.utils.data import IterableDataset
 
 from UCF_VIT.dataloaders.dataset import (
@@ -727,3 +729,56 @@ def test_filereader_epoch_shuffle_seed_differs_across_epochs(monkeypatch):
     epoch1 = [path for path, variables in reader]
     assert epoch0 != epoch1  # different permutation -- not the same shuffle replayed
     assert set(epoch0) == set(epoch1) == set(file_list)  # same underlying files either way
+
+
+# ---------------------------------------------------------------------------
+# FileReader.read_process_file -- z-score normalization via normalize_stats
+# ---------------------------------------------------------------------------
+
+
+def test_filereader_read_process_file_basic_ct_applies_normalize_stats(tmp_path):
+    raw = np.arange(2 * 2 * 2, dtype=np.float32).reshape(2, 2, 2)
+    path = tmp_path / "image1.nii"
+    nib.save(nib.Nifti1Image(raw, affine=np.eye(4)), str(path))
+
+    stats = {"ct1": {"mean": 3.5, "std": 2.0}}
+    reader = FileReader(
+        [str(path)], start_idx=0.0, end_idx=1.0, variables=("ct1",), gx="1",
+        ddp_group=None, data_par_size=1, dataset="basic_ct", normalize_stats=stats,
+    )
+    data = reader.read_process_file(str(path))
+
+    assert data.shape == (1, 2, 2, 2)  # channel-first, expand_dims applied before normalize
+    np.testing.assert_allclose(data[0], (raw - 3.5) / 2.0)
+
+
+def test_filereader_read_process_file_basic_ct_passthrough_without_stats(tmp_path):
+    raw = np.arange(2 * 2 * 2, dtype=np.float32).reshape(2, 2, 2)
+    path = tmp_path / "image1.nii"
+    nib.save(nib.Nifti1Image(raw, affine=np.eye(4)), str(path))
+
+    reader = FileReader(
+        [str(path)], start_idx=0.0, end_idx=1.0, variables=("ct1",), gx="1",
+        ddp_group=None, data_par_size=1, dataset="basic_ct",
+    )
+    data = reader.read_process_file(str(path))
+
+    np.testing.assert_allclose(data[0], raw)  # numerically unchanged (just float32, not uint8-era min-max)
+
+
+def test_filereader_read_process_file_imagenet_applies_normalize_stats(tmp_path):
+    raw = np.arange(4 * 4 * 3, dtype=np.uint8).reshape(4, 4, 3)
+    path = tmp_path / "img.png"
+    Image.fromarray(raw).save(str(path))
+
+    stats = {"r": {"mean": 50.0, "std": 10.0}}  # only the "r" channel configured
+    reader = FileReader(
+        [str(path)], start_idx=0.0, end_idx=1.0, variables=("r", "g", "b"), gx="1",
+        ddp_group=None, data_par_size=1, dataset="imagenet", normalize_stats=stats,
+    )
+    data = reader.read_process_file(str(path))
+
+    raw_chw = np.moveaxis(raw, -1, 0).astype(np.float32)
+    np.testing.assert_allclose(data[0], (raw_chw[0] - 50.0) / 10.0)
+    np.testing.assert_allclose(data[1], raw_chw[1])  # "g"/"b" untouched -- no stats configured for them
+    np.testing.assert_allclose(data[2], raw_chw[2])

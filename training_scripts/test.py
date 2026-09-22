@@ -117,6 +117,7 @@ def main():
                 canny_sigma = test_conf["ap"]["canny_sigma"],
                 canny_low_threshold = test_conf["ap"]["canny_low_threshold"],
                 canny_high_threshold = test_conf["ap"]["canny_high_threshold"],
+                normalize_stats = test_conf["data"]["normalize_stats"],
             )
 
             data_module.setup()
@@ -148,7 +149,7 @@ def main():
             test_list = sorted(glob.glob(os.path.join(test_conf["data"]["dict_root_dirs"][dkey_test],'*.jpg')))
             test_list = slice_file_list(test_list, test_conf["dataloader"]["dict_start_idx"][dkey_test], test_conf["dataloader"]["dict_end_idx"][dkey_test])
 
-            test_data = test_conf["dataloader"]["dataset_module"](test_list, test_conf["data"]["dict_in_variables"][dkey_test], test_conf["data"]["tile_size"], adaptive_patching=test_conf["ap"]["do_ap"], fixed_length=test_conf["ap"]["fixed_length"], interp_size=test_conf["data"]["interp_size"], num_channels=test_conf["data"]["num_channels"][dkey_test], dataset=test_conf["data"]["dataset"], resize=test_conf["dataset_options"]["resize"].get(test_conf["data"]["dataset"]), div=test_conf["tiling"]["div"], tile_overlap=test_conf["tiling"]["tile_overlap"], score_fn=test_conf["ap"]["score_fn"], min_size=test_conf["ap"]["min_size"], canny_sigma=test_conf["ap"]["canny_sigma"], canny_low_threshold=test_conf["ap"]["canny_low_threshold"], canny_high_threshold=test_conf["ap"]["canny_high_threshold"])
+            test_data = test_conf["dataloader"]["dataset_module"](test_list, test_conf["data"]["dict_in_variables"][dkey_test], test_conf["data"]["tile_size"], adaptive_patching=test_conf["ap"]["do_ap"], fixed_length=test_conf["ap"]["fixed_length"], interp_size=test_conf["data"]["interp_size"], num_channels=test_conf["data"]["num_channels"][dkey_test], dataset=test_conf["data"]["dataset"], resize=test_conf["dataset_options"]["resize"].get(test_conf["data"]["dataset"]), div=test_conf["tiling"]["div"], tile_overlap=test_conf["tiling"]["tile_overlap"], score_fn=test_conf["ap"]["score_fn"], min_size=test_conf["ap"]["min_size"], canny_sigma=test_conf["ap"]["canny_sigma"], canny_low_threshold=test_conf["ap"]["canny_low_threshold"], canny_high_threshold=test_conf["ap"]["canny_high_threshold"], normalize_stats=test_conf["data"]["normalize_stats"].get(dkey_test, {}))
 
             # Same reasoning as train.py's own DistributedSampler construction.
             test_sampler = torch.utils.data.distributed.DistributedSampler(test_data, shuffle=False, num_replicas=test_conf["parallelism"]["data_par_size"],rank=dist.get_rank(ddp_group))

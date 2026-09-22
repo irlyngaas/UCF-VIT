@@ -79,6 +79,55 @@ def test_save_inference_batch_multi_channel_regression_not_argmaxed(tmp_path):
     np.testing.assert_allclose(pred, 7.0, atol=1e-5)
 
 
+def _minimal_conf(dict_key, in_var, stats, out_var=None):
+    return {
+        "data": {
+            "dict_in_variables": {dict_key: [in_var]},
+            "dict_out_variables": {dict_key: [out_var]} if out_var else None,
+            "normalize_stats": {dict_key: stats},
+        },
+    }
+
+
+def test_save_inference_batch_denormalizes_input_for_classification(tmp_path):
+    # regression=False (e.g. basic_ct segmentation) -- data is still
+    # normalized at load time regardless of task, so it must still be
+    # denormalized, even though label/pred (discrete class indices) aren't.
+    batch = {
+        "data": torch.zeros(1, 1, 2, 2, 2),  # normalized value 0.0
+        "label": torch.zeros(1, 1, 2, 2, 2, dtype=torch.long),
+        "dict_key": "ct1",
+    }
+    output = torch.zeros(1, 2, 2, 2, 2)
+    conf = _minimal_conf("ct1", "ct_res1", {"ct_res1": {"mean": 100.0, "std": 20.0}})
+
+    save_inference_batch(str(tmp_path), batch, output, batch_idx=0, rank=0, regression=False, conf=conf)
+
+    data = np.array(nib.load(str(tmp_path / "rank0_batch0_sample0_input.nii.gz")).dataobj)
+    np.testing.assert_allclose(data, 100.0, atol=1e-4)  # 0.0 * 20 + 100 == 100
+
+
+def test_save_inference_batch_denormalizes_regression(tmp_path):
+    batch = {
+        "data": torch.zeros(1, 1, 2, 2, 2),
+        "label": torch.full((1, 1, 2, 2, 2), 2.0),
+        "dict_key": "sst1",
+    }
+    output = torch.full((1, 1, 2, 2, 2), 3.0)
+    conf = _minimal_conf(
+        "sst1", "u", {"u": {"mean": 100.0, "std": 20.0}, "p": {"mean": 5.0, "std": 1.0}}, out_var="p",
+    )
+
+    save_inference_batch(str(tmp_path), batch, output, batch_idx=0, rank=0, regression=True, conf=conf)
+
+    data = np.array(nib.load(str(tmp_path / "rank0_batch0_sample0_input.nii.gz")).dataobj)
+    label = np.array(nib.load(str(tmp_path / "rank0_batch0_sample0_label.nii.gz")).dataobj)
+    pred = np.array(nib.load(str(tmp_path / "rank0_batch0_sample0_pred.nii.gz")).dataobj)
+    np.testing.assert_allclose(data, 100.0, atol=1e-4)   # "u" stats: 0*20+100
+    np.testing.assert_allclose(label, 7.0, atol=1e-4)    # "p" stats: 2*1+5
+    np.testing.assert_allclose(pred, 8.0, atol=1e-4)     # "p" stats: 3*1+5
+
+
 def test_save_inference_batch_creates_output_dir(tmp_path):
     nested = tmp_path / "nested" / "dir"
     batch = {

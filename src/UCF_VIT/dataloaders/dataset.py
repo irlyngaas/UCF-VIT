@@ -14,6 +14,7 @@ from PIL import Image
 import cv2 as cv
 
 from UCF_VIT.utils.misc import calculate_tile_bounds, calculate_tile_overlap
+from UCF_VIT.utils.normalize import zscore_normalize
 
 class FileReader(IterableDataset):
     """Iterable dataset that reads and preprocesses raw data files, sharded across DDP ranks and dataloader workers.
@@ -42,6 +43,7 @@ class FileReader(IterableDataset):
         variables_out: Optional[list] = None,
         chunk_size: Optional[list] = None,
         full_domain_size: Optional[list] = None,
+        normalize_stats: Optional[Dict] = None,
     ) -> None:
         """Initializes the reader over the `[start_idx, end_idx)` fraction of `file_list`.
 
@@ -112,6 +114,11 @@ class FileReader(IterableDataset):
                 size `[nz, ny, nx]` -- what one raw per-variable file
                 actually spans, before any chunk splitting. Only used for
                 "sst"; `chunk_size` itself when omitted (1 chunk).
+            normalize_stats: `{variable_name: {"mean":..., "std":...}}` for
+                this dataset key -- see `UCF_VIT.utils.normalize.
+                zscore_normalize`'s own docstring. `None`/`{}` (default) or
+                a variable missing from it means that channel is returned
+                unnormalized, exactly today's behavior.
         """
         super().__init__()
         self.num_channels_available = len(variables)
@@ -128,6 +135,7 @@ class FileReader(IterableDataset):
         self.data_par_size = data_par_size
         self.return_label = return_label
         self.variables = variables
+        self.normalize_stats = normalize_stats or {}
         self.gx = gx
         self.keys_to_add = keys_to_add
         self.ddp_group = ddp_group
@@ -149,8 +157,12 @@ class FileReader(IterableDataset):
 
         For "imagenet", loads and resizes an RGB image and, if `return_label`,
         derives the class label from the parent directory name. For "basic_ct",
-        loads a NIfTI volume, min-max normalizes it, and if `return_label`, loads
-        the corresponding label volume from the sibling "labelsTr" directory.
+        loads a NIfTI volume and, if `return_label`, loads the corresponding
+        label volume from the sibling "labelsTr" directory. Every branch's
+        real (continuous) data -- and "sst"'s regression label, but never a
+        discrete class-index label -- is z-score normalized via `self.
+        normalize_stats` (`UCF_VIT.utils.normalize.zscore_normalize`) right
+        before returning, a no-op passthrough when unconfigured.
 
         Args:
             path: Path to the file to read.
@@ -167,7 +179,7 @@ class FileReader(IterableDataset):
                 # (width, height), so swap locally right here.
                 data = cv.resize(data, dsize=[self.resize[1], self.resize[0]])
             data = np.moveaxis(data,-1,0)
-
+            data = zscore_normalize(data, self.variables, self.normalize_stats, channel_axis=0)
 
             if self.return_label:
                 data_path = Path(path)
@@ -184,7 +196,9 @@ class FileReader(IterableDataset):
         elif self.dataset == "basic_ct":
             data = nib.load(path)
             data = np.array(data.dataobj).astype(np.float32)
-            data = (data-data.min())/(data.max()-data.min())
+            if self.num_channels_available == 1:
+                data = np.expand_dims(data, axis=0)
+            data = zscore_normalize(data, self.variables, self.normalize_stats, channel_axis=0)
 
             if self.return_label:
                 data_path = Path(path)
@@ -195,17 +209,9 @@ class FileReader(IterableDataset):
                 label = nib.load(path4)
                 label = np.array(label.dataobj).astype(np.int64)
                 label = label - 1 # subtract 1 as original labels are [1,4], new will be [0,3]
-
-            if self.num_channels_available == 1:
-                if self.return_label:
-                    return np.expand_dims(data,axis=0), label
-                else:
-                    return np.expand_dims(data,axis=0)
+                return data, label
             else:
-                if self.return_label:
-                    return data, label
-                else:
-                    return data
+                return data
 
         elif self.dataset == "sst":
             # "path" is a synthetic identifier (see process_root_dirs's own
@@ -261,9 +267,16 @@ class FileReader(IterableDataset):
                 return entry if isinstance(entry, tuple) else (entry, 0)
 
             data_list = [_read_channel(*_var_offset(entry)) for entry in self.variables]
+            data_list = zscore_normalize(data_list, self.variables, self.normalize_stats)
 
             if self.return_label:
                 label_list = [_read_channel(*_var_offset(entry)) for entry in self.variables_out]
+                # A real (continuous) regression target -- unlike basic_ct's/
+                # imagenet's discrete class-index label, this needs the same
+                # normalization as data_list so the loss compares like-scale
+                # values (see UCF_VIT.utils.normalize's own module docstring
+                # for why training loss stays in normalized space).
+                label_list = zscore_normalize(label_list, self.variables_out, self.normalize_stats)
                 return data_list, label_list
             else:
                 return data_list

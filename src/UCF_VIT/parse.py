@@ -953,6 +953,24 @@ def parse_config(args, load_balance_offline=False):
     else:
         time_offsets = None
 
+    #normalize_stats: {dataset_key: {variable_name: {"mean":..., "std":...}}},
+    #precomputed once (utils/compute_normalization_stats.py, over the train
+    #split only) and applied by FileReader.read_process_file/CatsDogsDataset
+    #.__getitem__ (UCF_VIT.utils.normalize.zscore_normalize) right after
+    #loading, before any tiling/adaptive patching runs. Optional -- omitted
+    #(or a dataset key/variable missing from the file) means that data stays
+    #unnormalized, exactly today's behavior; this is never required. A
+    #relative path is resolved against the repo root, same as
+    #trainer.checkpoint_path.
+    normalize_stats_path = conf['data'].get('normalize_stats_path')
+    if normalize_stats_path:
+        normalize_stats_path = os.path.join(find_repo_root(), normalize_stats_path)
+        assert os.path.exists(normalize_stats_path), f"data.normalize_stats_path does not exist: {normalize_stats_path}"
+        with open(normalize_stats_path) as f:
+            normalize_stats = yaml.load(f, Loader=yaml.FullLoader) or {}
+    else:
+        normalize_stats = {}
+
     #If using adaptive patching check if fixed length is compatible with tile_size
     if ap_conf['do_ap']:
         # Neither adaptive-patching path actually requires data.tile_size to be
@@ -1056,6 +1074,7 @@ def parse_config(args, load_balance_offline=False):
         "num_channels": num_channels,
         "dict_in_variables": dict_in_variables,
         "dict_out_variables": dict_out_variables,
+        "normalize_stats": normalize_stats,
         "time_offsets": time_offsets,
         "in_chans": in_chans,
     }
