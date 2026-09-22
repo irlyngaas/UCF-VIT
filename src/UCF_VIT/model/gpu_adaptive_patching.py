@@ -182,6 +182,7 @@ class GPUPatchify2D(torch.nn.Module):
             score_fn="variance", canny_sigma=1.0, canny_low_threshold=0.1,
             canny_high_threshold=0.2, canny_hysteresis_iters=2,
             region_backend=None, serialize_chunk_size=16,
+            merge_batch_ratio=0.15, merge_min_batch=4096, merge_max_batch=500_000,
     ):
         """Precomputes the level structure this image size implies.
 
@@ -256,11 +257,32 @@ class GPUPatchify2D(torch.nn.Module):
                 image sizes); tune down for very large images/channel
                 counts, up for small ones where the extra `grid_sample`
                 calls' overhead isn't worth it.
+            merge_batch_ratio: `run_merge_batch`'s own per-iteration
+                candidate-batch fraction -- see its own docstring for the
+                full tuning tradeoff. Dimensionless (a fraction of the
+                current candidate pool), so it doesn't need to scale with
+                `img_size`/`fixed_length`/batch size the way `merge_min_
+                batch`/`merge_max_batch` do -- `0.15` is the reference
+                implementation's own value, unchanged.
+            merge_min_batch: `run_merge_batch`'s own floor on the per-
+                iteration candidate batch size -- see its own docstring.
+                `4096` is the reference implementation's own value.
+            merge_max_batch: `run_merge_batch`'s own ceiling on the per-
+                iteration candidate batch size -- see its own docstring.
+                `500_000` is the reference implementation's own value,
+                carried over unchanged from a 2D-only source and not
+                re-tuned for this class's own (potentially much larger)
+                3D candidate pools -- `utils/tune_gpu_adaptive_patching.py`
+                searches for a better value at a given `img_size`/batch
+                size if the defaults turn out not to be a good fit.
         """
         super().__init__()
         self.interp_size = interp_size
         self.fixed_length = fixed_length
         self.serialize_chunk_size = serialize_chunk_size
+        self.merge_batch_ratio = merge_batch_ratio
+        self.merge_min_batch = merge_min_batch
+        self.merge_max_batch = merge_max_batch
 
         assert score_fn in ("variance", "canny"), f"score_fn must be 'variance' or 'canny', got {score_fn!r}"
         self.score_fn = score_fn
@@ -688,6 +710,17 @@ class GPUPatchify2D(torch.nn.Module):
         single global `topk` per iteration -- see this class's own
         docstring for why this is "level-parallel."
 
+        Each iteration's per-candidate-pool batch size `k` is clamped to
+        `[self.merge_min_batch, self.merge_max_batch]` (as a `self.merge_
+        batch_ratio` fraction of the current pool, before clamping) --
+        pure performance tuning, not correctness: `max_needed` (below)
+        always forces `k` at least as large as the batch's real remaining
+        merge quota regardless of these three, so termination/correctness
+        never depends on them. See `__init__`'s own docstring entries for
+        the tradeoff each one controls, and `utils/tune_gpu_adaptive_
+        patching.py` for a utility that searches for good values at a
+        given `img_size`/batch size.
+
         Args:
             batch_merge_costs: `merge_costs` from `_compute_all_levels_batch`.
             level_shapes: `level_shapes` from `_compute_all_levels_batch`.
@@ -706,9 +739,9 @@ class GPUPatchify2D(torch.nn.Module):
         leaves_remaining = torch.full((B,), alive[0][0].numel(), dtype=torch.long, device=device)
         end_leaves = self.fixed_length
 
-        batch_ratio = 0.15
-        min_batch = 4096
-        max_batch = 500_000
+        batch_ratio = self.merge_batch_ratio
+        min_batch = self.merge_min_batch
+        max_batch = self.merge_max_batch
 
         while (leaves_remaining > end_leaves).any():
             cand_costs, cand_img, cand_level, cand_row, cand_col = [], [], [], [], []
@@ -940,6 +973,7 @@ class GPUPatchify3D(torch.nn.Module):
             score_fn="variance", canny_sigma=1.0, canny_low_threshold=0.1,
             canny_high_threshold=0.2, canny_hysteresis_iters=2,
             region_backend=None, serialize_chunk_size=16,
+            merge_batch_ratio=0.15, merge_min_batch=4096, merge_max_batch=500_000,
     ):
         """Precomputes the level structure this volume size implies.
 
@@ -995,11 +1029,28 @@ class GPUPatchify3D(torch.nn.Module):
                 scale); tune down for very large volumes/channel counts,
                 up for small ones where the extra `grid_sample` calls'
                 overhead isn't worth it.
+            merge_batch_ratio: `run_merge_batch`'s own per-iteration
+                candidate-batch fraction -- see `GPUPatchify2D`'s own
+                identical entry for the full tuning tradeoff.
+            merge_min_batch: `run_merge_batch`'s own floor on the per-
+                iteration candidate batch size -- see `GPUPatchify2D`'s
+                own identical entry.
+            merge_max_batch: `run_merge_batch`'s own ceiling on the per-
+                iteration candidate batch size -- see `GPUPatchify2D`'s
+                own identical entry; this class's candidate pools grow
+                cubically (not quadratically) with `img_size/min_size`,
+                so the shared `500_000` default is more likely to actually
+                bind here than in the 2D case -- `utils/tune_gpu_adaptive_
+                patching.py` searches for a better value at a given
+                `img_size`/batch size.
         """
         super().__init__()
         self.interp_size = interp_size
         self.fixed_length = fixed_length
         self.serialize_chunk_size = serialize_chunk_size
+        self.merge_batch_ratio = merge_batch_ratio
+        self.merge_min_batch = merge_min_batch
+        self.merge_max_batch = merge_max_batch
 
         assert score_fn in ("variance", "canny"), f"score_fn must be 'variance' or 'canny', got {score_fn!r}"
         self.score_fn = score_fn
@@ -1450,7 +1501,11 @@ class GPUPatchify3D(torch.nn.Module):
         3D analog of `GPUPatchify2D`'s own method -- identical level-
         parallel design (see that method's own docstring), 8-way children
         (not 4-way): each merge removes exactly 7 leaves, so budget/
-        leaves-remaining bookkeeping divides by 7 (not 3).
+        leaves-remaining bookkeeping divides by 7 (not 3). Same `self.
+        merge_batch_ratio`/`merge_min_batch`/`merge_max_batch` tuning (see
+        `GPUPatchify2D.run_merge_batch`'s own docstring) -- this class's
+        candidate pools grow cubically rather than quadratically, so the
+        shared defaults are more likely to actually bind here.
 
         Args:
             batch_merge_costs: `merge_costs` from `_compute_all_levels_batch`.
@@ -1470,9 +1525,9 @@ class GPUPatchify3D(torch.nn.Module):
         leaves_remaining = torch.full((B,), alive[0][0].numel(), dtype=torch.long, device=device)
         end_leaves = self.fixed_length
 
-        batch_ratio = 0.15
-        min_batch = 4096
-        max_batch = 500_000
+        batch_ratio = self.merge_batch_ratio
+        min_batch = self.merge_min_batch
+        max_batch = self.merge_max_batch
 
         while (leaves_remaining > end_leaves).any():
             cand_costs, cand_img, cand_level, cand_d, cand_h, cand_w = [], [], [], [], [], []
