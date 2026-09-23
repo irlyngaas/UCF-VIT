@@ -156,7 +156,16 @@ def _iterate_iterative_dataloader(conf, split):
         dict_end_idx=conf["dataloader"][end_key],
         batches_per_rank_epoch=batches_per_rank_epoch,
         dataset_group_list=dataset_group_list,
-        dict_buffer_sizes=conf["dataloader"]["dict_buffer_sizes"],
+        # Stats don't care about sample order, so there's no reason to pay
+        # for real shuffling -- and with num_workers=0 (single-process,
+        # unlike a real training run), ShuffleIterableDataset.__iter__ has
+        # to serially fill the whole buffer before yielding anything at
+        # all, so a real config's (possibly large) buffer size would add
+        # pure startup latency here for zero benefit. 1 is the minimum
+        # ShuffleIterableDataset accepts (assert buffer_size > 0) and
+        # collapses it to a plain passthrough (see its own __iter__:
+        # buffer_size=1 yields each sample immediately, no real shuffling).
+        dict_buffer_sizes={k: 1 for k in conf["dataloader"]["dict_buffer_sizes"]},
         dict_in_variables=conf["data"]["dict_in_variables"],
         num_channels_used=conf["data"]["num_channels"],
         batch_size=conf["dataloader"]["batch_size"],
