@@ -17,11 +17,15 @@ normalize_stats_path` expects:
     ct1:
       ct_res1: {mean: ..., std: ...}
 
-Deliberately builds the dataloader with `adaptive_patching` forced off and
-`normalize_stats` left empty regardless of what the config says -- stats
-are computed over the *raw* per-sample data (not adaptively-patched
-sequences, and not already-normalized data from some existing
-`normalize_stats_path` the config might already point at).
+Deliberately builds the dataloader with `adaptive_patching`/`tiling` forced
+off and `normalize_stats` left empty regardless of what the config says --
+stats are computed over the *raw* per-sample data (not adaptively-patched
+sequences, not already-normalized data from some existing
+`normalize_stats_path` the config might already point at, and not tiled --
+tiling doesn't change the underlying value distribution when tile_overlap
+is 0, and actively biases it when tile_overlap > 0, since overlapping
+voxels would be double-counted; either way it multiplies the number of
+samples iterated for zero benefit to the computed stats).
 
 Usage:
     python utils/compute_normalization_stats.py path/to/config.yaml --output stats.yaml
@@ -127,6 +131,23 @@ def _iterate_iterative_dataloader(conf, split):
     split_conf["dataloader"]["dict_start_idx"] = conf["dataloader"][start_key]
     split_conf["dataloader"]["dict_end_idx"] = conf["dataloader"][end_key]
     split_conf["parallelism"]["data_par_size"] = 1  # matches this function's own single-process NativePytorchDataModule below
+
+    # Tiling doesn't matter for stats (mean/std over the union of tiles'
+    # values is identical to computing it over the whole untiled image, as
+    # long as there's no overlap) -- and is actively wrong to leave on: a
+    # real config's tile_overlap > 0 would double-count overlapping voxels,
+    # biasing the stats, and even with overlap:0 it multiplies the number
+    # of samples/batches iterated for zero benefit. Force div=1/overlap=0
+    # here, which also means data.tile_size must be recomputed (it's
+    # already pre-divided by the real div in parse.py) -- with div=1 and
+    # zero overlap, parse.py's own tile_size formula always collapses to
+    # exactly effective_size (resize, if any, else img_size), regardless of
+    # dimensionality, so no need to replicate its 2D/twoD-3D/3D branches.
+    effective_size = conf["dataset_options"]["resize"].get(conf["data"]["dataset"], conf["data"]["img_size"])
+    split_conf["data"]["tile_size"] = tuple(effective_size)
+    split_conf["tiling"]["div"] = 1
+    split_conf["tiling"]["tile_overlap"] = tuple(0 for _ in effective_size)
+
     batches_per_rank_epoch, dataset_group_list = calculate_load_balancing_on_the_fly(split_conf)
 
     data_module = NativePytorchDataModule(
@@ -142,11 +163,11 @@ def _iterate_iterative_dataloader(conf, split):
         num_workers=0,
         pin_memory=False,
         interp_size=conf["data"]["interp_size"],
-        tile_size=conf["data"]["tile_size"],
+        tile_size=split_conf["data"]["tile_size"],
         twoD=conf["data"]["twoD"],
         return_label=conf["dataloader"]["return_label"],
-        div=conf["tiling"]["div"],
-        tile_overlap=conf["tiling"]["tile_overlap"],
+        div=split_conf["tiling"]["div"],
+        tile_overlap=split_conf["tiling"]["tile_overlap"],
         adaptive_patching=False,  # stats need raw per-sample data, not adaptively-patched sequences
         fixed_length=conf["ap"]["fixed_length"],
         data_par_size=1,
@@ -194,11 +215,19 @@ def _iterate_catsdogs(conf, split):
     file_list = sorted(glob.glob(os.path.join(conf["data"]["dict_root_dirs"][dkey], "*.jpg")))
     file_list = slice_file_list(file_list, conf["dataloader"][start_key][dkey], conf["dataloader"][end_key][dkey])
 
+    # See _iterate_iterative_dataloader's identical comment -- tiling is
+    # irrelevant (and, with overlap > 0, actively biasing) for stats, so
+    # forced off here too; tile_size with div=1 must be the post-resize
+    # whole-image size, matching CatsDogsDataset.__init__'s own docstring
+    # ("When div == 1 ... this is the size the whole image actually is once
+    # resize ... has been applied").
+    resize = conf["dataset_options"]["resize"].get(conf["data"]["dataset"])
+    effective_size = resize or conf["data"]["img_size"]
     ds = CatsDogsDataset(
-        file_list, conf["data"]["dict_in_variables"][dkey], conf["data"]["tile_size"],
+        file_list, conf["data"]["dict_in_variables"][dkey], tuple(effective_size),
         adaptive_patching=False, num_channels=conf["data"]["num_channels"][dkey],
-        dataset=conf["data"]["dataset"], resize=conf["dataset_options"]["resize"].get(conf["data"]["dataset"]),
-        div=conf["tiling"]["div"], tile_overlap=conf["tiling"]["tile_overlap"],
+        dataset=conf["data"]["dataset"], resize=resize,
+        div=1, tile_overlap=(0, 0),
     )
     loader = DataLoader(
         ds, batch_size=conf["dataloader"]["batch_size"], shuffle=False, num_workers=0,
