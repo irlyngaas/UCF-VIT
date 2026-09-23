@@ -27,6 +27,7 @@ Usage:
     python utils/compute_normalization_stats.py path/to/config.yaml --output stats.yaml
     python utils/compute_normalization_stats.py path/to/config.yaml --output stats.yaml --split val
     python utils/compute_normalization_stats.py path/to/config.yaml --output stats.yaml --max-samples 2000
+    python utils/compute_normalization_stats.py path/to/config.yaml --output stats.yaml --progress-interval 5
 """
 
 import argparse
@@ -34,6 +35,7 @@ import copy
 import functools
 import os
 import sys
+import time
 
 import numpy as np
 import torch
@@ -207,7 +209,7 @@ def _iterate_catsdogs(conf, split):
         yield dkey, conf["data"]["dict_in_variables"][dkey], data, None
 
 
-def compute_stats(config_path, split="train", max_samples=None):
+def compute_stats(config_path, split="train", max_samples=None, progress_interval=20):
     """Computes per-(dataset key, variable) z-score stats over one split of `config_path`'s data.
 
     Args:
@@ -220,6 +222,13 @@ def compute_stats(config_path, split="train", max_samples=None):
             it's seen at least this many real values -- for a quick
             approximate run over a large dataset; `None` (default) uses the
             entire split.
+        progress_interval: Print a progress line every this many batches --
+            per-sample decode cost (a real NIfTI/CT volume vs. a small
+            imagenet crop) varies wildly enough that a real run's total
+            batch count isn't knowable up front, so this reports elapsed
+            time/rate and running per-key counts rather than a percentage.
+            `0` disables progress printing entirely (still prints the final
+            per-(key, variable) summary).
 
     Returns:
         `{dataset_key: {variable_name: {"mean": float, "std": float}}}`.
@@ -234,16 +243,35 @@ def compute_stats(config_path, split="train", max_samples=None):
     else:
         batches = _iterate_catsdogs(conf, split)
 
+    print(f"Computing normalization stats over the {split!r} split of {config_path}...", flush=True)
+    start = time.perf_counter()
+    num_batches = 0
+    num_samples = 0
+
     for dict_key, variables, data, out in batches:
         _accumulate_array(stats, dict_key, variables, data, max_samples)
         if out is not None:
             out_variables, label = out
             _accumulate_array(stats, dict_key, out_variables, label, max_samples)
+
+        num_batches += 1
+        num_samples += data.shape[0] if not isinstance(data, list) else data[0].shape[0]
+
+        if progress_interval and num_batches % progress_interval == 0:
+            elapsed = time.perf_counter() - start
+            counts = ", ".join(f"{k}/{v}={c}" for (k, v), c in sorted(stats.sample_counts().items()))
+            print(
+                f"  batch {num_batches} ({num_samples} samples, {elapsed:.1f}s elapsed, "
+                f"{num_samples / elapsed:.1f} samples/s) -- {counts}",
+                flush=True,
+            )
+
         if max_samples is not None and all(c >= max_samples for c in stats.sample_counts().values()):
             break
 
-    counts = stats.sample_counts()
-    for (key, variable), count in sorted(counts.items()):
+    elapsed = time.perf_counter() - start
+    print(f"Done: {num_batches} batches, {num_samples} samples, {elapsed:.1f}s elapsed.", flush=True)
+    for (key, variable), count in sorted(stats.sample_counts().items()):
         print(f"{key}/{variable}: {count} values")
 
     return stats.finalize()
@@ -255,9 +283,10 @@ def main():
     parser.add_argument("--output", required=True, help="Where to write the computed stats YAML")
     parser.add_argument("--split", choices=["train", "val", "test"], default="train")
     parser.add_argument("--max-samples", type=int, default=None, help="Cap per (dataset key, variable) values accumulated -- for a quick approximate run")
+    parser.add_argument("--progress-interval", type=int, default=20, help="Print progress every this many batches; 0 disables progress printing")
     args = parser.parse_args()
 
-    stats = compute_stats(args.config, split=args.split, max_samples=args.max_samples)
+    stats = compute_stats(args.config, split=args.split, max_samples=args.max_samples, progress_interval=args.progress_interval)
 
     output_path = args.output if os.path.isabs(args.output) else os.path.join(find_repo_root(), args.output)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
