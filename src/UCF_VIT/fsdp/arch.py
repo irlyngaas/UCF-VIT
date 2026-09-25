@@ -1139,6 +1139,18 @@ class DiffusionVIT(VIT):
         self.residual_feature_conv3d_channels = int(kwargs.pop(
             'residual_feature_conv3d_channels', 8
         ))
+        self.spatial_feature_conv3d_decoder = kwargs.pop(
+            'spatial_feature_conv3d_decoder', False
+        )
+        self.spatial_feature_conv3d_channels = int(kwargs.pop(
+            'spatial_feature_conv3d_channels', 8
+        ))
+        self.spatial_feature_conv2d_decoder = kwargs.pop(
+            'spatial_feature_conv2d_decoder', False
+        )
+        self.spatial_feature_conv2d_channels = int(kwargs.pop(
+            'spatial_feature_conv2d_channels', 16
+        ))
         self.decoder_depth = kwargs.pop('decoder_depth', '')
         self.decoder_embed_dim = kwargs.pop('decoder_embed_dim', '')
         self.decoder_num_heads = kwargs.pop('decoder_num_heads', '')
@@ -1158,6 +1170,47 @@ class DiffusionVIT(VIT):
                 "Select only one residual decoder: MLP, prediction Conv3D, "
                 "or feature Conv3D"
             )
+        spatial_decoder_count = sum((
+            bool(self.spatial_feature_conv2d_decoder),
+            bool(self.spatial_feature_conv3d_decoder),
+        ))
+        if spatial_decoder_count > 1:
+            raise ValueError(
+                "Select only one direct spatial decoder: Conv2D or Conv3D"
+            )
+        if spatial_decoder_count and residual_decoder_count:
+            raise ValueError(
+                "A direct spatial decoder cannot be combined with a "
+                "residual decoder"
+            )
+        if self.spatial_feature_conv2d_decoder:
+            if not self.linear_decoder:
+                raise ValueError(
+                    "spatial_feature_conv2d_decoder requires "
+                    "linear_decoder=True"
+                )
+            if not self.twoD:
+                raise ValueError(
+                    "spatial_feature_conv2d_decoder requires a 2D model"
+                )
+            if self.spatial_feature_conv2d_channels <= 0:
+                raise ValueError(
+                    "spatial_feature_conv2d_channels must be positive"
+                )
+        if self.spatial_feature_conv3d_decoder:
+            if not self.linear_decoder:
+                raise ValueError(
+                    "spatial_feature_conv3d_decoder requires "
+                    "linear_decoder=True"
+                )
+            if self.twoD:
+                raise ValueError(
+                    "spatial_feature_conv3d_decoder requires a 3D model"
+                )
+            if self.spatial_feature_conv3d_channels <= 0:
+                raise ValueError(
+                    "spatial_feature_conv3d_channels must be positive"
+                )
         if self.residual_conv3d_decoder:
             if not self.linear_decoder:
                 raise ValueError(
@@ -1200,7 +1253,11 @@ class DiffusionVIT(VIT):
             setattr(self,f'cond_map{i}', cond_map)
 
         if self.linear_decoder:
-            self.decoder_pred = nn.Linear(self.embed_dim, self.patch_dim)
+            # The direct spatial head replaces (rather than supplements) the
+            # patchwise prediction layer, avoiding unused parameters under
+            # distributed training.
+            if not spatial_decoder_count:
+                self.decoder_pred = nn.Linear(self.embed_dim, self.patch_dim)
             if self.residual_mlp_decoder:
                 residual_hidden_dim = int(
                     self.embed_dim * self.residual_mlp_ratio
@@ -1271,6 +1328,76 @@ class DiffusionVIT(VIT):
                     nn.SiLU(),
                     nn.Conv3d(
                         self.residual_feature_conv3d_channels,
+                        self.in_chans,
+                        kernel_size=3,
+                        padding=1,
+                        padding_mode='replicate',
+                    ),
+                )
+            if self.spatial_feature_conv3d_decoder:
+                feature_patch_dim = (
+                    int(self.patch_size) ** 3
+                    * self.spatial_feature_conv3d_channels
+                )
+                self.decoder_spatial_feature_proj = nn.Sequential(
+                    nn.LayerNorm(self.embed_dim),
+                    nn.Linear(self.embed_dim, feature_patch_dim),
+                    nn.SiLU(),
+                )
+                self.decoder_spatial_feature_conv3d = nn.Sequential(
+                    nn.Conv3d(
+                        self.spatial_feature_conv3d_channels,
+                        self.spatial_feature_conv3d_channels,
+                        kernel_size=3,
+                        padding=1,
+                        padding_mode='replicate',
+                    ),
+                    nn.SiLU(),
+                    nn.Conv3d(
+                        self.spatial_feature_conv3d_channels,
+                        self.spatial_feature_conv3d_channels,
+                        kernel_size=3,
+                        padding=1,
+                        padding_mode='replicate',
+                    ),
+                    nn.SiLU(),
+                    nn.Conv3d(
+                        self.spatial_feature_conv3d_channels,
+                        self.in_chans,
+                        kernel_size=3,
+                        padding=1,
+                        padding_mode='replicate',
+                    ),
+                )
+            if self.spatial_feature_conv2d_decoder:
+                feature_patch_dim = (
+                    int(self.patch_size) ** 2
+                    * self.spatial_feature_conv2d_channels
+                )
+                self.decoder_spatial_feature_proj = nn.Sequential(
+                    nn.LayerNorm(self.embed_dim),
+                    nn.Linear(self.embed_dim, feature_patch_dim),
+                    nn.SiLU(),
+                )
+                self.decoder_spatial_feature_conv2d = nn.Sequential(
+                    nn.Conv2d(
+                        self.spatial_feature_conv2d_channels,
+                        self.spatial_feature_conv2d_channels,
+                        kernel_size=3,
+                        padding=1,
+                        padding_mode='replicate',
+                    ),
+                    nn.SiLU(),
+                    nn.Conv2d(
+                        self.spatial_feature_conv2d_channels,
+                        self.spatial_feature_conv2d_channels,
+                        kernel_size=3,
+                        padding=1,
+                        padding_mode='replicate',
+                    ),
+                    nn.SiLU(),
+                    nn.Conv2d(
+                        self.spatial_feature_conv2d_channels,
                         self.in_chans,
                         kernel_size=3,
                         padding=1,
@@ -1383,6 +1510,58 @@ class DiffusionVIT(VIT):
             batch_size,
             self.num_patches,
             patch_size ** 3 * num_channels,
+        )
+
+    def _tokens_to_2d_image(
+        self, tokens: torch.Tensor, num_channels: Optional[int] = None
+    ) -> torch.Tensor:
+        """Invert 2D patchification using the repository's token layout."""
+        batch_size = tokens.shape[0]
+        patch_size = int(self.patch_size)
+        if num_channels is None:
+            num_channels = self.in_chans
+        expected_patch_dim = patch_size ** 2 * num_channels
+        if tokens.shape[-1] != expected_patch_dim:
+            raise ValueError(
+                f"Expected token dimension {expected_patch_dim} for "
+                f"{num_channels} channels, got {tokens.shape[-1]}"
+            )
+        grid_x, grid_y = self.grid_size
+        image = tokens.reshape(
+            batch_size,
+            grid_x,
+            grid_y,
+            patch_size,
+            patch_size,
+            num_channels,
+        )
+        image = torch.einsum('nhwpqc->nchpwq', image)
+        return image.reshape(
+            batch_size,
+            num_channels,
+            grid_x * patch_size,
+            grid_y * patch_size,
+        )
+
+    def _image_to_2d_tokens(self, image: torch.Tensor) -> torch.Tensor:
+        """Patchify a 2D image using the inverse established layout."""
+        batch_size = image.shape[0]
+        num_channels = image.shape[1]
+        patch_size = int(self.patch_size)
+        grid_x, grid_y = self.grid_size
+        tokens = image.reshape(
+            batch_size,
+            num_channels,
+            grid_x,
+            patch_size,
+            grid_y,
+            patch_size,
+        )
+        tokens = torch.einsum('nchpwq->nhwpqc', tokens)
+        return tokens.reshape(
+            batch_size,
+            self.num_patches,
+            patch_size ** 2 * num_channels,
         )
 
     def init_weights(self, mode: str = '') -> None:
@@ -1517,7 +1696,28 @@ class DiffusionVIT(VIT):
             if self.tensor_par_size > 1:
                 x = F_Identity_B_Broadcast(x, src_rank, group=self.tensor_par_group)
 
-        prediction = self.decoder_pred(x)
+        if self.linear_decoder and self.spatial_feature_conv2d_decoder:
+            feature_tokens = self.decoder_spatial_feature_proj(x)
+            feature_image = self._tokens_to_2d_image(
+                feature_tokens,
+                num_channels=self.spatial_feature_conv2d_channels,
+            )
+            prediction_image = self.decoder_spatial_feature_conv2d(
+                feature_image
+            )
+            prediction = self._image_to_2d_tokens(prediction_image)
+        elif self.linear_decoder and self.spatial_feature_conv3d_decoder:
+            feature_tokens = self.decoder_spatial_feature_proj(x)
+            feature_volume = self._tokens_to_3d_volume(
+                feature_tokens,
+                num_channels=self.spatial_feature_conv3d_channels,
+            )
+            prediction_volume = self.decoder_spatial_feature_conv3d(
+                feature_volume
+            )
+            prediction = self._volume_to_3d_tokens(prediction_volume)
+        else:
+            prediction = self.decoder_pred(x)
         if self.linear_decoder and self.residual_mlp_decoder:
             prediction = prediction + self.decoder_residual(x)
         if self.linear_decoder and self.residual_conv3d_decoder:

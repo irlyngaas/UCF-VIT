@@ -683,6 +683,26 @@ def main(device):
             'residual_feature_conv3d_channels', 8
         )
     )
+    spatial_feature_conv3d_decoder = bool(
+        conf['model']['net']['init_args'].get(
+            'spatial_feature_conv3d_decoder', False
+        )
+    )
+    spatial_feature_conv3d_channels = int(
+        conf['model']['net']['init_args'].get(
+            'spatial_feature_conv3d_channels', 8
+        )
+    )
+    spatial_feature_conv2d_decoder = bool(
+        conf['model']['net']['init_args'].get(
+            'spatial_feature_conv2d_decoder', False
+        )
+    )
+    spatial_feature_conv2d_channels = int(
+        conf['model']['net']['init_args'].get(
+            'spatial_feature_conv2d_channels', 16
+        )
+    )
 
     twoD = conf['model']['net']['init_args']['twoD']
 
@@ -887,6 +907,10 @@ def main(device):
         residual_conv3d_channels=residual_conv3d_channels,
         residual_feature_conv3d_decoder=residual_feature_conv3d_decoder,
         residual_feature_conv3d_channels=residual_feature_conv3d_channels,
+        spatial_feature_conv3d_decoder=spatial_feature_conv3d_decoder,
+        spatial_feature_conv3d_channels=spatial_feature_conv3d_channels,
+        spatial_feature_conv2d_decoder=spatial_feature_conv2d_decoder,
+        spatial_feature_conv2d_channels=spatial_feature_conv2d_channels,
         twoD=twoD,
         mlp_ratio_decoder=mlp_ratio_decoder,
         default_vars=default_vars,
