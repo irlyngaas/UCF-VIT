@@ -10,15 +10,22 @@ Scoped to `_RunningStats`/`_accumulate_array` (pure numpy math, fast, no
 real data files needed) rather than the full `compute_stats` entry point --
 that one was verified manually end-to-end against a synthetic basic_ct
 fixture (confirmed correct mean/std against ground truth, and confirmed the
-train split correctly excludes val/test-reserved files), but exercising the
-real `NativePytorchDataModule`/dataloader machinery here would make this
-suite slow and heavy for what's genuinely simple accumulation logic.
+train split correctly excludes val/test-reserved files), and a real 2-rank
+`gloo` distributed run (launched as two real separate processes, `SLURM_
+NTASKS=2`/`SLURM_PROCID` set) confirmed to produce the exact same combined
+result as the single-process run over all the same data -- but exercising
+either the real `NativePytorchDataModule`/dataloader machinery or a real
+multi-process `torch.distributed` group here would make this suite slow
+and heavy for what's genuinely simple accumulation logic. `_RunningStats.
+state()`/`merge_state()` (the pure-Python core of the cross-rank
+combination) *are* covered here, directly.
 """
 
 import os
 import sys
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "utils"))
 
@@ -106,3 +113,50 @@ def test_accumulate_array_respects_max_per_channel_cap():
 
     assert stats.sample_counts()[("ct1", "v0")] == 100  # not 200 -- second call skipped
     assert stats.finalize()["ct1"]["v0"]["mean"] == 5.0  # unpolluted by the 999.0 call
+
+
+def test_running_stats_merge_state_matches_single_accumulator():
+    """The real cross-rank combination path: merging N ranks' own state()
+    must give the exact same result as a single accumulator that saw all
+    the same values -- not an approximation, since sum-of-sums/sum-of-
+    sums-of-squares/counts are all exact regardless of partitioning.
+    """
+    rng = np.random.RandomState(0)
+    chunks = [rng.rand(200).astype(np.float32) * 100 for _ in range(4)]
+    all_values = np.concatenate(chunks)
+
+    single = _RunningStats()
+    single.update("ct1", "ct_res1", all_values)
+
+    # Simulate 4 ranks, each seeing only its own chunk, then merged as if
+    # gathered via dist.all_gather_object.
+    per_rank = []
+    for chunk in chunks:
+        rank_stats = _RunningStats()
+        rank_stats.update("ct1", "ct_res1", chunk)
+        per_rank.append(rank_stats.state())
+
+    merged = _RunningStats()
+    for state in per_rank:
+        merged.merge_state(state)
+
+    expected = single.finalize()
+    got = merged.finalize()
+    assert got["ct1"]["ct_res1"]["mean"] == pytest.approx(expected["ct1"]["ct_res1"]["mean"], rel=1e-9)
+    assert got["ct1"]["ct_res1"]["std"] == pytest.approx(expected["ct1"]["ct_res1"]["std"], rel=1e-9)
+    assert merged.sample_counts()[("ct1", "ct_res1")] == single.sample_counts()[("ct1", "ct_res1")]
+
+
+def test_running_stats_merge_state_combines_disjoint_keys():
+    a = _RunningStats()
+    a.update("ct1", "v0", np.full(10, 5.0))
+    b = _RunningStats()
+    b.update("ct2", "v0", np.full(10, 50.0))  # a different dataset key entirely, never seen by a
+
+    merged = _RunningStats()
+    merged.merge_state(a.state())
+    merged.merge_state(b.state())
+
+    result = merged.finalize()
+    assert result["ct1"]["v0"]["mean"] == 5.0
+    assert result["ct2"]["v0"]["mean"] == 50.0

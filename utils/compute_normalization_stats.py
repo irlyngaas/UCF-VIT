@@ -27,6 +27,21 @@ is 0, and actively biases it when tile_overlap > 0, since overlapping
 voxels would be double-counted; either way it multiplies the number of
 samples iterated for zero benefit to the computed stats).
 
+Scales across real, separate processes/nodes for free: if launched under a
+real multi-task `srun -n N` (detected via the same `SLURM_PROCID`/
+`SLURM_NTASKS` env vars `train.py` itself reads), each rank gets its own
+file shard via `NativePytorchDataModule`'s own existing `data_par_size`/
+`gx` sharding (the exact mechanism real distributed training already uses)
+and accumulates its own local count/sum/sum-of-squares; the ranks'
+partial sums are then combined -- exactly, not approximately, since a sum
+of sums is still exact regardless of how the underlying values were
+partitioned -- via one `dist.all_gather_object` at the end. Uses "gloo"
+(CPU), not `train.py`'s "nccl" -- this is pure CPU/file-IO work, no GPU
+tensor communication happens anywhere, so there's no reason to require
+real GPUs just to get multi-process/multi-node parallelism. Launched as a
+single plain process (no `srun`, `SLURM_NTASKS` unset or 1), it falls back
+to the exact single-process behavior this always had.
+
 Usage:
     python utils/compute_normalization_stats.py path/to/config.yaml --output stats.yaml
     python utils/compute_normalization_stats.py path/to/config.yaml --output stats.yaml --split val
@@ -41,6 +56,7 @@ import functools
 import os
 import sys
 import time
+from datetime import timedelta
 
 import numpy as np
 import torch
@@ -91,6 +107,24 @@ class _RunningStats:
         """`{(key, variable): count}` -- for the end-of-run summary print, not written to the stats file."""
         return dict(self._count)
 
+    def state(self):
+        """Returns this instance's raw accumulator state, for combining across ranks via `merge_state`."""
+        return dict(self._count), dict(self._sum), dict(self._sumsq)
+
+    def merge_state(self, state):
+        """Folds another instance's `state()` (e.g. gathered from another rank) into this one.
+
+        Exact, not approximate: a sum of per-rank sums (and sums-of-squares,
+        and counts) is mathematically identical to accumulating over the
+        same values in one place, regardless of how they were partitioned
+        across ranks.
+        """
+        count, sum_, sumsq = state
+        for k in count:
+            self._count[k] = self._count.get(k, 0) + count[k]
+            self._sum[k] = self._sum.get(k, 0.0) + sum_[k]
+            self._sumsq[k] = self._sumsq.get(k, 0.0) + sumsq[k]
+
 
 def _var_name(entry):
     return entry[0] if isinstance(entry, tuple) else entry
@@ -116,8 +150,34 @@ def _accumulate_array(stats, key, variables, array, max_per_channel):
         stats.update(key, name, np.asarray(channel))
 
 
-def _iterate_iterative_dataloader(conf, split, num_workers):
-    """Yields `(dict_key, variables, data_array[, (variables_out, label_array)])` per batch."""
+def _init_distributed():
+    """Initializes a real multi-rank `gloo` process group when launched under `srun -n N>1`, else a single-process one.
+
+    Detects a real SLURM multi-task launch via `SLURM_PROCID`/`SLURM_NTASKS`
+    -- the same env vars `training_scripts/train.py`'s own `dist_init` reads
+    (its Slurm branch only; this utility never needs the mpi4py path, since
+    it's launched the same simple way every other `launch/*/*.sh` script
+    is). Uses `"gloo"` (CPU), not `train.py`'s `"nccl"` -- this is pure CPU/
+    file-IO work, no GPU tensor communication happens anywhere, so there's
+    no reason to require real GPUs just to get multi-process/multi-node
+    parallelism.
+
+    Returns:
+        `(world_rank, world_size)`.
+    """
+    if int(os.environ.get("SLURM_NTASKS", 1)) > 1:
+        os.environ.setdefault("MASTER_ADDR", os.environ["HOSTNAME"])
+        os.environ.setdefault("MASTER_PORT", "29500")
+        world_size = int(os.environ["SLURM_NTASKS"])
+        world_rank = int(os.environ["SLURM_PROCID"])
+        dist.init_process_group("gloo", timeout=timedelta(seconds=7200), rank=world_rank, world_size=world_size)
+        return world_rank, world_size
+    init_single_process_dist()
+    return 0, 1
+
+
+def _iterate_iterative_dataloader(conf, split, num_workers, world_rank, world_size):
+    """Yields `(dict_key, variables, data_array[, (variables_out, label_array)])` per batch, sharded across `world_size` ranks."""
     start_key, end_key = {
         "train": ("dict_start_idx", "dict_end_idx"),
         "val": ("dict_val_start_idx", "dict_val_end_idx"),
@@ -131,8 +191,20 @@ def _iterate_iterative_dataloader(conf, split, num_workers):
     split_conf = copy.deepcopy(conf)
     split_conf["dataloader"]["dict_start_idx"] = conf["dataloader"][start_key]
     split_conf["dataloader"]["dict_end_idx"] = conf["dataloader"][end_key]
-    split_conf["parallelism"]["data_par_size"] = 1  # matches this function's own single-process NativePytorchDataModule below
+    split_conf["parallelism"]["data_par_size"] = world_size  # matches this function's own NativePytorchDataModule construction below
     split_conf["dataloader"]["num_workers"] = num_workers  # calculate_load_balancing_on_the_fly's own sizing must match what's actually constructed below
+
+    # world_size == 1 (no real srun -n N>1 launch): ddp_group=None, exactly
+    # today's single-process behavior. world_size > 1: a real ddp_group
+    # spanning every rank -- tensor_par_size/fsdp_size both 1 (no tensor
+    # parallelism or FSDP sharding, only plain data-parallel file sharding
+    # across all ranks) -- built the same way train.py builds its own,
+    # just with the trivial 1x1xworld_size shape.
+    ddp_group = None
+    if world_size > 1:
+        ddp_group, _, _, _, _ = init_par_groups(
+            world_rank=world_rank, data_par_size=world_size, tensor_par_size=1, fsdp_size=1, simple_ddp_size=world_size,
+        )
 
     # Tiling doesn't matter for stats (mean/std over the union of tiles'
     # values is identical to computing it over the whole untiled image, as
@@ -181,7 +253,8 @@ def _iterate_iterative_dataloader(conf, split, num_workers):
         tile_overlap=split_conf["tiling"]["tile_overlap"],
         adaptive_patching=False,  # stats need raw per-sample data, not adaptively-patched sequences
         fixed_length=conf["ap"]["fixed_length"],
-        data_par_size=1,
+        data_par_size=world_size,
+        ddp_group=ddp_group,
         dataset=conf["data"]["dataset"],
         resize=conf["dataset_options"]["resize"],
         num_classes=conf["model"]["kwargs"].get("num_classes"),
@@ -211,8 +284,8 @@ def _iterate_iterative_dataloader(conf, split, num_workers):
         yield dict_key, variables, data, out
 
 
-def _iterate_catsdogs(conf, split, num_workers):
-    """Yields `(dict_key, variables, data_array)` per batch, for `dataloader.type: "dataloader"`."""
+def _iterate_catsdogs(conf, split, num_workers, world_rank, world_size):
+    """Yields `(dict_key, variables, data_array)` per batch, for `dataloader.type: "dataloader"`, sharded across `world_size` ranks."""
     from UCF_VIT.datasets.catsdogs import CatsDogsDataset, CatsDogsCollate
     from UCF_VIT.utils.misc import slice_file_list
     import glob
@@ -225,6 +298,11 @@ def _iterate_catsdogs(conf, split, num_workers):
     dkey = next(iter(conf["data"]["dict_root_dirs"]))
     file_list = sorted(glob.glob(os.path.join(conf["data"]["dict_root_dirs"][dkey], "*.jpg")))
     file_list = slice_file_list(file_list, conf["dataloader"][start_key][dkey], conf["dataloader"][end_key][dkey])
+    # No NativePytorchDataModule/gx sharding here (catsdogs' own map-style
+    # Dataset path never uses that machinery) -- a plain interleaved slice
+    # is enough, since stats don't care about order or which rank sees
+    # which file, only that every file is seen exactly once across ranks.
+    file_list = file_list[world_rank::world_size]
 
     # See _iterate_iterative_dataloader's identical comment -- tiling is
     # irrelevant (and, with overlap > 0, actively biasing) for stats, so
@@ -259,39 +337,48 @@ def compute_stats(config_path, split="train", max_samples=None, progress_interva
             for stats actually used to train with; see this module's own
             docstring), `"val"`, or `"test"`.
         max_samples: Stop accumulating a given (dataset key, variable) once
-            it's seen at least this many real values -- for a quick
-            approximate run over a large dataset; `None` (default) uses the
-            entire split.
+            *this rank* has seen at least this many real values -- for a
+            quick approximate run over a large dataset; `None` (default)
+            uses the entire split. Per-rank, not global: with `world_size`
+            real ranks (see `_init_distributed`), the true total accumulated
+            for a given (key, variable) can be up to `world_size` times this
+            value, not exactly this value.
         progress_interval: Print a progress line every this many batches --
             per-sample decode cost (a real NIfTI/CT volume vs. a small
             imagenet crop) varies wildly enough that a real run's total
             batch count isn't knowable up front, so this reports elapsed
             time/rate and running per-key counts rather than a percentage.
             `0` disables progress printing entirely (still prints the final
-            per-(key, variable) summary).
+            per-(key, variable) summary). Only rank 0 prints (with more
+            than one real rank, this reflects only rank 0's own shard's
+            progress, not a true global aggregate -- ranks' shards can
+            finish at different times depending on file-size imbalance).
         num_workers: DataLoader worker processes for real per-sample file
             decode. `0` (default) keeps everything in this one process --
             safe to run anywhere (a login node, a laptop), but every file
-            decode is serial. On a real dedicated node (see `launch/tests/
+            decode is serial. On a real dedicated node (see `launch/utils/
             run_compute_normalization_stats.sh`), set this to actually use
-            the node's other CPU cores -- this is normally the dominant
-            lever for wall-clock time here, more than which node it runs
-            on at all.
+            the node's other CPU cores. Combines with real multi-rank
+            parallelism (below): each rank gets its own `num_workers`.
 
     Returns:
-        `{dataset_key: {variable_name: {"mean": float, "std": float}}}`.
+        `{dataset_key: {variable_name: {"mean": float, "std": float}}}` --
+        the same, fully combined result on every rank when running with
+        `world_size > 1` real ranks (see `_init_distributed`'s own
+        docstring), not just rank 0's own shard.
     """
-    init_single_process_dist()
+    world_rank, world_size = _init_distributed()
     args = argparse.Namespace(config=config_path, pretrained_config="")
     conf = parse_config(args, load_balance_offline=True)
 
     stats = _RunningStats()
     if conf["dataloader"]["type"] == "iterative_dataloader":
-        batches = _iterate_iterative_dataloader(conf, split, num_workers)
+        batches = _iterate_iterative_dataloader(conf, split, num_workers, world_rank, world_size)
     else:
-        batches = _iterate_catsdogs(conf, split, num_workers)
+        batches = _iterate_catsdogs(conf, split, num_workers, world_rank, world_size)
 
-    print(f"Computing normalization stats over the {split!r} split of {config_path}...", flush=True)
+    if world_rank == 0:
+        print(f"Computing normalization stats over the {split!r} split of {config_path} ({world_size} rank(s))...", flush=True)
     start = time.perf_counter()
     num_batches = 0
     num_samples = 0
@@ -305,22 +392,37 @@ def compute_stats(config_path, split="train", max_samples=None, progress_interva
         num_batches += 1
         num_samples += data.shape[0] if not isinstance(data, list) else data[0].shape[0]
 
-        if progress_interval and num_batches % progress_interval == 0:
+        if world_rank == 0 and progress_interval and num_batches % progress_interval == 0:
             elapsed = time.perf_counter() - start
             counts = ", ".join(f"{k}/{v}={c}" for (k, v), c in sorted(stats.sample_counts().items()))
             print(
                 f"  batch {num_batches} ({num_samples} samples, {elapsed:.1f}s elapsed, "
-                f"{num_samples / elapsed:.1f} samples/s) -- {counts}",
+                f"{num_samples / elapsed:.1f} samples/s) -- {counts}"
+                + (" [rank 0 only]" if world_size > 1 else ""),
                 flush=True,
             )
 
         if max_samples is not None and all(c >= max_samples for c in stats.sample_counts().values()):
             break
 
-    elapsed = time.perf_counter() - start
-    print(f"Done: {num_batches} batches, {num_samples} samples, {elapsed:.1f}s elapsed.", flush=True)
-    for (key, variable), count in sorted(stats.sample_counts().items()):
-        print(f"{key}/{variable}: {count} values")
+    if world_size > 1:
+        # Every rank's own local state(), gathered onto every rank -- a
+        # fresh accumulator merging all world_size entries (including this
+        # rank's own) replaces the local-only one, so what follows (and the
+        # return value) reflects the true combined total, not just this
+        # rank's shard.
+        gathered = [None] * world_size
+        dist.all_gather_object(gathered, stats.state())
+        merged = _RunningStats()
+        for state in gathered:
+            merged.merge_state(state)
+        stats = merged
+
+    if world_rank == 0:
+        elapsed = time.perf_counter() - start
+        print(f"Done: {num_batches} batches, {num_samples} samples, {elapsed:.1f}s elapsed" + (" (rank 0)" if world_size > 1 else "") + ".", flush=True)
+        for (key, variable), count in sorted(stats.sample_counts().items()):
+            print(f"{key}/{variable}: {count} values")
 
     return stats.finalize()
 
@@ -340,11 +442,15 @@ def main():
         progress_interval=args.progress_interval, num_workers=args.num_workers,
     )
 
-    output_path = args.output if os.path.isabs(args.output) else os.path.join(find_repo_root(), args.output)
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    with open(output_path, "w") as f:
-        yaml.dump(stats, f, sort_keys=False)
-    print(f"Wrote stats for {sum(len(v) for v in stats.values())} variable(s) across {len(stats)} dataset key(s) to {output_path}")
+    # With multiple real ranks (compute_stats's own _init_distributed),
+    # `stats` is already the same fully-combined result on every rank --
+    # only rank 0 actually writes, so N ranks don't clobber the same file.
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        output_path = args.output if os.path.isabs(args.output) else os.path.join(find_repo_root(), args.output)
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        with open(output_path, "w") as f:
+            yaml.dump(stats, f, sort_keys=False)
+        print(f"Wrote stats for {sum(len(v) for v in stats.values())} variable(s) across {len(stats)} dataset key(s) to {output_path}")
 
 
 if __name__ == "__main__":
