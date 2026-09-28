@@ -32,6 +32,7 @@ Usage:
     python utils/compute_normalization_stats.py path/to/config.yaml --output stats.yaml --split val
     python utils/compute_normalization_stats.py path/to/config.yaml --output stats.yaml --max-samples 2000
     python utils/compute_normalization_stats.py path/to/config.yaml --output stats.yaml --progress-interval 5
+    python utils/compute_normalization_stats.py path/to/config.yaml --output stats.yaml --num-workers 7
 """
 
 import argparse
@@ -115,7 +116,7 @@ def _accumulate_array(stats, key, variables, array, max_per_channel):
         stats.update(key, name, np.asarray(channel))
 
 
-def _iterate_iterative_dataloader(conf, split):
+def _iterate_iterative_dataloader(conf, split, num_workers):
     """Yields `(dict_key, variables, data_array[, (variables_out, label_array)])` per batch."""
     start_key, end_key = {
         "train": ("dict_start_idx", "dict_end_idx"),
@@ -131,6 +132,7 @@ def _iterate_iterative_dataloader(conf, split):
     split_conf["dataloader"]["dict_start_idx"] = conf["dataloader"][start_key]
     split_conf["dataloader"]["dict_end_idx"] = conf["dataloader"][end_key]
     split_conf["parallelism"]["data_par_size"] = 1  # matches this function's own single-process NativePytorchDataModule below
+    split_conf["dataloader"]["num_workers"] = num_workers  # calculate_load_balancing_on_the_fly's own sizing must match what's actually constructed below
 
     # Tiling doesn't matter for stats (mean/std over the union of tiles'
     # values is identical to computing it over the whole untiled image, as
@@ -169,7 +171,7 @@ def _iterate_iterative_dataloader(conf, split):
         dict_in_variables=conf["data"]["dict_in_variables"],
         num_channels_used=conf["data"]["num_channels"],
         batch_size=conf["dataloader"]["batch_size"],
-        num_workers=0,
+        num_workers=num_workers,
         pin_memory=False,
         interp_size=conf["data"]["interp_size"],
         tile_size=split_conf["data"]["tile_size"],
@@ -209,7 +211,7 @@ def _iterate_iterative_dataloader(conf, split):
         yield dict_key, variables, data, out
 
 
-def _iterate_catsdogs(conf, split):
+def _iterate_catsdogs(conf, split, num_workers):
     """Yields `(dict_key, variables, data_array)` per batch, for `dataloader.type: "dataloader"`."""
     from UCF_VIT.datasets.catsdogs import CatsDogsDataset, CatsDogsCollate
     from UCF_VIT.utils.misc import slice_file_list
@@ -239,7 +241,7 @@ def _iterate_catsdogs(conf, split):
         div=1, tile_overlap=(0, 0),
     )
     loader = DataLoader(
-        ds, batch_size=conf["dataloader"]["batch_size"], shuffle=False, num_workers=0,
+        ds, batch_size=conf["dataloader"]["batch_size"], shuffle=False, num_workers=num_workers,
         collate_fn=functools.partial(CatsDogsCollate, adaptive_patching=False, return_label=conf["dataloader"]["return_label"]),
     )
     for batch in loader:
@@ -247,7 +249,7 @@ def _iterate_catsdogs(conf, split):
         yield dkey, conf["data"]["dict_in_variables"][dkey], data, None
 
 
-def compute_stats(config_path, split="train", max_samples=None, progress_interval=20):
+def compute_stats(config_path, split="train", max_samples=None, progress_interval=20, num_workers=0):
     """Computes per-(dataset key, variable) z-score stats over one split of `config_path`'s data.
 
     Args:
@@ -267,6 +269,14 @@ def compute_stats(config_path, split="train", max_samples=None, progress_interva
             time/rate and running per-key counts rather than a percentage.
             `0` disables progress printing entirely (still prints the final
             per-(key, variable) summary).
+        num_workers: DataLoader worker processes for real per-sample file
+            decode. `0` (default) keeps everything in this one process --
+            safe to run anywhere (a login node, a laptop), but every file
+            decode is serial. On a real dedicated node (see `launch/tests/
+            run_compute_normalization_stats.sh`), set this to actually use
+            the node's other CPU cores -- this is normally the dominant
+            lever for wall-clock time here, more than which node it runs
+            on at all.
 
     Returns:
         `{dataset_key: {variable_name: {"mean": float, "std": float}}}`.
@@ -277,9 +287,9 @@ def compute_stats(config_path, split="train", max_samples=None, progress_interva
 
     stats = _RunningStats()
     if conf["dataloader"]["type"] == "iterative_dataloader":
-        batches = _iterate_iterative_dataloader(conf, split)
+        batches = _iterate_iterative_dataloader(conf, split, num_workers)
     else:
-        batches = _iterate_catsdogs(conf, split)
+        batches = _iterate_catsdogs(conf, split, num_workers)
 
     print(f"Computing normalization stats over the {split!r} split of {config_path}...", flush=True)
     start = time.perf_counter()
@@ -322,9 +332,13 @@ def main():
     parser.add_argument("--split", choices=["train", "val", "test"], default="train")
     parser.add_argument("--max-samples", type=int, default=None, help="Cap per (dataset key, variable) values accumulated -- for a quick approximate run")
     parser.add_argument("--progress-interval", type=int, default=20, help="Print progress every this many batches; 0 disables progress printing")
+    parser.add_argument("--num-workers", type=int, default=0, help="DataLoader worker processes for file decode -- 0 (default) is single-process, safe anywhere; set higher on a dedicated node to actually use its other CPU cores")
     args = parser.parse_args()
 
-    stats = compute_stats(args.config, split=args.split, max_samples=args.max_samples, progress_interval=args.progress_interval)
+    stats = compute_stats(
+        args.config, split=args.split, max_samples=args.max_samples,
+        progress_interval=args.progress_interval, num_workers=args.num_workers,
+    )
 
     output_path = args.output if os.path.isabs(args.output) else os.path.join(find_repo_root(), args.output)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
