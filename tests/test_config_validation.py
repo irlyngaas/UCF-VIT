@@ -841,3 +841,24 @@ def test_power_of_two_tile_size_prints_no_replication_warning(capsys):
     # do_ap:True config.
     parse_config(argparse.Namespace(config=SAP_CONFIG, pretrained_config=""), load_balance_offline=True)
     assert "not a power of 2" not in capsys.readouterr().out
+
+
+def test_normalize_stats_path_missing_file_points_to_compute_utility():
+    """A configured but not-yet-generated normalize_stats_path must fail
+    with a clear, actionable message -- not just "does not exist" -- since
+    the fix is always the same: run utils/compute_normalization_stats.py.
+    """
+    with open(SAP_CONFIG) as f:
+        conf = yaml.load(f, Loader=yaml.FullLoader)
+    conf["data"]["normalize_stats_path"] = "stats/this_file_does_not_exist.yaml"
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    os.close(fd)
+    try:
+        with open(path, "w") as f:
+            yaml.dump(conf, f)
+        args = argparse.Namespace(config=path, pretrained_config="")
+        with pytest.raises(AssertionError, match="utils/compute_normalization_stats.py"):
+            parse_config(args, load_balance_offline=True)
+    finally:
+        os.remove(path)

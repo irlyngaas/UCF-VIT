@@ -965,7 +965,10 @@ def parse_config(args, load_balance_offline=False):
     normalize_stats_path = conf['data'].get('normalize_stats_path')
     if normalize_stats_path:
         normalize_stats_path = os.path.join(find_repo_root(), normalize_stats_path)
-        assert os.path.exists(normalize_stats_path), f"data.normalize_stats_path does not exist: {normalize_stats_path}"
+        assert os.path.exists(normalize_stats_path), (
+            f"data.normalize_stats_path does not exist: {normalize_stats_path}\n"
+            f"Generate it with: python utils/compute_normalization_stats.py {args.config} --output {conf['data']['normalize_stats_path']}"
+        )
         with open(normalize_stats_path) as f:
             normalize_stats = yaml.load(f, Loader=yaml.FullLoader) or {}
     else:

@@ -26,10 +26,11 @@ import sys
 
 import numpy as np
 import pytest
+import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "utils"))
 
-from compute_normalization_stats import _RunningStats, _accumulate_array
+from compute_normalization_stats import _RunningStats, _accumulate_array, _default_output_path, _update_config_normalize_stats_path
 
 
 def test_running_stats_matches_numpy_mean_std_single_update():
@@ -160,3 +161,103 @@ def test_running_stats_merge_state_combines_disjoint_keys():
     result = merged.finalize()
     assert result["ct1"]["v0"]["mean"] == 5.0
     assert result["ct2"]["v0"]["mean"] == 50.0
+
+
+_FAKE_CONFIG = """\
+# a real user comment above the model section
+model:
+  type: "SAP"
+
+# ---------------------------- DATA ----------------------------------------------
+data:
+  dataset: "basic_ct"
+  img_size: [256, 256, 256] # a real inline comment
+  twoD: False
+"""
+
+
+def _patch_repo_root(monkeypatch, repo_root):
+    import compute_normalization_stats
+    monkeypatch.setattr(compute_normalization_stats, "find_repo_root", lambda: str(repo_root))
+
+
+def test_update_config_inserts_new_line_preserving_comments(tmp_path, monkeypatch):
+    _patch_repo_root(monkeypatch, tmp_path)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(_FAKE_CONFIG)
+
+    output_path = tmp_path / "stats" / "basic_ct_stats.yaml"
+    _update_config_normalize_stats_path(str(config_path), str(output_path))
+
+    updated = config_path.read_text()
+    for line in _FAKE_CONFIG.splitlines():
+        assert line in updated.splitlines()  # every original line untouched
+    assert 'normalize_stats_path: "stats/basic_ct_stats.yaml"' in updated
+
+    parsed = yaml.safe_load(updated)
+    assert parsed["data"]["normalize_stats_path"] == "stats/basic_ct_stats.yaml"
+
+
+def test_update_config_replaces_existing_line_not_duplicated(tmp_path, monkeypatch):
+    _patch_repo_root(monkeypatch, tmp_path)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(_FAKE_CONFIG)
+
+    _update_config_normalize_stats_path(str(config_path), str(tmp_path / "stats" / "first.yaml"))
+    first_line_count = len(config_path.read_text().splitlines())
+
+    _update_config_normalize_stats_path(str(config_path), str(tmp_path / "stats" / "second.yaml"))
+    updated = config_path.read_text()
+
+    assert updated.count("normalize_stats_path") == 1
+    assert len(updated.splitlines()) == first_line_count  # replaced in place, no new line added
+    assert 'normalize_stats_path: "stats/second.yaml"' in updated
+    for line in _FAKE_CONFIG.splitlines():
+        assert line in updated.splitlines()
+
+
+def test_update_config_raises_clearly_with_no_data_section(tmp_path, monkeypatch):
+    _patch_repo_root(monkeypatch, tmp_path)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("model:\n  type: \"SAP\"\n")
+
+    with pytest.raises(RuntimeError, match="data:"):
+        _update_config_normalize_stats_path(str(config_path), str(tmp_path / "stats.yaml"))
+
+
+def test_default_output_path_mirrors_configs_directory_structure(tmp_path, monkeypatch):
+    _patch_repo_root(monkeypatch, tmp_path)
+    (tmp_path / "configs" / "basic_ct" / "sap").mkdir(parents=True)
+    config_path = tmp_path / "configs" / "basic_ct" / "sap" / "base_config.yaml"
+    config_path.write_text(_FAKE_CONFIG)
+
+    result = _default_output_path(str(config_path))
+
+    assert result == str(tmp_path / "stats" / "basic_ct" / "sap" / "base_config.yaml")
+
+
+def test_default_output_path_disambiguates_same_basename_different_dirs(tmp_path, monkeypatch):
+    """Real motivation: this repo ships many "base_config.yaml" files, one
+    per dataset/model directory -- a flat "<basename>_stats.yaml" default
+    would collide across all of them.
+    """
+    _patch_repo_root(monkeypatch, tmp_path)
+    (tmp_path / "configs" / "basic_ct" / "sap").mkdir(parents=True)
+    (tmp_path / "configs" / "basic_ct" / "unetr").mkdir(parents=True)
+
+    sap_path = _default_output_path(str(tmp_path / "configs" / "basic_ct" / "sap" / "base_config.yaml"))
+    unetr_path = _default_output_path(str(tmp_path / "configs" / "basic_ct" / "unetr" / "base_config.yaml"))
+
+    assert sap_path != unetr_path
+    assert os.path.basename(sap_path) == os.path.basename(unetr_path) == "base_config.yaml"
+
+
+def test_default_output_path_falls_back_to_flat_basename_outside_configs(tmp_path, monkeypatch):
+    _patch_repo_root(monkeypatch, tmp_path)
+    config_path = tmp_path / "somewhere_else" / "my_config.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(_FAKE_CONFIG)
+
+    result = _default_output_path(str(config_path))
+
+    assert result == str(tmp_path / "stats" / "my_config.yaml")

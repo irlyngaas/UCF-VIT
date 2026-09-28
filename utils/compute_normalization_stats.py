@@ -49,18 +49,37 @@ real GPUs just to get multi-process/multi-node parallelism. Launched as a
 single plain process (no `srun`, `SLURM_NTASKS` unset or 1), it falls back
 to the exact single-process behavior this always had.
 
+By default (disable with `--no-update-config`), also rewrites `config`'s
+own `data.normalize_stats_path` in place to point at `--output`, so the
+same config is ready to train with immediately -- no separate manual edit
+step. See `_update_config_normalize_stats_path`'s own docstring for why
+this is a targeted text edit, not a full YAML re-serialize (which would
+silently discard every comment in a real config file). `UCF_VIT.parse.
+parse_config` raises a clear error pointing back at this script if a
+config's own `normalize_stats_path` is set but doesn't exist yet.
+
+`--output` defaults to mirroring `config`'s own path under `<repo_root>/
+stats/` (see `_default_output_path`) -- e.g. `configs/basic_ct/sap/
+base_config.yaml` -> `stats/basic_ct/sap/base_config.yaml` -- so every
+config gets its own uniquely, predictably located stats file with no
+manual naming needed, even across many configs that happen to share a
+basename (every dataset/model directory ships its own "base_config.yaml").
+
 Usage:
+    python utils/compute_normalization_stats.py configs/basic_ct/sap/base_config.yaml
     python utils/compute_normalization_stats.py path/to/config.yaml --output stats.yaml
-    python utils/compute_normalization_stats.py path/to/config.yaml --output stats.yaml --split val
-    python utils/compute_normalization_stats.py path/to/config.yaml --output stats.yaml --max-samples 2000
-    python utils/compute_normalization_stats.py path/to/config.yaml --output stats.yaml --progress-interval 5
-    python utils/compute_normalization_stats.py path/to/config.yaml --output stats.yaml --num-workers 7
+    python utils/compute_normalization_stats.py path/to/config.yaml --split val
+    python utils/compute_normalization_stats.py path/to/config.yaml --max-samples 2000
+    python utils/compute_normalization_stats.py path/to/config.yaml --progress-interval 5
+    python utils/compute_normalization_stats.py path/to/config.yaml --num-workers 7
+    python utils/compute_normalization_stats.py path/to/config.yaml --no-update-config
 """
 
 import argparse
 import copy
 import functools
 import os
+import re
 import sys
 import time
 from datetime import timedelta
@@ -74,7 +93,7 @@ from torch.utils.data import DataLoader
 from UCF_VIT.parse import parse_config
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.training import get_batch
-from UCF_VIT.utils.misc import calculate_load_balancing_on_the_fly, init_par_groups
+from UCF_VIT.utils.misc import calculate_load_balancing_on_the_fly, find_repo_root, init_par_groups
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from validate_config import init_single_process_dist
@@ -466,14 +485,97 @@ def compute_stats(config_path, split="train", max_samples=None, progress_interva
     return stats.finalize()
 
 
+def _default_output_path(config_path):
+    """Derives a default `--output` path from `config_path`, mirroring `configs/`'s own layout under `stats/`.
+
+    E.g. `configs/basic_ct/sap/base_config.yaml` -> `<repo_root>/stats/
+    basic_ct/sap/base_config.yaml`. Mirrors the *directory structure*, not
+    just a suffixed basename -- this repo ships many configs sharing the
+    same basename (every dataset/model directory has its own
+    `base_config.yaml`), so `<basename>_stats.yaml` alone would silently
+    collide across them. Matches this repo's own established convention of
+    mirroring one tree's layout under another (e.g. `launch/utils/`
+    mirroring `utils/`).
+
+    Args:
+        config_path: Path to a training config YAML, as given on the
+            command line (any absolute/relative form).
+
+    Returns:
+        Absolute path under `<repo_root>/stats/`. Falls back to a flat
+        `stats/<basename>` if `config_path` isn't actually under this
+        repo's own `configs/` directory.
+    """
+    repo_root = find_repo_root()
+    configs_root = os.path.join(repo_root, "configs")
+    abs_config_path = os.path.abspath(config_path)
+    if abs_config_path.startswith(configs_root + os.sep):
+        relative = os.path.relpath(abs_config_path, configs_root)
+    else:
+        relative = os.path.basename(abs_config_path)
+    return os.path.join(repo_root, "stats", relative)
+
+
+def _update_config_normalize_stats_path(config_path, output_path):
+    """Rewrites `config_path`'s own `data.normalize_stats_path` in place to point at `output_path`.
+
+    A targeted text edit -- find an existing `normalize_stats_path:` line
+    nested under `data:` and replace just its value, or insert a new line
+    right after `data:` if there isn't one yet -- rather than a full `yaml.
+    load`+`yaml.dump` round-trip. This repo's real configs are heavily
+    documented with inline comments (e.g. `configs/basic_ct/sap/
+    base_config.yaml`), which plain PyYAML's `dump()` silently discards
+    entirely on a round-trip; a targeted edit leaves every other line
+    (comments, key order, formatting) byte-for-byte untouched. Avoids
+    introducing a new dependency (`ruamel.yaml`, comment-preserving)
+    that isn't confirmed installed in this project's real conda
+    environments.
+
+    Args:
+        config_path: Path to the training config YAML that was actually
+            used to compute these stats (the same one passed to this
+            script) -- edited in place.
+        output_path: Absolute path the stats were just written to; stored
+            in the config as a path relative to the repo root, matching
+            `parse.py`'s own `normalize_stats_path` resolution convention
+            (a different anchor than this script's own `--output` CLI
+            argument, which resolves relative to the current directory --
+            see `main`'s own comment on that).
+    """
+    relative_path = os.path.relpath(output_path, find_repo_root())
+
+    with open(config_path) as f:
+        lines = f.readlines()
+
+    existing_line_idx = None
+    data_line_idx = None
+    for i, line in enumerate(lines):
+        if existing_line_idx is None and re.match(r"^\s+normalize_stats_path\s*:", line):
+            existing_line_idx = i
+        if data_line_idx is None and re.match(r"^data\s*:", line):
+            data_line_idx = i
+
+    if existing_line_idx is not None:
+        indent = lines[existing_line_idx][:len(lines[existing_line_idx]) - len(lines[existing_line_idx].lstrip())]
+        lines[existing_line_idx] = f'{indent}normalize_stats_path: "{relative_path}"\n'
+    elif data_line_idx is not None:
+        lines.insert(data_line_idx + 1, f'  normalize_stats_path: "{relative_path}"\n')
+    else:
+        raise RuntimeError(f"Could not find a top-level 'data:' section in {config_path} to add normalize_stats_path to.")
+
+    with open(config_path, "w") as f:
+        f.writelines(lines)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("config", help="Path to a training config YAML")
-    parser.add_argument("--output", required=True, help="Where to write the computed stats YAML")
+    parser.add_argument("--output", default=None, help="Where to write the computed stats YAML. Default: mirrors config's own path under <repo_root>/stats/ (see _default_output_path)")
     parser.add_argument("--split", choices=["train", "val", "test"], default="train")
     parser.add_argument("--max-samples", type=int, default=None, help="Cap per (dataset key, variable) values accumulated -- for a quick approximate run")
     parser.add_argument("--progress-interval", type=int, default=20, help="Print progress every this many batches; 0 disables progress printing")
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader worker processes for file decode -- 0 (default) is single-process, safe anywhere; set higher on a dedicated node to actually use its other CPU cores")
+    parser.add_argument("--no-update-config", action="store_true", help="Don't rewrite config's own data.normalize_stats_path to point at --output (on by default)")
     args = parser.parse_args()
 
     stats = compute_stats(
@@ -485,21 +587,27 @@ def main():
     # `stats` is already the same fully-combined result on every rank --
     # only rank 0 actually writes, so N ranks don't clobber the same file.
     if not dist.is_initialized() or dist.get_rank() == 0:
-        # Plain cwd-relative (via abspath), matching --config's own
-        # implicit resolution (just opened as-is, no special anchor) --
-        # NOT find_repo_root()-relative. A previous version joined a
-        # relative --output onto find_repo_root(), which silently produced
-        # the wrong path whenever the caller's own relative path (like
+        # --output omitted: _default_output_path's own repo_root/stats/-
+        # mirrored default (already absolute). --output given: plain
+        # cwd-relative (via abspath), matching --config's own implicit
+        # resolution (just opened as-is, no special anchor) -- NOT
+        # find_repo_root()-relative. A previous version joined a relative
+        # --output onto find_repo_root(), which silently produced the
+        # wrong path whenever the caller's own relative path (like
         # launch/utils/run_compute_normalization_stats.sh's own
         # "../../stats/..." default, written relative to *its own*
         # directory to match --config's identical style) wasn't also
         # written relative to the repo root -- e.g. "../../stats/x.yaml"
         # resolved to two directories *above* the repo entirely.
-        output_path = os.path.abspath(args.output)
+        output_path = _default_output_path(args.config) if args.output is None else os.path.abspath(args.output)
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
         with open(output_path, "w") as f:
             yaml.dump(stats, f, sort_keys=False)
         print(f"Wrote stats for {sum(len(v) for v in stats.values())} variable(s) across {len(stats)} dataset key(s) to {output_path}")
+
+        if not args.no_update_config:
+            _update_config_normalize_stats_path(args.config, output_path)
+            print(f"Updated {args.config}'s own data.normalize_stats_path to point at this stats file.")
 
 
 if __name__ == "__main__":
