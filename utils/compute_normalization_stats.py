@@ -18,14 +18,21 @@ normalize_stats_path` expects:
       ct_res1: {mean: ..., std: ...}
 
 Deliberately builds the dataloader with `adaptive_patching`/`tiling` forced
-off and `normalize_stats` left empty regardless of what the config says --
-stats are computed over the *raw* per-sample data (not adaptively-patched
-sequences, not already-normalized data from some existing
-`normalize_stats_path` the config might already point at, and not tiled --
-tiling doesn't change the underlying value distribution when tile_overlap
-is 0, and actively biases it when tile_overlap > 0, since overlapping
-voxels would be double-counted; either way it multiplies the number of
-samples iterated for zero benefit to the computed stats).
+off, `normalize_stats` left empty, and `batch_size` forced to 1, regardless
+of what the config says -- stats are computed over the *raw* per-sample
+data (not adaptively-patched sequences, not already-normalized data from
+some existing `normalize_stats_path` the config might already point at,
+and not tiled -- tiling doesn't change the underlying value distribution
+when tile_overlap is 0, and actively biases it when tile_overlap > 0,
+since overlapping voxels would be double-counted; either way it multiplies
+the number of samples iterated for zero benefit to the computed stats).
+The real config's own `dataloader.batch_size` (tuned for GPU training
+throughput) is irrelevant to accumulation and actively dangerous with many
+ranks -- confirmed on a real Frontier run: world_size=16 with batch_size=32
+against a ~168-file train split left most ranks with far fewer than 32
+images each, tripping `calculate_load_balancing_on_the_fly`'s own "too few
+images per rank" safety assertion (a real, correct check for actual
+training, not something stats computation needs to inherit).
 
 Scales across real, separate processes/nodes for free: if launched under a
 real multi-task `srun -n N` (detected via the same `SLURM_PROCID`/
@@ -193,6 +200,17 @@ def _iterate_iterative_dataloader(conf, split, num_workers, world_rank, world_si
     split_conf["dataloader"]["dict_end_idx"] = conf["dataloader"][end_key]
     split_conf["parallelism"]["data_par_size"] = world_size  # matches this function's own NativePytorchDataModule construction below
     split_conf["dataloader"]["num_workers"] = num_workers  # calculate_load_balancing_on_the_fly's own sizing must match what's actually constructed below
+    # The real config's own dataloader.batch_size (tuned for GPU training
+    # throughput, e.g. 32) is irrelevant here -- accumulation works over any
+    # grouping, even one sample at a time, at negligible extra overhead (the
+    # bottleneck is per-file decode, not batch collation). Forcing 1 avoids
+    # a real failure this hit on Frontier: with world_size=16 ranks and a
+    # train split of only ~168 files, most ranks got far fewer than
+    # batch_size=32 images each, and calculate_load_balancing_on_the_fly's
+    # own "too few images per rank" safety assertion (correctly) raised --
+    # a real production concern for actual training, not something stats
+    # computation needs to inherit at all.
+    split_conf["dataloader"]["batch_size"] = 1
 
     # world_size == 1 (no real srun -n N>1 launch): ddp_group=None, exactly
     # today's single-process behavior. world_size > 1: a real ddp_group
@@ -242,7 +260,7 @@ def _iterate_iterative_dataloader(conf, split, num_workers, world_rank, world_si
         dict_buffer_sizes={k: 1 for k in conf["dataloader"]["dict_buffer_sizes"]},
         dict_in_variables=conf["data"]["dict_in_variables"],
         num_channels_used=conf["data"]["num_channels"],
-        batch_size=conf["dataloader"]["batch_size"],
+        batch_size=split_conf["dataloader"]["batch_size"],
         num_workers=num_workers,
         pin_memory=False,
         interp_size=conf["data"]["interp_size"],
@@ -318,8 +336,13 @@ def _iterate_catsdogs(conf, split, num_workers, world_rank, world_size):
         dataset=conf["data"]["dataset"], resize=resize,
         div=1, tile_overlap=(0, 0),
     )
+    # batch_size=1, not the real config's own value -- see
+    # _iterate_iterative_dataloader's identical comment (this path can't
+    # hit that function's own zero-batches assertion, since a plain
+    # DataLoader just yields a smaller final batch instead of raising, but
+    # forcing 1 here too keeps both paths' behavior simple and consistent).
     loader = DataLoader(
-        ds, batch_size=conf["dataloader"]["batch_size"], shuffle=False, num_workers=num_workers,
+        ds, batch_size=1, shuffle=False, num_workers=num_workers,
         collate_fn=functools.partial(CatsDogsCollate, adaptive_patching=False, return_label=conf["dataloader"]["return_label"]),
     )
     for batch in loader:
