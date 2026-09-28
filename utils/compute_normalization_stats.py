@@ -74,7 +74,7 @@ from torch.utils.data import DataLoader
 from UCF_VIT.parse import parse_config
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.training import get_batch
-from UCF_VIT.utils.misc import calculate_load_balancing_on_the_fly, find_repo_root, init_par_groups
+from UCF_VIT.utils.misc import calculate_load_balancing_on_the_fly, init_par_groups
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from validate_config import init_single_process_dist
@@ -436,6 +436,22 @@ def compute_stats(config_path, split="train", max_samples=None, progress_interva
         # rank's shard.
         gathered = [None] * world_size
         dist.all_gather_object(gathered, stats.state())
+
+        if world_rank == 0:
+            # Per-rank visibility: every other rank's own progress/Done
+            # print is deliberately suppressed above, so without this
+            # there'd be no way to notice an uneven/empty shard on some
+            # ranks (e.g. real cross-node file-listing skew) except by
+            # comparing the merged total against what rank 0 alone
+            # reported -- print each rank's own per-key count directly.
+            per_rank_counts = {}
+            for r, (count, _, _) in enumerate(gathered):
+                for k, c in count.items():
+                    per_rank_counts.setdefault(k, {})[r] = c
+            for key_var, by_rank in sorted(per_rank_counts.items()):
+                counts_str = ", ".join(f"r{r}={by_rank.get(r, 0)}" for r in range(world_size))
+                print(f"Per-rank counts for {key_var[0]}/{key_var[1]}: {counts_str}", flush=True)
+
         merged = _RunningStats()
         for state in gathered:
             merged.merge_state(state)
@@ -469,7 +485,17 @@ def main():
     # `stats` is already the same fully-combined result on every rank --
     # only rank 0 actually writes, so N ranks don't clobber the same file.
     if not dist.is_initialized() or dist.get_rank() == 0:
-        output_path = args.output if os.path.isabs(args.output) else os.path.join(find_repo_root(), args.output)
+        # Plain cwd-relative (via abspath), matching --config's own
+        # implicit resolution (just opened as-is, no special anchor) --
+        # NOT find_repo_root()-relative. A previous version joined a
+        # relative --output onto find_repo_root(), which silently produced
+        # the wrong path whenever the caller's own relative path (like
+        # launch/utils/run_compute_normalization_stats.sh's own
+        # "../../stats/..." default, written relative to *its own*
+        # directory to match --config's identical style) wasn't also
+        # written relative to the repo root -- e.g. "../../stats/x.yaml"
+        # resolved to two directories *above* the repo entirely.
+        output_path = os.path.abspath(args.output)
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
         with open(output_path, "w") as f:
             yaml.dump(stats, f, sort_keys=False)
