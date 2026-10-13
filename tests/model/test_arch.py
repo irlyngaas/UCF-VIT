@@ -326,7 +326,7 @@ def _make_unetr(**overrides):
         feature_size=4,
         skip_connection=True,
         linear_decoder=False,
-        sqrt_len=4,
+        decoder_grid_size=4,
     )
     kwargs.update(overrides)
     return UNETR(**kwargs)

@@ -14,8 +14,9 @@ so even the tensor_par_size:2 cells validate with zero real GPUs). This is
 the same kind of check that would have caught, entirely locally, the
 tiling.tile_overlap-as-a-list bug documented in
 deep_merge_config_overrides's docstring, an invalid ap.fixed_length, a
-tile_size not divisible by patch_size, or a non-whole sqrt_len/cube-root for
-UNETR/SAP -- all before ever spending real Frontier GPU allocation time.
+tile_size not divisible by patch_size, or a non-whole decoder_grid_size/
+cube-root for UNETR/SAP -- all before ever spending real Frontier GPU
+allocation time.
 """
 
 import argparse

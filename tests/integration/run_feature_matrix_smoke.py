@@ -121,8 +121,8 @@ FEATURE_MATRIX = [
         # timeout back to cover it specifically.
         {"ap": {"do_ap": True, "interp_size": 32}, "model": {"token_selection": "area_weighted"}},
         # fixed_length:512 already valid (512 % 7 == 1, octree; cube root 8
-        # is a whole number, satisfying UNETR's extra sqrt_len constraint) --
-        # no override needed.
+        # is a whole number, so decoder_grid_size's auto-derivation loses no
+        # tokens for the default "point" token_selection) -- no override needed.
     ),
 
     # --- ap.do_gpu_ap:True -- adaptive patching runs on-device inside the
@@ -407,7 +407,7 @@ FEATURE_MATRIX = [
         # fixed_length:512 (unetr's baseline, valid for the twoD:False/
         # octree case) does NOT work once twoD:True routes this through the
         # quadtree check instead (fixed_length % 3 == 1) and a *square*
-        # (not cube) root requirement for UNETR's sqrt_len -- 512 % 3 == 2
+        # (not cube) root for decoder_grid_size's auto-derivation -- 512 % 3 == 2
         # and sqrt(512) isn't whole. fixed_length:196 (already used
         # elsewhere in this matrix/the shipped imagenet/catsdogs configs)
         # satisfies both: 196 % 3 == 1, sqrt(196) == 14. twoD:True still

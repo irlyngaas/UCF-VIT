@@ -19,9 +19,9 @@
 # interp_size:8 are translated from the old SST branch's config
 # (fixed_length:729, patch_size:8 -- that codebase had no separate
 # interp_size concept, patch_size served both roles) -- 9^3 == fixed_length
-# exactly, so UNETR's reconstructed canvas (sqrt_len=9) loses zero adaptive
-# tokens (see parse.py's own "UNETR's decoder bottleneck..." warning, which
-# this doesn't trigger).
+# exactly, so UNETR's reconstructed canvas (model.decoder_grid_size not set,
+# auto-derives to 9) loses zero adaptive tokens (see parse.py's own "UNETR's
+# decoder bottleneck..." warning, which this doesn't trigger).
 #
 # See base_config.yaml's own header comment for the "sst" data-layout/
 # chunking writeup (chunk_size==img_size==256^3, full_domain_size

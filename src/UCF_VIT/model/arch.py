@@ -1428,8 +1428,14 @@ class UNETR(VIT):
                 count for the convolutional decoder), `skip_connection` (whether
                 to add U-Net-style convolutional skip connections from
                 intermediate encoder features), and, when adaptive patching is
-                used, `sqrt_len` (the grid side length the flat adaptive-patch
-                sequence is reshaped to), `token_selection` (which method
+                used, `decoder_grid_size` (the decoder's reconstructed-canvas
+                side length -- `proj_feat`/`_adaptive_token_grid_index`/
+                `_adaptive_token_grid_weights`/`_cross_attention_query_and_mask`
+                all reconstruct a `decoder_grid_size**ndims`-cell canvas from
+                the flat adaptive-patch sequence via real geometric overlap,
+                not a reshape, so this is independent of `fixed_length` --
+                any positive int works, it need not be (and in general isn't)
+                a root of `fixed_length`), `token_selection` (which method
                 `_compute_token_selection_state` uses to reconstruct each
                 canvas cell -- see that method's docstring), and
                 `area_weighted_alpha` (only used when
@@ -1439,24 +1445,24 @@ class UNETR(VIT):
         self.linear_decoder = kwargs.pop('linear_decoder', '')
         self.feature_size = kwargs.pop('feature_size', '')
         self.skip_connection = kwargs.pop('skip_connection', '')
-        self.sqrt_len = kwargs.pop('sqrt_len', '')
+        self.decoder_grid_size = kwargs.pop('decoder_grid_size', '')
         self.token_selection = kwargs.pop('token_selection', 'point')
         self.area_weighted_alpha = kwargs.pop('area_weighted_alpha', 0.0)
         super().__init__(*args, **kwargs)
         #Remove decoder from VIT
-        self.head = None 
+        self.head = None
 
         if self.adaptive_patching:
             if self.twoD:
                 self.feat_size = (
-                    self.sqrt_len,
-                    self.sqrt_len,
+                    self.decoder_grid_size,
+                    self.decoder_grid_size,
                 )
             else:
                 self.feat_size = (
-                    self.sqrt_len,
-                    self.sqrt_len,
-                    self.sqrt_len,
+                    self.decoder_grid_size,
+                    self.decoder_grid_size,
+                    self.decoder_grid_size,
                 )
         else:
             if self.twoD:

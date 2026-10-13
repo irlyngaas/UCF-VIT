@@ -154,23 +154,50 @@ def get_kwargs(model_type, conf):
                 area_weighted_alpha = 0.0
             kwargs.update({"area_weighted_alpha": area_weighted_alpha})
 
-            if conf["data"]["twoD"]:
-                sqrt_len = int(math.sqrt(conf["ap"]["fixed_length"]))
-                token_capacity = sqrt_len**2
-            else:
-                sqrt_len=int(np.rint(math.pow(conf["ap"]["fixed_length"],1/3)))
-                token_capacity = sqrt_len**3
+            # decoder_grid_size (the decoder's reconstructed-canvas side
+            # length) is independent of fixed_length -- proj_feat's
+            # reconstruction is real geometric overlap, not a reshape, so
+            # decoder_grid_size**ndims need not equal (or be any root of)
+            # fixed_length at all. Optional: model.decoder_grid_size in the
+            # config explicitly sets it (e.g. to grow the decoder's canvas
+            # resolution -- cheap, since it's just conv work -- without also
+            # growing fixed_length, which would grow the encoder's attention
+            # cost). Defaults to the previous auto-derived heuristic
+            # (sqrt/cbrt of fixed_length) when omitted, so existing configs
+            # are unaffected.
+            try:
+                decoder_grid_size = conf["model"]["decoder_grid_size"]
+            except KeyError:
+                if conf["data"]["twoD"]:
+                    decoder_grid_size = int(math.sqrt(conf["ap"]["fixed_length"]))
+                else:
+                    decoder_grid_size = int(np.rint(math.pow(conf["ap"]["fixed_length"],1/3)))
+            token_capacity = decoder_grid_size**2 if conf["data"]["twoD"] else decoder_grid_size**3
             # "area_weighted"/"cross_attention" both let every token overlapping
             # a cell contribute (proportionally by area, or via a learned
             # attention weight) rather than picking one winner -- every real
             # token is guaranteed nonzero weight in some cell (leaves and cells
-            # both fully partition the domain), so neither is subject to this warning.
-            if token_capacity < conf["ap"]["fixed_length"] and token_selection not in ("area_weighted", "cross_attention"):
-                if dist.get_rank() == 0:
-                    print(f"Warning: UNETR's decoder bottleneck (sqrt_len={sqrt_len}, {token_capacity} cells) is smaller than fixed_length ({conf['ap']['fixed_length']}) -- at least {conf['ap']['fixed_length'] - token_capacity} adaptive-patch tokens per sample will never reach the reconstructed feature map.")
-            kwargs.update({"sqrt_len": sqrt_len})
+            # both fully partition the domain), so neither can ever drop a
+            # token to zero contribution the way "point"/"smallest_overlap" can,
+            # and isn't subject to that specific warning below.
+            if token_capacity < conf["ap"]["fixed_length"]:
+                if token_selection not in ("area_weighted", "cross_attention"):
+                    if dist.get_rank() == 0:
+                        print(f"Warning: UNETR's decoder bottleneck (decoder_grid_size={decoder_grid_size}, {token_capacity} cells) is smaller than fixed_length ({conf['ap']['fixed_length']}) -- at least {conf['ap']['fixed_length'] - token_capacity} adaptive-patch tokens per sample will never reach the reconstructed feature map.")
+                else:
+                    # No token is ever fully excluded here, but fewer cells
+                    # than tokens still means real information loss of a
+                    # different kind: cells get blended/diluted from
+                    # multiple real tokens instead of representing one real
+                    # token distinctly -- this ratio is the average, not a
+                    # per-cell guarantee (canny-style scoring concentrates
+                    # many small tokens unevenly, so some cells blend far
+                    # more than this average suggests).
+                    if dist.get_rank() == 0:
+                        print(f"Warning: UNETR's decoder bottleneck (decoder_grid_size={decoder_grid_size}, {token_capacity} cells) is smaller than fixed_length ({conf['ap']['fixed_length']}) -- no token_selection=={token_selection!r} token is ever fully dropped, but cells will blend ~{conf['ap']['fixed_length'] / token_capacity:.2f} tokens each on average (unevenly, since adaptive patching concentrates small tokens in detail-dense regions), diluting exactly the detail adaptive patching was meant to preserve.")
+            kwargs.update({"decoder_grid_size": decoder_grid_size})
         else:
-            kwargs.update({"sqrt_len": None})
+            kwargs.update({"decoder_grid_size": None})
 
     elif model_type == "DiffusionVIT":
         assert not conf["ap"]["do_ap"], "Adaptive patching is not implemented for Diffusion yet"            

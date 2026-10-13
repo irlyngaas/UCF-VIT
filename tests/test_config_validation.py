@@ -492,8 +492,8 @@ def test_area_weighted_alpha_threads_through():
 def test_token_capacity_warning_fires_for_point_but_not_area_weighted(capsys):
     """fixed_length:512 (this config's default) is a perfect cube (8**3) --
     no shortfall, no warning. Bumping to the next octree-valid value
-    (fixed_length % 7 == 1) that isn't a perfect cube (519: sqrt_len stays
-    8, 8**3=512 < 519) must trigger parse.py's "N tokens will never reach
+    (fixed_length % 7 == 1) that isn't a perfect cube (519: decoder_grid_size
+    stays 8, 8**3=512 < 519) must trigger parse.py's "N tokens will never reach
     the reconstructed feature map" warning for the default ("point")
     token_selection, but not for "area_weighted"/"cross_attention" -- see
     parse.py's own comment on why those methods aren't subject to it.
@@ -520,6 +520,39 @@ def test_token_capacity_warning_fires_for_point_but_not_area_weighted(capsys):
                 yaml.dump(conf, f)
             parse_config(args, load_balance_offline=True)
             assert "will never reach the reconstructed feature map" not in capsys.readouterr().out
+    finally:
+        os.remove(path)
+
+
+def test_token_capacity_warning_is_a_dilution_warning_for_area_weighted(capsys):
+    """Same shortfall as above (decoder_grid_size=8, 512 cells < fixed_length:519)
+    but for "area_weighted"/"cross_attention": no token is ever fully
+    dropped (every real token overlaps some cell by construction -- see
+    parse.py's own comment), so the exclusion warning above correctly
+    doesn't fire. But a real, different failure mode still exists --
+    cells blend multiple tokens together instead of representing one
+    distinctly -- and that gets its own, separately-worded warning instead
+    of silence.
+    """
+    with open(UNETR_CONFIG) as f:
+        conf = yaml.load(f, Loader=yaml.FullLoader)
+    conf["ap"]["do_ap"] = True
+    conf["ap"]["interp_size"] = 32
+    conf["ap"]["fixed_length"] = 519
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    os.close(fd)
+    try:
+        for value in ("area_weighted", "cross_attention"):
+            conf["model"]["token_selection"] = value
+            with open(path, "w") as f:
+                yaml.dump(conf, f)
+            args = argparse.Namespace(config=path, pretrained_config="")
+            parse_config(args, load_balance_offline=True)
+            out = capsys.readouterr().out
+            assert "will never reach the reconstructed feature map" not in out
+            assert "is ever fully dropped" in out
+            assert "blend ~1.01 tokens each on average" in out  # 519/512
     finally:
         os.remove(path)
 

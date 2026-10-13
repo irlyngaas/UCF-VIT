@@ -8,11 +8,12 @@
 #
 # This file: adaptive patching, token_selection:point.
 # fixed_length:1947 (<= half of non_adaptive.yaml's patch_size:16 sequence
-# length, 4096 -- this experiment's ceiling), sqrt_len=12 (bottleneck
-# capacity 12**3=1728, a real ~11% gap below fixed_length, so "point"/
-# "smallest_overlap" actually lose tokens here -- see UCF_VIT.model.arch.
-# UNETR._adaptive_token_grid_index/_adaptive_token_grid_weights/
-# _cross_attention_query_and_mask). interp_size:16 matches non_adaptive.yaml's
+# length, 4096 -- this experiment's ceiling); model.decoder_grid_size not set,
+# so it auto-derives to 12 (bottleneck capacity 12**3=1728, a real ~11% gap
+# below fixed_length, so "point"/"smallest_overlap" actually lose tokens
+# here -- see UCF_VIT.model.arch.UNETR._adaptive_token_grid_index/
+# _adaptive_token_grid_weights/_cross_attention_query_and_mask). interp_size:16
+# matches non_adaptive.yaml's
 # patch_size:16, so both approaches represent each token/patch at the same
 # resized resolution.
 
@@ -73,6 +74,12 @@ model:
   skip_connection: True
   token_selection: point
   area_weighted_alpha: 0 # unused unless token_selection:area_weighted
+  #decoder_grid_size: 12 # Decoder reconstruction-canvas side length (feat_size = decoder_grid_size**ndims cells).
+  # Independent of fixed_length -- proj_feat reconstructs via real geometric overlap (see UCF_VIT.model.arch.
+  # UNETR._adaptive_token_grid_index/_adaptive_token_grid_weights), not a reshape, so it need not be any root of
+  # fixed_length. Optional -- omitted here, so it auto-derives to round(fixed_length**(1/3))==12 (see parse.py's
+  # own get_kwargs). Uncomment and raise (e.g. 16 or 20) to give the decoder a finer canvas -- cheap, since it's
+  # just conv work, not attention -- without growing fixed_length (the encoder's actual compute-cost knob).
 
 # ---------------------------- TILING --------------------------------------------
 tiling:
