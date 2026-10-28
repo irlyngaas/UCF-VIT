@@ -13,6 +13,15 @@
 [ -z $JOBID ] && JOBID=$SLURM_JOB_ID
 [ -z $JOBSIZE ] && JOBSIZE=$SLURM_JOB_NUM_NODES
 
+# CONFIG is required -- no default, matching run_compute_normalization_
+# stats.sh's own convention (a silent fallback could run against the wrong
+# config entirely), e.g.:
+#   CONFIG=../../configs/xct/diffusion/multimodal_nct_xct_base_config.yaml sbatch diffusion.sh
+if [ -z "$CONFIG" ]; then
+    echo "ERROR: CONFIG must be set, e.g.:" >&2
+    echo "  CONFIG=../../configs/xct/diffusion/base_config.yaml sbatch diffusion.sh" >&2
+    exit 1
+fi
 
 #ulimit -n 65536
 
@@ -35,4 +44,4 @@ export OMP_NUM_THREADS=7
 export PYTHONPATH=$PWD:$PYTHONPATH
 
 time srun -n $((SLURM_JOB_NUM_NODES*8)) \
-python ../../training_scripts/train.py ../../configs/xct/diffusion/base_config.yaml
+python ../../training_scripts/train.py $CONFIG
