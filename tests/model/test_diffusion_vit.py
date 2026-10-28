@@ -95,3 +95,164 @@ def test_diffusion_vit_different_timesteps_change_the_output():
         out_t_last = model(x, torch.full((2,), 99, dtype=torch.long), ["v0"])
 
     assert not torch.equal(out_t0, out_t_last)
+
+
+# ---------------------------------------------------------------------------
+# Opt-in decoder refinements (residual_mlp/conv3d/feature_conv3d_decoder,
+# spatial_feature_conv3d/conv2d_decoder) -- ported from the colleague's
+# AKZ-upd4 branch (src/UCF_VIT/fsdp/arch.py there), adapted onto this
+# repo's current DiffusionVIT. Real correctness property each residual
+# option must have: an untrained model with the option on is *exactly*
+# (not approximately) equivalent to the plain linear decoder, since the
+# new branch's final layer is zero-initialized -- verified here the same
+# way the original branch's own tests did, bit-for-bit (atol=0, rtol=0).
+# ---------------------------------------------------------------------------
+
+_COMMON_KWARGS_3D = dict(
+    img_size=(8, 8, 8), patch_size=4, twoD=False, in_chans=1,
+    embed_dim=12, depth=1, num_heads=1, mlp_ratio=1.0,  # embed_dim must be divisible by 3 for get_3d_sincos_pos_embed
+    fixed_length=8, adaptive_patching=False,
+    weight_init="skip", class_token=False, pos_embed="learn",
+    block_fn=Block_diffusion,
+)
+
+
+def _make_diffusion_vit_3d(**overrides):
+    kwargs = dict(_COMMON_KWARGS_3D, num_time_steps=100, linear_decoder=True)
+    kwargs.update(overrides)
+    return DiffusionVIT(**kwargs)
+
+
+def test_legacy_linear_model_has_no_residual_parameters():
+    model = _make_diffusion_vit_3d()
+    assert not any(name.startswith("decoder_residual") for name in model.state_dict())
+    assert hasattr(model, "decoder_pred")
+
+
+def test_residual_mlp_decoder_step_zero_matches_legacy():
+    legacy = _make_diffusion_vit_3d()
+    refined = _make_diffusion_vit_3d(residual_mlp_decoder=True)
+    incompatible = refined.load_state_dict(legacy.state_dict(), strict=False)
+    assert incompatible.unexpected_keys == []
+    assert all(k.startswith("decoder_residual.") for k in incompatible.missing_keys)
+
+    features = torch.randn(2, legacy.num_patches, legacy.embed_dim)
+    torch.testing.assert_close(refined.forward_head(features, torch.zeros(2, dtype=torch.long)),
+                                legacy.forward_head(features, torch.zeros(2, dtype=torch.long)),
+                                atol=0, rtol=0)
+
+
+def test_residual_conv3d_decoder_step_zero_matches_legacy_and_round_trips():
+    legacy = _make_diffusion_vit_3d()
+    refined = _make_diffusion_vit_3d(residual_conv3d_decoder=True)
+    incompatible = refined.load_state_dict(legacy.state_dict(), strict=False)
+    assert incompatible.unexpected_keys == []
+    assert all(k.startswith("decoder_residual_conv3d.") for k in incompatible.missing_keys)
+
+    features = torch.randn(2, legacy.num_patches, legacy.embed_dim)
+    t = torch.zeros(2, dtype=torch.long)
+    torch.testing.assert_close(refined.forward_head(features, t), legacy.forward_head(features, t), atol=0, rtol=0)
+
+    # _tokens_to_3d_volume/_volume_to_3d_tokens must round-trip exactly
+    # (this is what lets the residual conv operate on real spatial
+    # structure without corrupting the underlying patch layout).
+    tokens = torch.randn(2, refined.num_patches, refined.patch_dim)
+    volume = refined._tokens_to_3d_volume(tokens)
+    assert volume.shape == (2, 1, 8, 8, 8)
+    torch.testing.assert_close(refined._volume_to_3d_tokens(volume), tokens)
+
+
+def test_residual_conv3d_decoder_requires_3d():
+    with pytest.raises(ValueError, match="requires a 3D model"):
+        _make_diffusion_vit_3d(residual_conv3d_decoder=True, twoD=True, img_size=(8, 8))
+
+
+def test_residual_feature_conv3d_decoder_step_zero_matches_legacy():
+    legacy = _make_diffusion_vit_3d()
+    refined = _make_diffusion_vit_3d(residual_feature_conv3d_decoder=True)
+    incompatible = refined.load_state_dict(legacy.state_dict(), strict=False)
+    assert incompatible.unexpected_keys == []
+    assert all(k.startswith("decoder_residual_feature_") for k in incompatible.missing_keys)
+
+    features = torch.randn(2, legacy.num_patches, legacy.embed_dim)
+    t = torch.zeros(2, dtype=torch.long)
+    torch.testing.assert_close(refined.forward_head(features, t), legacy.forward_head(features, t), atol=0, rtol=0)
+
+
+def test_residual_feature_conv3d_decoder_receives_gradient():
+    model = _make_diffusion_vit_3d(residual_feature_conv3d_decoder=True)
+    with torch.no_grad():
+        model.decoder_residual_feature_conv3d[-1].weight.normal_(std=1e-3)
+    features = torch.randn(2, model.num_patches, model.embed_dim, requires_grad=True)
+    target = torch.randn(2, model.num_patches, model.patch_dim)
+    t = torch.zeros(2, dtype=torch.long)
+    torch.nn.functional.mse_loss(model.forward_head(features, t), target).backward()
+
+    projection = model.decoder_residual_feature_proj[1]
+    output_conv = model.decoder_residual_feature_conv3d[-1]
+    assert projection.weight.grad.abs().sum().item() > 0
+    assert output_conv.weight.grad.abs().sum().item() > 0
+
+
+def test_spatial_feature_conv3d_decoder_replaces_decoder_pred():
+    model = _make_diffusion_vit_3d(spatial_feature_conv3d_decoder=True)
+    assert not hasattr(model, "decoder_pred")
+
+    features = torch.randn(2, model.num_patches, model.embed_dim, requires_grad=True)
+    target = torch.randn(2, model.num_patches, model.patch_dim)
+    t = torch.zeros(2, dtype=torch.long)
+    prediction = model.forward_head(features, t)
+    assert prediction.shape == target.shape
+
+    torch.nn.functional.mse_loss(prediction, target).backward()
+    assert model.decoder_spatial_feature_proj[1].weight.grad.abs().sum().item() > 0
+    assert model.decoder_spatial_feature_conv3d[-1].weight.grad.abs().sum().item() > 0
+
+
+def test_spatial_feature_conv2d_decoder_layout_and_gradients():
+    model = _make_diffusion_vit(spatial_feature_conv2d_decoder=True, spatial_feature_conv2d_channels=3)
+    assert not hasattr(model, "decoder_pred")
+
+    tokens = torch.randn(2, model.num_patches, 4 ** 2 * 3)
+    image = model._tokens_to_2d_image(tokens, num_channels=3)
+    assert image.shape == (2, 3, 16, 16)
+    torch.testing.assert_close(model._image_to_2d_tokens(image), tokens)
+
+    features = torch.randn(2, model.num_patches, model.embed_dim, requires_grad=True)
+    target = torch.randn(2, model.num_patches, model.patch_dim)
+    prediction = model.forward_head(features, torch.zeros(2, dtype=torch.long))
+    assert prediction.shape == target.shape
+
+    torch.nn.functional.mse_loss(prediction, target).backward()
+    assert model.decoder_spatial_feature_proj[1].weight.grad.abs().sum().item() > 0
+    assert model.decoder_spatial_feature_conv2d[-1].weight.grad.abs().sum().item() > 0
+
+
+def test_spatial_feature_conv2d_decoder_rejects_3d_model():
+    with pytest.raises(ValueError, match="requires a 2D model"):
+        _make_diffusion_vit_3d(spatial_feature_conv2d_decoder=True)
+
+
+def test_spatial_decoder_is_mutually_exclusive_with_residual():
+    with pytest.raises(ValueError, match="cannot be combined"):
+        _make_diffusion_vit_3d(spatial_feature_conv3d_decoder=True, residual_conv3d_decoder=True)
+
+
+def test_residual_modes_are_mutually_exclusive():
+    with pytest.raises(ValueError, match="only one residual decoder"):
+        _make_diffusion_vit_3d(residual_mlp_decoder=True, residual_conv3d_decoder=True)
+    with pytest.raises(ValueError, match="only one residual decoder"):
+        _make_diffusion_vit_3d(residual_conv3d_decoder=True, residual_feature_conv3d_decoder=True)
+
+
+def test_spatial_modes_are_mutually_exclusive():
+    with pytest.raises(ValueError, match="only one direct spatial decoder"):
+        _make_diffusion_vit_3d(spatial_feature_conv3d_decoder=True, spatial_feature_conv2d_decoder=True, twoD=True, img_size=(8, 8))
+
+
+def test_all_decoder_refinements_require_linear_decoder():
+    with pytest.raises(ValueError, match="requires linear_decoder=True"):
+        _make_diffusion_vit_3d(
+            spatial_feature_conv3d_decoder=True, linear_decoder=False,
+            decoder_depth=1, decoder_embed_dim=8, decoder_num_heads=1, decoder_mlp_ratio=1.0,
+        )

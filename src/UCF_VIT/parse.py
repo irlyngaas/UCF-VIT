@@ -208,12 +208,41 @@ def get_kwargs(model_type, conf):
             sys.exit("num_time_steps is required")
         kwargs.update({"num_time_steps": num_time_steps})
 
+        # Opt-in decoder refinements (DiffusionVIT.__init__ validates
+        # mutual exclusivity/dimensionality itself) -- all of them require
+        # linear_decoder=True, which feeds into linear_decoder's own
+        # default just below.
+        decoder_refinement_kwargs = {
+            "residual_mlp_decoder": conf['model'].get('residual_mlp_decoder', False),
+            "residual_mlp_ratio": conf['model'].get('residual_mlp_ratio', 2.0),
+            "residual_conv3d_decoder": conf['model'].get('residual_conv3d_decoder', False),
+            "residual_conv3d_channels": conf['model'].get('residual_conv3d_channels', 16),
+            "residual_feature_conv3d_decoder": conf['model'].get('residual_feature_conv3d_decoder', False),
+            "residual_feature_conv3d_channels": conf['model'].get('residual_feature_conv3d_channels', 8),
+            "spatial_feature_conv3d_decoder": conf['model'].get('spatial_feature_conv3d_decoder', False),
+            "spatial_feature_conv3d_channels": conf['model'].get('spatial_feature_conv3d_channels', 8),
+            "spatial_feature_conv2d_decoder": conf['model'].get('spatial_feature_conv2d_decoder', False),
+            "spatial_feature_conv2d_channels": conf['model'].get('spatial_feature_conv2d_channels', 16),
+        }
+        kwargs.update(decoder_refinement_kwargs)
+        any_decoder_refinement = any(
+            decoder_refinement_kwargs[k] for k in (
+                "residual_mlp_decoder", "residual_conv3d_decoder", "residual_feature_conv3d_decoder",
+                "spatial_feature_conv3d_decoder", "spatial_feature_conv2d_decoder",
+            )
+        )
+
         try:
             linear_decoder = conf["model"]["linear_decoder"]
         except KeyError:
-            if dist.get_rank() == 0:
-                print("linear_decoder is not set, by default this is set to False")
-            linear_decoder = False
+            if any_decoder_refinement:
+                linear_decoder = True
+                if dist.get_rank() == 0:
+                    print("linear_decoder is not set, but a decoder refinement option is -- those all require linear_decoder=True, so defaulting to True instead of the usual False")
+            else:
+                if dist.get_rank() == 0:
+                    print("linear_decoder is not set, by default this is set to False")
+                linear_decoder = False
         kwargs.update({"linear_decoder": linear_decoder})
 
         if not linear_decoder:
