@@ -392,8 +392,11 @@ def process_root_dirs(dataset, dict_root_dirs, data_par_size=None, img_size=None
 
     For "imagenet", lists every image under each root directory (grouped by
     class, in deterministic sorted-class/sorted-image order), one entry per key
-    in `dict_root_dirs`. For "sst", see below. For other datasets, lists all
-    files under each root directory's "imagesTr" subfolder, same shape.
+    in `dict_root_dirs`. For "sst", see below. For "xct", lists every `.npy`
+    volume directly under each root directory (flat, no "imagesTr" subfolder
+    -- a root dir can also hold non-data metadata, e.g. a global_stats.json,
+    deliberately excluded here). For other datasets, lists all files under
+    each root directory's "imagesTr" subfolder, same shape.
 
     Deliberately *not* bucketed by rank count here -- that would make *which
     files count as train/val/test* depend on `data_par_size` (a real problem on
@@ -519,6 +522,14 @@ def process_root_dirs(dataset, dict_root_dirs, data_par_size=None, img_size=None
                     for w in windows
                 ]
             dict_lister_trains[k] = entries
+    elif dataset == "xct":
+        # xct roots are flat (no "imagesTr" subfolder) and can contain
+        # non-data metadata alongside the real volumes (e.g. a
+        # global_stats.json) -- only list the real .npy volumes.
+        dict_lister_trains = {
+            k: [path for path in dp.iter.FileLister(root_dir) if str(path).lower().endswith(".npy")]
+            for k, root_dir in dict_root_dirs.items()
+        }
     else:
         dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in dict_root_dirs.items() }
     return dict_lister_trains
@@ -624,11 +635,12 @@ def slice_file_list(file_list, start_idx, end_idx):
     end = int(end_idx * len(file_list))
     return file_list[start:end]
 
-def _find_representative_file(root_dir, key, what):
+def _find_representative_file(root_dir, key, what, dataset=None):
     """Finds one real file to sample for auto-detecting a per-dataset-key
-    property (channel count, image size, ...), using the same
-    `imagesTr/`-listing convention `process_root_dirs` uses to list
-    non-imagenet datasets.
+    property (channel count, image size, ...), using the same listing
+    convention `process_root_dirs` uses for this `dataset` (`imagesTr/` for
+    most non-imagenet datasets; flat, `.npy`-only for "xct" -- see that
+    function's own docstring).
 
     Args:
         root_dir: Root directory for this dataset key (a
@@ -637,16 +649,24 @@ def _find_representative_file(root_dir, key, what):
             error message specific.
         what: Short description of what's being detected, only used to
             make the error message specific (e.g. "num_channels").
+        dataset: Dataset name; "xct" lists `root_dir` itself (`.npy` files
+            only), anything else (including `None`, for existing callers)
+            lists `root_dir/imagesTr/`.
 
     Returns:
-        Path to one real file under `root_dir/imagesTr/`.
+        Path to one real representative file for this dataset key.
 
     Raises:
-        FileNotFoundError: If `root_dir/imagesTr/` is missing or empty.
+        FileNotFoundError: If the relevant directory is missing or empty.
     """
-    images_dir = os.path.join(root_dir, "imagesTr")
+    if dataset == "xct":
+        images_dir = root_dir
+        candidates = lambda names: sorted(n for n in names if n.lower().endswith(".npy"))
+    else:
+        images_dir = os.path.join(root_dir, "imagesTr")
+        candidates = sorted
     try:
-        filename = sorted(os.listdir(images_dir))[0]
+        filename = candidates(os.listdir(images_dir))[0]
     except (FileNotFoundError, IndexError) as e:
         raise FileNotFoundError(
             f"Could not auto-detect {what} for dataset key '{key}': "
@@ -705,7 +725,7 @@ def detect_num_channels(dataset, dict_root_dirs):
 
     num_channels = {}
     for k, root_dir in dict_root_dirs.items():
-        path = _find_representative_file(root_dir, k, "num_channels")
+        path = _find_representative_file(root_dir, k, "num_channels", dataset=dataset)
 
         if dataset == "basic_ct":
             shape = nib.load(path).shape
@@ -717,6 +737,21 @@ def detect_num_channels(dataset, dict_root_dirs):
                     f"{path} has shape {shape} (not 3D), so the channel axis is "
                     f"ambiguous -- no verified convention for multi-channel "
                     f"basic_ct files exists in this repo yet. Set num_channels "
+                    f"manually in the config for this key instead."
+                )
+        elif dataset == "xct":
+            # mmap_mode='r' reads just the .npy header, not the real
+            # (often large) volume data -- cheap, matching basic_ct's own
+            # lazy nib.load(path).shape above.
+            shape = np.load(path, mmap_mode="r").shape
+            if len(shape) == 3:
+                num_channels[k] = 1
+            else:
+                raise RuntimeError(
+                    f"Could not auto-detect num_channels for dataset key '{k}': "
+                    f"{path} has shape {shape} (not 3D), so the channel axis is "
+                    f"ambiguous -- no verified convention for multi-channel "
+                    f"xct files exists in this repo yet. Set num_channels "
                     f"manually in the config for this key instead."
                 )
         else:
@@ -747,12 +782,18 @@ def detect_img_size(dataset, dict_root_dirs):
     handling).
 
     Behavior, using the same representative-file lookup as
-    detect_num_channels (dict_root_dirs[k]/imagesTr/):
+    detect_num_channels (dict_root_dirs[k]/imagesTr/, or flat for "xct"):
       - "basic_ct": the file's shape via nibabel's lazy ArrayProxy
         (nib.load(path).shape reads only the NIfTI header, not the voxel
         data, so this is cheap even for large volumes) -- returned as-is,
         matching how img_size's elements are used directly as array axes
         throughout tiling/patching code, with no axis reordering.
+      - "xct": the file's shape via `.npy`'s own lazy mmap header read,
+        with axes 0 and 2 swapped to match `dataset.py.FileReader.
+        read_process_file`'s own fixed on-disk-layout correction for this
+        dataset -- unlike basic_ct, the raw on-disk shape is *not* what
+        gets yielded, so this must apply the same swap or img_size would
+        silently describe the wrong (pre-swap) axis order.
       - Every other dataset (e.g. "imagenet", "catsdogs"): the file's
         pixel dimensions via PIL (Image.open(path).size, a cheap, lazy
         read that doesn't decode full pixel data). PIL's own .size is
@@ -783,10 +824,13 @@ def detect_img_size(dataset, dict_root_dirs):
         k, root_dir = next(iter(dict_root_dirs.items()))
     except StopIteration:
         raise FileNotFoundError("Could not auto-detect img_size: dict_root_dirs is empty.")
-    path = _find_representative_file(root_dir, k, "img_size")
+    path = _find_representative_file(root_dir, k, "img_size", dataset=dataset)
 
     if dataset == "basic_ct":
         return list(nib.load(path).shape)
+    elif dataset == "xct":
+        z, y, x = np.load(path, mmap_mode="r").shape
+        return [x, y, z]
     else:
         width, height = Image.open(path).size
         return [height, width]

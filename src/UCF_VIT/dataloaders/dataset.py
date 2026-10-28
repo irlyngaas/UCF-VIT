@@ -158,9 +158,12 @@ class FileReader(IterableDataset):
         For "imagenet", loads and resizes an RGB image and, if `return_label`,
         derives the class label from the parent directory name. For "basic_ct",
         loads a NIfTI volume and, if `return_label`, loads the corresponding
-        label volume from the sibling "labelsTr" directory. Every branch's
-        real (continuous) data -- and "sst"'s regression label, but never a
-        discrete class-index label -- is z-score normalized via `self.
+        label volume from the sibling "labelsTr" directory. For "xct", loads a
+        `.npy` volume directly (fixed on-disk axis order, not configurable --
+        see the swapaxes call below) -- no labels; `parse.py` rejects any
+        model type that would set `return_label` with this dataset. Every
+        branch's real (continuous) data -- and "sst"'s regression label, but
+        never a discrete class-index label -- is z-score normalized via `self.
         normalize_stats` (`UCF_VIT.utils.normalize.zscore_normalize`) right
         before returning, a no-op passthrough when unconfigured.
 
@@ -280,6 +283,18 @@ class FileReader(IterableDataset):
                 return data_list, label_list
             else:
                 return data_list
+
+        elif self.dataset == "xct":
+            data = np.load(path).astype(np.float32)
+            # On-disk axis order doesn't match this codebase's (Z, Y, X)
+            # convention everywhere else -- swapping axes 0/2 here is the
+            # real, fixed on-disk-layout correction (not a tunable config
+            # value), matching detect_img_size's own swap for the same file.
+            data = np.swapaxes(data, 0, 2)
+            if self.num_channels_available == 1:
+                data = np.expand_dims(data, axis=0)
+            data = zscore_normalize(data, self.variables, self.normalize_stats, channel_axis=0)
+            return data
 
     def _reshuffled_and_replicated_file_list(self):
         """Builds this call's `keys_to_add`-times-replicated, freshly shuffled `file_list`.

@@ -771,7 +771,7 @@ def parse_config(args, load_balance_offline=False):
     #TODO: Add checking on each argument, e.g. > 0
 
     dataset = conf['data']['dataset']
-    assert dataset in ["imagenet", "catsdogs", "basic_ct", "sst"], "This training script only supports the following datasets: imagenet, catsdogs, basic_ct, sst"
+    assert dataset in ["imagenet", "catsdogs", "basic_ct", "sst", "xct"], "This training script only supports the following datasets: imagenet, catsdogs, basic_ct, sst, xct"
 
     #img_size is always the real/native size of the data. If omitted,
     #auto-detect it by reading one real file (see detect_img_size's own
@@ -811,6 +811,7 @@ def parse_config(args, load_balance_offline=False):
     #once resize (if any) has been applied.
     resize_conf = conf.get('dataset_options', {}).get('resize', {}) or {}
     assert "basic_ct" not in resize_conf, "resize is not supported for basic_ct -- it has no resize step (dataset.py reads NIfTI volumes at native resolution). Remove it from dataset_options.resize."
+    assert "xct" not in resize_conf, "resize is not supported for xct -- it has no resize step (dataset.py reads .npy volumes at native resolution). Remove it from dataset_options.resize."
     effective_size = resize_conf.get(dataset, img_size)
 
     if not isinstance(tiling_conf["tile_overlap"], tuple):
@@ -1124,6 +1125,9 @@ def parse_config(args, load_balance_offline=False):
 
         elif data_conf['dataset'] in ["sst"]:
             assert model_conf['type'] in ["UNETR"], "This dataset can only be used for regression (UNETR with model.loss_fn:\"MSE\")"
+
+        elif data_conf['dataset'] in ["xct"]:
+            assert False, "xct has no labels -- use a model type that doesn't require return_label (e.g. MAE, DiffusionVIT), not VIT/SAP/UNETR"
 
     dataloader_type = conf['dataloader']['type']
     assert dataloader_type in ["dataloader", "iterative_dataloader"], "dataloader type not valid"
