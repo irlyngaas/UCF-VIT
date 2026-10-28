@@ -26,11 +26,12 @@ def main():
     dataset-agnostic and works for any DiffusionVIT config, single- or
     multi-modality alike.
 
-    `--dict_key` only selects which dataset key's `data.dict_in_variables` entry
-    is passed as `variables` to the model; it is required whenever a config
-    trains on more than one dataset key (DiffusionVIT.forward on this branch
-    takes no dict_key argument itself -- that only exists on the modality-
-    conditioning work on xct-integration, not yet merged here).
+    `--dict_key` selects which dataset key's `data.dict_in_variables` entry is
+    passed as `variables` to the model; it is required whenever a config
+    trains on more than one dataset key. When `model.use_modality_conditioning`
+    is also set, the same `dict_key` is additionally passed to the model
+    itself, to drive its per-block modality conditioning -- see
+    DiffusionVIT.forward's own docstring.
     """
     parser = ArgumentParser(description="")
     parser.add_argument("config", type=str, help="Path to configuration YAML file")
@@ -63,6 +64,7 @@ def main():
     else:
         sys.exit("This config trains on more than one dataset key -- pass --dict_key to pick which one's variables to generate with")
     variables = conf["data"]["dict_in_variables"][dict_key]
+    use_modality_conditioning = conf["model"]["kwargs"].get("use_modality_conditioning", False)
 
     ddp_group, tensor_par_group, data_seq_ort_group, fsdp_group, simple_ddp_group = init_par_groups(world_rank=world_rank, data_par_size=conf["parallelism"]["data_par_size"], tensor_par_size=conf["parallelism"]["tensor_par_size"], fsdp_size=conf["parallelism"]["fsdp_size"], simple_ddp_size=conf["parallelism"]["simple_ddp_size"])
 
@@ -103,7 +105,10 @@ def main():
     with torch.no_grad():
         for t in reversed(range(num_time_steps)):
             t_batch = torch.full((args.num_samples,), t, dtype=torch.long, device=device)
-            predicted_noise = model(z.to(device=device, dtype=precision_dt), t_batch, variables)
+            if use_modality_conditioning:
+                predicted_noise = model(z.to(device=device, dtype=precision_dt), t_batch, variables, dict_key)
+            else:
+                predicted_noise = model(z.to(device=device, dtype=precision_dt), t_batch, variables)
             predicted_noise = unpatchify(predicted_noise, z.to(device=device, dtype=precision_dt), patch_size, twoD).detach().float().cpu()
             noise = torch.randn(z.shape, generator=generator) if t > 0 else None
             z = diffusion_reverse_step(z, predicted_noise, t, ddpm_scheduler, variance_mode=args.variance_mode, noise=noise)
