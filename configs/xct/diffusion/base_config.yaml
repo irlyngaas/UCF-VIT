@@ -99,6 +99,26 @@ ap:
   canny_hysteresis_iters: 2 # Binary-dilation passes approximating hysteresis edge-linking, GPU path only. Only used when do_gpu_ap:True and score_fn:"canny".
 
 # ---------------------------- DATA ----------------------------------------------
+# No data.normalize_stats_path here, deliberately -- unlike every other
+# dataset, this dict_root_dirs path already holds the colleague's own
+# offline-standardized output ((raw - 5714.432) / 838.625, baked in by his
+# utils/preprocessing.py, not something this repo's zscore_normalize ever
+# touches at load time). Setting normalize_stats_path would re-normalize
+# already-normalized data. compute_normalization_stats.py can still be run
+# against this path as a verification step (expect mean=0, std=1 back if
+# the files really are standardized as expected) -- just don't wire its
+# output in as normalize_stats_path.
+#
+# Known, accepted limitation: those baked-in stats were computed over
+# however much data existed before this config's own val/test split
+# concept existed, so this split's train/val/test partition has some
+# normalization leakage (val/test data influenced the stats every file,
+# train included, was normalized with) -- likely minor at this dataset's
+# scale (~960 volumes per an old AKZ-upd4 config's own comment), and not
+# fixable without the original raw (pre-standardization) data, which no
+# longer exists on disk. Not addressed now; revisit only if it turns out
+# to matter (e.g. the colleague re-runs preprocessing with a real raw
+# copy retained, or this leakage is ever suspected of skewing real results).
 data:
   dataset: "xct"
   img_size: [512, 512, 512] #Can be 2D or 3D. Optional -- if omitted, auto-detected from the real data files under dict_root_dirs (see UCF_VIT.utils.misc.detect_img_size). Always the actual/native size of the data, never a resize target.
