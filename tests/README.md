@@ -1,0 +1,6754 @@
+# Running the test suite
+
+This project uses [pytest](https://docs.pytest.org/). Tests live under `tests/`,
+mirroring the layout of `src/UCF_VIT/`.
+
+## Three tiers
+
+- **Tier 1** (`tests/*.py`, `tests/dataloaders/`, `tests/utils/`): fast,
+  single-process tests that don't need a GPU or a SLURM allocation. Runs
+  anywhere in a couple of seconds.
+- **Tier 2** (`tests/distributed/`): multi-process/multi-GPU tests for the
+  code that genuinely needs a live `torch.distributed` process group.
+  Launched via `sbatch launch/tests/run_distributed_tests.sh` on Frontier —
+  see "Running the distributed (Tier 2) tests" below. These are meaningless
+  as a single local process, so `tests/distributed/conftest.py` skips the
+  whole directory (with a clear reason) if not actually launched under `srun`.
+- **Tier 3** (`tests/integration/`): a real (tiny, tiny-model) training run
+  against your actual data on Frontier, through the real
+  `training_scripts/train.py` entry point, including a checkpoint
+  save-then-resume cycle. Launched via
+  `sbatch launch/tests/run_training_smoke.sh` — see "Running the training
+  smoke test (Tier 3)" below. Not pytest-based, and not a single local
+  process either — see that section for why.
+- **Tier 3b** (`tests/integration/run_feature_matrix_smoke.py`): same
+  mechanics as Tier 3, but for a different purpose — Tier 3 proves the 10
+  shipped configs' shared baseline (advanced features off by default) still
+  works; Tier 3b proves those advanced features (adaptive patching, tiling,
+  `twoD`, tensor parallelism) still work when turned back on, one
+  representative config per feature. Launched via
+  `sbatch launch/tests/run_feature_matrix_smoke.sh` — see "Running the
+  feature-matrix smoke test (Tier 3b)" below.
+
+## Setup
+
+From the repo root, with your environment activated (e.g. the `forge-vit`
+conda env on Frontier, or any environment that already has the project's
+dependencies installed):
+
+```bash
+pip install -e ".[test]"
+```
+
+This installs `pytest` on top of the project's normal dependencies. If you
+just want to run the Tier 1 tests somewhere lighter (no `monai`/`timm`/
+`xformers`), you only need: `torch`, `torchvision`, `opencv-python-headless`,
+`scipy`, `matplotlib`, `nibabel`, `torchdata==0.9.0`, `pyyaml`, and `pytest`.
+Model-level tests (`UCF_VIT.model.*`) aren't in the suite yet for exactly this
+reason — see "What isn't covered yet" below.
+
+No editable install is required just to run tests: `pyproject.toml` adds
+`src/` (and `utils/`) to pytest's `pythonpath`, so `import UCF_VIT` and
+`import validate_config` work out of the box from the repo root.
+
+## Running tests
+
+```bash
+# everything
+pytest
+
+# one file
+pytest tests/dataloaders/test_quadtree.py
+
+# one test
+pytest tests/utils/test_misc.py::test_is_power_of_two
+
+# verbose, stop at the first failure
+pytest -v -x
+
+# only the shipped-config regression checks
+pytest tests/test_config_validation.py -v
+```
+
+## What's covered today
+
+| File | Covers |
+| --- | --- |
+| `tests/dataloaders/test_quadtree.py` | `Rect` geometry, `FixedQuadTree` subdivision, node-value/encode-decode. `Rect.contains` is unnormalized (`test_rect_contains` asserts a raw sum, not divided by 255) — see the `test_transform.py` row below for why. |
+| `tests/dataloaders/test_octree.py` | `Cube` geometry, `FixedOctTree` subdivision. `Cube.contains`/`FixedOctTree` no longer take a `norm_factor` at all (removed, not just defaulted) — same reasoning as `Rect.contains`. |
+| `tests/dataloaders/test_transform.py` | `Patchify`'s edge detection, split by `dataset`: `imagenet`/`catsdogs` still use `cv2.Canny` directly (untouched — real, already-uint8 photos, possibly multi-channel, which `skimage.feature.canny` can't accept), every other dataset (e.g. `basic_ct`) uses `skimage.feature.canny` instead of `cv2.Canny((img*255).astype(np.uint8), ...)`, which silently assumed the float image was already normalized to exactly `[0,1]` — wrong (wastes dynamic range, or clips) whenever that assumption doesn't hold. Regression test uses a float range far outside `[0,1]` to confirm the fix actually detects the edge. Also covers the non-photo path's real limitation — `skimage.feature.canny` only accepts single-channel 2D input, so multi-channel input raises a clear `NotImplementedError` rather than being silently mishandled. `canny_quantiles` (new constructor param, added alongside `Patchify`'s existing `cannys`) are quantile-based hysteresis thresholds (`use_quantiles=True`), dataset-scale-independent by construction unlike `cannys`' absolute values — starting values, not empirically tuned. New `scikit-image` dependency, added to `pyproject.toml`. `Patchify_3D`'s own coverage is separate — see the "Replaced `Patchify_3D`'s edge detection with a genuinely 3D `SimpleITK.CannyEdgeDetection`" section further down for the full rewrite and what these tests specifically verify. |
+| `tests/dataloaders/test_dataset.py` | `TileDataIter` (2D, 3D-full, and 3D-twoD-sliced tiling, with/without labels, overlap), `ShuffleIterableDataset` (no data loss/duplication across buffer sizes), `ProcessChannels` (batching, adaptive-patching wiring, `separate_channels`), `FileReader` (DDP-rank + dataloader-worker sharding disjointness/coverage up to `num_workers=7`, `keys_to_add` replication) |
+| `tests/dataloaders/test_datamodule.py` | `collate_fn` across `adaptive_patching`/`return_label`/`separate_channels`/`return_qdt`/dataset-type combinations, built from real `ProcessChannels` output rather than hand-fabricated tuples |
+| `tests/datasets/test_catsdogs.py` | `CatsDogsDataset` (label-from-filename, resize/channel-first conversion, adaptive-patching shapes, `div x div` tiling — `__len__` scaling, a deliberately non-square full-coverage regression test, and tiling composed with adaptive_patching) and `CatsDogsCollate`, against small real JPEG files written to a temp dir — `catsdogs` is the only shipped dataset using `dataloader.type: "dataloader"` (a plain `Dataset` + `DistributedSampler`, not the `iterative_dataloader` stack the two rows above cover), and previously had no tiling capability at all (`tiling.div` was silently ignored) |
+| `tests/utils/test_misc.py` | `is_power_of_two`, `calculate_tile_overlap`, `calculate_tile_bounds` (`div==1` passthrough, no-overlap tiling, overlap at first/middle/last tile boundaries — extracted from `TileDataIter` so `CatsDogsDataset`'s tiling can reuse the exact same math), `patchify`/`unpatchify` roundtrips, `process_root_dirs` (`imagenet` per-class bucketing — evenly/non-evenly-divisible `> data_par_size`, `<= data_par_size`, bucket-content correctness — and the non-`imagenet` branch), `detect_num_channels` (`imagenet` hardcoding with no filesystem touched, `catsdogs`/PIL real-file band-count detection across RGB/`L`/RGBA, `basic_ct`/nibabel real-file 3D-shape detection, the 4D-shape-raises case, missing-`imagesTr`-raises, and independent per-key detection), `detect_img_size` (`basic_ct`/nibabel real-file native-shape detection, `imagenet`/`catsdogs`/PIL real-file native-pixel-size detection using a deliberately non-square fixture to verify PIL's native `(width, height)` `.size` is correctly swapped to the `[height, width]` convention, first-`dict_root_dirs`-key-only sampling, missing-`imagesTr`-raises, empty-`dict_root_dirs`-raises), `shard_mlp_state_dict`/`shard_attention_state_dict` (weight-slice reconstruction, `fc2.bias`/`proj.bias` summing back to the original exactly, `qk_norm` rejection) |
+| `tests/utils/test_pos_embed.py` | 1D/2D/3D sin-cos position embeddings |
+| `tests/utils/test_time_embed.py` | `SinusoidalEmbeddings` — moved here from `pos_embed.py` alongside `UCF_VIT.utils.time_embed` itself, when `Block_diffusion` (see `test_diffusion_vit.py` below) needed it as a per-block submodule rather than a `DiffusionVIT`-level one |
+| `tests/utils/test_lr_scheduler.py` | `LinearWarmupCosineAnnealingLR` warmup/annealing shape |
+| `tests/utils/test_metrics.py` | `masked_mse`, `DiceBLoss`, `native_resolution_patch_mse`/`native_resolution_patch_masked_mse` (renamed from `adaptive_patching_mse`/`adaptive_patching_masked_mse` — the original name didn't distinguish it from `MSE`/`maskMSE`'s own per-patch averaging under `ap.do_ap:True`; the real distinguishing property is comparing against the *native-resolution* image region each patch covers, not the already-resized fixed-`interp_size` token) — 2D and 3D crop-vs-prediction correctness via real `y` slices (not hand-derived pixel formulas, which turned out to be error-prone to get right by hand even for a case that was actually correct, see below), padding-patch exclusion, shared-vs-independent-per-channel adaptive-patching grids, masked-variant mask+padding exclusion. Rewritten to be fully vectorized (`torch.nn.functional.grid_sample`, one batched call across every batch/channel/sequence position, no Python-level loop) — the original was an unvectorized, never-hooked-up, never-run triple-nested-loop implementation with a real axis-order bug: it indexed the target `y[..., x_start:x_end, y_start:y_end]`, but `x`/`y` (from `UCF_VIT.dataloaders.quadtree.Rect`'s own convention) are the *width*/*height*-derived bounds respectively, while `y`'s real axis order is `(..., H, W)` — swapped, invisible on square images, the same class of bug found and fixed elsewhere this session (`TileDataIter`, `catsdogs.py`, the whole `img_size`/`resize`/`tile_size` convention flip). Fixed as part of the rewrite by using `grid_sample`'s own native `x`/`y`[`/z`]-to-last/second-to-last[/third-to-last]-axis convention directly, which — confirmed by tracing `dataloaders/dataset.py`'s `np.moveaxis(np_image, 0, -1)` (only ever relocates the channel axis, never the 3 spatial ones) all the way through `Patchify`/`Patchify_3D` — already matches how this codebase's real axes are laid out end to end, no permutation needed. |
+| `tests/test_config_validation.py` | Every YAML under `configs/` actually parses via `parse_config`, plus a negative-case regression test that `ap.do_ap:True` with no `ap.interp_size` set fails with a clear error, not a bare `KeyError`; UNETR's `token_selection`/`area_weighted_alpha` `get_kwargs` plumbing (defaults, threading through for all 3 values, invalid-value rejection, and the token-capacity warning firing for `"point"` but correctly suppressed for `"area_weighted"`) |
+| `tests/model/test_arch.py` | `VIT.effective_patch_size` (`interp_size` used when `adaptive_patching`, `patch_size` otherwise, `patch_size`/`interp_size` themselves never overwritten, missing-`interp_size`-under-`adaptive_patching` raises clearly) — needs the real `timm`/`monai`/`xformers` stack (`UCF_VIT.model.arch`'s own imports), skips cleanly via `importorskip` otherwise |
+| `tests/model/test_diffusion_vit.py` | `Block_diffusion` (`building_blocks.py`) — `DiffusionVIT`'s new per-block timestep conditioning (a `SinusoidalEmbeddings` + learned `EmbeddingDenseLayer` projection re-injected into the token sequence before every block's attention, replacing the earlier design that added a timestep embedding once, before the first block). Confirms `get_model`'s `block_fn=Block_diffusion` (`DiffusionVIT`-only) actually produces `Block_diffusion` instances for both `self.blocks` and, when `linear_decoder:False`, `self.decoder_blocks`; a real forward+backward pass runs and stays finite in both decoder modes; and, the actual point of the feature, that different timesteps produce genuinely different output, not just get plumbed through and ignored. See the narrative section below for the real bugs found wiring this in. |
+| `tests/model/test_pretrained_loading.py` | `interpolate_pos_embed`/`interpolate_pos_embed_3d` (independent, non-1:1 height:width[:depth] ratio changes in both directions, class-token prefix preserved, same-size no-op), `extract_encoder_state_dict` against both a fake dict (allowlist keeps only the shared `VIT` encoder — including the `UNETR.encoder1`-vs-`"decoder" not in k` collision case that motivated an allowlist over a denylist) and every real model type's own real `state_dict()` as a pretrained source (`VIT`/`MAE`/`SAP`/`UNETR`/`DiffusionVIT` — not just the two types any shipped config actually uses, since nothing in `get_model` restricts which type the pretrained source is), and end-to-end pretrained-checkpoint transplant (same-architecture 2D and 3D non-cubic ratio changes, cross-architecture `MAE`→`VIT` *and* `VIT`→`MAE` — both class-token-count-mismatch directions, not just one) — same `importorskip` gating as `test_arch.py`. The `VIT`→`MAE` direction caught a real bug: `extract_encoder_state_dict`'s allowlist includes `cls_token` (genuinely a shared `VIT.__init__` attribute when present), but a downstream model with no `cls_token` at all (any non-`VIT` type, or `class_token=False`) made `load_state_dict(strict=True)` raise `"Unexpected key(s): cls_token"` — unlike `pos_embed`, which always has *some* value to reconcile shapes against, `cls_token` can be entirely absent on one side. Fixed with a new `_prune_incompatible_cls_token`, called in `get_model` right after `_transplant_pos_embed`. Used to also cover `_patch_embed_img_size` (a `tile_size`-to-`PatchEmbed`-`img_size` conversion, needed because `tile_size` was `[width, height]` for `imagenet`/`catsdogs`; a real bug caught by a real Tier 3 run, see the Tier 3c section below) — that function was later deleted once the config/data-loading layer itself was changed to store `img_size`/`resize`/`tile_size` as `[height, width]` (see "Flipped `img_size`/`resize`/`tile_size` to `[height, width]`" further down), which made it a true no-op for every dataset. Also covers the flat (adaptive) `pos_embed` case on a `fixed_length` mismatch: reviewing `interpolate_pos_embed_adaptive` (formerly used there, 1D linear interpolation along the sequence-slot-index axis) found it rested on an adjacency assumption adaptive-patching sequences don't actually satisfy (`FixedQuadTree`/`FixedOctTree`'s node order reflects greedy-split order, not spatial position) and, independently, never sliced out `num_prefix_tokens` first — a real, reachable bug corrupting the class-token row into the interpolation whenever `class_token:True`. Replaced with simply dropping the pretrained `pos_embed` on a mismatch (new model keeps its own fresh init); `interpolate_pos_embed_adaptive` deleted, archived at `../UCF-VIT-claude-archive/src/UCF_VIT/utils/misc.py`. `test_pretrained_loading_adaptive_patching_fixed_length_mismatch_drops_pos_embed` exercises this directly with `class_token=True` on both sides — the exact scenario that used to be corrupted. |
+| `tests/test_parse_pretrained_config.py` | `parse_pretrained_config` (+ `get_kwargs`'s per-model-type branch) for `SAP`/`UNETR`/`DiffusionVIT` as the pretrained source specifically — `tests/model/test_pretrained_loading.py`/`test_pretrained_loading_real.py` only ever use `VIT`/`MAE`. Pure `parse.py`-level (no `UCF_VIT.model.arch` import at all), so no `importorskip` needed — runs in any environment. |
+| `tests/test_forward_step.py` | `training.py`'s `forward_step` (renamed from `train_step` — see the `eval_epoch` narrative section below) MAE loss dispatch: `loss_fn:"MSE"` (plain `nn.MSELoss` over every patch) and `loss_fn:"maskMSE"` (`masked_mse`, averaged only over the masked/encoder-hidden patches — the standard MAE-paper loss), for both `ap.do_ap:True` and `False`; and, `ap.do_ap:True`-only, `loss_fn:"nativeResMSE"`/`"nativeResMaskMSE"` (`native_resolution_patch_mse`/`native_resolution_patch_masked_mse` — compares against the real, native-resolution image region each adaptive patch covers, not the already-resized fixed-`interp_size` token `"MSE"`/`"maskMSE"` compare against under `do_ap:True`). `"maskMSE"` was previously dead code (the `do_ap:True` branch was a bare `#TODO`, the `do_ap:False` branch was fully written but commented out), and `"nativeRes*"` didn't exist at all — now all wired up. Uses a fake model (`forward_step` only ever calls `model.forward(...)`, so a stub returning a fixed `(output, mask)` is enough, no real MAE/`timm`/`monai`/`xformers` needed). The `"MSE"`/`"maskMSE"` tests construct output so masked and unmasked patches have a different, known error, so the two losses produce different, independently-verifiable numbers from the same fixture rather than coincidentally agreeing; the `"nativeRes*"` tests verify `forward_step`'s dispatch against directly calling `native_resolution_patch_mse`/`_masked_mse` itself, including that `batch["seq_ps"]` (`process_batch`'s own combined, squeezed `[size, pos]` tensor, built for the adaptive positional embedding) gets correctly sliced back apart and its `adaptive_patching_channels` dim restored. Every test also asserts the fake model was called with the expected input tensor (`batch["seq"]` vs `batch["data"]`) — `forward_step`'s previously-found real bugs (see below) were all about picking the wrong branch/input, not just computing the wrong number. |
+| `tests/integration/test_run_training_smoke_helpers.py` | `run_training_smoke.py`'s `compute_narrow_dict_idx` (real-data-found narrowing, empty-but-existing-dir and nonexistent-dir both raising `NoRealDataFoundError`, no-op for non-`iterative_dataloader` configs) and `deep_merge_config_overrides` (nested-key merge, wholesale-replace of non-dict values, new-key insertion, multiple independent sections) |
+| `tests/integration/test_feature_matrix_smoke_helpers.py` | `run_feature_matrix_smoke.py`'s `FEATURE_MATRIX` well-formedness (unique labels, real base-config paths, no accidental list-valued `tile_overlap` overrides) and — the most valuable check — every cell's tiny-model config surviving a real `parse_config` call |
+
+`tests/dataloaders/test_dataset.py`'s `TileDataIter` coverage is deliberately
+thorough: that class is where a real, live bug was found and fixed this
+session (a 3D `basic_ct` volume being twoD-sliced into 2D z-planes was
+silently treated as genuinely-2D data, leaving the whole z-axis attached to
+every tile and producing a 5D batch several layers downstream — see "Real
+runs on Frontier so far" below). The `twoD=True`/`twoD=False` 3D tests there
+are regression tests for exactly that bug.
+
+Writing `test_filereader_*` also surfaced and fixed a second real bug (not
+found via a real run, so not in the Frontier findings log below), more
+serious than it first looked: `FileReader.__iter__`'s `num_workers=0`
+branch (`torch.utils.data.get_worker_info()` returns `None` whenever
+`num_workers=0`) never applied DDP-rank sharding at all — it unconditionally
+set `iter_start=0, iter_end=len(file_list)`, so *every* DDP rank read the
+*entire* file list instead of its own shard. This was live at the time,
+against `basic_ct/sap` and `basic_ct/unetr`'s then-shipped `num_workers: 0`
++ `simple_ddp_size: 8` (both now ship `num_workers: 1` as part of this
+session's config-baseline reconfiguration, but the bug and its regression
+test stand regardless of what any shipped config currently uses). A related
+symptom of the same
+broken branch: combined with `keys_to_add > 1` (dataset-balancing
+replication across multiple, differently-sized `dict_root_dirs` keys), it
+would walk past the end of `file_list` and raise `IndexError` — that part
+alone doesn't hit any shipped config today (every shipped `basic_ct` config
+has exactly one key), but the missing DDP-rank sharding did. Fixed by
+routing `num_workers=0` through the same DDP-rank/`gx`-based sharding math
+as `num_workers >= 1`, instead of duplicating (and getting wrong) a separate
+code path for it. `test_filereader_num_workers_zero_shards_by_ddp_rank` and
+`test_filereader_shards_combine_ddp_rank_and_dataloader_workers` (the
+latter parametrized up to `num_workers=7`, matching real Frontier node
+core counts) are the regression tests.
+
+`tests/dataloaders/test_datamodule.py`'s `collate_fn` tests surfaced and
+fixed four more real bugs, all in the `return_label=False` +
+`adaptive_patching=True` corner, which had drifted out of sync with its
+(correct) `return_label=True` sibling — exactly the territory the code's own
+`# TODO: Finish and Test separate_channels implementation` comments flagged
+as unfinished:
+1. `ProcessChannels.__iter__` raised `UnboundLocalError` for
+   `separate_channels=True`: the per-channel patchify loop discarded the
+   quadtree object into `_` instead of `qdt`, then referenced the
+   never-assigned `qdt` name a few lines later.
+2. The same discard-into-`_` mistake in the `separate_channels=False`
+   sibling, but only triggered by `return_qdt=True` — unreachable in
+   production today (`return_qdt` defaults to `False`, nothing sets it
+   `True`).
+3. `collate_fn`'s `seq` computation for `dataset="basic_ct"` +
+   `separate_channels=True` produced a wrong, spurious extra dimension — the
+   `return_label=True` branch applied an `expand_dims` meant only for
+   `separate_channels=False`, without checking `separate_channels` first
+   (unlike `size`/`pos` right below it, which already did).
+4. `collate_fn`'s `return_label=False` branch never added the channel
+   dimension `basic_ct`'s (typically single-channel, un-separated) `seq`
+   needs at all, producing a 3D tensor where the model's
+   `rearrange(x, 'b c s p -> b s (p c)')` needs 4D.
+
+None of these are hit by any shipped config today — all four need either
+`separate_channels: True` (every shipped config uses `False`), `return_qdt:
+True` (nothing sets it), or a `basic_ct` MAE/DiffusionVIT config with
+`do_ap: True` (both ship with `do_ap: False`) — but all four are real, and
+all four are fixed. See `tests/dataloaders/test_datamodule.py`'s module
+docstring for the full detail on each, and
+`test_dataset.py::test_processchannels_separate_channels_does_not_crash` for
+the `ProcessChannels`-level regression test on #1.
+
+Writing `tests/datasets/test_catsdogs.py`'s `adaptive_patching=True` tests
+surfaced a real bug too, this time in `training_scripts/train.py` rather
+than in `catsdogs.py` itself: it constructed `CatsDogsDataset` with
+`num_channels=conf["data"]["num_channels"]` — the whole `{key: count}`
+dict — instead of the per-key int
+`conf["data"]["num_channels"][dkey_train]`. Harmless when
+`adaptive_patching` is `False` (`num_channels` goes unused then), but with
+`adaptive_patching: True` it's stored as `Patchify.num_channels` and
+immediately compared with `if self.num_channels > 1`, raising `TypeError:
+'>' not supported between instances of 'dict' and 'int'`. The shipped
+`catsdogs` config ships with `ap.do_ap: False`, so this was dormant, not an
+active failure — confirmed fixed by constructing `CatsDogsDataset` and
+`Patchify` directly (bypassing `train.py`) with real fabricated JPEGs and
+`adaptive_patching=True` end to end.
+
+`tests/utils/test_misc.py`'s new `process_root_dirs` coverage fixed a real,
+if long-dormant, bug: for `imagenet`-format datasets with `<= data_par_size`
+classes, `classes_to_combine` was only assigned inside an `if len(classes) >
+data_par_size:` block, so `UnboundLocalError` on the very next line. Never
+hit by any shipped config (real ImageNet-1k's 1000 classes are far above any
+realistic `data_par_size`), but a real crash waiting for the first small
+custom classification dataset in `imagenet` format. Fixed to combine 1 class
+per bucket in that case (`len(classes)` buckets rather than `data_par_size`
+— matches the function's own "`data_par_size` (or fewer) buckets"
+docstring). The new tests also document, without fixing, a separate,
+pre-existing, self-flagged limitation in the `> data_par_size` branch: when
+`len(classes)` doesn't divide evenly by `data_par_size`, the leftover
+classes past `data_par_size * classes_to_combine` are silently dropped —
+already called out by its own `# TODO: Add shuffling for data_par_size if it
+doesn't divide 1000 equally` comment, so left as-is here rather than folded
+into this fix.
+
+`tests/dataloaders/test_dataset_speed.py` has informational-only throughput
+measurements (buffer_size, num_workers) for the same pipeline — no
+pass/fail threshold, and not run by default; see "Running the dataloader
+speed tests" below.
+
+`tests/conftest.py` provides a session-wide, autouse fixture that initializes
+a single-process (`world_size=1`, `gloo` backend) `torch.distributed` group.
+This exists because several functions (notably `parse_config`) call
+`dist.get_rank()`/`dist.get_world_size()` even outside of a real multi-process
+launch; the fixture lets those calls succeed locally without any SLURM
+allocation. You don't need to do anything to use it — it's automatic.
+
+## Running the dataloader speed tests
+
+`tests/dataloaders/test_dataset_speed.py` measures throughput of
+`ShuffleIterableDataset` across `buffer_size` values and of a `DataLoader`
+wrapping a synthetic (artificially delayed) source across `num_workers`
+values. These are excluded from the default `pytest` run (see `addopts` in
+`pyproject.toml`) since they take longer and, being timing measurements,
+aren't meaningfully pass/fail — run them explicitly and read the printed
+numbers:
+
+```bash
+pytest -m dataloader_speed -s
+```
+
+`test_dataset_speed.py` runs anywhere (no GPU/SLURM needed) — that's just
+the local invocation. `test_pin_memory_speed.py` (below) needs a real GPU
+and skips module-level without one. To run everything on a real Frontier
+compute node instead of a login node (mainly so the `num_workers` cases
+have real, uncontended cores behind them, and so `test_pin_memory_speed.py`
+has a real GPU to measure against):
+
+```bash
+cd launch/tests
+sbatch run_dataloader_speed.sh
+```
+
+A single plain process (no `srun`, unlike `run_distributed_tests.sh`) — none
+of these tests touch `torch.distributed` or launch multiple ranks; only
+`test_pin_memory_speed.py` touches a GPU at all (the other two are
+CPU-only). Output lands in `pytest-dataloader-speed-<jobid>.out`.
+
+`tests/dataloaders/test_dataset_speed_real_data.py` replaces
+`test_dataset_speed.py`'s made-up `time.sleep()` delay with genuine
+NIfTI/JPEG decode, for `basic_ct/unetr`, `imagenet/classification`, and
+`catsdogs/classification` — the same real construction
+`tests/distributed/test_dataloader_real_pipeline.py` uses
+(`parse_config`/`calculate_load_balancing_on_the_fly`/
+`NativePytorchDataModule` for the first two; `CatsDogsDataset` +
+`DistributedSampler` + `DataLoader` for `catsdogs`), just single-process —
+`parse_config(..., load_balance_offline=True)` skips the
+`data_par_size * tensor_par_size == world_size` assertion the real shipped
+configs (`data_par_size=8`) would otherwise fail under a lone process, and
+`calculate_load_balancing_on_the_fly`/`NativePytorchDataModule` both derive
+sharding from the config's stated `data_par_size` rather than the real
+world size regardless, so this process still ends up decoding a real,
+correctly-sharded ~1/8th slice — genuine work, not a full-scale
+measurement. Sweeps `num_workers` up to 7 (matching real Frontier node core
+counts) for all three; needs real Frontier data to mean anything, so (like
+`tests/distributed/`'s real-data files) it skips gracefully rather than
+failing when the real paths aren't reachable — `run_dataloader_speed.sh`
+above is what actually runs it against real data. See the module docstring
+for a caveat on `num_workers > 0`: worker-subprocess startup cost is
+included in the timed region, so it can dominate the measurement at small
+batch counts, especially at higher worker
+counts.
+
+Added later, alongside a real production bug this surfaced (see "Fixed a
+real, severe pre-existing bug" above): a fourth, generic
+`test_real_decode_throughput_config`, for investigating one specific real
+config instead of the three fixed ones — driven by new `tests/dataloaders/
+conftest.py` CLI options (`--speed-config`, `--speed-buffer-sizes`,
+`--speed-num-workers`), since sweeping every shipped config for one real
+question (raised directly by the user: is `basic_ct/sap`'s
+`dict_buffer_sizes: 100` too large relative to its real per-rank shard
+size, given `ShuffleIterableDataset` can't yield anything until its buffer
+fills — see that entry above) would be far more expensive than needed.
+Skipped entirely unless `--speed-config` is given; `--speed-buffer-sizes`/
+`--speed-num-workers` each default to just the pointed-at config's own
+shipped value (a single run) rather than sweeping, so pointing this at a
+config costs one real decode run by default -- passing either flag
+explicitly widens it into a real sweep. `_narrowed_generic_config_path`
+computes `min_files` from the *given* config's own `batch_size`/
+`fsdp_size`/`simple_ddp_size` (no per-dataset constant to reach for, unlike
+the three fixed tests) and inflates it to comfortably exceed the largest
+swept `buffer_size` too, not just enough for `NUM_BATCHES_TO_PULL`
+batches — otherwise every swept `buffer_size` would exceed the narrowed
+per-rank shard and `ShuffleIterableDataset` would never reach its
+steady-state swap-and-yield behavior for *any* of them, hiding the exact
+effect the sweep exists to show. Only supports
+`dataloader.type:"iterative_dataloader"` configs (asserted) — `"dataloader"`-
+type configs (catsdogs) have no `buffer_size`/`ShuffleIterableDataset` in
+the pipeline to sweep at all.
+
+**Tier 1 coverage:** none of this is unit-testable in the usual sense (it's
+itself a Tier 3-adjacent, real-Frontier-data speed measurement) — verified
+locally instead: collection produces exactly one parametrized instance when
+`--speed-config`/`--speed-buffer-sizes`/`--speed-num-workers` are all
+omitted (the single-run default), the correct full matrix when sweep values
+are given explicitly, and the new test skips cleanly (not fails) with no
+`--speed-config` and again when pointed at a real config path locally (no
+real `/lustre/...` data reachable off Frontier) — confirmed the existing
+three fixed tests and the rest of the local suite are unaffected (263
+passed, 4 skipped, 0 failures). The actual empirical question (is
+`buffer_size:100` really the dominant cost for a real SAP run) still needs
+a real Frontier run with `--speed-config` pointed at `basic_ct/sap`'s
+config — not yet done.
+
+#### Follow-up: two real Frontier failures, one infra, one a real data ceiling
+
+First real run (job 5421658) never got past dataloader construction at
+all: `NativePytorchDataModule._my_dataset_key()` raised `NotImplementedError`
+("Only support distributed training"). `tests/conftest.py`'s autouse
+single-process `torch.distributed` fixture steps aside whenever
+`SLURM_PROCID`/`SLURM_NTASKS`/`SLURM_LOCALID` are all set, assuming that
+means real multi-rank `tests/distributed/` tests are running -- but
+`run_dataloader_speed.sh` submits via a real `sbatch` job too, just without
+`srun`, and this Frontier cluster populates those same variables for a bare
+`sbatch` script regardless. Fixed with a new, always-on single-process init
+fixture scoped to `tests/dataloaders/` itself (independent of that
+heuristic -- safe since nothing here is ever real multi-rank, and
+conftest.py fixtures don't cross into sibling directories).
+
+Second run (job 5421778) got further but hit a real gloo error resolving
+`MASTER_ADDR` ("Address family not supported by protocol") -- the ambient
+shell environment already had `MASTER_ADDR` set to a hostname
+(`localhost.localdomain`) whose DNS/NSS resolution trips an IPv6 mismatch
+on this cluster; the fixture's `os.environ.setdefault(...)` left it alone
+since it was already set. Fixed by forcing a numeric loopback literal and a
+freshly-bound port unconditionally, instead of deferring to whatever's
+already in the environment -- this process group has nothing to do with
+whatever that ambient `MASTER_ADDR` was for.
+
+Third run (job 5421875, after both fixes) finally reached real decode
+work, but every single swept `buffer_size` failed identically:
+`_time_batches`'s hard `assert len(batches) == num_batches` only ever
+pulled 2 of the requested 4 batches. Confirmed by hand this is a real data
+ceiling, not a bug in `_narrowed_generic_config_path`'s `min_files` math:
+852 real `basic_ct` files -> ~681 training (default 0.8/0.1/0.1 split) ->
+÷8 (`basic_ct/sap`'s real `simple_ddp_size`) ≈ 85 files for one simulated
+1/8th-shard rank -> ÷32 (`batch_size`) = exactly 2 batches, regardless of
+`buffer_size` -- independently reproducing the same ~85-file/2-batch math
+this whole investigation started from. Fixed with a new
+`_time_batches_lenient` (used only by `test_real_decode_throughput_config`,
+not the three fixed tests -- their `*_MIN_FILES` targets are already known
+to fit) that requires only >= 1 batch instead of an exact count, reports
+however many were actually available, and additionally times the *first*
+batch specifically -- a more precise metric for a `ShuffleIterableDataset`
+buffer-fill question anyway, since the stall happens before the first
+sample is ever yielded, independent of how many batches follow after that.
+
+#### Real multi-rank version: `tests/distributed/test_dataloader_speed_real_pipeline.py`
+
+After three real-Frontier-run failures in a row on the single-process
+version above -- all fixed, but all in scaffolding *this test itself*
+introduced (the SLURM-launch heuristic, the ambient `MASTER_ADDR`, the
+simulated-1/8th-rank narrowing math), none of them actually caused by
+`gloo` vs. `NCCL` -- the user asked directly whether the single-process
+approach was simply the wrong tool, since the whole point is measuring
+performance "in an environment similar to where I'm doing testing." It
+was: `gloo`/single-process can validly measure raw decode cost in
+isolation, but it gives one process a whole node's cores to itself, while
+real SAP training runs `data_par_size` ranks' worth of `num_workers`
+subprocesses on the same node's cores *simultaneously* -- a real CPU-
+contention gap the single-process number can't show, on top of not using
+the real launch mechanics at all.
+
+Added a real multi-rank counterpart instead of continuing to patch the
+single-process version: `test_real_decode_throughput_config_distributed`,
+reusing `tests/distributed/conftest.py`'s already-proven `dist_info`
+fixture (real `srun`, real NCCL, confirmed passing on a real Frontier run
+elsewhere in this suite) and the exact real-pipeline construction
+`test_dataloader_real_pipeline.py` uses (`parse_config` with **no**
+`load_balance_offline` -- this rank's real world size must equal the
+config's real `data_par_size * tensor_par_size`, exactly as production
+enforces). Every real rank narrows/builds/times its own real shard
+concurrently, synchronized by a `dist.barrier()` right before the timed
+region so every rank's clock starts together; results are gathered onto
+rank 0 via `dist.all_gather_object` and printed as a per-rank breakdown
+plus an aggregate (total real samples across every rank ÷ the *slowest*
+rank's elapsed time) -- that aggregate, not any single rank's number, is
+what approximates real steady-state per-node throughput under contention.
+
+The `--speed-config`/`--speed-buffer-sizes`/`--speed-num-workers` CLI
+options themselves moved up to the top-level `tests/conftest.py` (a shared
+ancestor of both `tests/dataloaders/` and `tests/distributed/`) rather than
+being duplicated in a second directory-level `conftest.py` -- `testpaths =
+["tests"]` in `pyproject.toml` means a bare `pytest` invocation collects
+both directories together, and registering the same `argparse` option
+twice would crash collection outright, not just this one test. Each
+directory keeps its own (duplicated, not shared) `pytest_generate_tests`/
+`_config_default`, since those are directory-scoped hooks with no
+conflict risk. Run via `run_distributed_tests.sh`'s own `"$@"` forwarding
+(added alongside this, matching `run_dataloader_speed.sh`'s existing
+pattern):
+
+```bash
+sbatch run_distributed_tests.sh -m dataloader_speed \
+  -k test_real_decode_throughput_config_distributed \
+  --speed-config ../../configs/basic_ct/sap/base_config.yaml \
+  --speed-buffer-sizes 16,32,64,100
+```
+
+**Tier 1 coverage:** same as the single-process version -- verified
+locally that both `conftest.py` changes don't reintroduce an `argparse`
+conflict (`pytest --collect-only tests/` collects both directories
+together without error), the new test collects one parametrized instance
+by default and the full sweep matrix when `--speed-buffer-sizes`/
+`--speed-num-workers` are given, and skips cleanly (via `dist_info`'s own
+srun check) with no real SLURM launch present -- confirmed the rest of the
+local suite is unaffected.
+
+#### Real run (job 5445830) found a page-cache artifact biasing sweep comparisons
+
+First real run of the multi-rank test, `--speed-buffer-sizes 16,32,64,100`
+against `basic_ct/sap`: `buffer_size=16` (first in the sweep) took ~540s
+per rank; `32`/`64`/`100` all dropped to ~110-125s per rank, uniformly
+across every one of the 8 real ranks. Diagnosed by hand, not a real
+`buffer_size` effect -- if buffer-fill time genuinely dominated, a
+*smaller* buffer should reach its first batch *faster*, not 5x slower, so
+the direction of the effect was itself the tell.
+
+Root cause: `_narrowed_generic_config_path`'s `min_files` only depends on
+`max(buffer_size, batch_size * NUM_BATCHES_TO_PULL)`, and for
+`basic_ct/sap` (`batch_size=32`, `NUM_BATCHES_TO_PULL=4`) the
+`batch_size * NUM_BATCHES_TO_PULL` term (128) dominates every swept
+`buffer_size` (16/32/64/100, all ≤ 128) -- so `min_files`, and therefore
+`compute_narrow_dict_idx`'s returned window width, comes out identical for
+all four. Combined with `dict_start_idx` always being `0.0`, every sweep
+point narrowed to the *exact same real files*. Only the first one pays
+real cold Lustre I/O (metadata + OST reads); every later point reads the
+identical files back out of page cache, which has nothing to do with
+`buffer_size` at all.
+
+Fixed with a new `_sweep_offset_frac` (duplicated in both the
+single-process and multi-rank files, same convention as
+`_time_batches_lenient`): computes this parametrized test's position within
+the full `--speed-buffer-sizes` × `--speed-num-workers` sweep and turns it
+into a `[0, 1)` starting fraction, so `_narrowed_generic_config_path` gives
+each sweep point a disjoint slice of the real file list instead of always
+starting at `0.0` (clamped so `start + width` never exceeds `1.0` -- falls
+back to overlapping only when the narrowed window is already close to the
+whole dataset, which is unavoidable either way). With a single default run
+(no sweep values given), `total_slots == 1` and the offset is always `0.0`
+-- unchanged from before. Verified locally: the offset/window math produces
+four cleanly disjoint `[start, end)` ranges for the real
+`--speed-buffer-sizes 16,32,64,100` case, and the full local suite is
+unaffected. Not yet re-run for real on Frontier to confirm the sweep now
+gives comparable, non-cache-biased numbers.
+
+**Tier 1 coverage:** none of this is unit-testable for the same reason as
+above -- verified locally instead (compiles, full local suite still 263
+passed/4 skipped/0 failures, `dataloader_speed`-marked tests still run/skip
+correctly with no double-init conflicts between the two `tests/dataloaders/
+conftest.py` fixtures). A fourth real Frontier run, with all three fixes in
+place, is what's actually needed to get the real empirical numbers this was
+all for -- not yet done.
+
+`tests/dataloaders/test_pin_memory_speed.py` measures whether
+`dataloader.pin_memory:True` (every shipped config currently has this
+`False`) is actually worth turning on — raised while looking at whether
+adding `non_blocking=True` to `training.py`'s dataloader-sourced
+`.to(device)` calls would help (it only produces a real async copy when the
+source is pinned, so as shipped today it would be a no-op). Two levels: a
+synthetic microbenchmark isolating pure host->device transfer cost (pinned
+vs. pageable source memory, crossed with `non_blocking` True/False, at two
+batch sizes, no real decode involved), and a real basic_ct/unetr
+`NativePytorchDataModule` run (same construction as
+`test_dataset_speed_real_data.py`'s own basic_ct case) with `pin_memory`
+swept True/False, timing real decode *and* the `.to(device)` transfer
+together — the actual per-iteration cost a training run would feel. Needs a
+real GPU (skips module-level without one, unlike the other two files here)
+since pinning's whole effect is on the host->device copy — that's also why
+`run_dataloader_speed.sh` requests `--gres=gpu:8` even though the other two
+files in this directory don't use it.
+
+Writing this surfaced a real gap in `compute_narrow_dict_idx` (shared with
+`test_dataloader_real_pipeline.py` and Tier 3's smoke test): it already
+handled a `dict_root_dirs` path that exists but is empty (raising
+`NoRealDataFoundError`, caught and skipped), but a path that doesn't exist
+*at all* let a raw `FileNotFoundError` (from `process_root_dirs`'
+`os.listdir`/`FileLister` calls) propagate uncaught instead — this only
+surfaced now because this file is the first real-data test that isn't
+gated behind a real SLURM launch (`test_dataloader_real_pipeline.py` lives
+in `tests/distributed/`, so it's skipped entirely before ever reaching this
+code path when run without `srun`). Fixed by normalizing both cases to the
+same `NoRealDataFoundError`; `tests/integration/test_run_training_smoke_
+helpers.py` (new — `run_training_smoke.py`'s narrowing helpers had no unit
+tests of their own before this) is the regression test.
+
+## What isn't covered yet
+
+- `UCF_VIT.model.arch` — the full `VIT` forward pass (patch embedding,
+  positional embedding, `Block` stacking) has no dedicated test yet, only
+  indirect coverage via Tier 3/3b's real training runs.
+  `UCF_VIT.model.building_blocks`'s `Mlp`/`Attention` tensor-parallel,
+  `Block`-level FSDP (`sharding_strategy=FULL_SHARD`), and combined
+  `fsdp_size > 1` + `tensor_par_size > 1` (`HYBRID_SHARD`) forward *and
+  backward* correctness *are* now covered — see
+  `tests/distributed/test_tensor_parallel_correctness.py`,
+  `tests/distributed/test_fsdp_correctness.py`, and
+  `tests/distributed/test_hybrid_shard_correctness.py` below (needs
+  `timm`, `monai`, and `xformers` — the last is GPU/build-toolchain-
+  sensitive, so all three files `importorskip` cleanly rather than
+  erroring at collection when they're not installed).
+- `training.py`'s `process_batch` tensor-parallel broadcasts specifically
+  (as opposed to the rest of a training run, which Tier 3 now covers
+  end-to-end) — would need its own live distributed setup like Tier 2's.
+- `UCF_VIT.parse` itself only has indirect coverage today, through
+  `test_config_validation.py` running real shipped configs end to end
+  (rather than unit tests of individual branches) — this is what caught the
+  config vs. parser mismatches below. One exception: `conf['data']
+  ['num_channels']` is now optional — if omitted, `parse_config` falls back
+  to `UCF_VIT.utils.misc.detect_num_channels`, which reads one real file per
+  dataset key to auto-detect the channel count (`imagenet` is hardcoded to
+  3, no read needed — `dataset.py` always forces `.convert("RGB")`; other
+  datasets read a real file's PIL band count or, for `basic_ct`, its NIfTI
+  header shape via nibabel's lazy `ArrayProxy`, cheap even for large
+  volumes). Every shipped config already specifies `num_channels`
+  explicitly, so this is purely additive — the detection logic itself has
+  direct Tier 1 coverage in `test_misc.py` (see the table above), separate
+  from `parse_config`'s own still-indirect-only coverage. Same story for
+  `conf['data']['img_size']`, now also optional (falls back to
+  `UCF_VIT.utils.misc.detect_img_size`) — but with a bigger semantic change
+  alongside it: `img_size` now *always* means the real/native size of the
+  data (auto-detectable for every dataset type, unlike `num_channels`),
+  and resizing to a *different* size than native became a separate,
+  optional `dataset_options.resize` step for `imagenet`/`catsdogs` (`resize`
+  used to be required for `imagenet` and didn't exist at all for
+  `catsdogs`, where `tile_size` itself doubled as the resize target).
+  `basic_ct` still has no resize step at all (unchanged) — `parse_config`
+  raises a clear error if `dataset_options.resize` has a `basic_ct` entry.
+  Every shipped `imagenet`/`catsdogs` config picked up an explicit
+  `dataset_options.resize` entry matching its existing `img_size` (`catsdogs`
+  never had one before, since `tile_size` was its implicit resize target),
+  preserving today's exact behavior — zero behavior change for existing
+  configs.
+
+### Found and fixed a real width/height axis-order bug while reviewing this
+
+Auditing `img_size`/`resize`'s actual index order (to answer "does
+`cv.resize`'s output come back `(H, W)` or `(H, W, D)`?") surfaced a real,
+pre-existing bug, independent of the auto-detection work itself:
+`img_size`/`resize`/`tile_size` are stored `[width, height]` (confirmed via
+PIL's `Image.size`, cv2's own `dsize` convention, and `catsdogs.py`'s own
+docstring), but `dataset.py`'s `TileDataIter.__iter__`'s 2D branch (used
+only by `imagenet` in practice — `catsdogs` never reaches `TileDataIter`
+at all, see below) applied `tile_size[0]` (width-derived) to the array's
+height axis and `tile_size[1]` (height-derived) to its width axis. The
+real array `imagenet` produces is `(C, H, W)`: `cv.resize(...,
+dsize=(W, H))` returns `(H, W, C)` (OpenCV's own convention), and
+`np.moveaxis(-1, 0)` only moves the channel axis to the front, it doesn't
+touch H/W order. This was invisible because every shipped config is
+square (`W == H`, so swapping them is a no-op) — but `detect_img_size`
+makes a genuinely non-square `img_size` far more likely for real-world
+data, which would have immediately exposed it (truncated/incomplete
+tiles — numpy silently clips an out-of-bounds slice end rather than
+raising, so this wouldn't even have crashed loudly). Fixed by swapping
+which `tile_size_no_overlap`/`start_overlap`/`end_overlap` index feeds
+the array's first vs. second spatial slice, scoped to only the 2D branch
+(the 3D `basic_ct` branches need no such swap — `basic_ct` has no resize
+step, so its `img_size`'s axes already match the array's axes directly).
+Added `test_tiledataiter_2d_non_square_tile_size_axes_arent_swapped` to
+`tests/dataloaders/test_dataset.py`, deliberately using `H != W` (every
+other `TileDataIter` test in that file is square, and so can't
+distinguish the two possible index-to-axis mappings) — confirmed it fails
+without the fix and passes with it.
+
+**Update:** the underlying storage convention was later flipped (see
+"Flipped `img_size`/`resize`/`tile_size` to `[height, width]`" below) —
+`img_size`/`resize`/`tile_size` are now `[height, width]`, matching the
+array's own axis order directly, so the index-swap described above has
+since been removed (not reintroduced) from `TileDataIter`'s 2D branch.
+
+### Added tiling to `catsdogs`
+
+`catsdogs` previously had no tiling capability at all — `CatsDogsDataset`
+had no `div`/`tile_overlap` parameters, and `train.py`'s construction call
+never passed `conf["tiling"]["div"]`/`tile_overlap`, so they were silently
+ignored for any `catsdogs` config. `imagenet`/`basic_ct` get tiling via
+`TileDataIter` (an `IterableDataset` that expands one sample into `div *
+div` yielded tiles), but `CatsDogsDataset` is a **map-style** `Dataset`
+(`__len__`/`__getitem__`) used with a real `DistributedSampler` +
+`DataLoader` — a different mechanism was needed: `__len__` now reports
+`len(file_list) * div * div`, and `__getitem__(idx)` maps `idx` →
+`(file_idx, tile_idx)` → `(w_idx, h_idx)` and slices out just that one
+tile. `DistributedSampler`/`DataLoader`/`CatsDogsCollate` needed no
+changes — they only ever see `len(dataset)` and whatever `__getitem__`
+returns.
+
+`TileDataIter.calculate_tile_bounds` (the per-axis tile-bounds math) was
+extracted into a standalone `UCF_VIT.utils.misc.calculate_tile_bounds` so
+`CatsDogsDataset` could reuse the exact same logic instead of duplicating
+it a second time — `TileDataIter` now calls the extracted function too
+(passing `self.div` explicitly instead of reading it implicitly via
+`self`).
+
+Deliberately avoided repeating the width/height axis-order bug just fixed
+above: the new tile-slicing code uses explicit `start_h/end_h`,
+`start_w/end_w` names (not `x`/`y`), and was verified against a
+deliberately non-square fake image
+(`test_catsdogs_dataset_tiling_non_square_full_coverage_no_overlap`) —
+confirmed it fails when the width/height mapping is swapped and passes
+with the correct mapping, the same discipline used for the `TileDataIter`
+fix.
+
+`div` defaults to `1` (already `parse.py`'s own no-tiling default — see
+`"div": conf["tiling"]["div"] if do_tiling else 1`), so this is purely
+additive — zero behavior change for every existing `catsdogs` config,
+none of which set `tiling.do_tiling: True` today. Not yet exercised by a
+`run_feature_matrix_smoke.py` cell or real Frontier data — a natural
+follow-up.
+
+### Added `interp_size`, retired `patch_size` reuse under adaptive patching
+
+`patch_size` used to be overloaded: with `do_ap:False` it's the standard
+conv-patching stride/kernel size; with `do_ap:True` the *same* config value
+was silently reused as the target size each adaptive (quadtree/octree) leaf
+patch gets interpolated to, both in the dataloader (`Patchify`/`Patchify_3D`)
+and in every dependent model-layer size calc (`VIT.token_embeds`,
+`SAP.neck`, `UNETR`'s linear-decoder upsample, the sin-cos pos-embed grid
+calc, `training.py`'s SAP/UNETR sequence-reshape `einops.rearrange` calls
+and their tensor-parallel placeholder-tensor sizing). A new `interp_size`
+config value (under `ap:`, required whenever `ap.do_ap:True`) now takes over
+every one of those roles, so `patch_size` is never read at all once
+adaptive patching is turned on.
+
+`UCF_VIT.model.arch.VIT` gained an `effective_patch_size` property
+(`self.interp_size if self.adaptive_patching else self.patch_size`) — the
+single place this dispatch happens, inherited unchanged by `SAP`/`UNETR`/
+`MAE`/`DiffusionVIT` rather than repeating the ternary at each of the ~6
+call sites across those classes. `self.patch_size`/`self.interp_size`
+themselves are never overwritten, so both stay truthful to their raw config
+values.
+
+`basic_ct/sap`'s shipped config moved its `data.patch_size: 4` to
+`ap.interp_size: 4` (SAP always requires `do_ap:True`, so `patch_size` was
+already unused for it in practice — this just makes that explicit). Every
+`run_feature_matrix_smoke.py` cell that turns `do_ap:True` on via override
+for a base config shipping `do_ap:False` (and thus no `interp_size`) got an
+explicit `ap.interp_size` override added, set to that base config's own
+`data.patch_size` value to preserve exact prior numerics.
+
+Verified locally: the full local suite (`tests/model/test_arch.py`'s new
+`effective_patch_size` dispatch tests, `tests/test_config_validation.py`'s
+new missing-`interp_size`-under-`do_ap` negative test, and every shipped
+config including `basic_ct/sap`) and `tests/integration/
+test_feature_matrix_smoke_helpers.py::test_feature_matrix_cells_parse`
+(exercises every new `interp_size` override through the real
+`parse_config`). `tests/model/test_arch.py` needs the real
+`timm`/`monai`/`xformers` stack (`UCF_VIT.model.arch`'s own imports) and
+skips cleanly via `importorskip` otherwise, matching the existing
+`tests/distributed/test_*_correctness.py` convention — not yet run against
+real Frontier training (no dedicated Tier 2/3 cell exercises `basic_ct/sap`
+training end-to-end beyond `basic_ct-sap+tensor_par`'s parse-level check,
+which already covers the new config shape).
+
+### Generalized pretrained-checkpoint loading to any h:w[:d] ratio
+
+The intended real workflow is: pretrain via `MAE`, then fine-tune its encoder
+into any downstream model type. Two real, independent bugs stood in the way
+of that actually working when the pretrained and downstream configs have
+*different* `img_size`/`tile_size`:
+
+1. `UCF_VIT.utils.pos_embed.interpolate_pos_embed` recovered the checkpoint's
+   original `(h, w)` grid from just its flattened patch count by *assuming a
+   hardcoded 2:1 width:height ratio* — wrong for every shipped config (all
+   square) and any non-2:1 volume. It also looked for checkpoint keys
+   `"net.pos_embed"`/`"net.channel_embed"`, which don't exist in this repo's
+   real state dicts (`self.pos_embed`, `self.var_embed`, no `.net` wrapper) —
+   a silent no-op even where reachable. Never actually called anywhere.
+2. `model/utils.py`'s encoder-extraction step only populated `encoder_dict`
+   when the pretrained source was `MAE` — for every other pretrained model
+   type it stayed empty, so `model.load_state_dict(model_dict)` was a no-op
+   and no pretrained weight was ever actually applied (there was already a
+   `#TODO: Add encoder_dict for different pretrained model types` comment
+   acknowledging this).
+
+Fixed both together. `interpolate_pos_embed` (and a new 3D
+`interpolate_pos_embed_3d`) now take the original grid shape as an **explicit
+parameter** instead of guessing it — any independent height:width[:depth]
+ratio works, for both the pretrained and the new grid, verified directly
+(`(8,16)→(16,8)`, `(4,8,16)→(8,4,4)`, etc. — deliberately swapped/non-uniform
+ratios, not just a uniform rescale). A new `extract_encoder_state_dict`
+replaces the `MAE`-only branch with a single **allowlist** of the top-level
+state-dict key prefixes `VIT.__init__` itself creates (`patch_embed`,
+`token_embeds`, `cls_token`, `pos_embed`, `var_embed`, `adaptive_pos_dep_emb`,
+`blocks`, `norm`) — verified against every subclass's own `__init__` to
+produce the identical result to the old MAE-only filter for MAE specifically,
+while also correctly generalizing to `VIT`/`SAP`/`UNETR`/`DiffusionVIT` as
+pretrained sources. Deliberately an allowlist, not a `"decoder" not in
+k`-style denylist: `UNETR` has its own `self.encoder1`/`encoder2`/`encoder3`/
+`encoder4` (U-Net skip-connection convs feeding its *decoder*, not the
+transformer encoder) that a denylist would mishandle — a fake `"encoder1.
+weight"` key is a direct regression test for exactly this in
+`test_extract_encoder_state_dict_keeps_only_shared_vit_attrs`.
+
+`model/utils.py`'s `get_model` now builds `pretrained_model` at the
+pretrained model's own true `img_size`/`twoD`/`patch_size`/`interp_size`/
+`fixed_length`/`use_adaptive_pos_emb` (from `parse_pretrained_config`'s
+`p_conf`, which previously only carried `model_type`/`default_vars`/
+`kwargs`) rather than the new model's — required for the checkpoint to load
+into it without a shape mismatch at all, regardless of any difference from
+the new model's own config. `parse_pretrained_config`'s hard equality asserts
+on `tile_size`/`patch_size`/`interp_size` between pretrained and new (which
+previously made a resolution difference impossible in the first place) are
+removed; `twoD`/`do_ap`/`in_chans`/`use_channel_aggregation` equality is
+still required (those genuinely can't differ). Also fixed, found while
+tracing this same path: `get_kwargs(model_type, conf)` was building the
+pretrained model's own decoder/head kwargs from the *new* model's config
+(`conf`) instead of the pretrained one's (`pretrained_conf`) — would crash
+outright the moment the pretrained and downstream model types actually
+differ (e.g. pretrained `MAE` → downstream `UNETR`: `conf["model"]` has no
+`mask_ratio` key at all), and an unimported `OrderedDict` (would have raised
+`NameError` the moment this code path executed for real, for any model
+type including `MAE`).
+
+**Found and explicitly excluded from this fix, not fixed at the time**: for
+`SAP` and `UNETR+do_ap` (`sqrt_len_method:True`), `self.pos_embed` was
+allocated at `patch_embed`'s raw `img_size/effective_patch_size` grid size
+(`64×64×64 = 262144` for `basic_ct/sap`'s shipped config) but the real
+runtime token count was `sqrt_len³` (`8³ = 512`) — a real, separate,
+pre-existing inconsistency, verified by directly constructing a real `SAP`
+instance. Silently harmless at the time only because every shipped
+`SAP`/`UNETR+do_ap` config also sets `use_adaptive_pos_emb:True`, so
+`self.pos_embed` was never actually read in the forward pass — dead,
+oversized, wasted memory, not a crash. `_transplant_pos_embed` raised a
+clear `NotImplementedError` for a pretrained/new size mismatch under
+`sqrt_len_method:True` rather than interpolating via a `grid_size` that
+didn't reflect the real token count. **Since fixed** (see "Removed
+`sqrt_len_method`..." further down): `sqrt_len_method` no longer exists at
+all -- `SAP`/`UNETR` never build a `patch_embed` under adaptive patching,
+so this inconsistency (and the rejection it required) is gone, not just
+worked around.
+
+Verified locally at Tier 1 first — per the user, sufficient for the h:w[:d]
+ratio logic itself, since Tier 1 deliberately calls `extract_encoder_state_
+dict`/`_transplant_pos_embed` directly, bypassing `get_model`/
+`parse_pretrained_config` entirely. That left the actual integration/wiring
+layer with zero coverage, though, so real Tier 2/3 tests were added next
+(see below) — and turned up three more real, previously-undiscovered,
+unconditionally-crashing bugs in that layer, none related to h:w[:d] ratios
+at all: `use_pretrained_model:True` had apparently never actually run
+successfully, at any point in this repo's history, even before any of this
+session's changes.
+
+### Real wiring bugs found while testing the pretrained-loading path itself
+
+The first three are unconditional — every one fires regardless of any
+resolution difference, so `use_pretrained_model:True` never got as far as
+the interpolation logic above before hitting one of them. The fourth is
+conditional on which model types are on each side of the transplant, found
+only once cross-architecture coverage was widened beyond the one direction
+(`MAE`→`VIT`) originally tested:
+
+1. `model/utils.py`'s pretrained branch read `conf["pretrained_model"]
+   ["checkpoint_path"]`, but `conf["pretrained_model"]` was never populated
+   anywhere — `parse_config` doesn't create that key, no shipped config has
+   a `pretrained_model:` section, and it's referenced nowhere else in the
+   codebase. Unconditional `KeyError`. Fixed by threading the pretrained
+   model's own real `checkpoint_path` (already correctly read from
+   `pretrained_conf["trainer"]["checkpoint_path"]` for the existence check)
+   through `p_conf`, the same pattern as the other pretrained-specific
+   fields added earlier.
+2. `parse_config`'s own `trainer_conf` reconstruction never copied
+   `pretrained_checkpoint_filename` through from the raw config at all —
+   found while locally verifying the Tier 2 test's config-building logic
+   (see `tests/distributed/test_pretrained_loading_real.py`'s own
+   docstring), *before* spending any real Frontier job time on it.
+   `parse_pretrained_config`'s later read of this (both its
+   checkpoint-existence check and the actual filename `get_model`'s
+   pretrained branch loads) always `KeyError`'d, unconditionally. Fixed by
+   adding it to `trainer_conf`'s construction.
+3. `parse_pretrained_config`'s checkpoint-existence check
+   (`os.path.isfile(os.path.join(pretrained_conf["trainer"]
+   ["checkpoint_path"], pretrained_checkpoint_filename))`) looked for a
+   plain file named exactly `pretrained_checkpoint_filename` (e.g.
+   `"epoch_0"`) — a *different* filename than what actually gets loaded
+   later (`..._rank_{world_rank}.ckpt`) and than what any real training run
+   ever writes. Found while writing the Tier 2 test's checkpoint fixture;
+   **initially assessed as harmless** ("just an imprecise existence
+   pre-check, doesn't block anything") — that assessment was wrong. A real
+   Tier 3 run (job 5348717) hit it directly: phase 1 (fresh training)
+   passed and wrote a real `epoch_0_rank_0.ckpt`, but phase 2 (pretrained)
+   failed immediately with `"Checkpoint file does not exist"`, since no
+   file is ever named plain `"epoch_0"`. The Tier 1/Tier 2 tests never
+   caught this because they worked around it by creating that exact dummy
+   file as part of the test fixture, masking the real bug. Fixed by
+   checking for `"<pretrained_checkpoint_filename>_rank_0.ckpt"` instead
+   (mirroring `run_training_smoke.py`'s own `rank0_checkpoint_exists`); the
+   now-unnecessary dummy-file workarounds were removed from
+   `test_pretrained_loading_real.py`/`test_parse_pretrained_config.py`.
+4. `extract_encoder_state_dict`'s allowlist includes `cls_token` (genuinely
+   a shared `VIT.__init__` attribute whenever it's present), but only `VIT`
+   ever actually has one (`get_model`'s own `class_token=True if
+   conf["model"]["type"] == "VIT" else False`) — a pretrained `VIT` source
+   paired with any non-`VIT` (or `class_token=False`) downstream model made
+   `model.load_state_dict(..., strict=True)` raise `"Unexpected key(s):
+   cls_token"`. Found by `test_pretrained_loading_cross_architecture_vit_
+   encoder_into_mae`, added specifically to close a coverage gap identified
+   by the user: the existing `MAE`→`VIT` test only exercised the 0→1
+   prefix-token direction, not the reverse 1→0. Fixed with a new
+   `_prune_incompatible_cls_token`, called in `get_model` right after
+   `_transplant_pos_embed`.
+5. **Not pretrained-loading specific — affects every model construction,
+   including training from scratch.** `get_model` built `PatchEmbed`'s
+   `img_size` straight from `conf["data"]["tile_size"]`
+   (`img_size=(tile_size[0], tile_size[1])`), but `tile_size` is `[width,
+   height]` for `imagenet`/`catsdogs` (this repo's own resize/dsize
+   convention, established earlier this session) while `PatchEmbed.forward`
+   (`building_blocks.py`) expects `(H, W)` (`B, C, H, W = x.shape`, then
+   asserts `H == self.img_size[0]`) — genuinely swapped. `basic_ct` goes
+   through the exact same line but needed *no* swap: it has no resize step
+   at all, so its `tile_size` already mirrors the raw NIfTI array's own axis
+   order directly (the same reasoning `TileDataIter`'s own twoD/3D branch
+   distinction, fixed earlier this session, already relies on). Invisible
+   for every shipped (square) config — a uniform swap would have fixed
+   `imagenet`/`catsdogs` but broken `basic_ct`. Caught by a real Tier 3 run
+   (job 5348773, after item 3 above was fixed and got far enough to reach
+   the actual forward pass for the first time): `AssertionError: Input
+   height (192) doesn't match model (128)`, from a `catsdogs` config
+   deliberately using a non-square `resize: [128, 192]`. Fixed with a new
+   `_patch_embed_img_size(tile_size, twoD, dataset)`, dataset-aware, used at
+   both `img_size=` construction sites in `get_model` (the main model and
+   the pretrained model). `p_conf` gained a `"dataset"` key for the second
+   call site.
+
+   **Later superseded:** once the root cause was traced further, the real
+   question was why the *config* layer alone used `[width, height]` when
+   every real tensor and even the tiling-bounds code already worked in
+   `(H, W)` terms — see "Flipped `img_size`/`resize`/`tile_size` to
+   `[height, width]`" below. That change made `_patch_embed_img_size` a
+   true no-op for every dataset, so it (and `p_conf["dataset"]`, which
+   existed only to feed it) were deleted; both `get_model` call sites now
+   just pass `tuple(tile_size)` straight through.
+
+Items 1-2 and 4 were verified together in one real run (job 5348693): all
+62 tests passed across all 8 ranks, including both
+`test_pretrained_loading_real.py` cases
+(`test_pretrained_loading_wiring_real_get_model` and
+`test_pretrained_loading_cross_architecture_mae_into_unetr`) — both use
+square `img_size`s, so item 5 (not yet found at that point) wouldn't have
+been caught there regardless. Items 3 and 5 were only caught by the Tier 3
+runs below, in sequence — see that section.
+
+### Flipped `img_size`/`resize`/`tile_size` to `[height, width]`
+
+Item 5 above (`_patch_embed_img_size`) was a compensating shim: `tile_size`
+was `[width, height]` at the config/data-loading layer, but every real
+tensor in the model (`PatchEmbed`'s `(B, C, H, W)` contract, all of
+`model/arch.py`) is `(H, W)`-ordered, so `get_model` needed a swap right
+before constructing `PatchEmbed`. Revisiting that boundary raised a
+broader question: since every real tensor, and even `catsdogs.py`'s/
+`dataset.py`'s own tile-bounds code (which indexes directly into the
+loaded `(H, W[, C])` numpy array), already work in `(H, W)` terms, why did
+the *config* layer alone use the opposite order? No reason was found to
+keep `[width, height]` — every shipped `imagenet`/`catsdogs` config is
+square (`[256, 256]`), so no real config's meaning silently changes — and
+an audit found only two genuinely *external*, width-first-native
+touchpoints in the whole pipeline: `cv2.resize`'s `dsize` argument and
+PIL's `Image.size` read. Everywhere else (the tiling-bounds math,
+`PatchEmbed`) is either order-agnostic elementwise arithmetic or already
+implicitly `(H, W)`-shaped.
+
+Flipped `img_size`/`resize`/`tile_size`/`tile_overlap` to `[height, width]`
+(2D) / `[height, width, depth]` (3D) throughout the config and
+data-loading layers for `imagenet`/`catsdogs`, isolating the two
+width-first-native calls to single-line local swaps right at their call
+sites:
+
+- `UCF_VIT.utils.misc.detect_img_size`: swaps PIL's native `(width,
+  height)` `.size` to `[height, width]` before returning, for
+  `imagenet`/`catsdogs` (`basic_ct` unchanged — its `img_size` is the raw
+  NIfTI array shape, no resize step, no width/height concept at all).
+- `UCF_VIT.datasets.catsdogs.CatsDogsDataset.__getitem__`: swaps
+  `self.resize` to `(width, height)` right before the `cv.resize` call;
+  the tile-bounds swap that previously compensated for `tile_size` being
+  width-first (`start_h`/`end_h` reading index 1, `start_w`/`end_w`
+  reading index 0) was removed — index 0 now bounds `H` and index 1 now
+  bounds `W` directly, no swap needed.
+- `UCF_VIT.dataloaders.dataset.FileReader.read_process_file` (`imagenet`
+  branch) and `TileDataIter`'s 2D branch (`imagenet`-only in practice):
+  the identical two changes, mirroring `catsdogs.py`'s.
+- `utils/visualize_adaptive.py` (a standalone repo-level script, not under
+  `src/UCF_VIT/`): same `cv.resize` swap, for consistency — it consumes
+  `dataset_options.resize` directly too.
+
+`_patch_embed_img_size`'s width/height-swap half became a no-op once the
+config layer matched `PatchEmbed`'s own convention, so at the time it was
+deleted entirely and both `get_model` call sites were changed to just pass
+`tuple(conf["data"]["tile_size"])`/`tuple(p_conf["tile_size"])` straight
+through. **This assumption turned out to be wrong for `basic_ct`** — see
+"Regression: deleting `_patch_embed_img_size` also dropped its
+`basic_ct`+`twoD` truncation" below, found on a later Frontier run and
+fixed by reinstating a narrower `_model_img_size` helper. `p_conf["dataset"]`
+(`parse.py`), which existed only to feed `_patch_embed_img_size`'s
+`dataset` argument, was removed too — confirmed via grep no other code or
+test read it (still true after the fix below, since `_model_img_size`
+doesn't take a `dataset` argument either). `parse.py`'s own `tile_size`
+computation needed no functional change at all — it was always pure
+elementwise arithmetic (`effective_size[i] // div + tile_overlap[i]`) with
+no width/height-specific logic, only comments describing the old order.
+
+As a side effect, this also makes `training.py`'s tensor-parallel
+broadcast-placeholder construction (`torch.zeros(..., tile_size[0],
+tile_size[1], ...)`, already implicitly `(H, W)`-ordered, a pre-existing
+latent inconsistency never exercised by any non-square `imagenet` +
+`tensor_par_size > 1` combination) correct for the first time — no code
+change needed there, just a corroborating data point that the flip fixes
+a real inconsistency rather than introducing a new requirement.
+
+**Confirmed on real Frontier runs:** `run_distributed_tests.sh` (job
+5350427) — **62/62 passed on all 8 ranks**, including
+`test_pretrained_loading_real.py`'s real `get_model` wiring tests and the
+real `imagenet`/`catsdogs`/`basic_ct` dataloader/tiling tests.
+`run_pretrained_smoke.sh` (job 5350429, Tier 3c) — **full end-to-end
+pass**, phase 1 fresh training PASS (64s), phase 2 pretrained fine-tune at
+the non-square `[128, 192]` resize PASS (48s). The convention flip works
+correctly under real, real multi-rank training.
+
+### Regression: deleting `_patch_embed_img_size` also dropped its `basic_ct`+`twoD` truncation
+
+A later feature-matrix smoke run (job 5388433, run independently of the
+height-first-flip work above) turned up a real crash the local test suite
+had no way to catch: `basic_ct-unetr+twoD` and
+`basic_ct-unetr+twoD+tensor_par` both failed with
+
+```
+ValueError: Input and output must have the same number of spatial
+dimensions, but got input with spatial dimensions of [128, 128] and output
+size of (256, 256, 256).
+```
+
+Root cause: `_patch_embed_img_size` did two independent jobs, not one.
+Its width/height-swap job (for `imagenet`/`catsdogs`) did become a no-op
+once the config layer flipped to `[height, width]` — but its other job was
+`return (tile_size[0], tile_size[1]) if twoD else (tile_size[0],
+tile_size[1], tile_size[2])`, i.e. truncating `basic_ct`'s `tile_size` to a
+genuine 2-tuple whenever `twoD` is True. `parse.py` deliberately keeps
+`basic_ct`'s `tile_size` a 3-tuple `(H_tile, W_tile, Z_native)` even when
+`twoD` is True (the raw, undivided z-depth is needed for
+`TileDataIter`'s 3-vs-2-tuple dispatch and its per-z-slice walk — see
+`parse.py`'s own comment above its `elif twoD:` `tile_size` branch). That
+truncation was *not* a no-op, and was lost when the whole function was
+deleted on the assumption it now always was one. `PatchEmbed` itself never
+surfaced this (it only ever indexes `img_size[0]`/`[1]`, silently ignoring
+a stray 3rd entry), but `UNETR`'s decoder does not: `unetr_head` calls
+`nn.Upsample(size=self.img_size, ...)`, which requires the target `size`
+to have exactly as many entries as the input tensor has spatial dims —
+`self.img_size` staying a 3-tuple crashes there.
+
+Fixed by reinstating the truncation as `UCF_VIT.model.utils._model_img_size(tile_size, twoD)`
+— a small, directly unit-testable function (`tests/model/test_pretrained_loading.py`'s
+`test_model_img_size_*` tests) rather than an inline expression at each
+`get_model` call site, specifically so this behavior has direct Tier 1
+coverage this time instead of only being reachable through a real,
+FSDP/dist-requiring `get_model` call. Also dropped the `dataset` argument
+`_patch_embed_img_size` used to take (`_model_img_size` only needs
+`twoD` — the imagenet/catsdogs-vs-basic_ct distinction was always really
+"does `tile_size` have a trailing entry the model shouldn't see", which
+`twoD` already answers directly).
+
+**Not yet re-confirmed on Frontier** — the local Tier 1 fix (`_model_img_size`
+tests, 197/197 passed locally) restores direct unit coverage of the
+truncation logic itself, but `get_model`'s FSDP/dist wiring around it can
+only be exercised for real via `run_pretrained_smoke.sh` (Tier 3c) or a
+feature-matrix smoke rerun (Tier 3b) — recommended before trusting
+`basic_ct`+`twoD` UNETR runs again.
+
+### Fixed a real, intermittent `basic_ct-sap+tensor_par` segfault: fork-after-CUDA-init
+
+A second real Frontier smoke run (job 5390076, after the `_model_img_size` fix above
+was confirmed working) still showed one failure: `basic_ct-sap+tensor_par`, killed by
+`RuntimeError: DataLoader worker (pid ...) is killed by signal: Segmentation fault`,
+with no Python traceback at all inside the worker. Tracked down by comparing job
+timestamps against `git log`: the same crash (same signature) had already happened on
+earlier smoke runs going back to job 5338382 (2026-08-24), *before* the
+`SimpleITK`-based `Patchify_3D` rewrite even existed (`ef125a5`, 2026-08-27) — with two
+runs passing in between (jobs 5341294, 5347454). So this was never a regression from
+any single commit; it's a pre-existing, timing-dependent race that just happened to
+pass twice by luck.
+
+Root cause: `training_scripts/train.py` calls `get_model` (builds the model, moves it
+to the GPU, initializes NCCL process groups, wraps in FSDP) *before*
+`data_module.setup()`/`train_dataloader()`. Every shipped config sets
+`dataloader.num_workers: 1`, and PyTorch's `DataLoader` defaults to `fork()` on Linux
+whenever `num_workers > 0` (`datamodule.py`'s `train_dataloader()` never set
+`multiprocessing_context`). Forking a process that already has an active CUDA/NCCL
+context is a documented PyTorch hazard: CUDA/NCCL keep internal background threads
+that can be mid-critical-section (holding a malloc-arena lock, a driver lock, etc.) at
+the instant of the fork; `fork()` only clones the calling thread, so the child
+inherits that lock held forever by a thread that no longer exists. Any ordinary CPU
+work in the child that touches libc's allocator (which nearly all Python code does)
+can then hang or segfault, with no relation to what code the child is actually
+running — exactly matching the traceback-free crash observed.
+
+This explains why `basic_ct-sap+tensor_par` is the *only* failure across all 19
+feature-matrix configs, every one of which forks a worker after CUDA init the same
+way: it uniquely combines `tensor_par_size: 2` (more NCCL process groups active in the
+parent -> more background threads -> a wider race window at the moment of fork) with
+`do_ap: True` on 3D `basic_ct` data (SAP always requires adaptive patching -- building
+an octree over a full 3D volume is the heaviest per-sample CPU workload of any
+worker in the matrix -> the child spends longer than any other config's worker doing
+allocator-heavy work while a stuck lock could be waiting). Every other config is
+missing one side of that combination (2D adaptive patching's octree is far lighter;
+3D adaptive patching without `tensor_par_size > 1` has a much narrower parent-side
+race window).
+
+First attempt: added an opt-in `multiprocessing_context` option (`None` by default --
+`DataLoader`'s own default, i.e. unchanged `fork` behavior for every other config),
+threaded through `parse.py`'s `dataloader_conf` -> `NativePytorchDataModule.__init__`
+-> `train_dataloader()`'s `DataLoader(...)` call, and separately through `train.py`'s
+own manual `DataLoader` construction (the `dataloader.type: "dataloader"` map-style
+path, not exercised by any shipped config but fixed for consistency). `spawn` requires
+the `DataLoader`'s `collate_fn` to be picklable, which the previous closure `lambda
+batch: collate_fn(batch, return_label=self.return_label, ...)` was not -- replaced
+with `functools.partial(collate_fn, return_label=self.return_label, ...)` in both
+`datamodule.py` and `train.py` (`collate_fn`/`CatsDogsCollate` were already
+module-level functions, so `functools.partial` over them pickles cleanly). Verified
+`train.py`'s actual training logic is already guarded behind `if __name__ ==
+"__main__":` with no risky module-level side effects above it, so `spawn` re-importing
+the module in each worker doesn't re-run `dist.init_process_group`/etc.
+
+`configs/basic_ct/sap/base_config.yaml` set `multiprocessing_context: "spawn"` to try
+it. **This traded the crash for a worse one.** A real Frontier rerun (job 5394881, this
+time confirmed running the actual `spawn` code -- an earlier rerun, job 5391242, had
+been submitted before the Frontier checkout was pulled, so it was silently still
+testing the old `fork` code and is not evidence either way) showed a *different*
+failure: no more `DataLoader worker ... killed by signal: Segmentation fault` (so
+`spawn` did eliminate that original fork-after-CUDA-init race), but one or more ranks
+died silently within 42s (vs. 171-252s before -- a startup-time crash, not a
+mid-iteration one), no Python-level output at all from the crashing ranks, with the
+survivors killed by NCCL's watchdog ("possible application crash on rank 0 or a
+network set up issue") and the whole `srun` step terminated. Plausibly `spawn`
+conflicting with Frontier's Cray/Slurm launch environment itself (network interconnect
+binding, PMI/process tracking, or similar assumptions a fresh `spawn`ed process
+disturbs that a `fork`ed one doesn't) -- not confirmed further, since the crashing
+ranks left no trace of what actually happened.
+
+**Final fix:** `configs/basic_ct/sap/base_config.yaml` now sets `num_workers: 0`
+instead (and leaves `multiprocessing_context` unset, back to `None`/`fork`, same as
+every other config) -- avoids forking *or* spawning a worker process at all for this
+config, sidestepping both hazards entirely. The tradeoff is losing dataloader/compute
+overlap for this one config (data loading now runs in the main process); acceptable
+given adaptive-patching a 3D volume is comparatively light next to this config's own
+GPU compute. The `multiprocessing_context` option itself was kept (not reverted) --
+it's real, generically useful infrastructure for a future config that needs it, just
+not the right fix for this specific crash.
+
+Deliberately did *not* make `spawn` the new global default even before finding its own
+problem -- it starts a fresh Python interpreter per worker and re-imports the whole
+`torch`/`timm`/`monai`/`xformers` chain, real per-worker startup latency every other
+(non-crashing) config would pay for no benefit.
+
+**Tier 1 coverage:** `tests/test_config_validation.py`'s
+`test_multiprocessing_context_defaults_to_none_when_omitted` (now covers
+`basic_ct/sap` directly, since no shipped config sets it any more) and
+`test_multiprocessing_context_read_from_config_when_set` (a synthetic override on a
+temp config file, so the `parse.py` plumbing itself stays covered even with no shipped
+config exercising it) cover the config-parsing plumbing. The actual runtime behavior
+(crash or no crash) can only be exercised for real via a real multi-rank Frontier run
+(no local CUDA/NCCL/Slurm environment to reproduce either hazard against) --
+**confirmed fixed** on Frontier: job 5394938 (`basic_ct-sap+tensor_par` alone, real
+data, `num_workers:0`) **PASS (281s)**.
+
+Checked whether `num_workers:0` needed any special-casing elsewhere: it doesn't --
+`calculate_load_balancing_on_the_fly` (`UCF_VIT.utils.misc`, used both by
+`train.py`'s always-on load-balancing call and by the standalone
+`utils/load_balance.py` script) already explicitly treats `num_workers == 0` as `1`
+for its own per-worker-batch arithmetic (with a comment predating this incident
+explaining why: `num_workers:0` means the main process acts as the sole worker, not
+"zero workers"), so `basic_ct-sap+tensor_par`'s real Frontier pass exercised that path
+correctly with no changes needed.
+
+Also added a friendlier error message for this exact crash: `UCF_VIT.training.get_batch`
+(every `next(it_loader)` call site funnels through here) now catches PyTorch's own
+`RuntimeError: DataLoader worker (pid(s) ...) exited unexpectedly` (confirmed, by
+reading the installed `torch`'s own `dataloader.py` source, as the exact, stable outer
+wording every worker-crash case raises -- the more specific "is killed by signal: ..."
+text is one level deeper, chained as `__cause__`) and re-raises it with a pointer to
+try `dataloader.num_workers: 0`, only when `dataloader.num_workers > 0` (so it can't
+misfire when there's no worker process to have crashed) -- `tests/test_get_batch.py`
+covers the augmented case, the `num_workers:0` non-augmented passthrough case, and an
+unrelated-`RuntimeError` non-augmented passthrough case, via a fake iterator (no real
+crash, real DataLoader, or heavy model deps needed). This only helps the
+segfault-in-worker crash mode, not the `spawn`-vs-Cray-launch-environment crash mode
+from job 5394881 above -- that one killed the process with no catchable Python
+exception at all, so no error message can be attached to it; `num_workers:0` avoiding
+the worker process entirely is still the only real fix for that one.
+
+### Switched `Patchify`/`Patchify_3D`'s non-photo Canny path to `skimage.feature.canny`, then removed the `255`/`norm_factor` scaling from both quadtree and octree entirely
+
+Investigating `Patchify`/`Patchify_3D`'s edge-detection pipeline (used by
+adaptive patching) surfaced a real bug: the non-`imagenet`/`catsdogs` path
+(e.g. `basic_ct`) computed `cv2.Canny((img*255).astype(np.uint8), ...)` —
+silently assuming the float input was already normalized to exactly
+`[0,1]` before scaling into `cv2.Canny`'s required 8-bit range. Wrong
+(wastes dynamic range, or clips) whenever that assumption doesn't hold,
+e.g. real un-normalized CT-style intensities. Switched that path to
+`skimage.feature.canny`, which operates on the real float values directly
+— no scaling/casting needed at all. `imagenet`/`catsdogs` deliberately
+kept `cv2.Canny` unchanged: `skimage.feature.canny` only accepts
+single-channel 2D input (verified directly — `cv2.Canny` silently combines
+multi-channel gradients internally, `skimage.feature.canny` does not), so
+switching those over too would have been a real regression for real,
+multi-channel photos. `Patchify`'s non-photo path now raises a clear
+`NotImplementedError` for multi-channel input rather than silently
+mishandling it; `Patchify_3D` needed no such guard, since it already loops
+per-channel itself. New `scikit-image` dependency, added to
+`pyproject.toml`.
+
+Making that switch required feeding `skimage.feature.canny`'s boolean
+output back into `FixedQuadTree`/`FixedOctTree` (both expect a
+`0`-vs-nonzero-scaled `domain`, not a boolean array) — which raised the
+question of what scale to rescale to. Tracing where that scale actually
+gets consumed turned up a bigger, orthogonal finding: `FixedQuadTree`
+(`quadtree.py`) and `FixedOctTree` (`octree.py`) were themselves
+inconsistent siblings — `Rect.contains` hardcoded a literal `/255`, while
+`Cube.contains`/`FixedOctTree` already took an explicit `norm_factor`
+parameter (`Patchify_3D` computed its own `norm_factor =
+int(255/self.num_channels)` to compensate for per-channel score
+accumulation). Checked every consumer of the per-node score
+(`self.nodes`'s `[Rect/Cube, value]` pairs) in both files — `serialize`,
+`nodes_value`, `encode_nodes`, every `draw*` method — and confirmed `value`
+is *only* ever read in one place in each file:
+`max(self.nodes, key=lambda x:x[1])` inside `_build_tree`, to pick which
+node to split next. That's a pure relative comparison, provably invariant
+to any uniform positive scale applied to every candidate (`255*3 > 255*2`
+iff `3 > 2`) — so the normalization was never functionally necessary in
+either tree, only ever affecting the human-readable magnitude of a score
+nothing else reads (the commented-out `# print([v for _,v in
+self.nodes])` debug line in `quadtree.py`'s own `_build_tree` is a good
+hint why it existed at all). Removed the scaling entirely from both:
+`Rect.contains`/`Cube.contains` now return a plain `int(np.sum(patch))`,
+`FixedOctTree`'s `norm_factor` parameter is gone (not just defaulted), and
+`Patchify`/`Patchify_3D` no longer rescale their edge maps at all before
+handing them to either tree — same tree structures, same patches, same
+everything observable, just simpler (and marginally more numerically
+robust: an exact integer sum on integer-dtype input, no floating-point
+division at all).
+
+`tests/dataloaders/test_quadtree.py`/`test_octree.py`'s existing
+`contains()`/`FixedOctTree` assertions were updated to match (raw sums,
+no `norm_factor` kwarg) — genuinely equivalent behavior, not a new
+correctness claim, so no new tree-structure tests were added for this
+part; `tests/dataloaders/test_transform.py` (new) covers the actual
+Canny-implementation switch itself. Not yet verified against real
+`basic_ct`+`do_ap:True` data on Frontier — no Tier 2/3 coverage exercises
+that combination yet.
+
+### Replaced `Patchify_3D`'s edge detection with a genuinely 3D `SimpleITK.CannyEdgeDetection`
+
+Reviewing `Patchify_3D`'s edge-detection pipeline in detail (walking
+through what each step actually computes) surfaced a real, structural
+limitation, independent of the `skimage.feature.canny` switch above: every
+gradient/edge computation in it (`cv2.Sobel`, `cv2.Canny`) only ever
+operated on one 2D `(H, W)` slice at a time — there was no derivative
+computed along the depth axis anywhere in the pipeline. Verified directly
+with a synthetic volume that's a step function purely along depth (uniform
+within every single slice, only a hard transition *across* slices, e.g.
+`vol[6:10,:,:] = 1.0`): the per-slice approach reported zero edges there
+entirely (no in-plane gradient exists at that kind of boundary), while a
+genuine 3D Canny correctly marks the transition planes. For volumes where
+depth-direction structure genuinely matters (not just anisotropic CT/MRI
+where in-plane detail dominates), this was a real blind spot, not merely a
+style difference.
+
+Replaced the whole per-slice Sobel/Canny pipeline with
+`SimpleITK.CannyEdgeDetection` — a true N-D Canny (smoothing + gradient +
+non-max-suppression + hysteresis, all genuinely volumetric), called once
+per channel over the *entire* volume rather than once per `(slice,
+channel)` pair. Confirmed directly it does **not** support multi-channel/
+vector images (`Pixel type: vector of 32-bit float is not supported in
+3D`), so the per-channel loop is still needed — this only collapses the
+inner slice loop, not the channel loop. New `SimpleITK` dependency, added
+to `pyproject.toml`.
+
+The old pipeline's separate `gradient_direction` computation
+(`np.arctan2(sobely, sobelx)`, a strictly 2D angle) and the
+direction-consistency gate built on it (`edge_data_normalized >
+threshold`) were dropped entirely rather than reimplemented in 3D — that
+angle has no natural 3D generalization (would need a full 3D gradient
+vector or a two-angle spherical representation, not a drop-in
+replacement), and its likely original purpose — suppressing noisy/
+spurious edges from the per-slice, single-"best-channel" accumulation —
+is largely redundant with what a real 3D Canny already provides for free
+(its own non-max-suppression + hysteresis thresholding already produces a
+clean, thinned edge mask). This connects directly to the `norm_factor`
+finding above: `FixedOctTree`'s consumed score is only ever used for
+relative (`max()`-based) comparison, never read for its precise value —
+so the simpler score doesn't need to also be a "clean" signal, just a
+meaningfully-ordered one.
+
+The actual design intent behind `edges_combined_counter` — give more
+weight to a voxel flagged as an edge on more channels — was preserved
+exactly, not just in spirit: verified directly (two channels, one shared
+edge region and one channel-1-only region) that the shared region scores
+`2` and the single-channel region scores `1`, the same relative weighting
+as before, just fed by genuinely 3D per-channel edge masks instead of
+stacked-per-slice 2D ones.
+
+Old implementation archived at
+`../UCF-VIT-claude-archive/src/UCF_VIT/dataloaders/transform.py`
+(`Patchify_3D` only — `Patchify`, the 2D sibling class, wasn't replaced).
+
+`tests/dataloaders/test_transform.py` gained 3 `Patchify_3D`-specific
+tests: `test_patchify_3d_detects_edge_purely_along_depth` (the direct
+regression test for the depth-blind-spot fix — asserts full-plane edges
+at the depth-only transition, zero everywhere else, which the old
+pipeline could never produce), `test_patchify_3d_weights_by_channel_
+agreement` (the channel-count-weighting verification described above),
+and `test_patchify_3d_shape_and_dtype` (basic sanity). One pre-existing,
+unrelated quirk found incidentally while writing these:
+`FixedOctTree._build_tree` can only exactly reach node counts in the
+sequence `1, 8, 15, 22, 29, ...` (`1 + 7k` — each split replaces 1 node
+with 8, net +7), so an arbitrary `fixed_length` can trip
+`FixedOctTree.serialize`'s own `assert len(seq_patch) == self.fixed_length`
+pre-existing check; not something this rewrite introduced or fixes, just
+something to keep in mind when picking `fixed_length` values. Not yet
+verified against real `basic_ct`+`do_ap:True` data on Frontier, same gap
+noted above.
+
+### Added `Block_diffusion`: per-block timestep conditioning for `DiffusionVIT`
+
+The user made local changes adding `Block_diffusion` (`building_blocks.py`,
+a `Block` subclass) so `DiffusionVIT` re-injects a per-block timestep
+embedding before every block's attention, instead of adding one timestep
+embedding once before the first block and letting it propagate implicitly
+through the residual stream. Checking the changes before committing found
+three real, blocking bugs, all fixed:
+
+1. `parse.py`'s `get_kwargs` referenced `Block_diffusion` in
+   `kwargs.update({"block_fn": Block_diffusion})` without ever importing
+   it — confirmed directly (`hasattr(parse_module, "Block_diffusion")` was
+   `False`) that this would raise `NameError` on every `DiffusionVIT`
+   config, immediately, before ever reaching model construction. Fixing
+   it by adding the import to `parse.py` worked, but introduced a real
+   side effect: `parse.py` is deliberately kept free of
+   `building_blocks.py`'s own real, unconditional `timm`/`monai`/`xformers`
+   top-level imports (see `tests/test_parse_pretrained_config.py`'s own
+   docstring), specifically so config parsing/validation works without the
+   full model stack installed — confirmed this broke for `DiffusionVIT`
+   configs specifically by actually running `test_config_validation.py`
+   (3 real `ModuleNotFoundError: xformers.components` failures, not a
+   stub gap). Asked the user, who chose to move `block_fn` selection to
+   `model/utils.py`'s `get_model` instead — which already does
+   conditional, per-model-type imports of the real model classes, so
+   adding `Block_diffusion` there costs nothing new (that file already
+   unconditionally imports `building_blocks.py` at its own top level).
+   `block_fn=Block_diffusion if <type> == "DiffusionVIT" else Block` was
+   added at both of `get_model`'s real construction sites (the main model
+   and the pretrained-loading branch), and removed from `get_kwargs`
+   entirely — restoring `parse.py`'s standalone usability for every model
+   type, `DiffusionVIT` included.
+2. `src/UCF_VIT/training.py` (not `training_scripts/train.py`, a
+   different file — the user correctly updated the latter) had two
+   remaining reads of `conf["model"]["kwargs"]["time_steps"]`, the
+   config-kwargs key name before the user's own rename to
+   `num_time_steps` (needed since `VIT.__init__` gained a real
+   `num_time_steps` parameter that `DiffusionVIT` no longer pops out of
+   `kwargs` early). Found via a repo-wide grep for the old key name after
+   fixing (1) — both would have raised `KeyError` the moment a real
+   `DiffusionVIT` training step actually ran (building the noised input
+   `t`), in two different code paths (`process_batch`'s
+   `tensor_par_size == 1` and `> 1` branches). Fixed by updating both to
+   the new key name.
+3. Three existing tests referenced the pre-rename `time_steps` name and
+   would have failed as stale assertions/`TypeError`s regardless of the
+   above:
+   `tests/test_parse_pretrained_config.py::test_parse_pretrained_config_diffusionvit_source`
+   (asserted `p_conf["kwargs"]["time_steps"]`),
+   `tests/model/test_pretrained_loading.py::test_extract_encoder_state_dict_strips_real_diffusionvit_decoder`
+   (constructed a real `DiffusionVIT` with `time_steps=10` — `VIT.__init__`
+   has no such parameter, only `num_time_steps`), and
+   `tests/utils/test_pos_embed.py` (imported `SinusoidalEmbeddings` from
+   its old location — the user moved it, correctly, out of `pos_embed.py`
+   into a new dedicated `UCF_VIT.utils.time_embed`, since `Block_diffusion`
+   needed it as a per-block submodule rather than a `DiffusionVIT`-level
+   one; the class itself is unchanged, just relocated). All three updated;
+   the `SinusoidalEmbeddings` test moved into a new
+   `tests/utils/test_time_embed.py` alongside the class's new home, rather
+   than just import-patched in place, matching this repo's one-test-file-
+   per-source-module convention.
+
+Also added missing docstrings (`Block.__init__`'s new `num_time_steps`
+parameter, `Block_diffusion` itself) and simplified two
+`for i, blk in enumerate(self.blocks/decoder_blocks): x = blk(x,t)` loops
+to `for blk in ...` (`i` was unused) — matching the file's otherwise
+thorough docstring convention and its own pre-existing, *used*-`i`
+`enumerate` pattern elsewhere (`forward_intermediates`), which was left
+untouched.
+
+Verified directly (not just via the test suite): constructed a real
+`DiffusionVIT` with `block_fn=Block_diffusion`, confirmed `model.blocks`
+are genuinely `Block_diffusion` instances, ran a real forward+backward
+pass in both `linear_decoder` modes, and confirmed two different `t`
+tensors produce genuinely different output (not just plumbed through and
+ignored) — the actual point of the feature.
+
+Not yet verified on real Frontier hardware/data.
+
+### Added `val.py`/`test.py` and automatic train/val/test dataset splitting
+
+Previously `training_scripts/train.py` was the only training script -- the
+README said explicitly "we leave it to the user to implement their own
+validation and testing routines." Added `training_scripts/val.py` and
+`training_scripts/test.py`, structured like `train.py` but forward-only
+(`model.eval()` + `torch.no_grad()`, no optimizer/scheduler/checkpoint-save),
+plus the config-level plumbing to give them something to evaluate against
+even when a dataset has no dedicated validation/test directory (none of the
+datasets shipped with this repo do).
+
+Confirmed by direct code-reading before writing anything: `train_step`
+(`training.py`) was *already* forward-pass-only -- it's `train_epoch` that
+adds the backward/optimizer/scheduler/checkpoint-save on top -- and
+`get_model`'s `resume_from_checkpoint` branch already loads just
+`model_state_dict` with no optimizer state touched. So `eval_epoch` (new,
+mirrors `train_epoch`'s per-iteration `process_batch`->`train_step`->
+metric->print logic exactly, reusing both functions unchanged, just wrapped
+in `torch.no_grad()` with no backward/optimizer/scheduler/checkpoint) and
+`val.py`/`test.py` (which force `trainer.resume_from_checkpoint = True` in
+code and never build an optimizer/scheduler at all) needed no changes to
+either of those existing functions. Once `train_step` was genuinely shared by
+both `train_epoch` and `eval_epoch`, its name stopped being accurate (it
+never touches training-specific state at all) -- renamed to `forward_step`
+throughout (`training.py`, `tests/test_train_step.py` ->
+`tests/test_forward_step.py`, this file), a pure rename with no behavior
+change.
+
+New optional config keys (`data.dict_val_root_dirs`/`dict_test_root_dirs`,
+`dataloader.dict_val_start_idx`/`dict_val_end_idx`/`dict_test_start_idx`/
+`dict_test_end_idx`, `dataloader.val_split_ratio`/`test_split_ratio`, default
+`0.1`/`0.1`) let a dataset key either point val/test at a real, separate
+directory, or -- the common case today -- get an automatic 80/10/10 split
+carved out of that key's own already-configured `[dict_start_idx,
+dict_end_idx)` window (`UCF_VIT.parse._resolve_dataset_splits`), narrowing
+what `train.py` itself uses down from `dict_end_idx` accordingly. This *is* a
+deliberate behavior change for every shipped config (confirmed with the user
+before implementing): they all used the full `[0,1)` range for training
+before this existed, so training now uses 80% by default unless a config
+explicitly sets both ratios to `0`. Every shipped
+`configs/*/*/base_config.yaml` got explicit `val_split_ratio: 0.1`/
+`test_split_ratio: 0.1` lines added for discoverability, even though those
+match the code-level default.
+
+`_resolve_dataset_splits` resolves per dataset key independently (an
+explicit separate root for one key and auto-split for another, in the same
+config, both work correctly) and respects an *already*-narrowed
+`dict_start_idx`/`dict_end_idx` window rather than assuming `[0,1)` (e.g. a
+config already trimmed to `[0.0, 0.5)` for some other reason gets its 80/10/10
+split carved out of that 0.5-wide window, not the full directory).
+`get_split_conf(conf, "val"/"test")` returns a shallow-copied `conf` with
+just `data["dict_root_dirs"]`/`dataloader["dict_start_idx"]`/`["dict_end_idx"]`
+swapped to the resolved split -- `val.py`/`test.py` feed this straight into
+the *same* `calculate_load_balancing_on_the_fly`/`NativePytorchDataModule`
+construction `train.py` already uses, completely unchanged; no new logic was
+needed in either of those.
+
+The map-style `"dataloader"` path (catsdogs only) had no slicing mechanism
+at all before this (it just globbed every file unconditionally) -- new
+`UCF_VIT.utils.misc.slice_file_list` (mirrors `FileReader.__init__`'s own
+slice formula exactly) is applied to the globbed list in `train.py` (using
+its own, possibly-now-narrowed range -- a no-op slice for any config not
+using the new auto-split) and in `val.py`/`test.py` (using the resolved
+val/test range).
+
+**Tier 1 coverage:** `tests/test_split_resolution.py` covers
+`_resolve_dataset_splits`/`get_split_conf` directly -- default 80/10/10,
+respecting an already-narrowed window, zero-ratio reproduces the pre-existing
+100%-train behavior exactly, an explicit separate root leaves train's own
+range untouched, mixed per-key behavior across two dataset keys in one
+config, and the ratio-sum-too-large/empty-split-resolved error cases.
+`tests/test_eval_epoch.py` mirrors `test_forward_step.py`'s fake-model
+technique (a fake MAE model recording `torch.is_grad_enabled()` at each
+forward call, a fake always-iterable dataloader) to verify `eval_epoch` runs
+every iteration under `torch.no_grad()` and sums (not averages) loss across
+iterations, matching `train_epoch`'s own accumulation semantics.
+`tests/utils/test_misc.py` covers `slice_file_list` directly against
+`FileReader`'s own formula. `tests/test_config_validation.py`'s existing
+`test_shipped_config_parses` (parametrized over every real
+`configs/*/*/base_config.yaml`) now exercises the new split-resolution logic
+for real on every shipped config, confirming none of them break.
+
+**Not yet verified end-to-end on Frontier** -- recommend a real run of
+`val.py`/`test.py` against a config with an already-trained checkpoint (both
+the auto-split `iterative_dataloader` case, e.g. `basic_ct`, and the
+catsdogs map-style case), plus a rerun of the existing
+`run_feature_matrix_smoke.sh`/`run_training_smoke.sh` Tier 3 scripts to
+confirm real training runs are unaffected beyond the intentional 80%
+narrowing.
+
+#### Follow-up: fixed a real data-leakage bug the above surfaced
+
+Raised by the user immediately after the above landed: "will auto-split use
+the same files if we do a checkpoint restart?" Tracing it through found the
+answer was no -- and worse than just restarts.
+
+`NativePytorchDataModule.setup()`/`.reset()` (`datamodule.py`, pre-existing,
+called once per script invocation and once per epoch respectively) reshuffle
+each dataset key's file listing via unseeded `np.random.choice(...,
+replace=False)` for legitimate reasons (per-epoch training variety, per-rank
+sharding fairness) -- but that reshuffle happened *before*
+`dict_start_idx`/`dict_end_idx`'s ratio slice (applied inside `FileReader`,
+via `set_iterative_dataloader`). Confirmed via `grep`: no `np.random.seed`/
+`torch.manual_seed` anywhere in `src/`, so this shuffle is genuinely
+different every call. Before auto-split, `dict_start_idx`/`dict_end_idx` was
+always the full `[0,1)` range for every shipped config, so shuffling before
+taking 100% of a list was a no-op -- harmless. Once it can be a genuine
+partial range (auto-split's whole point), it stopped being harmless: which
+files count as "train" vs held-out "val"/"test" silently changed on every
+checkpoint restart, every separate `val.py`/`test.py` invocation, **and even
+between epochs of the same continuous training run** (`train.py` calls
+`reset()` after every epoch) -- real data leakage, not just a
+reproducibility nuisance.
+
+Fixed by slicing once, deterministically, in `NativePytorchDataModule.__init__`
+-- `sorted()` first (since `os.listdir`/`glob.glob`/`FileLister`'s own order
+isn't guaranteed stable across calls either), then `slice_file_list` (the
+same helper added for the catsdogs map-style path) -- replacing
+`self.dict_lister_trains[k]` with the fixed, correct membership *before*
+`setup()`/`reset()` ever see it. `set_iterative_dataloader` now passes a
+no-op `start_idx=0.0`/`end_idx=1.0` to `FileReader`, since the real slicing
+already happened. `setup()`/`reset()`'s own reshuffle is otherwise completely
+untouched -- it still reorders (and `keys_to_add`-replicates) *within* the
+now-fixed membership, exactly as intended, just never changes *which* files
+are in it. The map-style `"dataloader"` (catsdogs) path didn't have this
+exact bug (no `np.random.choice` shuffle exists there), but got the same
+`sorted()` treatment on its `glob.glob(...)` calls in `train.py`/`val.py`/
+`test.py` for the same determinism reason, since `glob.glob`'s order isn't
+guaranteed stable across separate process launches either.
+
+**Tier 1 coverage:** new `tests/dataloaders/test_datamodule_membership.py`
+constructs `NativePytorchDataModule` directly against a small real fake
+directory (`tmp_path`, no mocking) and checks `dict_lister_trains` --
+membership is identical across two separate constructions with the same
+inputs (simulating a restart), train/val/test ranges resolve to disjoint
+sets that together cover every file, and `setup()`/`reset()` never mutate
+`dict_lister_trains` itself (they build their own local shuffled copy).
+
+#### Follow-up: `allow_file_reuse` for fewer files than DDP ranks
+
+Raised by the user next, as a design question rather than a bug report:
+today, if a dataset key has fewer files than the DDP ranks x dataloader
+workers assigned to it, training fails loudly (two separate asserts --
+`calculate_load_balancing_on_the_fly`'s `min(num_images_per_rank) >= 1.0`,
+and `FileReader.__iter__`'s `per_worker > 0`, since its own worker-sharding
+divides the file list into `num_shards` *contiguous* chunks and some chunk
+comes up empty). The user proposed an opt-in way to proceed anyway, reusing
+(duplicating) files across ranks instead of failing, with a warning. Also
+flagged, correctly, when initially framed as a small/debug-dataset-only
+concern: this repo targets potentially thousands of nodes, so `data_par_size`
+can exceed a real (not toy) dataset's file count too.
+
+Implemented as a new `dataloader.allow_file_reuse` config option (default
+`False` -- the hard-fail stays the default). When `True`:
+- `calculate_load_balancing_on_the_fly` floors `num_images_per_rank`/
+  `num_images_per_rank_worker` to `1` instead of asserting, printing a
+  specific warning (files available vs. ranks x workers requested) when it
+  actually kicks in for a given key.
+- `FileReader.__iter__`'s contiguous-chunk `per_worker` computation falls
+  back to `per_worker = 1` instead of asserting when a shard would be
+  empty, and every file index is wrapped with `% len(self.file_list)`
+  (a no-op in the normal case, since `idx` never reaches the list length
+  there) -- giving round-robin reuse: shard `i` gets
+  `file_list[i % len(file_list)]`. Prints its own quantified warning
+  (oversubscription ratio) from exactly one rank/worker.
+- Both paths keep a **separate, unconditional** guard for a dataset key
+  resolving to zero files at all (`allow_file_reuse` can't reuse files that
+  don't exist) -- writing this surfaced a real, pre-existing, unrelated bug:
+  `calculate_load_balancing_on_the_fly` previously fell through a zero-files
+  key straight into a bare `ZeroDivisionError` (`total_tiles_all_data`) with
+  no clear message at all; now asserts clearly, right where `num_total_images`
+  is built, regardless of `allow_file_reuse`.
+
+**Tier 1 coverage:** `tests/dataloaders/test_dataset.py` adds three
+`FileReader`-level tests (mirroring its existing worker-sharding test
+style/fixtures) -- raises with `allow_file_reuse` off, reuses round-robin
+(verified against the exact expected `file_list[i % len(file_list)]`
+assignment) with it on, and still raises on genuinely zero files even with
+it on. `tests/utils/test_misc.py` adds the equivalent three tests for
+`calculate_load_balancing_on_the_fly` directly, against a small real fake
+`basic_ct`-shaped directory (`tmp_path`).
+
+**Immediate follow-up correction from the user:** `allow_file_reuse` should
+never apply to `val.py`/`test.py`, regardless of what the config says. Their
+whole purpose is a fixed, exact computation over the same files every time,
+so results are directly comparable across different amounts of training
+(different checkpoints/epochs) -- reuse would make the aggregate loss/
+accuracy a distorted, weighted (not uniform) average instead (files landing
+on more than one rank/worker counted more than once), and *which* files get
+duplicated can shift with `data_par_size` too, so even the bias itself
+wouldn't stay comparable across runs. If there genuinely aren't enough val/
+test files for the requested parallelism, that should still fail loudly, not
+silently evaluate on a distorted set.
+
+Fixed by overriding `allow_file_reuse:False` on `val_conf`/`test_conf`
+(`get_split_conf`'s output) right after it's built in `val.py`/`test.py`,
+before it reaches either `calculate_load_balancing_on_the_fly` or
+`NativePytorchDataModule` -- both need the override, not just one, or the
+two would disagree about whether reuse happened (`calculate_load_balancing_
+on_the_fly`'s counts assuming reuse while `FileReader` doesn't actually do
+it, or vice versa). If the config being evaluated actually set
+`allow_file_reuse:True` (for training's own sake), `val.py`/`test.py` print
+a one-line note that they're ignoring it, rather than silently diverging
+from what the config appears to say.
+
+#### Follow-up: imagenet's train/val/test split still depended on `data_par_size`
+
+Raised as a direct follow-up question after the membership-stability fix
+above: does a checkpoint restart with a different node count change which
+files land in train/val/test? For `basic_ct` (and any non-imagenet dataset),
+no -- confirmed the fix above already makes it fully independent. For
+`imagenet`, tracing it through found the answer was still yes:
+`NativePytorchDataModule.process_root_dirs`'s imagenet branch bucketed
+classes into `self.data_par_size` groups (`classes_to_combine = len(classes)
+// self.data_par_size`) *before* the train/val/test slice ever ran -- change
+`data_par_size` and the buckets regroup from different classes entirely, so
+bucket `0`'s images after a restart aren't the same images as bucket `0`
+before it, even though the slice ratio itself didn't change.
+
+This connects to something bigger than a single-file fix, though:
+`train_dataloader` picks which bucket a rank consumes by matching `gx`
+(built from `calculate_load_balancing_on_the_fly`'s own, *separate*,
+independently-implemented bucketing in `utils/misc.py`) against
+`dict_data_train`'s bucket enumeration order --
+
+```python
+group_id = np.where(np.cumsum(group_list) > ddp_rank)[0][0]
+for idx, k in enumerate(self.dict_data_train.keys()):
+    if idx == group_id:
+        data_train = self.dict_data_train[k]
+```
+
+-- so the two bucketing implementations had to agree on bucket count/order
+exactly, manually kept in sync, for rank-to-data assignment to be correct at
+all. A drift between them would silently misassign which rank trains on
+which data, in a way nothing local can catch (only a real multi-rank run
+would show it). Given that stake, this was flagged explicitly to the user
+before implementing, rather than assumed safe to fix quietly.
+
+Fixed by eliminating the duplicate-implementation risk at its root instead
+of patching around it:
+- `UCF_VIT.utils.misc.process_root_dirs` (the shared, module-level function)
+  no longer buckets by `data_par_size` for imagenet at all -- it just lists
+  every image, grouped by class, in deterministic sorted order (classes via
+  `sorted(os.listdir(...))`, images within a class now also via
+  `sorted(glob.glob(...))`, fixing a second, smaller pre-existing
+  non-determinism along the way). Same shape as the non-imagenet branch now:
+  one entry per `dict_root_dirs` key.
+- New `bucket_file_list(file_list, num_buckets)` (also `utils/misc.py`) does
+  simple, deterministic, order-preserving index-based chunking (`np.array_split`,
+  so no file is ever silently dropped for not dividing evenly -- unlike the
+  old per-class bucketing, which did drop leftover classes; see the now-removed
+  `test_process_root_dirs_imagenet_more_classes_than_data_par_size_not_evenly_
+  divisible`). Buckets are purely a rank/GPU-group assignment mechanism --
+  `FileReader.read_process_file` derives each image's label from its own
+  parent directory at read time, not from which bucket it's in -- so
+  abandoning the old "whole classes per bucket" property has no correctness
+  cost.
+- Both `calculate_load_balancing_on_the_fly` and `NativePytorchDataModule.
+  __init__` now call the exact same sequence -- `process_root_dirs` (list) ->
+  `slice_file_list` on a sorted copy (resolve train/val/test membership,
+  `data_par_size`-independent) -> `bucket_file_list` (divide the *already-
+  resolved* membership into `data_par_size` buckets) -- so bucket count/order
+  agreement between the two is now guaranteed by construction (same shared
+  functions, same inputs), not by manually keeping two implementations in
+  sync. `NativePytorchDataModule.process_root_dirs` (the class method) is now
+  a thin wrapper delegating to the shared function, removing the
+  near-duplicate implementation entirely.
+
+**Tier 1 coverage:** `tests/utils/test_misc.py`'s old bucketing-contract
+tests for `process_root_dirs` were rewritten for the new unbucketed contract
+(every image present, deterministic sorted-class order, `data_par_size`
+argument now ignored) and five new `bucket_file_list` tests added (even/
+uneven division with nothing dropped, order preservation, capping to
+`len(file_list)` buckets instead of ever producing an empty one, empty-input
+handling). `tests/dataloaders/test_datamodule_membership.py` adds three
+imagenet-specific tests, including the direct regression test for the actual
+question asked --
+`test_imagenet_membership_deterministic_across_different_data_par_size`
+constructs two `NativePytorchDataModule`s against the same directory with
+`data_par_size=100` and `data_par_size=4` and asserts the *set* of images in
+the (train-ratio) split is identical, even though bucket structure legitimately
+differs between them.
+
+**Not yet verified on real Frontier hardware** -- per the explicit risk
+discussed with the user before implementing, this needs a real multi-rank
+imagenet run to confirm rank-to-data assignment (via `gx`/`group_id`) is
+still correct end to end, not just that the two bucketing implementations
+now agree by construction.
+
+#### Immediate follow-up: `bucket_shuffle_seed`, since bucketing is now visibly contiguous
+
+Once imagenet's split no longer depended on `data_par_size`, the user spotted
+a related consequence of *how* it's independent: `process_root_dirs` lists
+images sorted class-by-class, and `bucket_file_list`'s `np.array_split` is a
+contiguous, order-preserving split -- so each bucket (and therefore each DDP
+rank) only ever gets a narrow range of adjacent classes, every epoch. Not a
+correctness bug (`FileReader.read_process_file` derives each image's label
+from its own parent directory at read time, independent of bucket identity),
+but a real data-parallel-SGD quality concern: class-homogeneous local
+batches skew BatchNorm statistics and correlate gradients within a rank's
+own step sequence.
+
+Fixed by adding an optional `shuffle_seed` parameter to `bucket_file_list`
+itself (not a separate step some caller could apply inconsistently) --
+shuffles a copy of the file list with a seeded, deterministic RNG
+(`np.random.RandomState(seed).shuffle(...)`) before chunking. Exposed as
+`dataloader.bucket_shuffle_seed` (imagenet only; default `42`, not `None` --
+shuffling is a strict improvement with no reproducibility cost, so it's on
+by default rather than opt-in; set to `null` to keep the original contiguous
+ordering). Threaded through the same `parse.py` -> `NativePytorchDataModule`/
+`calculate_load_balancing_on_the_fly` path as `allow_file_reuse`, and
+inherited unchanged by `val.py`/`test.py` via `get_split_conf` (no
+train/eval conflict here, unlike `allow_file_reuse` -- shuffling only
+affects which bucket an image lands in, never train/val/test membership, so
+there's no reason for val/test to disable it).
+
+**Tier 1 coverage:** `tests/utils/test_misc.py` adds four `bucket_file_list`
+tests (deterministic given the same seed, still covers every file exactly
+once, actually breaks up the contiguous order relative to no seed, and
+confirms no seed still preserves it). `tests/dataloaders/test_datamodule_
+membership.py` adds five imagenet-specific tests: one documenting the
+narrow-class-range problem directly (no seed -> `<=2` classes per bucket for
+a 20-classes/10-buckets fixture), one confirming a seed spreads at least one
+bucket across more than that, determinism across separate constructions
+(same as the restart-stability tests above), and -- the one that actually
+matters most -- confirming the `data_par_size`-independence fix from the
+section above still holds with shuffling layered on top of it.
+
+#### Immediate follow-up: `reset()`/`setup()` doing O(`data_par_size`) redundant work per rank
+
+**Flagged by the user as a candidate for possible future reversion** -- it
+may make `NativePytorchDataModule` more complicated than the win is worth.
+If `_my_dataset_key`/`_shuffle_and_replicate` ever get in the way, it's safe
+to revert `setup()`/`reset()`/`train_dataloader()` to rebuilding every key in
+`dict_lister_trains` each call (the simpler, if O(`data_par_size`)-wasteful,
+version this replaced -- see this commit's parent for that version).
+
+Raised as a direct question about a real-world symptom the user had already
+observed: `reset()` being "costly and problematic to perform." Tracing it
+through found a genuine, pre-existing (not introduced this session)
+architectural issue, one this session's imagenet work made more visible
+(more buckets now exist, `data_par_size`-many) rather than caused:
+
+```python
+def reset(self):
+    dict_data_train = {}
+    for i, k in enumerate(self.dict_lister_trains.keys()):
+        ...
+        dict_data_train = self.set_iterative_dataloader(dict_data_train, k, lister_train, keys_to_add)
+```
+
+`reset()`/`setup()` looped over **every** key in `self.dict_lister_trains`
+-- rebuilding a full `ProcessChannels(ShuffleIterableDataset(TileDataIter(
+FileReader(...))))` pipeline and doing an independent `np.random.choice`
+reshuffle for each one -- even though `train_dataloader()` only ever
+consumes a single one (selected via `gx`/`group_id` matching). For
+`basic_ct` with one root dir this loop already only had one key (no-op
+inefficiency), but for imagenet (now up to `data_par_size` bucket keys) or
+any multi-root-dir joint training, every rank redundantly did this for
+every other rank's bucket too -- O(`data_par_size`) wasted work per rank,
+every epoch, and since every rank does it simultaneously, O(`data_par_size`^2)
+wasted work cluster-wide. At the node counts this framework targets, that's
+a real, scale-dependent cost, not a fixed one -- directly explains
+"costly, and gets worse with more nodes."
+
+Before implementing, the user asked whether this meant only doing the
+partial work actually needed, rather than everything -- confirmed yes:
+`train_dataloader()` already computes exactly which single bucket a rank
+needs (via `group_id`), just *after* `setup()`/`reset()` had already
+wastefully built every bucket. Moving that same selection earlier lets
+`reset()`/`setup()` skip the other `data_par_size - 1` buckets entirely.
+
+Fixed by extracting the `gx`/`group_id` matching logic (previously computed
+fresh inside `train_dataloader()`, using `self.dict_data_train`'s full
+enumeration) into a new `_my_dataset_key()` method, called from `setup()`/
+`reset()` *before* the shuffle-and-replicate step -- restricting to
+`self.dict_lister_trains[k]` for just that one key. `train_dataloader()`
+itself simplifies accordingly: since `self.dict_data_train` now only ever
+holds one entry, it just takes it directly (`next(iter(...))`) instead of
+re-deriving `group_id` and searching for the matching enumeration index.
+Two dead-code local variables (`group_size`/`group_rank`, computed but never
+used anywhere) were dropped along the way. `self.dict_lister_trains` itself
+(built once in `__init__`, holding every bucket) is untouched -- only the
+per-epoch `dict_data_train` rebuild is restricted, keeping the one-time
+construction cost and existing tests' ability to inspect the full bucketed
+structure via `dict_lister_trains` unchanged.
+
+**Tier 1 coverage:** `tests/dataloaders/test_datamodule_membership.py` adds
+two tests -- `test_setup_and_reset_only_build_this_ranks_own_key_not_every_
+bucket` confirms `dict_lister_trains` still holds every bucket (8) while
+`dict_data_train` holds exactly 1 after `setup()`/`reset()`; and, the
+highest-risk part of this change, `test_train_dataloader_gives_different_
+ranks_different_buckets` simulates 4 separate ranks (monkeypatching
+`torch.distributed.get_rank`, matching `test_dataset.py`'s own established
+pattern for this) with `dataset_group_list="1:1:1:1"` (matching what
+`calculate_load_balancing_on_the_fly` really produces for imagenet -- not
+the single-group default `NativePytorchDataModule` falls back to when
+`dataset_group_list` is omitted, which this test had to catch and account
+for explicitly) and confirms each rank's real `train_dataloader()` output
+wraps a genuinely different bucket, covering every bucket between them
+exactly once.
+
+**Not yet measured on real Frontier hardware** -- the fix is a structural
+O(`data_par_size`) -> O(1) reduction per rank, not a micro-optimization, so
+the expected win should be visible in wall-clock epoch-boundary time at
+scale, but that hasn't been measured against a real large-`data_par_size`
+run yet.
+
+#### Fixed a `.to(precision_dt).to(device)` ordering bug that silently defeated `pin_memory`
+
+Raised while discussing whether `non_blocking=True` would speed up
+`training.py`'s dataloader-sourced `.to(device)` calls: `non_blocking=True`
+only produces a real asynchronous copy when the source CPU tensor is
+pinned. Every one of `process_batch`'s dataloader-sourced tensors
+(`data`/`seq`/`seq_size`/`seq_pos`/`seq_label`) was being cast to
+`precision_dt` *before* moving to device -- `.to(precision_dt).to(device)`.
+When `precision_dt` actually differs from the tensor's own dtype
+(`trainer.data_type: bfloat16`), `.to(precision_dt)` allocates a fresh,
+*unpinned* CPU tensor, so even with `dataloader.pin_memory:True` the
+subsequent `.to(device)` would silently lose pinning and fall back to a
+blocking copy regardless of `non_blocking`. (`float32` configs were
+unaffected -- casting to a tensor's own dtype is a no-op, so the original
+pinned tensor passed through unchanged either way.)
+
+Fixed by reordering every one of those calls to `.to(device).to(precision_dt)`
+-- move first (from pinned memory, if `pin_memory:True`), cast dtype
+afterward as a cheap on-device op. Same final dtype/device either way (the
+`tensor_par_size > 1` branch's own comment about matching the broadcast
+receivers' placeholder still holds), so this is a pure reordering, not a
+behavior change. `ddpm_scheduler.alpha[t]`-derived tensors (not sourced from
+the dataloader, so pinning was never relevant to them) were deliberately
+left as `.to(precision_dt).to(device)`, unchanged.
+
+Also added `non_blocking=True` to every one of these same dataloader-sourced
+`.to(device)` calls (`data`/`seq`/`seq_size`/`seq_pos`/`seq_label`/`label`).
+This is safe to do unconditionally, regardless of `dataloader.pin_memory`:
+when the source tensor isn't pinned, PyTorch silently falls back to an
+ordinary blocking copy (identical to `non_blocking=False`) rather than
+erroring or warning -- so **`non_blocking=True` only actually changes
+anything when `pin_memory:True`**; with every shipped config still at
+`pin_memory:False` today, this is a no-op in production until that's
+flipped. No need to thread `pin_memory`'s value into `process_batch` just to
+gate the flag. `ddpm_scheduler.alpha[t]`-derived tensors, the `torch.zeros`
+broadcast-receiver placeholders on non-tensor-parallel-rank-0 processes, and
+`t = t.to(device)` (`DiffusionVIT`'s freshly-`torch.randint`-ed timestep)
+were all deliberately left unchanged -- none of them originate from the
+dataloader, so none of them can ever be pinned in the first place, and
+adding the flag there would misleadingly suggest otherwise. Whether to
+actually flip `pin_memory:True` in a shipped config is exactly what
+`tests/dataloaders/test_pin_memory_speed.py` (see "Running the dataloader
+speed tests" above) exists to measure with real numbers first.
+
+#### Real Frontier run (jobs 5397294/5397298) found a real `ZeroDivisionError`: the automatic train/val/test split can starve an already-tight allocation
+
+The first real Tier 2 (`pytest-distributed-5397294.out`) and Tier 3
+(`training-smoke-5397298.out`) runs against everything from this session's
+auto train/val/test splitting work onward. Tier 2: 61 passed (including,
+for the first time on real hardware, `test_eval_real_pipeline.py`'s
+checkpoint-resume/`eval_epoch` test and both `test_pretrained_loading_real.py`
+cases), 2 failed --
+`test_dataloader_real_pipeline.py::test_real_pipeline_basic_ct_unetr` (got 1
+batch, wanted 2) and `::test_real_pipeline_imagenet_classification` (got 0
+batches, wanted 2). Tier 3: all 4 `basic_ct-*` configs (diffusion/mae/sap/
+unetr) crashed identically on every rank with a bare `ZeroDivisionError` in
+`NativePytorchDataModule._shuffle_and_replicate`
+(`self.max_balance/self.batches_per_rank_epoch[k]`); `catsdogs-*`/
+`imagenet-*` all passed (fresh + resume).
+
+Root cause, same for both: `run_training_smoke.py`'s `make_smoke_config`
+narrows `basic_ct` real data to *exactly* `batch_size * data_par_size` files
+-- a pre-existing, deliberately zero-margin cap (added earlier, to keep
+`basic_ct-unetr`'s expensive full-resolution conv decoder from timing out
+the smoke test), safe as long as 100% of narrowed files went to training.
+Once `dataloader.val_split_ratio`/`test_split_ratio` (default 0.1/0.1) exist
+and apply automatically, train's own share of that narrowing shrinks to
+80% -- 80% of "exactly enough for 1 batch/rank" is *less* than 1 batch/rank,
+so `batches_per_rank_epoch["ct1"]` floors to 0. `test_dataloader_real_
+pipeline.py`'s own `BASIC_CT_MIN_FILES`/`IMAGENET_MIN_FILES` had the same
+staleness (sized for 100% going to train, before auto-split existed); the
+imagenet case is compounded by this session's own bucket-after-slice fix
+(`bucket_file_list` now divides the *narrowed* total across `data_par_size`
+buckets, not the full pre-narrowing dataset, so `min_files` no longer means
+"per bucket" the way `process_root_dirs`'s old internal bucketing made it
+mean). `catsdogs`/`imagenet` configs survived Tier 3 only because their own
+narrowing helper (`create_narrow_catsdogs_dir`) uses a *floor*
+(`max(min_files, batch_size*data_par_size)`) with real margin above it, not
+a tight cap -- basic_ct was the one config type with zero margin to begin
+with.
+
+This isn't just a test-narrowing artifact -- it means any real dataset sized
+close to `batch_size * data_par_size` hits the same bare `ZeroDivisionError`
+in production now that auto-split is on by default. Fixed two ways:
+
+1. **Production** (`UCF_VIT/utils/misc.py`,
+   `calculate_load_balancing_on_the_fly`): replaced the silent path to that
+   `ZeroDivisionError` with an explicit assert, right where
+   `batches_per_rank_epoch` is fully built -- `assert not zero_batch_keys`,
+   naming which dataset key(s) yield 0 batches/rank and listing every
+   remedy (more data, smaller `batch_size`, fewer GPUs/workers,
+   `allow_file_reuse:True`, or lower `val_split_ratio`/`test_split_ratio`).
+   **Tier 1 coverage**: `tests/utils/test_misc.py`'s new
+   `test_calculate_load_balancing_raises_when_zero_batches_per_rank` --
+   8 files / `data_par_size=8` (1 image/rank, clears the pre-existing "at
+   least one image" assert) with `batch_size=2` (needs 2), reproducing the
+   exact real failure mode as a fast, no-Frontier-needed regression test.
+2. **Test narrowing**: added `inflate_min_files_for_train_split(conf,
+   min_files)` (`tests/integration/run_training_smoke.py`, alongside
+   `compute_narrow_dict_idx`/`create_narrow_catsdogs_dir`) -- scales
+   `min_files` up by `1 / (1 - val_split_ratio - test_split_ratio)` so that
+   many files still land in *training* after the split, not just somewhere
+   in the pre-split narrowed total. `make_smoke_config` (Tier 3, shared with
+   Tier 3b) and every real-data narrowing call site
+   (`test_dataloader_real_pipeline.py`, `test_dataset_speed_real_data.py`,
+   `test_pin_memory_speed.py`) now call it before narrowing; imagenet call
+   sites additionally multiply by `data_par_size` first, to restore the
+   "per bucket" `min_files` semantics `process_root_dirs`'s old internal
+   bucketing used to provide for free. `compute_narrow_dict_idx`'s own
+   docstring updated to stop claiming imagenet narrowing is "per bucket" --
+   it isn't, since `process_root_dirs` stopped bucketing internally
+   earlier this session. **Tier 1 coverage**: 3 new tests in
+   `tests/integration/test_run_training_smoke_helpers.py` for
+   `inflate_min_files_for_train_split` itself (default ratios, explicit
+   ratios, zero-ratio no-op).
+
+**Rerun on Frontier (jobs 5397300/5397960/5397961) found the fix above was
+itself incomplete, plus one real bug in the test-narrowing side of it:**
+
+1. `make_smoke_config`'s cap logic inflated the *cap itself*
+   (`min(min_files, inflate_min_files_for_train_split(conf, batch_size *
+   data_par_size))`) rather than the *value actually used to narrow* --
+   `min()` picks the smaller side, so whenever the caller's own `min_files`
+   (a `FEATURE_MATRIX` cell's explicit `min_files_override`, or
+   `DEFAULT_MIN_FILES` when it happened to already equal the uninflated cap,
+   e.g. every `batch_size:32` config) was already `<=` the *uninflated*
+   cap, the inflation silently never applied -- the exact bug this fix was
+   supposed to close. Caught 6 more `feature-matrix-smoke-5397300.out`
+   failures (`+do_ap`/`+do_tiling`/`+twoD` cells, whose `min_files_override`
+   is deliberately pinned smaller than the cap to begin with) and, in
+   `training-smoke-5397960.out`, `imagenet-*`/`basic_ct-diffusion`/
+   `basic_ct-mae`/`basic_ct-sap` newly failing too (previously-passing
+   `batch_size:32` configs, where `DEFAULT_MIN_FILES:256` exactly equals the
+   uninflated cap). Fixed by restructuring to two unconditional steps --
+   `min_files = min(min_files, batch_size * data_par_size)` (the original,
+   uninflated cap, unchanged), then `min_files =
+   inflate_min_files_for_train_split(conf, min_files)` (always applied to
+   whatever that produced, not folded into the `min()` itself) -- so every
+   caller's value gets inflated regardless of which side of the cap it came
+   from.
+2. `test_dataloader_real_pipeline.py`/`test_dataset_speed_real_data.py`'s
+   own new imagenet `data_par_size` multiplier
+   (`conf["parallelism"]["data_par_size"]`) read a key that doesn't exist on
+   the raw, un-parsed YAML dict these functions load directly -- `parse_config`
+   computes and adds `data_par_size` later, from `fsdp_size`/
+   `simple_ddp_size`; at this point in the code only those two exist. A bare
+   `KeyError`, caught by `pytest-distributed-5397961.out`'s remaining
+   `test_real_pipeline_imagenet_classification` failure (`basic_ct_unetr`'s
+   sibling case had already started passing by this rerun, confirming fix 1
+   above worked for it). Fixed by computing `fsdp_size * simple_ddp_size`
+   directly, matching how `make_smoke_config`/`compute_narrow_dict_idx`
+   already do it from the same raw dict.
+
+**Rerun on Frontier (jobs 5398917/5398918/5398920) confirms both follow-up
+fixes worked**: Tier 2 63/63 passed (`test_real_pipeline_imagenet_
+classification`'s `KeyError` fixed), Tier 3b 19/19 passed (every `+do_ap`/
+`+do_tiling`/`+twoD` cell fixed). Tier 3 was 9/10 -- `catsdogs-mae` fresh run
+failed, but with an unrelated, pre-existing bug this session's work never
+touched: `configs/catsdogs/mae/base_config.yaml` was simply missing the
+`dataset_options.resize` section entirely (present in
+`catsdogs/classification`/`catsdogs/diffusion`'s shipped configs, which both
+passed in this same run), so real cat/dog photos at their varying native
+sizes never got resized to a common size before `CatsDogsCollate`'s
+`torch.stack` -- `RuntimeError: stack expects each tensor to be equal size,
+but got [3, 374, 500] at entry 0 and [3, 499, 431] at entry 1`. Fixed by
+adding the same `resize: {'catsdogs': [256, 256]}` block the other two
+catsdogs configs already have. **Not yet re-verified against a real
+Frontier run.**
+
+#### Fixed a real channel-scrambling bug in `Patchify`/`Patchify_3D`'s multi-channel reshape
+
+`qdt.serialize`/`octree.serialize` return each patch as `(H, W[, D], Channel)`
+-- channel last. The `num_channels > 1` branch (`separate_channels:False`
+adaptive patching on a multi-channel dataset) reshaped straight from
+`(fixed_length, ..., num_channels)` to `(num_channels, fixed_length, ...)`
+with a plain `np.reshape`, which never moves data -- it just reinterprets the
+existing flat buffer, so instead of separating channels it silently scrambled
+patches/channels together. Verified with a small repro (each element tagged
+with its true `(patch, position, channel)` identity) before fixing. Not a
+crash -- `do_ap:True` + `separate_channels:False` on any multi-channel dataset
+fed the model channel-incoherent data. Fixed by adding `np.moveaxis(seq_img,
+-1, 0)` before the reshape in both `Patchify.forward` and `Patchify_3D.forward`.
+**Tier 1 coverage:** two new tests in `test_transform.py` build a
+perfectly-flat, distinct-constant-per-channel image (no internal edges, so
+resizing can't introduce intermediate values) and assert every real patch's
+value is exactly its own channel's constant -- confirmed each fails against
+the pre-fix behavior (simulated by disabling `np.moveaxis`) and passes fixed.
+
+#### Fixed a real architectural bug: `SAP`/`UNETR`'s adaptive-patching sequence was treated as a spatial grid it isn't
+
+`FixedQuadTree`/`FixedOctTree.serialize` return `fixed_length` patches in
+greedy-split tree-traversal order (edge-dense regions get many small
+patches, flat regions get few large ones) -- not raster-scan order.
+`SAP.mask_head` and `UNETR.proj_feat` both reshaped this sequence into a
+`sqrt_len x sqrt_len[ x sqrt_len]` grid by raw index and ran real spatial
+ops on it, silently assuming sequence position == grid position.
+
+For `SAP`, this made the decoder's raw output not spatially meaningful (its
+`neck`/`mask_header` conv has `stride == kernel_size`, so there's no
+cross-token mixing to actually corrupt -- but the output still can't be
+used as a real mask without undoing the same arbitrary, per-sample,
+re-randomized-every-read reshape). Fixed by having `SAP.mask_head` un-grid
+its output back to per-token predictions (indexed by real sequence
+position, exploiting the same no-cross-token-mixing property to invert the
+grid reshape exactly), and adding `native_resolution_dice_loss`
+(`utils/metrics.py`, mirroring the existing `native_resolution_patch_mse`'s
+`grid_sample`-based technique) to compare each token's prediction directly
+against the real label sampled at that token's own native position/size,
+instead of a `seq_label` that had undergone the same lossy grid reshape.
+
+For `UNETR`, this was a real correctness bug, not just an output-usability
+one: `proj_feat`'s reshape fed a REAL multi-stage convolutional decoder
+(`decoder5`-`decoder2`, genuine `kernel_size=3` cross-cell receptive
+fields) that actively blended "neighbor" grid cells that usually weren't
+real neighbors, and `forward_step` compared the result directly against
+`batch["label"]`, the true-order ground truth. (`encoder1`'s skip
+connection was already correct -- `UNETR.forward` passes it the real,
+native-resolution `batch["data"]`, not the fake grid.) Forcing a uniform
+(non-adaptive) grid was considered and rejected -- it would defeat the
+entire point of adaptive patching. Fixed instead by replacing `proj_feat`'s
+`.view()` with a differentiable gather: since quadtree/octree leaves
+exactly tile the domain (no gaps or overlaps, always square/cubic), a new
+`_adaptive_token_grid_index` does a vectorized point-in-box test (each
+canvas cell's true position vs. every token's real `pos +/- size/2` box,
+from the same `seq_ps` already computed for adaptive positional
+embeddings) to find each cell's true owning token, then `torch.gather`
+reconstructs the feature map from it -- fully differentiable, and it keeps
+the real benefit of adaptive patching (dense regions really do get more,
+smaller, correctly-placed tokens in the reconstructed feature map).
+
+**Tier 1 coverage:** `test_metrics.py` has new tests for
+`native_resolution_dice_loss` (2D and 3D, correct/wrong-prediction and
+padding-token cases, mirroring `native_resolution_patch_mse`'s existing
+test structure). `test_arch.py` has new tests for `SAP.mask_head`'s
+per-token output shape (2D and 3D) and for
+`UNETR._adaptive_token_grid_index`/`proj_feat`: tokens are given in a
+deliberately shuffled (non-raster) order with known true `pos`/`size`
+boxes, each tagged with its original (pre-shuffle) index, and the
+reconstructed canvas is asserted to place each token's value at the cell
+its true box actually covers -- the direct regression test that
+reconstruction now follows real position, not sequence index.
+
+### Removed `sqrt_len_method` entirely, and the now-dead `seq_label` adaptive-label pipeline
+
+Follow-up to the `proj_feat` fix above. The user asked whether it removed
+the requirement that `fixed_length` be a perfect square/cube (2D) or cube
+(3D) -- it didn't, fully: `training.py`'s `seq`/`x_seq` construction (the
+*encoder's* input) still built a grid via `einops.rearrange`, which
+enforces exact factorization, independently of the (already-fixed)
+decoder-side constraint. Tracing why that rearrange existed at all found it
+was purely to satisfy `PatchEmbed`'s (`building_blocks.py`) `Conv2d`/`Conv3d`
+API, which needs a `(B,C,H,W)`-shaped input -- not because of any genuine
+spatial-adjacency requirement (`PatchEmbed`'s conv has `stride ==
+kernel_size`, the same degenerate/no-cross-token-mixing pattern as
+everywhere else in this bug, and its own `forward` exactly inverts whatever
+row-major order the grid was built in via `flatten(2).transpose(1,2)`).
+`MAE`/`VIT`/`DiffusionVIT`'s `adaptive_patching and not sqrt_len_method`
+path already had the alternative built: a plain per-token
+`nn.Sequential(nn.LayerNorm, nn.Linear, nn.LayerNorm)` operating directly on
+the flat sequence, no grid needed.
+
+Routed `SAP`/`UNETR` onto that same path -- every condition in `arch.py`
+gating on `adaptive_patching and not sqrt_len_method` collapsed to just
+`adaptive_patching`, since `sqrt_len_method` no longer distinguished
+anything: `VIT.__init__`'s `token_embeds`/`patch_embed` construction,
+`forward_features`/`forward_intermediates`'s embedding step, and
+`init_weights`'s fixed sin-cos `pos_embed` overwrite. `training.py`'s
+`seq`/`x_seq` `einops.rearrange` calls (both `SAP` and `UNETR`) were
+deleted outright -- `model.forward` now receives `batch["seq"]` directly,
+matching `MAE`'s own `do_ap:True` call pattern exactly.
+
+This made `sqrt_len_method` itself fully vestigial, so it was removed as a
+concept entirely, not just left unused: the constructor parameter (`VIT`,
+`PatchEmbed`), `parse.py`'s `get_kwargs` (stopped setting it for
+`SAP`/`UNETR`), and -- the one real behavior change beyond the encoder --
+`model/utils.py`'s `_transplant_pos_embed`, which had an explicit
+`sqrt_len_method:True` rejection (`NotImplementedError`) for pretrained-
+checkpoint size mismatches, added deliberately in the pretrained-loading
+work above specifically because that regime's `pos_embed` was sized from a
+`PatchEmbed` grid that didn't reflect its real token count. Since `SAP`/
+`UNETR` no longer build a `PatchEmbed` under adaptive patching at all, they
+now have no `grid_size` and fall cleanly into the same "flat, dropped on
+`fixed_length` mismatch" path every other adaptive model already uses via
+`_transplant_pos_embed`'s existing `hasattr(model, "grid_size")` dispatch --
+a real capability gain (pretrained-checkpoint fine-tuning at a different
+`fixed_length` now works for `SAP`/`UNETR+do_ap` instead of hard-erroring),
+not just a rename. `sqrt_len` itself (the *decoder*-side bottleneck-canvas
+resolution `SAP.mask_head`/`UNETR.proj_feat` use) is unrelated and
+untouched -- `sqrt_len_method` only ever controlled the encoder's embedding
+path.
+
+Separately, tracing the loss/label side of this same question (whether
+`UNETR`, like `SAP`, needed the adaptively-patched labels) surfaced that
+`seq_label` -- a full second per-sample tree-based label serialization
+(`FixedQuadTree`/`FixedOctTree.serialize_labels`, `dataset.py`'s
+`seq_label_list` construction, `datamodule.py`'s one-hot collate) -- was now
+dead for *both* model types: `SAP`'s new `native_resolution_dice_loss`
+samples the real, native-resolution `batch["label"]` directly (no
+`seq_label` involved), and `UNETR` never consumed `seq_label` in the first
+place (`forward_step`'s `UNETR` branch always compared its dense decoder
+output against dense `batch["label"]` via `DiceCELoss`, both before and
+after today's changes). Removed the entire pipeline: `serialize_labels`
+deleted from both `quadtree.py` and `octree.py` (unused anywhere else,
+confirmed by grep before deleting); `dataset.py`'s `ProcessChannels.__iter__`
+no longer builds or yields `seq_label_list` (the `basic_ct`/other-dataset
+`do_ap+return_label` yield tuple is now exactly `(image, seq_image,
+seq_size, seq_pos, label, variables, [qdt])` -- the same shape `imagenet`
+already used, since `imagenet` never had `seq_label` to begin with);
+`datamodule.py`'s `collate_fn` no longer builds `seq_label`/one-hot-encodes
+it (its `num_classes` parameter, only ever used for that one-hot encode,
+was removed too -- unused anywhere else in the function); `training.py`'s
+`get_batch`/`process_batch` no longer read, cast, broadcast, or return
+`seq_label` at all (`get_batch`'s `"VIT"` and `["UNETR", "SAP"]` branches
+became identical once `seq_label` was the only thing distinguishing them,
+so they're now one merged `["VIT", "UNETR", "SAP"]` branch).
+
+**Tier 1 coverage:** `test_datamodule.py`'s `collate_fn` tests updated for
+the new (shorter) tuple shapes and the removed `num_classes` parameter --
+no new tests needed since this is pure deletion of a dead path, not new
+logic. `test_pretrained_loading.py`'s
+`test_pretrained_loading_sqrt_len_method_mismatch_raises_clearly` (the
+explicit-rejection test) replaced with
+`test_pretrained_loading_sap_fixed_length_mismatch_drops_pos_embed`,
+confirming a real `SAP` instance now has no `grid_size` and its `pos_embed`
+is dropped-not-raised on a `fixed_length` mismatch, mirroring the existing
+non-`SAP` adaptive test right above it. `test_parse_pretrained_config.py`'s
+two `sqrt_len_method`-asserting tests updated to check `sqrt_len` directly
+instead (the value that actually matters now).
+
+**Follow-up:** `parse_config`'s own separate `fixed_length`-is-a-perfect-
+square/cube validation (`parse.py`, distinct from `get_kwargs`) still gated
+on `model_type in ["UNETR", "SAP"]`, unnarrowed by the `proj_feat` fix --
+still correctly required for `SAP` (`mask_head`'s `einops` grid reshape
+needs exact factorization) but now a stale, overly strict rejection for
+`UNETR` (nothing in its code needs this anymore). Narrowed to `model_type
+== "SAP"` only -- `UNETR+do_ap` configs with a non-square/cube
+`fixed_length` are now accepted, not just correctly computed.
+
+**Follow-up:** when `sqrt_len**ndims < fixed_length` (the common case for a
+non-square `fixed_length`), `_adaptive_token_grid_index`'s bottleneck canvas
+has fewer cells than there are real tokens, so some tokens never reach the
+reconstructed feature map at all -- `parse.py`'s `get_kwargs` now prints a
+one-time warning naming exactly how many. Tracing *which* tokens are most
+likely to be the dropped ones surfaced a real, fixable bias: the original
+(now `"point"`) selection tests each canvas cell's *center point* against
+every token's box, so a token's odds of winning any cell scale with its
+area -- small tokens are disproportionately likely to lose, and adaptive
+patching concentrates small tokens exactly in the detail/edge-dense regions
+adaptive patching exists to capture well. Added a second method,
+`"smallest_overlap"`: tests real box-vs-cell overlap (not just a point) and
+picks the smallest overlapping token, inverting the bias -- large,
+low-detail tokens become the ones more likely to lose a cell, which costs
+far less (their neighbors, typically also flat, interpolate over a missing
+cell gracefully). Exposed as `conf["model"]["token_selection"]` (`"point"`
+default, `"smallest_overlap"` opt-in) specifically so both can be A/B
+tested for real rather than committing to one from first-principles
+reasoning alone -- shown (commented, `do_ap:False` baseline) in
+`configs/basic_ct/unetr/base_config.yaml`.
+
+**Tier 1 coverage:** `test_arch.py` has a `"point"`-vs-`"smallest_overlap"`
+pair: a small token placed to physically overlap a canvas cell it doesn't
+contain the center point of -- `"point"` loses it to a large, whole-domain-
+covering token entirely (demonstrating the bias directly), while
+`"smallest_overlap"` on the identical setup always wins that cell for the
+small token.
+
+**Follow-up: a third `token_selection`, `"area_weighted"`.** Both `"point"`
+and `"smallest_overlap"` are winner-take-all -- exactly one token
+represents each cell, and every other token that also touches that cell
+contributes nothing. Added `_adaptive_token_grid_weights`: for each cell,
+computes the real overlap area (2D) / volume (3D) with every token that
+touches it (per-axis overlap length, clamped at 0, multiplied across axes),
+normalizes into per-cell weights summing to 1, and `proj_feat` combines
+them via a weighted sum (`einsum`) instead of a `gather` -- the adaptive-
+patching analog of ordinary average-pooling. Since real leaves fully tile
+the domain and canvas cells do too, every real token is guaranteed nonzero
+weight in at least one cell -- no token is ever entirely invisible to the
+canvas the way `"point"` (and, in dense small-leaf clusters, even
+`"smallest_overlap"`) can leave one. `proj_feat`/`unetr_head`'s parameter
+generalized from `token_grid_index` (always a `(B,G)` long index tensor) to
+`token_selection_state` (that, for `"point"`/`"smallest_overlap"`; a
+`(B,G,S)` float weight tensor for `"area_weighted"`), computed once per
+forward pass by a new small dispatcher, `_compute_token_selection_state`.
+`parse.py`'s "N tokens will never reach the reconstructed feature map"
+warning is gated off for `"area_weighted"` specifically, since it isn't
+true there -- reordered so `token_selection` is read before that check
+runs, rather than always printing regardless of which method a config
+actually selected.
+
+**Tier 1 coverage:** `test_arch.py` -- an exact-tiling case (weights
+collapse to one-hot, `proj_feat`'s weighted-sum output exactly matches the
+gather-based reconstruction, not just approximately) and a genuine
+proportional-blend case (two real, non-overlapping square leaves both
+landing inside one cell, weights asserted equal to their actual
+overlap-area fractions, verified against the closed-form expected value
+computed by hand, not just "sums to 1").
+
+**Follow-up: `area_weighted_alpha`.** Multiplies each token's overlap area
+by `size ** -alpha` before normalizing (`alpha=0`, the default, is plain
+area-proportional weighting -- unchanged). Turns `"area_weighted"` into a
+one-parameter family that subsumes `"smallest_overlap"` as its `alpha ->
+infinity` limit (the smallest overlapping token's weight -> 1, every other
+token's -> 0 -- the same relationship softmax-with-temperature-0 has to
+argmax) without removing `"smallest_overlap"` as a separate method: it
+stays cheaper (`gather`, not a full weighted sum) and exact rather than a
+large-`alpha` approximation whose required magnitude depends on the actual
+dynamic range of leaf sizes present. `"point"` has no `alpha` equivalent at
+all -- it's not in this family, since it selects by whether a cell's center
+point falls inside a box, never by area/overlap. Padding tokens (`size ==
+0`) need `size` clamped to a small epsilon *before* the `** -alpha` power,
+not after -- `0 ** -alpha` is `inf`, and `inf * 0` (their already-zeroed
+overlap area) is `nan`, not `0`.
+
+**Tier 1 coverage:** `test_arch.py` -- `alpha` defaults to 0; `alpha=0`
+reproduces the pre-`alpha` proportional-blend test's exact result; and a
+monotonicity test across `alpha in (0, 1, 5, 50)` on the same small/big
+two-token setup used elsewhere confirms the small token's weight strictly
+increases with `alpha`, starting at its plain area share and reaching
+~1 (`"smallest_overlap"`'s outcome) by `alpha=50`.
+
+**Follow-up:** all of the above tested `token_selection`/`area_weighted_alpha`
+at the `arch.py`/model-construction level, bypassing `parse.py` entirely --
+`get_kwargs`'s own plumbing (reading `conf["model"]["token_selection"]`/
+`conf["model"]["area_weighted_alpha"]`, defaults, invalid-value rejection,
+and the token-capacity warning's `"area_weighted"` gating) had no coverage
+of its own. Added to `tests/test_config_validation.py`, matching that
+file's existing real-`parse_config`-call style (load a shipped config,
+mutate, write to a temp file, parse) rather than testing `get_kwargs` in
+isolation -- including a `capsys`-based test that the token-capacity
+warning actually prints for `"point"` and is actually silent for
+`"area_weighted"`, using a real octree-valid non-cube `fixed_length` (519:
+`% 7 == 1`, `sqrt_len` stays 8, `8**3=512 < 519`) rather than asserting
+against the warning-gating logic's own source.
+
+**Follow-up: Tier 3b coverage.** `test_arch.py`/`test_config_validation.py`
+above cover `token_selection`/`area_weighted_alpha` at the model-
+construction and config-parsing levels respectively -- neither runs a real
+forward+backward+loss step against real data/`DistributedSampler`, which is
+exactly the kind of thing that's caught real, otherwise-invisible bugs
+elsewhere in this matrix (see e.g. the tensor-parallel dtype-mismatch
+broadcast fixes above). `"smallest_overlap"`/`"area_weighted"`/
+`area_weighted_alpha` had zero Tier 3b coverage -- `basic_ct-unetr+do_ap`
+only ever exercised the config default (`"point"`). Added 3 sibling cells,
+identical to `basic_ct-unetr+do_ap` except for `model.token_selection`
+(and, for the third, `model.area_weighted_alpha`): `basic_ct-unetr+do_ap+
+smallest_overlap`, `basic_ct-unetr+do_ap+area_weighted` (`alpha` left at
+its default, 0), `basic_ct-unetr+do_ap+area_weighted_alpha` (`alpha:2.0` --
+meaningfully size-biased per `test_arch.py`'s own monotonicity test, without
+being large enough to be numerically indistinguishable from
+`"smallest_overlap"`). Deliberately not crossed with `twoD`/`do_tiling` --
+`token_selection` is orthogonal to dataset specifics, the same
+representative-subset reasoning `tensor_par_size`'s cells below already
+use, rather than a full cross product. `test_feature_matrix_smoke_helpers.py`
+confirms all 3 new cells' configs parse via a real `parse_config` call
+before ever touching real Frontier data (27/27 passing locally, up from
+24/24).
+
+### Added a 4th `token_selection`: `"cross_attention"` (learned soft pooling)
+
+Follow-up to the 3 heuristic methods above. Those are all fixed formulas
+(geometric containment, or a hand-tuned `size ** -alpha` bias); this one
+lets the model learn each overlapping token's contribution instead of
+prescribing it. Reuses the exact same overlap test `"area_weighted"`
+already has (a token contributes to a cell iff it geometrically overlaps
+it -- same many-to-many relationship: a token overlapping 2 cells is an
+independent candidate at each, with its own attention weight per cell,
+same as every other method), but replaces the fixed area-proportional
+weight with real learned attention: a new `_cross_attention_query_and_mask`
+computes each cell's query (via `self.token_query_mlp`, a small MLP over
+the cell's own normalized center position -- position-*derived*, not a
+`feat_size`-shaped lookup table, so it isn't tied to one canvas resolution)
+and the same overlap mask as `_adaptive_token_grid_weights`; `proj_feat`'s
+new branch projects each call's own token embeddings through
+`self.token_key_proj`/`self.token_value_proj`, computes masked (`-1e9` on
+non-overlapping/padding entries, avoiding `NaN` the way literal `-inf`
+would risk) scaled dot-product attention, and combines values via the
+resulting softmax weights. Query/mask are still computed once per forward
+pass and reused across `unetr_head`'s 4 `proj_feat` calls (`dec4`/`enc4`/
+`enc3`/`enc2`) -- only key/value depend on each call's own token
+embeddings, so those are the only part recomputed fresh each time.
+
+Architecturally different from the other 3 in one real way: this is the
+first `token_selection` method with actual trainable parameters
+(`token_query_mlp`/`token_key_proj`/`token_value_proj`), built only when
+`token_selection == "cross_attention"` and initialized via the same generic
+recursive `init_weights_vit_timm` every other submodule already gets --
+the other 3 add zero parameters and are pure geometry.
+
+**Tier 1 coverage:** `test_arch.py` -- the 3 submodules exist for
+`"cross_attention"` and don't exist for the other methods; `query`/`mask`
+shapes and masking correctness (a 3-real-token, 4-cell scenario with one
+token spanning 2 cells, matching the same shape of setup used for
+`"smallest_overlap"`/`"area_weighted"` above); and a full `proj_feat`
+integration test with `token_key_proj`/`token_value_proj` fixed to the
+identity (rather than left at random init) so the masked-attention output
+is exactly predictable -- each cell's reconstructed feature must exactly
+equal its one real owning token's embedding, and the token spanning two
+cells must produce the identical result in both (verified robust to
+`token_query_mlp`'s random init by construction: each cell here has
+exactly one unmasked candidate, so softmax gives it weight exactly 1
+regardless of the actual query/score values -- `exp(-1e9)` underflows to
+exactly `0.0` in float32, not just approximately). `test_config_validation.py`
+extended the existing threading/warning-gating tests to include
+`"cross_attention"` rather than adding new ones (same generalization the
+tests were already written for). `run_feature_matrix_smoke.py` gained a
+4th sibling cell, `basic_ct-unetr+do_ap+cross_attention` -- its real point,
+unlike the other 3, is proving the new trainable submodules actually
+participate in a real backward pass under real distributed training (28/28
+feature-matrix-helper tests passing locally, up from 27/27), not just that
+the reconstruction logic itself is correct (already covered above).
+
+### Added an optional `inference_output` sample-inference dump for `test.py`/`val.py`
+
+Lets a `UNETR` run write its own real predictions to disk for visual
+inspection (e.g. in 3D Slicer/ITK-SNAP), rather than only ever seeing the
+scalar Dice accuracy `eval_epoch` already prints. Off by default -- a new
+`inference_output` config section (`save`/`all_batches`/`num_batches`/
+`output_dir`), parsed with the same `try/except KeyError` pattern as
+`tiling`/`ap`, defaults to fully off (and a `save:False` config forces
+every other field back to its own default too, the same "off means off"
+convention `tiling_conf`/`ap_conf` already use) so every shipped config
+that doesn't mention it keeps parsing exactly as before.
+
+New `UCF_VIT.utils.inference_output.save_inference_batch` writes one
+batch's `data`/`label`/argmax(`output`) volumes as NIfTI files
+(`rank{r}_batch{b}_sample{i}_{input,label,pred_label}.nii.gz`) with an identity
+affine -- `dataset.py`'s `basic_ct` loader already discards each file's
+real affine on load (keeps only `.dataobj`), so there's no real affine
+available to preserve on the way back out. Wired into `eval_epoch`'s
+existing `UNETR` branch (shared by both `val.py` and `test.py`), right
+after the Dice-accuracy computation, gated on
+`conf["inference_output"]["save"]` and either `all_batches` or
+`counter <= num_batches`. Deliberately **not** gated to rank 0 only, unlike
+most of this codebase's file I/O -- with `all_batches:True`, every rank
+saves its own local shard of test batches, which together make up the
+whole distributed test set; gating to rank 0 would silently drop every
+other rank's batches instead.
+
+**Tier 1 coverage:** new `tests/utils/test_inference_output.py` -- confirms
+the 3 files-per-sample are written with the expected `rank`/`batch`/
+`sample`-keyed names, that the saved prediction volume actually matches
+`output.argmax(dim=1)` rather than raw logits, and that `output_dir` is
+created if it doesn't already exist. `test_config_validation.py` gained 3
+tests: `inference_output` defaults to fully off when omitted from a real
+shipped config, threads all 4 fields through when set, and collapses back
+to defaults when `save:False` even if the other fields are set to
+something else.
+
+#### Follow-up: renamed `_pred.nii.gz` to `_pred_label.nii.gz` for viewer auto-detection
+
+Real usage (visually comparing `non_adaptive_200epoch` inference dumps in
+3D Slicer) surfaced that Slicer's "Add Data" import auto-detects Scalar
+Volume vs. Labelmap by filename convention, not by the NIfTI header's
+actual datatype -- `_label.nii.gz` got picked up as a Labelmap (discrete
+per-class colors) while `_pred.nii.gz` didn't, defaulting to a continuous
+grayscale Scalar Volume, even though both files are written with identical
+`int16` headers (`_write_nifti` never wrote float data for either; this was
+purely a Slicer-side import heuristic, confirmed by inspecting both files'
+on-disk headers directly -- byte-for-byte identical `datatype`/`scl_slope`/
+`scl_inter`/`cal_min`/`cal_max`). Renamed the prediction file to
+`_pred_label.nii.gz` so it matches the same filename convention as the
+ground truth and gets auto-detected the same way, with no manual
+"convert/reformat" step needed in the viewer. `tests/utils/
+test_inference_output.py` updated to match the new filename.
+
+### Fixed the fork-after-CUDA-init segfault at its root: persistent `DataLoader` workers, forked before any CUDA context exists
+
+Follow-up to "Fixed a real, intermittent `basic_ct-sap+tensor_par` segfault"
+above -- that fix (`num_workers:0`) sidestepped the hazard but gave up
+dataloader/compute overlap entirely, for every config that hit it (also
+applied to the 9 new `unetr_token_selection_experiment` configs after job
+5411961 hit the same crash). Asked whether the hazard itself could be
+avoided instead: fork the worker pool once, before this process's first
+CUDA context exists, and never fork again.
+
+Two real blockers, both in `NativePytorchDataModule` (`datamodule.py`):
+
+1. `train_dataloader()` hard-required `torch.distributed.is_initialized()`
+   already being `True` -- so even the first `DataLoader` couldn't be built
+   before `dist.init_process_group`. Turned out not to matter:
+   `dist.init_process_group('nccl', ...)` itself doesn't establish a CUDA
+   context (no `device_id` passed, so NCCL communicator creation stays lazy)
+   -- only the later `torch.cuda.set_device(local_rank)` call actually does.
+2. `train.py`'s epoch loop rebuilt the `DataLoader` from scratch every
+   epoch (`data_module.reset()` + `train_dataloader()` again, "to ensure
+   all files get used") -- `persistent_workers=True` only keeps a worker
+   pool alive *within one `DataLoader` object*, so a fresh object every
+   epoch re-forked fresh workers every epoch regardless, after CUDA was by
+   then long since initialized. Pre-forking epoch 0 safely would have left
+   every epoch after it exactly as exposed as before.
+
+Fixed both by moving the per-epoch file-order reshuffle *inside*
+`FileReader.__iter__` (`dataset.py`) itself, instead of the caller
+rebuilding a whole new pipeline between epochs:
+
+- New `FileReader.__init__` argument `epoch_shuffle_seed` (`None` by
+  default, preserving every existing test's exact contract of "`file_list`
+  used as-is"). When set, `__iter__` reshuffles+replicates
+  `self.master_file_list` fresh at the top of every call (via
+  `np.random.RandomState(epoch_shuffle_seed + self._epoch)`, `self._epoch`
+  incrementing each call) instead of receiving an already-shuffled list
+  from the caller.
+- Critically, this is *deterministic given the same seed and call count* --
+  every DDP rank/worker sharing a dataset key runs its own `FileReader`
+  instance in its own process, with no way to communicate a shuffle order
+  to each other once forked. Since `epoch_shuffle_seed` (from
+  `dataloader.epoch_shuffle_seed`, defaulting to 42, same convention as
+  `bucket_shuffle_seed`) is identical across all of them and every
+  process's `_epoch` counter advances in lockstep (one `__iter__` call per
+  epoch, everywhere), they independently reproduce the *identical*
+  permutation for a given epoch with zero cross-process communication --
+  exactly what keeps `__iter__`'s disjoint-window sharding across
+  ranks/workers correct.
+- `NativePytorchDataModule.setup()` no longer shuffles anything itself --
+  `set_iterative_dataloader` now passes `dict_lister_trains[k]` straight
+  through (unshuffled) plus `epoch_shuffle_seed`, and `_shuffle_and_replicate`
+  shrank to `_compute_keys_to_add` (just the replication-count math, no
+  shuffle). `reset()` is gone entirely -- nothing left for it to do.
+- `train_dataloader()` now sets `persistent_workers=self.num_workers > 0`.
+
+With the rebuild-every-epoch problem gone, `train.py`'s `main()` could
+actually reorder around the remaining real constraint. Split `init_dist`
+(rank/world-size bookkeeping + `dist.init_process_group`, no CUDA touched)
+from a new `set_cuda_device` (the actual `torch.cuda.set_device` call) and
+moved dataloader construction to run *between* them: `data_module.setup()`
++ `train_dataloader()` now happen right after `init_par_groups` (needs
+`dist.init_process_group`, not CUDA), followed by one bare `iter(train_dataloader)`
+call (discarding the returned iterator) whenever `num_workers > 0` --
+forces the worker pool to fork immediately, while this process has touched
+no CUDA at all yet, exactly the same way persistent-worker pools are
+meant to be triggered once and reused. Only *then* does `set_cuda_device`
+establish this process's first real CUDA context, followed by `get_model`
+and the rest of setup as before. The epoch loop's `reset()`+rebuild block
+is gone -- `train_dataloader` is now built exactly once per run and reused
+unchanged for every epoch. Applied the same `persistent_workers`+pre-fork
+treatment to the map-style `"dataloader"` (catsdogs) construction path too,
+for consistency, even though no shipped config exercises it.
+
+`val.py`/`test.py` also now thread `epoch_shuffle_seed` through their own
+`NativePytorchDataModule` construction (to preserve the pre-existing
+"shuffle once before reading" behavior for a single eval pass, which would
+otherwise have silently regressed to `None`/no-shuffle-at-all) -- their own
+CUDA-init ordering wasn't touched, since single-pass evaluation only ever
+forks once regardless.
+
+**Tier 1 coverage:** `tests/dataloaders/test_dataset.py` gained 4
+`epoch_shuffle_seed` tests on `FileReader` directly -- `None` leaves
+`file_list` byte-for-byte unchanged across repeated `__iter__` calls (the
+default-behavior contract every pre-existing `FileReader` test in the file
+already relies on); repeated calls replicate `keys_to_add` times from the
+stable master list without ballooning (the exact bug caught while writing
+this -- an earlier version read `self.file_list` instead of
+`self.master_file_list`, re-replicating an already-replicated list every
+epoch); two independently-constructed `FileReader` instances with the same
+seed produce byte-for-byte identical shuffled order (the actual
+cross-process correctness property this exists for); and successive epochs
+on the same instance produce genuinely different permutations (not the
+same shuffle replayed). `tests/dataloaders/test_datamodule_membership.py`
+gained tests for `train_dataloader()`'s `persistent_workers` following
+`num_workers`, `epoch_shuffle_seed` threading through to the `FileReader`
+`set_iterative_dataloader` builds, and `setup()` no longer shuffling
+`dict_lister_trains` order itself; its two `reset()`-calling tests were
+updated to drop the (now-nonexistent) call. `test_config_validation.py`
+gained `epoch_shuffle_seed` default/threading tests, matching
+`bucket_shuffle_seed`'s own convention.
+
+The actual runtime claim -- that this eliminates the fork-after-CUDA-init
+race rather than just reducing how often it's hit -- can only be verified
+for real on Frontier (no local CUDA/NCCL/Slurm environment to reproduce
+either the original hazard or its fix against); not yet confirmed there.
+
+### Follow-up: removed `multiprocessing_context` and every remaining `num_workers:0` workaround
+
+Once the fix above landed, both of the fork-after-CUDA-init hazard's old
+band-aids became redundant: `multiprocessing_context` (the `"spawn"` opt-in
+that traded the segfault for a worse Cray/Slurm launch crash, job 5394881,
+and was never actually used by any shipped config after that) and
+`num_workers:0` (`basic_ct/sap/base_config.yaml` and all 9
+`unetr_token_selection_experiment` configs, which lost dataloader/compute
+overlap as the price of avoiding the fork entirely). Removed the option
+entirely (`NativePytorchDataModule.__init__`/`train_dataloader()`,
+`parse.py`'s `dataloader_conf`, and both `DataLoader(...)` construction
+sites in `train.py`) rather than leaving it as unused dead infrastructure,
+and reverted every config back to `num_workers:1`.
+
+While reverting the two eval scripts, found and fixed a real breakage this
+session's own `train.py` reorder had silently introduced: `val.py`/`test.py`
+both still did `device, local_rank = init_dist(args)`, but `init_dist` had
+been changed (in the fork-after-CUDA-init fix above) to return only
+`local_rank`, with CUDA binding split out into the new `set_cuda_device`.
+Neither script has any local test coverage that actually calls `main()`
+(both need a real GPU/Slurm environment), so this shipped silently until
+caught while making this change. Fixed by applying the exact same reorder
+`train.py` already got: both scripts now build their `eval_dataloader`
+(and force its worker pool to fork, via a bare `iter(eval_dataloader)`,
+whenever `num_workers > 0`) *before* calling the new `set_cuda_device`,
+instead of after `get_model` as before -- so the two eval entry points get
+the same fork-after-CUDA-init protection `train.py` does, not just a fix
+for the immediate crash.
+
+`training.py`'s `get_batch` error-wrapping message (added alongside the
+original `num_workers:0` workaround) was updated to match: it no longer
+recommends `num_workers:0` as the primary fix, since the DataLoader-before-
+CUDA-init ordering should make the underlying race unreachable through
+`train.py`/`val.py`/`test.py` now -- it points at checking that ordering
+first, with `num_workers:0` demoted to a last-resort mention.
+
+**Tier 1 coverage:** removed the 2 `multiprocessing_context` tests from
+`test_config_validation.py` (nothing left to default/thread through).
+`test_get_batch.py`'s existing 3 tests (unaffected by the message wording
+change, since they only assert on stable substrings like `"exited
+unexpectedly"`/`"num_workers"`, not the removed `"Try setting
+dataloader.num_workers"` exact phrase) still pass. Full local suite: 254
+passed (down from 256, the 2 removed tests), 4 skipped, 0 failures.
+
+Like the fix above, whether removing `num_workers:0` actually holds up
+without the segfault returning can only be confirmed on real Frontier runs
+of the affected configs -- not yet done.
+
+### Follow-up: moved `launch/val.sh`/`launch/test.sh` to `launch/eval/`
+
+Raised while working in this area: the two generic eval launch scripts lived
+directly under `launch/`, one directory shallower than the per-dataset
+training launch scripts (`launch/[DATASET]/*.sh`), so their relative path to
+`configs/`/`training_scripts/` was `../` instead of the training scripts'
+`../../` -- an easy trap when copy-pasting a `sbatch` invocation between the
+two. Moved both (`git mv`) to a new `launch/eval/` directory, matching the
+training launch scripts' depth, and updated their internal `../` ->
+`../../` paths, usage comments, and the walkthrough in the top-level
+`README.md` to match.
+
+### Added `parallelism.simple_ddp_size: "auto"`
+
+Raised while working in this area: training runs often use more nodes than
+the `val.py`/`test.py` runs evaluating their checkpoints, but
+`simple_ddp_size` was always a fixed integer that has to exactly satisfy
+`fsdp_size * simple_ddp_size * tensor_par_size == world_size` -- switching
+node counts between a training launch and its eval launches meant
+hand-editing the config (or maintaining separate copies) every time, even
+though `fsdp_size`/`tensor_par_size` are normally architecture choices that
+don't change with node count at all.
+
+`parse.py`'s `PARALLELISM` section now accepts the literal string `"auto"`
+for `simple_ddp_size`: resolves to `dist.get_world_size() // (fsdp_size *
+tensor_par_size)` -- fsdp/tensor-parallel sizes stay fixed, simple_ddp_size
+fills whatever's left of the actual launch's world_size. Opt-in via the
+literal string (not a new default) so every existing config with a real
+integer keeps parsing identically. Two failure modes get clear, explicit
+assertions rather than a bare `ZeroDivisionError`/silently-wrong value:
+`world_size` not evenly divisible by `fsdp_size * tensor_par_size`, and
+`"auto"` used under `load_balance_offline=True` (`utils/load_balance.py`'s
+offline precompute path has no live process group to read `world_size`
+from at all).
+
+**Tier 1 coverage:** `test_config_validation.py` gained 5 tests --
+`"auto"` correctly divides out both `fsdp_size` and `tensor_par_size`
+(two separate tests, monkeypatching `torch.distributed.get_world_size`
+rather than needing a real multi-rank launch), the not-evenly-divisible
+case raises clearly, `load_balance_offline=True` raises clearly, and an
+explicit integer's behavior is unaffected by `"auto"`'s existence.
+
+#### Follow-up: `"auto"` gated on the wrong condition -- caught by actually using it
+
+Switched all 9 `unetr_token_selection_experiment` configs to
+`simple_ddp_size: "auto"` and immediately broke `test_shipped_config_parses`
+for every one of them. Root cause: `"auto"`'s guard asserted `not
+load_balance_offline`, on the assumption that `load_balance_offline=True`
+meant "no live process group exists." False -- `utils/validate_config.py`
+(which both `test_shipped_config_parses` and the standalone
+`validate_config.py` CLI tool call) always calls `init_single_process_dist()`
+first, so it *does* have a live (single-process, world_size=1)
+`torch.distributed` group by the time `parse_config(..., load_balance_offline=True)`
+runs. `load_balance_offline` only means "skip the world_size *consistency*
+assert further down" -- a genuinely different thing from "is there a group
+to read `world_size` from at all," which only `utils/load_balance.py`'s
+standalone precompute script actually lacks (it never initializes one).
+
+Fixed by gating on the real precondition, `dist.is_initialized()`, instead
+of `load_balance_offline`. Under `validate_config`'s single-process group,
+`"auto"` now resolves against `world_size=1` and parses successfully (same
+as any other config, since the later consistency assert is still skipped
+under `load_balance_offline=True` regardless) -- it doesn't need to match
+the real training launch's world_size to be valid syntax, same as every
+already-shipped config with an explicit `simple_ddp_size` integer that
+doesn't happen to equal 1 either.
+
+**Tier 1 coverage:** replaced the old
+`test_simple_ddp_size_auto_raises_under_load_balance_offline` (which could
+no longer actually trigger the failure it claimed to, now that the guard
+changed) with `test_simple_ddp_size_auto_raises_with_no_live_process_group`
+(monkeypatches `torch.distributed.is_initialized` to `False` -- the one
+real Frontier caller with no live group at all, `utils/load_balance.py`) and
+`test_simple_ddp_size_auto_works_under_load_balance_offline_with_live_group`
+(the `validate_config.py` case: `load_balance_offline=True` *and* a live
+group -- must resolve, not raise). Full local suite: 260 passed, 4 skipped,
+0 failures, including `test_shipped_config_parses` for all 9
+`unetr_token_selection_experiment` configs now using `"auto"`.
+
+### Replaced the `launch/eval/` directory-depth workaround with resolving config paths against the repo root in `parse.py`
+
+Moving `val.sh`/`test.sh` into `launch/eval/` (see the earlier "moved
+`launch/val.sh`/`launch/test.sh` to `launch/eval/`" entry) fixed the
+symptom -- config files' relative paths (`trainer.checkpoint_path`,
+`inference_output.output_dir`) are written relative to the repo root, and
+only resolved correctly because `launch/eval/` happened to sit exactly as
+many directories below the repo root as `launch/[DATASET]/` does. That's
+fragile: any future script (a new user's own eval tool, something launched
+from an IDE, a script nested one level deeper) breaks the same way again,
+silently -- there's no error, just files written/read from the wrong place.
+
+First attempt: a new `UCF_VIT.utils.misc.chdir_to_repo_root()`, called by
+`training_scripts/train.py`/`val.py`/`test.py` and `utils/load_balance.py`
+right after parsing CLI args, changing the whole process's working
+directory to the repo root before any config-relative path was ever read.
+Raised two problems before it shipped: (1) it creates a second "reference
+point" a user has to track -- SLURM log files (`#SBATCH -o`/`-e`) still
+land in the *submission* directory (resolved by SLURM before the job's
+script or the Python process even starts, entirely unaffected by a later
+`os.chdir()` inside that process), while checkpoints now land at the repo
+root -- two different answers to "where do my outputs go" for the same
+job, previously just one; (2) `os.chdir()` is a global, process-wide side
+effect that silently changes the meaning of *every* relative path
+operation anywhere in the codebase, not just the two fields it was meant
+to fix -- a much wider blast radius than necessary, and nothing audited
+whether anything else relied on the old cwd.
+
+Replaced with a narrower fix: resolve `trainer.checkpoint_path` and
+`inference_output.output_dir` explicitly, in `parse_config` itself, by
+joining them with the new `UCF_VIT.utils.misc.find_repo_root()` (computed
+from *its own* fixed location -- `src/UCF_VIT/utils/misc.py` is always
+exactly 3 directories below the repo root -- rather than the caller's, so
+any script gets the right answer just by calling it). `os.path.join`
+discards the first argument whenever the second is already absolute, so
+this is a no-op for anyone who sets an absolute `checkpoint_path`
+deliberately (e.g. pointing at scratch storage outside the repo).
+`parse_pretrained_config`'s own separately-`yaml.load`ed pretrained config
+(never routed through `parse_config`'s own `trainer_conf` construction)
+needed the identical fix applied a second time, at its own read site.
+`chdir_to_repo_root()` and the CLI-arg-absolutizing code in the 4 scripts
+that briefly called it were removed entirely -- the process's own working
+directory is never touched now, so every *other* relative path a script
+might use behaves exactly like it always did, and only these two config
+fields get the repo-root treatment.
+
+**Tier 1 coverage:** `test_misc.py` keeps 2 `find_repo_root` tests (it
+actually resolves to the real repo root, and is stable across different
+starting `cwd`s) and drops the `chdir_to_repo_root` test entirely (nothing
+left to test -- the process's `cwd` is never touched). The 3 existing
+`inference_output` tests in `test_config_validation.py` were updated to
+expect `output_dir` as an absolute path (`os.path.join(find_repo_root(),
+...)`) instead of the bare relative string. Full local suite: 262 passed,
+4 skipped, 0 failures.
+
+### Fixed a real, severe pre-existing bug: `process_batch` was calling `iter(dataloader)` on every batch, not once per epoch
+
+Reported directly by the user: a real SAP training run on Frontier was
+taking a very long time to reach the first batch -- clearly slower than
+before this session's dataloader changes. Traced to `training.py`'s
+`process_batch`, which has *always* (this predates the whole
+`persistent_workers`/`epoch_shuffle_seed` effort) called `it_loader =
+iter(train_dataloader)` fresh on every single batch, not once per epoch --
+`train_epoch`'s `while counter < iterations_per_epoch:` loop calls
+`process_batch` once per batch, and `process_batch` rebuilt the iterator
+every time it ran.
+
+Under the old design (`num_workers:0`, no `persistent_workers`, no
+`epoch_shuffle_seed`) this was wasteful but cheap -- `iter()` on a
+`num_workers:0` `DataLoader` just wraps the dataset, no real state to
+discard. Once this session's fork-after-CUDA-init fix made
+`persistent_workers:True` real (`num_workers:1` restored everywhere) and
+moved the per-epoch reshuffle into `FileReader.__iter__` (see
+`epoch_shuffle_seed` above), the exact same per-batch call became
+catastrophic: `DataLoader.__iter__()` on a `persistent_workers:True` loader
+calls `_reset()`, which discards whatever's already prefetched/in-flight
+and re-invokes the underlying `IterableDataset.__iter__()` from scratch --
+including a full `epoch_shuffle_seed` reshuffle of the entire file list.
+So every batch was: discard in-flight prefetch -> reshuffle the whole file
+list -> restart `ShuffleIterableDataset`'s buffer fill from empty. For
+`SAP` specifically (real octree construction over full 3D volumes, the
+heaviest per-sample cost of any shipped config, per its own config
+comments), that's expensive enough to make training visibly stall.
+
+Fixed by making `process_batch` accept an already-built `it_loader`
+instead of building its own: `train_epoch`/`eval_epoch` each now build the
+iterator exactly once, before their batch loop, and pass it through for
+every batch that epoch -- the standard, correct `DataLoader` usage pattern.
+
+**Immediate follow-up, same session:** `train.py`/`val.py`/`test.py`'s own
+pre-CUDA-init warm-up `iter(dataloader)` call (forces the persistent
+worker pool to fork before `set_cuda_device`, see "Fixed the
+fork-after-CUDA-init segfault at its root" above) had the same discard-and-
+redo problem one level up: iterating a `DataLoader` queues real prefetch
+work immediately (not just the fork), so throwing that iterator away and
+letting `train_epoch`'s first real epoch build a fresh one wasted one full
+reshuffle-and-buffer-fill cycle at startup. Fixed by threading an optional
+`it_loader` parameter through `train_epoch`/`eval_epoch`: the three launch
+scripts now keep their warm-up iterator (renamed `warm_it_loader`) and
+pass it through for `epoch_start` (`train.py`) or the single eval pass
+(`val.py`/`test.py`), instead of discarding it -- every epoch after
+`epoch_start` still builds its own fresh iterator as normal.
+
+**Tier 1 coverage:** `test_eval_epoch.py` gained a test that passes a real,
+independent `it_loader` alongside an `eval_dataloader` stub that raises if
+`iter()` is ever called on it -- directly proving `it_loader`, when given,
+is used as-is rather than rebuilt. `test_forward_step.py`/`test_get_batch.py`
+(which exercise `process_batch`/`get_batch` at the `it_loader` layer
+directly) needed no changes, since their fakes already behaved as
+already-constructed iterators. Full local suite: 263 passed, 4 skipped, 0
+failures.
+
+Like everything else in this dataloader effort, whether this actually
+resolves the real slowdown can only be confirmed by the user re-running
+the real SAP job on Frontier -- not yet done.
+
+## Running the distributed (Tier 2) tests
+
+```bash
+cd launch/tests
+sbatch run_distributed_tests.sh
+```
+
+This requests 1 node / 8 GPUs (matching every other script in `launch/`) and
+runs `srun -n 8 python -m pytest ../../tests/distributed/ -v` — each of the 8
+tasks is an independent pytest process, one per rank, all running the same
+test files. `tests/distributed/conftest.py` initializes an NCCL process group
+per-process from `SLURM_PROCID`/`SLURM_NTASKS`/`SLURM_LOCALID` (the same env
+vars `training_scripts/train.py`'s `init_dist` uses), so no `torchrun` wrapper
+is needed. Output lands in `pytest-distributed-<jobid>.out` in that directory.
+
+**Covered today:**
+
+| File | Covers |
+| --- | --- |
+| `tests/distributed/test_smoke.py` | Basic connectivity: rank/world_size sanity, a plain `all_reduce`. Check this first if anything else fails — it isolates launch/environment problems from actual `UCF_VIT` bugs. |
+| `tests/distributed/test_init_par_groups.py` | `init_par_groups`'s process-group membership (world size and this rank's local rank within each of the 5 returned groups), across several `tensor_par_size`/`fsdp_size`/`simple_ddp_size` splits of the job's actual world size. |
+| `tests/distributed/test_dist_functions.py` | Forward (and, for `all_reduce`/`broadcast`, backward) correctness of the collective autograd ops most exercised by tensor parallelism: `all_reduce`, `broadcast`, `all_gather`, `gather`, `F_Identity_B_AllReduce`, `F_AllReduce_B_Identity`. |
+| `tests/distributed/test_tensor_parallel_correctness.py` | Numerical correctness of `Mlp`/`Attention`'s real `tensor_par_size > 1` forward **and backward** pass: given weights sliced from an identical `tensor_par_size=1` reference module (via `UCF_VIT.utils.misc.shard_mlp_state_dict`/`shard_attention_state_dict`) and an identical input, checks the sharded forward pass (across real 2/4/8-rank tensor-parallel groups, using real `F_Identity_B_AllReduce`/`F_AllReduce_B_Identity`/`dist.all_reduce` collectives) matches the reference's output within `float32` tolerance. The backward tests additionally check, after a non-uniform-weighted `.sum().backward()`: the input's gradient (should already be fully all-reduced by `F_Identity_B_AllReduce`'s backward); each sharded parameter's gradient against the corresponding slice of the reference's full gradient (reusing the same, already-verified `shard_*_state_dict` slicing on the gradient tensors); and the unsharded `fc2.bias`/`proj.bias` gradient (same value on every rank, by linearity of the forward all-reduce-sum). Model-level only (not the full training loop/FSDP/checkpointing pipeline) — deliberately targets the exact class of bug found earlier this session in `training.py`'s `process_batch` and `arch.py`'s `_pos_embed`, which only a real multi-rank launch can exercise. |
+| `tests/distributed/test_fsdp_correctness.py` | Numerical correctness of a small stack of real `Block`s wrapped in PyTorch's own FSDP with `sharding_strategy=FULL_SHARD` (`fsdp_size > 1`, `tensor_par_size=1`) against an identically-seeded, unwrapped reference, forward **and backward** — mirrors `model/utils.py`'s `get_model` `FULL_SHARD` branch exactly (same `FSDP(...)` call shape, `transformer_auto_wrap_policy` targeting `Block`), but with a `float32` `MixedPrecision` policy for a tight tolerance instead of production's `bfloat16`. The backward test checks the input's gradient directly (never sharded, no FSDP-specific handling needed) and every parameter's gradient via `FSDP.summon_full_params(..., with_grads=True)` (the documented way to materialize FSDP's internally-sharded gradients for inspection) against the reference. Combined `fsdp_size > 1` + `tensor_par_size > 1` (`HYBRID_SHARD`) is covered separately by `test_hybrid_shard_correctness.py` below. |
+| `tests/distributed/test_hybrid_shard_correctness.py` | Numerical correctness of the combined `fsdp_size > 1` + `tensor_par_size > 1` case — production's `HYBRID_SHARD` branch — forward **and backward**. A small stack of real `Block`s is built with real tensor-parallel sharding (weights sliced via `shard_attention_state_dict`/`shard_mlp_state_dict`, same as `test_tensor_parallel_correctness.py`), then wrapped in FSDP with `sharding_strategy=HYBRID_SHARD` (`process_group=(fsdp_group, simple_ddp_group)`), and checked against an identically-seeded, unwrapped, unsharded reference. Scoped to the one `(tensor_par_size, fsdp_size, simple_ddp_size)` triple with all three `> 1` that fits this repo's 8-rank `run_distributed_tests.sh` launch: `(2, 2, 2)`. The backward test combines both siblings' techniques: `FSDP.summon_full_params(..., with_grads=True)` undoes FSDP's own sharding, then the resulting (still tensor-parallel-sized) gradients are checked against the reference using the same `shard_*_state_dict`-based slicing `test_tensor_parallel_correctness.py`'s backward tests already verified. |
+| `tests/distributed/test_dataloader_real_data.py` | `FileReader`'s DDP-rank sharding and `ShuffleIterableDataset`'s no-loss/no-duplication guarantee, against real `basic_ct` and `imagenet` file lists on Frontier and `torch.distributed.get_rank()` for real (not simulated) across all `world_size` ranks, across `num_workers` (0/1/4) and `buffer_size` (1/20/100) — the real-scale counterpart to `tests/dataloaders/test_dataset.py`'s simulated-rank coverage of the same `num_workers=0` fix. File I/O itself is stubbed out (`FileReader.read_process_file` monkeypatched to a no-op) so this stays fast and focused on correctness, not decode speed. |
+| `tests/distributed/test_epoch_shuffle_seed_real.py` | `epoch_shuffle_seed`'s cross-rank/cross-worker determinism (the property that lets a `persistent_workers:True` `DataLoader` be reused for a whole run instead of rebuilt every epoch — see "Fixed the fork-after-CUDA-init segfault at its root" above), against real `basic_ct` files and real ranks, across `num_workers` (0/1/4) and 3 real consecutive epochs. Drives the *same* `FileReader` instance(s) through multiple real `__iter__` calls (one `FileReader` per simulated worker, mirroring a real fork's independent per-worker copy) rather than building fresh ones per epoch — checks every epoch's shard stays disjoint across real ranks *and* real simulated workers within a rank, and that each rank's own shard actually changes from epoch to epoch (real reshuffling, not a frozen order). Deliberately doesn't spawn a real `num_workers > 0` `DataLoader` — this directory's own `dist_info` fixture already initializes CUDA/NCCL before any test runs, so a real fork here would be exactly the fork-after-CUDA-init hazard being tested against; see the module's own docstring. |
+| `tests/distributed/test_catsdogs_real_data.py` | The real production `DistributedSampler` + `DataLoader` + `CatsDogsDataset`/`CatsDogsCollate` wiring, against real CatsDogs JPEGs and real ranks — disjoint/complete file sharding across `num_workers` (0/1/4), and `adaptive_patching=True` against real photo content (not synthetic random-noise JPEGs, unlike `tests/datasets/test_catsdogs.py`), which actually exercises Canny edge detection on real image structure. Unlike the row above, file I/O is *not* stubbed — `CatsDogsDataset.__getitem__` has no meaningful decode-free path. |
+| `tests/distributed/test_dataloader_real_pipeline.py` | The full real pipeline — decode, tile, (for `basic_ct`) adaptive patch, collate — for `basic_ct`/`unetr`, `imagenet`/`classification`, and `catsdogs`/`classification`, each built via the exact real construction `train.py` itself uses for that dataloader type (`parse_config` + `calculate_load_balancing_on_the_fly` + `NativePytorchDataModule` for `basic_ct`/`imagenet`'s `iterative_dataloader`; a plain `CatsDogsDataset` + `DistributedSampler` + `DataLoader` for `catsdogs`'s `dataloader` type, which never touches the other two calls in production either). No stubbing anywhere; checks the actual decoded/collated batch (shapes, finite values, normalized ranges, valid label ranges, one-hot `seq_label` correctness for `basic_ct`'s real segmentation masks) rather than just sharding math. |
+| `tests/distributed/test_pretrained_loading_real.py` | The real, end-to-end pretrained-checkpoint-loading wiring — `parse_pretrained_config` building `p_conf`, `get_model` constructing `pretrained_model` at `p_conf`'s own (not the new model's) size, loading a real per-rank checkpoint file (`training.py`'s own `save_checkpoint` format), `extract_encoder_state_dict`/`_transplant_pos_embed`, and FSDP-wrapping the result — the integration layer `tests/model/test_pretrained_loading.py`'s Tier 1 tests deliberately bypass. Two cases: (1) same-architecture `VIT`→`VIT`, two small fully-synthetic configs (no real data files needed) at different, non-square `img_size`s (`[32,64]`→`[64,32]`); (2) cross-architecture `MAE`→`UNETR` (segmentation, `basic_ct`) at the same two sizes — the real production workflow, not just a resolution change on the same architecture, exercising `UNETR`'s own real kwargs (`feature_size`, `linear_decoder`) that case (1) never touches. Both check `get_model` returns an `FSDP`-wrapped model whose `pos_embed` shape matches the *new* config, whose task-specific head/decoder keeps the *new* model's own shape (not transplanted), and that a real forward+backward pass runs. Writing the first case surfaced two more real, previously-undiscovered, unconditionally-crashing bugs on top of the one found while planning it (`conf["pretrained_model"]["checkpoint_path"]` never populated) — see the narrative section below. |
+| `tests/distributed/test_eval_real_pipeline.py` | `val.py`/`test.py`'s two integration gaps not covered anywhere else: `get_model`'s `resume_from_checkpoint:True` load path (never previously run under a real distributed launch), and `eval_epoch`'s forward-only loop against a real, `FSDP`-wrapped model (Tier 1's `test_eval_epoch.py` only ever uses a fake model). One test: builds a fresh tiny synthetic `VIT`/`catsdogs` model, hand-writes a real-format checkpoint from its own state dict, reloads it via `get_model(resume_from_checkpoint=True)` and checks the resumed `epoch_start`/`loss_list`/every parameter match what was saved, then runs `eval_epoch` against it with a fake in-memory dataloader and checks the loss is finite and no parameter accumulated a gradient. Deliberately does not re-derive real narrowed dataloader/sharding coverage — that's `test_dataloader_real_pipeline.py`'s job, and `get_split_conf` feeds the exact same `calculate_load_balancing_on_the_fly`/`NativePytorchDataModule` construction that file already exercises with real data. |
+
+**Important constraint if you add more tests here**: `init_par_groups` and the
+`dist_functions.py` ops all make *collective* calls (`dist.new_group`,
+`dist.broadcast`, etc.), which every process in the job must call in the same
+order. Since each rank runs its own independent pytest process (there's no
+cross-process pytest coordination here), any test skip/parametrize decision
+must depend only on values that are identical across ranks and available
+before any process has connected — i.e. `SLURM_NTASKS`/world size, never this
+rank's own `SLURM_PROCID`. Both existing test files follow this pattern
+(see the module docstrings); breaking it will hang or crash the job, not just
+fail a test.
+
+Verified with a real 1-node/8-GPU run on Frontier (job 5314922): all 14
+tests passed on all 8 ranks. (An earlier run, job 5314802, caught a real bug
+first — `tests/conftest.py`'s autouse fixture was also firing for
+`tests/distributed/` since it's a parent directory, racing this directory's
+own multi-process init and making every test error out at setup with
+"trying to initialize the default process group twice!"; fixed in
+`tests/conftest.py`, see its docstring.) If something fails after a future
+change, `test_smoke.py`'s result tells you whether to look at the
+environment or at the specific collective's logic.
+
+`test_dataloader_real_data.py` (added later, alongside the `FileReader`
+`num_workers=0` DDP-sharding fix) bumps the sbatch time limit to 10 minutes
+(from 5) since it's 2 datasets x 3 `num_workers` x 3 `buffer_size` = 18
+parametrized cases. It covers both `basic_ct` (where the `num_workers=0` fix
+specifically mattered — `basic_ct/sap` and `basic_ct/unetr` shipped with
+`num_workers: 0` at the time; both now ship `num_workers: 1` as part of this
+session's config-baseline reconfiguration) and `imagenet` (a meaningfully different code path in
+`process_root_dirs`, per-class bucketing rather than a flat file listing,
+though every shipped `imagenet` config uses `num_workers: 1` so wasn't
+actually broken); `imagenet`'s real directory can be on the order of a
+million files, so its file list here is deliberately narrowed to the first
+few real class subdirectories (`IMAGENET_MAX_CLASSES` in the test file) —
+same "real data, just less of it" principle as Tier 3's
+`create_narrow_catsdogs_dir`. `num_workers > 0` combines a real DDP rank
+with a *simulated* per-worker split (monkeypatched
+`torch.utils.data.get_worker_info`, same technique as Tier 1), rather than
+spawning real DataLoader multiprocessing workers — real ranks are what Tier
+1 could only simulate and is the part that was actually broken; real
+multiprocess workers under an already-NCCL-initialized process add real
+complexity (CUDA-after-fork concerns) without testing anything Tier 1 didn't
+already cover for the per-worker-split math itself. Each combination also
+round-trips this rank's real shard through `ShuffleIterableDataset` at the
+given `buffer_size` and checks the result is set-identical to the
+unshuffled shard (no loss/duplication), reusing Tier 1's synthetic-data
+invariant against real files instead. If a given `(num_workers,
+buffer_size)` combination needs more real files than are actually available,
+that combination is skipped rather than failed — see the test's docstring
+(in practice this doesn't trigger: `Tr8_Training` turned out to have 852
+real file pairs, not the ~8 its name suggests).
+
+`test_epoch_shuffle_seed_real.py` (added later, alongside the fork-after-
+CUDA-init fix's `epoch_shuffle_seed` mechanism) reuses
+`test_dataloader_real_data.py`'s established real-basic_ct-file-list/
+monkeypatched-worker-info pattern, but drives the *same* `FileReader`
+instance(s) through `NUM_EPOCHS=3` real, consecutive `__iter__` calls
+instead of pulling one shard and stopping -- the specific gap `epoch_shuffle_
+seed` left uncovered on real hardware (Tier 1's synthetic-data tests already
+cover the seeding logic itself; `test_dataloader_real_data.py` predates
+`epoch_shuffle_seed` and never exercises more than one simulated epoch per
+`FileReader` instance). One `FileReader` per simulated worker (not one
+shared instance re-iterated), matching how a real fork gives each worker
+process its own independent copy with its own independent `_epoch` counter.
+Checks, per epoch: no two simulated workers within a rank overlap, no two
+real ranks overlap (`dist.all_gather_object`, same collective-ordering
+discipline as the sibling file -- the skip guard and the number of
+`all_gather_object` calls both depend only on `world_size`/`num_workers`,
+identical across ranks, never anything rank-specific), and total coverage
+stays within the expected floor-division bounds -- then, across all 3
+epochs, that this rank's own shard actually differs from the previous
+epoch's (real reshuffling, not a frozen order). Not yet run on Frontier --
+sanity-checked locally against synthetic files and a single-process `gloo`
+group (world_size=1, same fixture `tests/conftest.py` provides), but that
+can't exercise the real multi-rank property the test actually exists to
+check.
+
+`test_catsdogs_real_data.py` is a different kind of check: `catsdogs` is the
+only shipped dataset using
+`dataloader.type: "dataloader"`, sharded by PyTorch's own
+`DistributedSampler` rather than any UCF_VIT-custom logic like
+`FileReader`'s — so there's no known bug to regression-test the way there
+was for `test_dataloader_real_data.py`. Its value is confirming the real
+production wiring (`train.py`'s exact
+`DistributedSampler(..., num_replicas=data_par_size, rank=world_rank)` +
+`DataLoader(..., num_workers=...)` + `CatsDogsCollate` construction) works
+end to end against real files, real ranks, and — for `adaptive_patching`
+specifically — real photo content, since Canny edge detection on an actual
+photo exercises real image structure that
+`tests/datasets/test_catsdogs.py`'s synthetic random-noise JPEGs can't.
+Narrows the real `CatsDogs` directory to an exact multiple of `world_size`
+real files (`FILES_PER_RANK * world_size`) so `DistributedSampler`'s default
+`drop_last=False` padding (which repeats samples to round up to a multiple
+of `num_replicas`) never kicks in, keeping the disjointness check
+unambiguous. File reads are *not* stubbed here, unlike
+`test_dataloader_real_data.py` — `CatsDogsDataset.__getitem__` has no
+meaningful decode-free path, and real decode against a handful of narrowed
+files is fast enough not to need it.
+
+Both files verified with a real 1-node/8-GPU run on Frontier (job 5321217):
+all 36 tests passed on all 8 ranks (the original 14 plus these two files'
+18 + 4 new parametrized cases) in 28s.
+
+`test_dataloader_real_pipeline.py` (added later, not yet run on Frontier)
+closes what was, as of this session, the biggest remaining gap in
+dataloader test coverage: every other real-data test above deliberately
+stubs out file I/O to stay fast and focus on sharding correctness, so
+nothing previously decoded a real file and checked what came out the other
+end of `TileDataIter`/`ProcessChannels`/`collate_fn`. This file does exactly
+that, with no stubbing, for `basic_ct/unetr` (real NIfTI decode, the
+baseline config -- no tiling/adaptive patching -- and real segmentation
+labels -- the other gap flagged this session, since
+`test_dataloader_real_data.py` only ever globs `imagesTr`, never
+`labelsTr`), `imagenet/classification` (real JPEG decode +
+resize, real classification labels), and `catsdogs/classification` (also
+real JPEG decode + resize + classification labels, but a completely
+different production code path — `dataloader.type: "dataloader"`, not
+`"iterative_dataloader"`). Rather than hand-assembling
+`FileReader`/`TileDataIter`/`ProcessChannels`/`collate_fn` (or, for
+`catsdogs`, `CatsDogsDataset`/`CatsDogsCollate`) a third or fourth time, each
+config is built via the exact real construction `train.py` itself makes for
+its dataloader type: `parse_config` + `calculate_load_balancing_on_the_fly`
++ `NativePytorchDataModule` for `basic_ct`/`imagenet` — skipping only the
+model/optimizer/training-loop parts this file has no need for — or, for
+`catsdogs`, a plain `CatsDogsDataset` + `DistributedSampler` + `DataLoader`
+straight from `parse_config`'s real output, since production never calls
+`calculate_load_balancing_on_the_fly`/`NativePytorchDataModule` at all for
+`dataloader.type: "dataloader"`. Narrowing is reused rather than
+reimplemented too: Tier 3's `compute_narrow_dict_idx` for
+`basic_ct`/`imagenet`, its `create_narrow_catsdogs_dir` for `catsdogs`. All
+three configs' real `parallelism` settings (`data_par_size=8`,
+`tensor_par_size=1`) already exactly match this file's real 8-rank launch,
+so unlike Tier 3's smoke test, no parallelism overrides are needed anywhere.
+Building `catsdogs`'s version through real `parse_config` output (rather
+than `test_catsdogs_real_data.py`'s hand-picked constants) also gives free
+regression coverage for the `num_channels` dict-vs-int `train.py` wiring bug
+fixed earlier this session (see `tests/datasets/test_catsdogs.py`'s module
+docstring) — a wrong argument there surfaces here as a real crash.
+
+`compute_narrow_dict_idx`'s `min_files` means something different across the
+`iterative_dataloader` datasets, which the test accounts for with separate
+constants: for `basic_ct` (one `dict_root_dirs` key) it's a total file count
+that `FileReader`'s own sharding then divides across ranks; with the
+baseline config's `do_tiling=False`/`twoD=False`, each real file is exactly
+one sample (no tiling/z-slice multiplication), so `min_files` must directly
+cover `batch_size * NUM_BATCHES_TO_CHECK * data_par_size` real files total
+(`BASIC_CT_MIN_FILES = 512`), the same reasoning as `catsdogs` below. For
+`imagenet`, `process_root_dirs` already buckets real files one bucket per
+rank *before* `min_files` narrows within each bucket — so `min_files` there
+must directly cover `batch_size * NUM_BATCHES_TO_CHECK` real images per rank
+(`IMAGENET_MIN_FILES = 100`, comfortably above `32 * 2 = 64`), not just per
+dataset. `catsdogs`'s
+`create_narrow_catsdogs_dir` has its own, different floor
+(`max(min_files, batch_size * data_par_size)`), so `CATSDOGS_MIN_FILES` is
+set explicitly to `batch_size * NUM_BATCHES_TO_CHECK * data_par_size` rather
+than relying on that floor to happen to be enough. Getting any of these
+wrong doesn't error loudly — it just silently returns fewer batches than
+expected, caught here by asserting the exact batch count pulled.
+
+Verified locally against fabricated NIfTI/JPEG files structured to match
+the real directories (single-process, `parallelism` scaled to
+`world_size=1` so `parse_config`'s real-world-size assertion holds without
+needing 8 real ranks) before ever touching real Frontier data — all three
+configs' full chain (decode through collate) produces correctly-shaped,
+finite, correctly-ranged batches.
+
+`test_tensor_parallel_correctness.py` and `test_fsdp_correctness.py` (added
+later, real multi-rank numerical-correctness checks for `tensor_par_size >
+1` and `fsdp_size > 1` respectively — see their own module docstrings and
+their `tests/utils/test_misc.py` weight-slicing-helper coverage above). Both
+`importorskip` cleanly in any environment without `timm`/`monai`/`xformers`
+installed, confirmed locally. Run `run_distributed_tests.sh` to exercise
+them for real; if either file's tolerance (`rtol`/`atol`) turns out too
+tight, retune and rerun.
+
+First real run (job 5339980) found a real bug in `test_fsdp_correctness.py`
+itself, not production code: `init_par_groups` was called with
+`data_par_size=fsdp_size` for every `fsdp_size` value, but `data_par_size`
+must span the *entire* world when `tensor_par_size=1` (production's own
+`parse.py` asserts `data_par_size*tensor_par_size == world_size`) — passing
+just `fsdp_size` (2 or 4, both < `WORLD_SIZE:8`) left every rank outside
+`range(fsdp_size)` with `fsdp_group=None`, so those ranks' `FSDP(...,
+process_group=None, ...)` call silently fell back to the world-default
+8-rank group instead — a real size mismatch against the `fsdp_size`-rank
+group the other ranks got, for the *same* nominal wrap call. This aborted
+Frontier's real run with a fatal `Aborted` signal inside FSDP's own
+`_move_states_to_device`, mid-`fsdp_size=2` for most ranks (2 of 8 ranks —
+the ones inside the real subgroup — did print `PASSED` first). Fixed by
+passing `data_par_size=WORLD_SIZE` and `simple_ddp_size=WORLD_SIZE //
+fsdp_size` (not `1`), which makes `init_par_groups` actually partition the
+full 8-rank world into `WORLD_SIZE // fsdp_size` independent, symmetric
+`fsdp_size`-rank FULL_SHARD groups. `test_tensor_parallel_correctness.py`'s
+own `init_par_groups` call already derived `data_par_size = WORLD_SIZE //
+tensor_par_size` correctly and needed no change. Neither
+`test_init_par_groups.py` nor `test_tensor_parallel_correctness.py` (later
+alphabetically) got to run at all in that job — the whole `srun` step was
+cancelled once one rank aborted. Fixed locally (full Tier 1 suite green,
+153 passed) — verified against real Frontier data by job 5341031 below
+(confirmed working: no more abort, all `fsdp_size` values pass).
+
+Second real run (job 5341031), after that fix: `test_fsdp_correctness.py`
+passed for real (all `fsdp_size` values, no more abort), and
+`test_mlp_tensor_parallel_forward_matches_reference` passed too, but
+`test_attention_tensor_parallel_forward_matches_reference` failed for
+every `tensor_par_size` (2, 4, 8) with ~99.9% of elements mismatched
+(`Greatest relative difference: 719...`) — not a tolerance problem, a real
+correctness bug. Found in `UCF_VIT.utils.misc.shard_attention_state_dict`
+itself (not production `Attention` code, which never needs to convert a
+`tensor_par_size=1` reference's weights into a sharded set — only this
+test's helper does): `qkv`'s output (dim 0, size `dim * 3`) is 3
+contiguous `dim`-sized blocks (Q, K, V), each internally split into
+`num_heads` head-groups, and `Attention.forward` reshapes each rank's own
+`qkv` output as `(3, num_heads // tensor_par_size, head_dim)` — meaning
+every rank's shard must be the *same* head range from each of Q, K, and V
+independently. `shard_attention_state_dict` instead took one flat
+contiguous row-slice of the whole `dim * 3`-sized output, which — for
+`tensor_par_size:2`, `dim:64` — gives rank 0 all of Q plus the first half
+of K, and rank 1 the second half of K plus all of V: a completely
+different (and wrong) partition. `proj`'s column-slice (dim 1) was
+already correct as a plain contiguous chunk, since head ranges are
+assigned to ranks in contiguous order and `proj`'s input columns are
+head-major, so the two coincide there — only `qkv` needed the fix. Fixed
+by adding a required `num_heads` parameter (not derivable from the state
+dict's shapes alone) and slicing each of the 3 Q/K/V blocks by head range
+before re-concatenating. `tests/utils/test_misc.py`'s
+`test_shard_attention_state_dict_reconstructs_full_weights` had not
+caught this: concatenating any contiguous partition back together always
+reconstructs the original tensor via `torch.cat`, regardless of whether
+the partition boundaries have the right *semantic* meaning, so it exercised
+none of the actual bug. Replaced with
+`test_shard_attention_state_dict_slices_qkv_by_head_range_not_flat_chunk`,
+which reimplements the expected head-range reshape independently and
+checks each shard against it directly, and
+`test_shard_attention_state_dict_reconstructs_full_proj_weight` (the old
+test's still-valid `proj.weight` assertion, split out on its own since
+`proj`'s slicing didn't need the same treatment). Fixed locally (full
+Tier 1 suite green, 156 passed).
+
+Third real run (job 5341143), after the `shard_attention_state_dict` fix:
+**all 8 ranks report 49 passed, 0 failed** — `test_fsdp_correctness.py`,
+`test_tensor_parallel_correctness.py` (`Mlp` and now `Attention` too, all
+of `tensor_par_size` 2/4/8), and every other file in `tests/distributed/`
+all pass cleanly on real Frontier data. Both new correctness test files
+are now fully verified for real, closing out this round of Tier 2 work.
+
+### Major finding while scoping a combined `fsdp_size > 1` + `tensor_par_size > 1` test
+
+While investigating how to build that deferred test (which needs to
+construct a real `Block`/`VIT`-family model with `tensor_par_size > 1` the
+same way production does, to wrap in `HYBRID_SHARD` FSDP), found that
+**`model/utils.py`'s `get_model` never actually wires `tensor_par_size`/
+`tensor_par_group` into the model it builds.** `model_arch(...)`'s
+constructor call (and the `use_pretrained_model` path's
+`pretrained_model_arch(...)` call) only passes `**conf['model']['kwargs']`
+plus a fixed list of other kwargs — never `tensor_par_size`/
+`tensor_par_group` — and `conf['model']['kwargs']` (built by `parse.py`'s
+`get_kwargs`) never sets them either. So every `VIT`/`SAP`/`MAE`/`UNETR`/
+`DiffusionVIT` instance built by `get_model` fell back to the class
+defaults (`tensor_par_size=1, tensor_par_group=None`) **regardless of
+`conf["parallelism"]["tensor_par_size"]`.**
+
+Practical effect: every `if self.tensor_par_size > 1:` guard throughout
+`arch.py`/`building_blocks.py` (the real `Attention`/`Mlp` sharding, MAE's
+noise-mask broadcast, etc.) never fired in production. The model was built
+at full, unsharded size on every rank — `training.py`'s `process_batch`
+still correctly distributed data according to the real `tensor_par_group`
+(wired directly from `train.py`, not through `get_model`), so
+`tensor_par_size > 1` configs ran to completion with no crash — which is
+exactly why every `+tensor_par` cell in the Tier 3b feature-matrix passed
+— but did **zero actual model-parallel sharding**: pure redundant compute
+plus broadcast overhead, not real tensor parallelism. This has presumably
+been true since tensor parallelism was first added to this repo, and is
+unrelated to any of this session's other fixes.
+
+Fixed by passing `tensor_par_size=conf["parallelism"]["tensor_par_size"]`
+and `tensor_par_group=tensor_par_group` (already an existing `get_model`
+parameter) to both `model_arch(...)` call sites. Fixed locally (full Tier
+1 suite green, 156 passed) — **not yet verified against real Frontier
+data.** This is a much bigger behavioral change than the earlier fixes in
+this file (those were data-plumbing bugs; this changes whether the model
+itself shards at all for the first time), so every `tensor_par_size > 1`
+config — including every already-passing `+tensor_par` Tier 3b cell and
+the whole Tier 2 distributed suite — needs a fresh real run to check for
+fallout: real sharded `Attention`/`Mlp` layers, actually exercised for the
+first time by the full `train.py` pipeline, may surface new bugs that
+running full-size unsharded models never could.
+
+### Backward-pass coverage added to both correctness test files
+
+Both `test_tensor_parallel_correctness.py` and `test_fsdp_correctness.py`
+were forward-pass-only until now (every model call wrapped in
+`torch.no_grad()`) — correct forward output says nothing about whether
+gradients are synchronized correctly across the parallel group during
+backprop, which is what `F_Identity_B_AllReduce`/`F_AllReduce_B_Identity`
+(tensor parallelism's hand-rolled autograd functions) and FSDP's own
+gradient reduce-scatter actually exist to do; a bug there wouldn't crash
+training, just silently corrupt gradients. Added
+`test_mlp_tensor_parallel_backward_matches_reference`,
+`test_attention_tensor_parallel_backward_matches_reference`, and
+`test_fsdp_full_shard_backward_matches_reference` — see the updated Tier 2
+table entries above and each test's own docstring for exactly what's
+compared and why. Fixed/added locally (full Tier 1 suite green, 156
+passed unchanged — these are all-new Tier 2 files that skip cleanly via
+`importorskip` locally).
+
+First real run (job 5341269): `test_mlp_tensor_parallel_backward_
+matches_reference` and `test_attention_tensor_parallel_backward_
+matches_reference` both **passed for real** (all `tensor_par_size`
+values) — the gradient-slicing reuse of `shard_mlp_state_dict`/
+`shard_attention_state_dict` and the unsharded-bias/input-gradient
+reasoning both check out. `test_fsdp_full_shard_backward_matches_
+reference` failed for every `fsdp_size`, but at the
+`FSDP.summon_full_params(..., with_grads=True)` call itself, before ever
+reaching the actual gradient comparisons: `NotImplementedError:
+with_grads=True, use_orig_params=False, offload_to_cpu=False is not
+supported yet`. Traced directly to PyTorch's own
+`_validate_unshard_params_args` (`torch/distributed/fsdp/
+_unshard_param_utils.py`): `with_grads=True` requires
+`use_orig_params=True` on the `FSDP(...)` wrapper, which neither this
+test nor production's own `get_model` sets (both default to `False`).
+Fixed by adding `use_orig_params=True` to this backward test's `FSDP(...)`
+call only (not the forward test, not production) — it only changes how
+parameters are exposed for access (original `nn.Parameter` objects vs.
+one internal `FlatParameter`), not `FULL_SHARD`'s actual sharding/gradient
+math. Fixed locally (full Tier 1 suite green, 156 passed); **the actual
+gradient-value comparisons in this test have still never been reached —
+needs a fresh real run to know if they pass.**
+
+Second real run (job 5341295), after the `use_orig_params=True` fix:
+**all 8 ranks report 58 passed, 0 failed** — `test_fsdp_full_shard_
+backward_matches_reference` now passes for real across all `fsdp_size`
+values, alongside everything else in `tests/distributed/`. Both
+correctness test files' backward-pass coverage is now fully verified on
+real Frontier data, closing out this round of work.
+
+Third real run (job 5347343), after the `test_hybrid_shard_correctness.py`
+file was added and the `interp_size`/`img_size`/`resize`/catsdogs-tiling
+work landed: **all 8 ranks report 60 passed, 0 failed** —
+`test_hybrid_shard_forward_matches_reference[2-2-2]`/`test_hybrid_shard_
+backward_matches_reference[2-2-2]` pass for the first time ever (this file
+had only been `importorskip`-verified locally before), and
+`test_dataloader_real_pipeline.py`/`test_catsdogs_real_data.py` passing
+confirms the `img_size`/`resize` decoupling and the `TileDataIter`
+width/height axis-order fix work correctly against real data. Everything
+else in `tests/distributed/` still passes too — no regressions from any of
+that work.
+
+## Running the training smoke test (Tier 3)
+
+```bash
+cd launch/tests
+sbatch run_training_smoke.sh
+```
+
+Unlike Tier 2, this does **not** run under a top-level `srun` — `sbatch`
+launches `tests/integration/run_training_smoke.py` as a single plain
+process, and that script spawns its own `srun -n 8 python
+training_scripts/train.py <config>` subprocess per training run. Nesting a
+real training launch inside a pytest process already running under its own
+`srun` (the way Tier 2 works) would hit the same "process group already
+initialized twice" class of bug fixed for Tier 2 — running the driver as an
+unwrapped single process and letting *it* own each `srun` call sidesteps
+that entirely. Output lands in `training-smoke-<jobid>.out`.
+
+For each of the 10 shipped configs, in order:
+
+1. Writes a smoke-test config to `/tmp/$SLURM_JOB_ID/checkpoint_smoke_test/<config>/smoke.yaml`:
+   real data paths, tiling, and adaptive-patching settings, unmodified; only
+   the model is shrunk (`embed_dim=24, num_heads=2, depth=4` — `embed_dim`
+   must be divisible by `LCM(4, 6)=12` for the 2D/3D sincos position
+   embeddings and by `num_heads`), `max_epochs=1`,
+   `resume_from_checkpoint=False`, `checkpoint_path` pointed at that scratch
+   directory, and one of two real-data-narrowing mechanisms depending on
+   `dataloader.type`, so only a small, fixed number of real files get read
+   regardless of how large the real dataset actually is:
+   - For the iterative dataloader (`basic_ct`/`imagenet`):
+     `dict_start_idx`/`dict_end_idx` narrowed so only ~64 real files get read
+     per dataset key. This is computed dynamically
+     (`compute_narrow_dict_idx`) by calling the same
+     `UCF_VIT.utils.misc.process_root_dirs` the real pipeline uses to get
+     actual file counts on Frontier's filesystem, rather than guessing a
+     fixed fraction that could round to 0 files for a modest dataset or
+     barely help for one as huge as full ImageNet.
+   - For the plain dataloader (`catsdogs`), which globs every real file
+     directly in `train.py` with no config-level trimming knob at all:
+     `create_narrow_catsdogs_dir` globs the real directory itself the same
+     way `train.py` does, then points `dict_root_dirs` at a scratch
+     directory of *symlinks* to a subset of the real files — `max(min_files,
+     batch_size * data_par_size)` of them, not just `min_files`, since
+     `train.py` wraps this dataset in a `DataLoader` with `drop_last=True`:
+     with too few files, `DistributedSampler` would give some rank an
+     undersized batch that gets silently dropped entirely, yielding 0
+     iterations/epoch (and a false `PASS`) instead of an error.
+
+   `--min-files` overrides the target for both mechanisms (default 256 —
+   comfortably above `data_par_size` (8) and every shipped config's now
+   shared `batch_size` (32), so at least one real batch per rank should
+   still be possible; if a real run shows too few/many files, adjust this
+   rather than editing either mechanism directly). If no real files are found at all —
+   almost always a stale/wrong `dict_root_dirs` path in the config, not a
+   code bug — this step raises `NoRealDataFoundError` with the offending key
+   and path, and that config is marked `FAIL (no real data found)` **without
+   ever launching `srun`**, rather than burning GPU allocation on a run
+   that's guaranteed to crash confusingly deep inside
+   `calculate_load_balancing_on_the_fly` with a bare `ZeroDivisionError`.
+2. Runs it, and checks it exits 0 and actually wrote a rank-0 checkpoint.
+3. Edits that *same* config file in place — `resume_from_checkpoint=True`,
+   `checkpoint_filename="epoch_0"` (the file the fresh run actually
+   produced), `max_epochs=2` — the way a real user resumes: flipping fields
+   in their one config, not maintaining a separate "resume" file.
+4. Runs it again and checks it exits 0 — this is the first real exercise of
+   `get_model`'s and `load_optimizer_scheduler_from_checkpoint`'s actual
+   resume path against a real checkpoint (Tier 2 only covers the
+   process-group primitives underneath it).
+5. Sets `resume_from_checkpoint` back to `False` in the file, then deletes
+   the whole scratch directory for that config.
+
+Prints a per-config, per-stage PASS/FAIL/TIMEOUT table at the end and exits
+nonzero if anything failed. Defaults: 8 `srun` tasks and a 300s timeout per
+run; both are CLI flags (`--ntasks`, `--timeout`, and `--min-files` — see
+above) if a config needs more (or you want to fail faster). All 10 shipped
+configs share the same data-pipeline baseline (tensor parallelism, adaptive
+patching, tiling, and — for `basic_ct` — `twoD` all off by default), with
+three documented, architecture-driven exceptions for `basic_ct`: `sap` keeps
+`ap.do_ap: True` (`parse.py` hard-requires it for `SAP`) and `patch_size: 4`
+(its decoder is a single `ConvTranspose3d(kernel=stride=patch_size)`, whose
+memory scales as `patch_size**3`); `unetr` keeps `batch_size: 4` (its
+skip-connection decoder runs a plain `Conv3d` on the full-resolution volume
+regardless of `patch_size`/`embed_dim`, so memory scales with `batch_size`
+directly). No config currently needs a different `--min-files`/`--timeout`
+CLI value than the shared default. You can also run it directly against one
+config instead of all 10:
+
+```bash
+python tests/integration/run_training_smoke.py configs/basic_ct/unetr/base_config.yaml
+```
+
+For iterating on a single failing config without paying for (or waiting on)
+the other 9 every time, `run_training_smoke_single.sh` wraps this in its own
+sbatch script with a shorter time limit. It shares the same 300s default
+per-run timeout as `run_training_smoke.sh` (it doesn't pass `--timeout`
+itself), so the two scripts can't drift out of sync — pass `--timeout`
+explicitly to override it for just one run:
+
+```bash
+cd launch/tests
+sbatch run_training_smoke_single.sh ../../configs/basic_ct/unetr/base_config.yaml
+# extra flags pass straight through to run_training_smoke.py:
+sbatch run_training_smoke_single.sh ../../configs/basic_ct/unetr/base_config.yaml --timeout 600 --min-files 128
+```
+
+**Writing this surfaced a real, serious bug before it ever touched
+Frontier**: `parse_config`'s pre-flight checkpoint-existence check (used
+whenever `resume_from_checkpoint: True`) looked for a bare
+`<checkpoint_path>/<checkpoint_filename>` file — but `save_checkpoint`
+always writes `<checkpoint_path>/epoch_<N>_rank_<R>.ckpt`, and the code that
+actually loads a checkpoint looks for
+`<checkpoint_path>/<checkpoint_filename>_rank_<N>.ckpt`. The pre-check's
+filename never matched anything that gets created, so it would
+`sys.exit("Checkpoint file does not exist")` on *every* resume attempt, for
+any config, checkpoint present or not — `resume_from_checkpoint` could never
+have worked in production before this. Fixed in `parse.py` to check every
+tensor-parallel rank's actual checkpoint file (fully resolving a `#TODO`
+left in that code for the multi-rank case); verified locally against real
+`parse_config` calls with both a complete and a partially-missing checkpoint
+set, for `tensor_par_size` of 1 and 2.
+
+`compute_narrow_dict_idx` was verified against fabricated local directory
+structures mimicking both the `basic_ct` (`imagesTr/`) and `imagenet`
+(class-subdirectory) layouts, in both the "fewer real files than
+`--min-files`" (kept as-is) and "more" (correctly trimmed) cases, plus a
+real `parse_config` call end to end against those fixtures.
+
+**Real runs on Frontier so far:**
+
+1. The `UCF_VIT` package resolved to a stale, unrelated checkout
+   (`.../DUMMY_DATASET/src/UCF_VIT/...`) instead of this one, even though
+   `training_scripts/train.py` itself was read from the right place —
+   `PYTHONPATH=$PWD:$PYTHONPATH` (copied from every other `launch/*/*.sh`
+   script) only helps if `$PWD` happens to contain `UCF_VIT`, which it
+   doesn't from `launch/tests/`; the actual import was resolving via a
+   separately-installed editable package. Not a bug in this repo's code —
+   fixed by correcting the environment directly. Worth checking whether the
+   *other* `launch/*/*.sh` scripts have silently had the same issue.
+2. With that fixed, all 7 `basic_ct`/`imagenet` configs still failed, but for
+   an unrelated reason confirmed by direct filesystem inspection: their
+   `dict_root_dirs` paths are themselves stale (only `catsdogs`'s data path
+   is currently valid). This is what motivated the `NoRealDataFoundError`
+   fail-fast check described above — it turns a ~20s confusing
+   `ZeroDivisionError` deep in a training subprocess into an immediate,
+   clear "no real files found at `<path>`" before `srun` is even invoked.
+3. All 3 `catsdogs` configs (the only ones with currently-valid data) hit
+   the 150s per-run timeout rather than failing outright — `catsdogs` uses
+   `dataloader.type: "dataloader"`, which globs every real file directly in
+   `train.py` with no `dict_start_idx`/`dict_end_idx` trimming mechanism
+   available, so this is plausibly just real data loading taking longer than
+   150s rather than an actual hang. Not yet root-caused; try a longer
+   `--timeout` (e.g. via `run_training_smoke_single.sh`, which defaults to
+   300s) next.
+4. With one `dict_root_dirs` path fixed, `basic_ct-unetr` (a 3D config —
+   `twoD: False`) got past data loading and failed inside `get_model` with
+   `assert embed_dim % 3 == 0` in `get_3d_sincos_pos_embed` — a bug in
+   `TINY_MODEL_OVERRIDES` itself, not the library: `embed_dim=32` isn't
+   divisible by 3. Tracing the exact assert chain: `get_2d_sincos_pos_embed`
+   needs `embed_dim % 4 == 0` (halves it, then the halved value must itself
+   be even) and `get_3d_sincos_pos_embed` needs `embed_dim % 6 == 0` (same
+   halving, split three ways) — since the override applies to both 2D and 3D
+   configs uniformly, fixed to `embed_dim=24` (divisible by `LCM(4,6)=12`,
+   and by `num_heads=2`). Verified against the real `pos_embed.py` functions
+   locally before pushing back.
+5. With that fixed, `basic_ct-unetr`'s **fresh run passed end to end for the
+   first time** — real data loading, model construction, training, and
+   checkpoint save all completed (227s) — but its resume run failed
+   immediately with `RuntimeError: No backend type associated with device
+   type cpu` inside `get_model`'s checkpoint-resume rank-sync broadcast
+   (added earlier this session): `torch.tensor(epoch_start, ...)` created a
+   CPU tensor by default, but `dist.broadcast` on an NCCL process group
+   needs a GPU tensor. Fixed by passing `device=device` (already used
+   elsewhere in `get_model` for the same purpose) to that call, and
+   proactively to the following `dist.broadcast_object_list` call too, since
+   it would have hit the identical failure right after — PyTorch added a
+   `device` parameter to that function specifically for this NCCL
+   requirement.
+6. With both fixed, **`basic_ct-unetr` passed fully — fresh and resume —
+   against real data**, the first shipped config to do so end to end. The
+   first genuine, from-scratch validation of this session's `get_model`
+   checkpoint-resume consistency fix, the `parse_config` checkpoint-existence
+   fix, and everything else these logs surfaced along the way.
+7. Root-caused the `catsdogs` timeout from item 3: `dataloader.type:
+   "dataloader"` has no index-based trimming knob, so with no narrowing at
+   all, every real file in `dict_root_dirs` gets globbed and decoded each
+   epoch — for a real `catsdogs` directory of any real size, comfortably
+   over 150s (or 300s). Fixed by adding `create_narrow_catsdogs_dir` (see
+   above): globs the real directory the same way `train.py` does, then
+   symlinks a `max(min_files, batch_size * data_par_size)`-sized subset into
+   a scratch directory and points `dict_root_dirs` at that instead.
+   **Verified: `catsdogs-classification` now passes against real data** with
+   this fix in place.
+8. A full `run_training_smoke.sh` run (job 5317650) against real data: all 3
+   `catsdogs` and all 3 `imagenet` configs **passed fully, fresh and
+   resume** — 6 of 10 shipped configs now fully verified end to end.
+   `basic_ct-unetr` and `basic_ct-diffusion` both hit `run_training_smoke.sh`'s
+   then-default 150s timeout — not a regression: `basic_ct-unetr`'s fresh run
+   had already measured 227s in item 6, comfortably over 150s but under
+   `run_training_smoke_single.sh`'s separate 300s default, so the two
+   scripts' timeouts had silently drifted apart. Fixed by making 300s the one
+   shared default both scripts use (see "Running the training smoke test"
+   above) — `run_training_smoke_single.sh` no longer hardcodes its own
+   `--timeout`.
+
+   `basic_ct-mae` and `basic_ct-sap` both failed for real, and for the same
+   root cause: `UCF_VIT.parse.parse_config` computes `data.tile_size` as a
+   plain 2-tuple `(x, y)` whenever `twoD` is `True` — which conflates two
+   different situations that both set `twoD=True`: genuinely 2D data
+   (`imagenet`/`catsdogs`, where `img_size` itself has 2 entries and a
+   2-tuple `tile_size` is correct) and 3D data being *sliced* into 2D
+   z-planes (`basic_ct` with `data.twoD: True`, where `img_size` has 3
+   entries but `tile_size` collapsed to 2D anyway). `TileDataIter.__iter__`
+   uses `len(self.tile_size) == 3` to decide whether the *raw* incoming data
+   is 3D; with a collapsed 2-tuple, `basic_ct-mae`/`basic_ct-sap` silently
+   took the plain-2D tiling branch, which only slices the x/y axes and
+   leaves the entire untouched z-axis (256) tacked onto every tile —
+   producing a 5D batch (`(32, 1, 64, 64, 256)`) by the time it reached
+   `PatchEmbed` (`ValueError: too many values to unpack (expected 4)` for
+   `basic_ct-mae`) or the quadtree serializer (`...expected 3` for
+   `basic_ct-sap`). `basic_ct-unetr` (`twoD: False`, full 3D tiling) never
+   exercised this branch, and `imagenet`/`catsdogs` never exercised it
+   incorrectly (their `img_size` genuinely is 2D), which is why this went
+   undetected until the first real run of a `twoD: True` `basic_ct` config.
+   Fixed in three places:
+   - `parse.py`: `tile_size` is now a 3-tuple whenever `img_size` is 3D,
+     regardless of `twoD` — for `twoD: True` the z entry is the raw,
+     undivided depth (`img_size[2]`, not tiled — z-planes are walked one
+     index at a time, not chunked), restoring `len(tile_size) == 3` as an
+     accurate "raw data is 3D" signal.
+   - `TileDataIter.__init__`: `tile_size_no_overlap` now loops over
+     `len(tile_overlap)` instead of `len(tile_size)`, since `tile_size` can
+     now have an extra z entry with no corresponding overlap value (would
+     otherwise `IndexError`).
+   - `TileDataIter.__iter__`: its z-slice loop bound was `data.shape[2]`,
+     which is actually the *y*-axis size for channel-first `(C, X, Y, Z)`
+     data, not z — silently harmless only because `basic_ct`'s volumes are
+     cubic (256×256×256). Changed to `self.tile_size[2]` (the now-correct z
+     size threaded through from `parse.py`), which is right regardless of
+     whether the volume is cubic.
+   Verified locally: a synthetic `(1, 256, 256, 256)` sample through the
+   fixed `TileDataIter` now yields exactly `(1, 64, 64)` tiles (was `(1, 64,
+   64, 256)`), and `parse_config` against the real `basic_ct-mae`/
+   `basic_ct-sap`/`basic_ct-unetr` configs now reports `tile_size` of
+   `(64, 64, 256)`, `(64, 64, 256)`, and `(64, 64, 64)` respectively. Not yet
+   verified against a real Frontier run — and since `basic_ct-mae`/
+   `basic_ct-sap` will now actually iterate instead of crashing in ~30-45s,
+   watch for a *new* timeout: each real volume yields `div² × 256` z-sliced
+   tiles (4096 for `div=4`) versus `basic_ct-unetr`'s `div³` full-3D tiles
+   (64), so an epoch over even a handful of real files could turn out to
+   need much more than 300s.
+9. Confirmed: a rerun had **7 of 10 configs pass** (all 3 `catsdogs`, all 3
+   `imagenet`, and now `basic_ct-unetr` too), leaving `basic_ct-diffusion`,
+   `basic_ct-mae`, and `basic_ct-sap` timing out — as predicted in item 8 for
+   `mae`/`sap`. Root-caused with real numbers this time: `Tr8_Training` has
+   852 real file pairs (not ~8 as its name suggests), so the shared
+   `min_files=64` default narrows to ~64 files total, ~8/rank across
+   `simple_ddp_size=8`. For `mae`/`sap` (`twoD: True`, `tiling.div: 4`),
+   each of those real files yields `div² × 256 = 4096` z-sliced tiles (not
+   `div³ = 64` the way `basic_ct-unetr`'s `twoD: False` does), so 8
+   files/rank is ~32768 tiles/rank/epoch. `basic_ct-diffusion` is
+   `twoD: False` with the same tile-count formula, `batch_size`, and
+   `fixed_length` as `basic_ct-unetr` (whose own fresh run measured 227s,
+   only ~73s under the then-300s default) — no tile-count explanation, so
+   plausibly just real Frontier I/O/scheduling variance pushing it over that
+   thin margin.
+
+   Added `PER_CONFIG_OVERRIDES` in `run_training_smoke.py` — a slug-keyed
+   dict of `min_files`/`timeout` overrides applied under the shared
+   `--min-files`/`--timeout` CLI defaults but under an explicit CLI flag
+   (which always wins over both): `basic_ct-mae`: `min_files=16` (~2
+   files/rank — chosen with margin above the `simple_ddp_size=8` floor,
+   against `int()` truncation in `FileReader`'s start/end-idx narrowing,
+   rather than cutting to the bare 1-file/rank minimum), bringing it to
+   ~256 iterations/epoch, close to `basic_ct-unetr`'s own real iteration
+   count. `basic_ct-sap`: same `min_files=16`, but its `batch_size=2` (vs
+   `mae`'s 32) means that's still ~4096 iterations/epoch — `min_files` is
+   already near its practical floor (can't drop below ~8 total without
+   going under 1 file/rank and hitting `FileReader`'s own `per_worker > 0`
+   assertion), so `sap` additionally gets `timeout=1800` as the real lever;
+   if that's still not enough, the next lever would be lowering `tiling.div`
+   for the smoke test specifically (fewer spatial tiles per z-slice), not
+   `min_files`. `basic_ct-diffusion`: `timeout=900`, no `min_files` change
+   (no tile-count case for it). Bumped both launch scripts' sbatch time
+   limits for the new worst-case totals
+   (`run_training_smoke.sh`: 90min → 2h; `run_training_smoke_single.sh`:
+   20min → 75min, since `sap` alone could now need up to 30min for a single
+   run). Not yet verified against a real Frontier run — the `min_files=16`
+   estimates in particular are rough (based on iteration-count reasoning,
+   not a measured per-iteration cost), so treat these as a first attempt to
+   tune from, not a guaranteed fix.
+
+10. Rather than keep tuning `PER_CONFIG_OVERRIDES` around `basic_ct-mae`'s
+    persistent timeout, reconfigured all 4 `basic_ct` configs
+    (`unetr`/`mae`/`sap`/`diffusion`) to share one baseline: `ap.do_ap`,
+    `tiling.do_tiling`, and `data.twoD` all `False` (removing the
+    `twoD: True` + `do_tiling: True` z-slice/tile explosion that motivated
+    the overrides in the first place -- each real volume now yields exactly
+    one sample), `tiling.div`/`tiling.tile_overlap` set to `1`/`0`
+    (cosmetic -- `parse.py` already force-overrides these whenever
+    `do_tiling: False`), `data.patch_size: 32` (512 tokens/sample, the same
+    order of magnitude as `imagenet`/`catsdogs`'s 256-token baseline), and
+    `dataloader.batch_size`/`num_workers`/`dict_buffer_sizes.ct1` unified to
+    `32`/`1`/`100`, matching `imagenet`/`catsdogs`. One exception, found by
+    running `tests/test_config_validation.py` against the edited configs:
+    `parse.py` (`get_kwargs`) hard-asserts `SAP` requires `do_ap: True` --
+    architectural, not a cost tradeoff -- so `basic_ct-sap` keeps
+    `do_ap: True` with `fixed_length: 512` (needed a value satisfying both
+    "cube root is a whole number" and "`fixed_length % 7 == 1`" now that
+    `twoD: False` routes it through the octree check instead of the quadtree
+    one its old `twoD: True` + `fixed_length: 196` combination satisfied).
+    Confirmed all 10 shipped configs still parse (`pytest
+    tests/test_config_validation.py -v`) and manually verified `tile_size`/
+    `twoD`/`patch_size`/`do_ap`/`fixed_length` come out as intended for all
+    4 edited configs. Updated
+    `tests/distributed/test_dataloader_real_pipeline.py`'s
+    `test_real_pipeline_basic_ct_unetr` for the new non-adaptive 4-tuple
+    batch shape (`inp, label, variables, dict_key`, mirroring
+    `test_real_pipeline_imagenet_classification`) -- including that
+    non-adaptive `basic_ct` labels come straight from `FileReader` as
+    `int64`, not the `uint8` the adaptive-patching branch explicitly casts
+    to, a real dtype difference between the two code paths this test now
+    asserts on. `BASIC_CT_MIN_FILES` in both that file and
+    `tests/dataloaders/test_dataset_speed_real_data.py` raised from 16 to
+    `batch_size(32) * N * data_par_size(8)` (512 and 1024 respectively) --
+    with tiling/z-slicing no longer multiplying each file into many
+    samples, `min_files` must now directly cover a full batch per rank, the
+    same reasoning `catsdogs` already used. Removed `PER_CONFIG_OVERRIDES`
+    from `run_training_smoke.py` entirely (all 4 `basic_ct` configs now
+    share the same defaults as everything else) and raised
+    `DEFAULT_MIN_FILES` from 64 to 256 for the same batch-coverage reason.
+    Confirmed real basic_ct file count is comfortably in the hundreds+
+    (consistent with `Tr8_Training`'s known 852 real file pairs from item 9
+    above), so `batch_size: 32` is achievable. Full local `pytest -q` (Tier
+    1) passes (113 passed, 36 skipped -- the real-data tests needing
+    Frontier mounts). **Not yet verified against a real Frontier run** --
+    next step is rerunning `run_training_smoke.sh` (Tier 3) and
+    `run_distributed_tests.sh` (Tier 2, for the updated real-pipeline test)
+    to confirm all 10 configs now pass with the simplified defaults, and to
+    get a real "real runs on Frontier" measurement to replace item 9's
+    now-obsolete tile-count-based numbers.
+11. Real run (job 5322693) against item 10's baseline: **`basic_ct-diffusion`
+    passed fully, fresh and resume** (177s/102s) -- confirming the
+    tiling/`twoD` fix actually resolves the timeout it was meant to.
+    `basic_ct-mae`, `basic_ct-sap`, and `basic_ct-unetr` all failed, each for
+    a different, genuine reason -- not the same root cause repeating:
+    - `basic_ct-mae`: `AssertionError: embed_dim % 3 == 0` in
+      `get_3d_sincos_pos_embed`, called from `MAE.init_weights` for the
+      *decoder* pos embed. `decoder_embed_dim: 512` was never touched by
+      this session's baseline changes (it's a per-model decoder setting, not
+      an "advanced feature"), but flipping `mae`'s `twoD` to `False` routed
+      it through the 3D sincos path (`embed_dim % 3 == 0`) instead of the 2D
+      one (`% 4 == 0`) it satisfied before -- 512 divides by 4 but not by 3.
+      Fixed: `decoder_embed_dim: 480` (divisible by both 3 and
+      `decoder_num_heads=16`).
+    - `basic_ct-sap`: `torch.OutOfMemoryError: HIP out of memory. Tried to
+      allocate 512.00 GiB` inside `SAP.mask_head`'s `neck` -- a single
+      `nn.ConvTranspose3d(embed_dim, 256, kernel_size=patch_size,
+      stride=patch_size)` (`arch.py:685-693`). Its memory scales as
+      `patch_size**3`; the requested 512 GiB is *exactly*
+      `(32/4)**3 = 512` times whatever `patch_size=4` needed -- unambiguous
+      confirmation of the cubic relationship. Unlike `do_ap`, this isn't a
+      config-parsing assertion, so nothing caught it before a real GPU run.
+      Fixed: reverted `sap`'s `patch_size` to its original `4` (an
+      architecture-driven exception, documented alongside its `do_ap: True`
+      exception) -- confirmed via `training.py`'s loss computation
+      (`einops.rearrange` using `conf["data"]["patch_size"]` dynamically for
+      both the model output and the reshaped `seq_label`) that this doesn't
+      introduce a shape mismatch: output and label resolution are always
+      `sqrt_len * patch_size` by construction, self-consistent for any
+      `patch_size` value, not tied to the literal `tile_size`.
+    - `basic_ct-unetr`: `torch.OutOfMemoryError: HIP out of memory. Tried to
+      allocate 40.00 GiB` inside MONAI's `dynunet_block.py`, not
+      `PatchEmbed` -- `UNETR.encoder1` (`arch.py:1135-1143`) is a plain
+      `Conv3d` that runs directly on the **full 256^3-resolution raw
+      volume**, with `feature_size=16` output channels, entirely
+      independent of `patch_size`/`embed_dim`. At `batch_size=32` that one
+      activation alone is `32 * 16 * 256**3 * 4 bytes` ~= 34 GB, comfortably
+      explaining the OOM on a 64 GB GPU. This is a structural property of
+      full-resolution conv segmentation decoders, not something the
+      tiny-model smoke-test override (`embed_dim`/`depth`/`num_heads`) could
+      mask, since none of those touch `feature_size` or `batch_size`.
+      Fixed: `unetr`'s `batch_size` reverted to `4` (another
+      architecture-driven exception; `patch_size` stays `32` since the OOM
+      was batch_size-driven, not patch_size-driven). `BASIC_CT_MIN_FILES` in
+      `test_dataloader_real_pipeline.py`/`test_dataset_speed_real_data.py`
+      (which target `basic_ct/unetr`'s config) lowered from the
+      `batch_size=32` formula to `batch_size=4` accordingly.
+
+    So `basic_ct` now has three documented, architecture-driven exceptions
+    on top of the unified baseline: `sap` (`do_ap: True`, `patch_size: 4`)
+    and `unetr` (`batch_size: 4`) -- not a regression back to
+    `PER_CONFIG_OVERRIDES`-style tuning (those were workarounds for a single
+    shared root cause; these are three separate, real architectural
+    constraints specific to each model's decoder). Full local `pytest -q`
+    passes (113 passed, 36 skipped) and all 10 configs still parse with
+    these changes. **Not yet verified against a real Frontier run** -- next
+    step is rerunning `run_training_smoke.sh` again to confirm all three
+    fixes actually work (the `sap`/`unetr` memory numbers in particular are
+    reasoned from the failure messages, not yet measured after the fix).
+12. Reran after item 11's fixes: `basic_ct-mae`'s and `basic_ct-sap`'s
+    failures are gone, but `basic_ct-unetr` now **times out** instead of
+    OOMing (log not saved, but reported directly). Root cause: `min_files`
+    (the target real-file count `make_smoke_config` narrows to) was a flat
+    `DEFAULT_MIN_FILES=256` shared by every config, sized for the shared
+    `batch_size=32` most configs use (256 = 32 * data_par_size(8), ~1
+    batch/rank). `basic_ct-unetr`'s `batch_size=4` exception (item 11) meant
+    the same 256 real files worked out to 32 files/rank / 4 = 8
+    batches/rank/epoch instead of 1 -- 8x the iterations through UNETR's
+    inherently expensive full-resolution conv decoder (`encoder1` runs a
+    plain `Conv3d` on the raw 256^3 volume regardless of `patch_size`/
+    `embed_dim`, so every iteration is costly no matter what else changed).
+    This was flagged as a risk when `batch_size:4` was applied ("generous
+    ... but that's harmless" -- true for correctness, false for wall-clock
+    time). Fixed structurally rather than with another single-config
+    override: `make_smoke_config` now caps whatever `min_files` it's given
+    down to *that config's own* `batch_size * data_par_size`, so every
+    config gets ~1 batch/rank regardless of its `batch_size` -- automatically
+    right-sizing itself for any future batch_size exception too, not just
+    `unetr`'s current one. Doesn't change behavior for any config that
+    already had `batch_size=32` (256 already equalled that cap). Full local
+    `pytest -q` still passes (113 passed, 36 skipped). **Not yet verified
+    against a real Frontier run.**
+13. Reran after item 12's fix (job 5322916): **all 10 shipped configs now
+    pass Tier 3 fully, fresh and resume** --
+    `basic_ct-{diffusion,mae,sap,unetr}` (145s/94s, 81s/68s, 212s/173s,
+    220s/43s), all 3 `imagenet` configs, and all 3 `catsdogs` configs. This
+    closes out the config-baseline reconfiguration effort: the original
+    `basic_ct-mae` timeout that started it is gone (structural fix, not a
+    tuned-around workaround), and the three follow-on issues it
+    surfaced -- `mae`'s decoder pos-embed divisibility, `sap`'s
+    patch_size-cubed decoder memory, `unetr`'s batch_size-linear decoder
+    memory and its knock-on min_files/iteration-count timeout -- are all
+    fixed and verified for real. `basic_ct` now ships with three documented,
+    architecture-driven exceptions to the shared baseline (`sap`:
+    `do_ap: True` + `patch_size: 4`; `unetr`: `batch_size: 4`); everything
+    else (tensor parallelism, tiling, `twoD`, `num_workers`,
+    `dict_buffer_sizes`) is uniform across all 4 `basic_ct` configs, matching
+    `imagenet`/`catsdogs`.
+14. Tier 2 rerun (job 5323450) confirms the rest: **all 39 tests pass on all
+    8 ranks** (74.72s), including `test_real_pipeline_basic_ct_unetr` against
+    its updated non-adaptive 4-tuple batch shape. No failures anywhere in the
+    log. This closes out the config-baseline reconfiguration effort
+    end to end -- both Tier 3 (all 10 configs, item 13) and Tier 2 (all 39
+    tests, real data, real 8-rank launch) are green against the new
+    `basic_ct` baseline.
+
+That fixture testing also surfaced a narrower, real edge case in
+`process_root_dirs`: when an `imagenet`-format dataset has `<= data_par_size`
+classes, `classes_to_combine` was only assigned inside an `if len(classes) >
+data_par_size:` block, so it was referenced unassigned (`UnboundLocalError`)
+right after. Real ImageNet-1k (1000 classes) is far above any realistic
+`data_par_size`, so this never affected the configs actually shipped here —
+now fixed anyway (`classes_to_combine = 1` in that case, giving one bucket
+per class — `len(classes)` buckets rather than `data_par_size`, matching the
+function's own "`data_par_size` (or fewer) buckets" docstring), with new
+`tests/utils/test_misc.py` coverage for `process_root_dirs`'s bucketing
+generally: the evenly- and non-evenly-divisible `> data_par_size` cases
+(including documenting, not fixing, the pre-existing "leftover classes past
+`data_par_size * classes_to_combine` are silently dropped" behavior — flagged
+by its own `# TODO: Add shuffling for data_par_size if it doesn't divide
+1000 equally` comment), the `<= data_par_size` regression case parametrized
+across several class counts, bucket-content correctness (not just counts),
+and the non-`imagenet` (`basic_ct`-style) branch.
+
+## Running the feature-matrix smoke test (Tier 3b)
+
+```bash
+cd launch/tests
+sbatch run_feature_matrix_smoke.sh
+```
+
+Tier 3 verifies all 10 shipped configs still work under this session's
+shared baseline (tensor parallelism, adaptive patching, tiling, and — for
+`basic_ct` — `twoD` all off by default, with `basic_ct/sap`'s and
+`basic_ct/unetr`'s three documented architecture-driven exceptions). Tier 3b
+verifies the advanced features *themselves* still work now that they're
+opt-in: for one representative (model, dataset) combination per feature —
+not a full combinatorial sweep, see
+`tests/integration/run_feature_matrix_smoke.py`'s module docstring for why —
+it flips that one feature back on and runs the same kind of tiny/fast
+real-data training run Tier 3 does.
+
+Same "not run under a top-level `srun`" structure as Tier 3, for the same
+reason (see Tier 3's section above) — this script also spawns its own
+`srun` subprocess per run. Output lands in
+`feature-matrix-smoke-<jobid>.out`.
+
+**Covered today** (see `run_feature_matrix_smoke.py`'s `FEATURE_MATRIX` for
+the exact overrides and reasoning behind each cell):
+
+| Feature | Cell(s) |
+| --- | --- |
+| `ap.do_ap:True` | `basic_ct/unetr`, `basic_ct/mae`, `imagenet/classification`, `catsdogs/classification` |
+| `tiling.do_tiling:True` | `basic_ct/unetr`, `imagenet/classification`, `catsdogs/classification` (the last via `CatsDogsDataset`'s own `div`/`tile_overlap` tiling added this session, not `TileDataIter` — `catsdogs`'s `dataloader.type: "dataloader"` never invokes that) |
+| `data.twoD:True` | `basic_ct/unetr` only (`imagenet`/`catsdogs` always run `twoD:True` already — `parse.py` forces it whenever `img_size` has 2 entries) |
+| `parallelism.tensor_par_size:2` | `imagenet/classification` (+ resume cycle), `basic_ct/mae`, `catsdogs/classification`, `basic_ct/sap`, `catsdogs/diffusion` |
+| Multi-feature combinations | `basic_ct/unetr` (`do_ap`+`do_tiling`, `do_ap`+`twoD`, `twoD`+`tensor_par_size`), `basic_ct/mae` (`twoD`+`do_tiling`), `imagenet/classification` (`do_ap`+`tensor_par_size`, `do_tiling`+`tensor_par_size`) |
+
+Every dataset (`basic_ct`/`imagenet`/`catsdogs`) and every model type
+(`VIT`/`MAE`/`SAP`/`UNETR`/`DiffusionVIT`) appears in at least one cell.
+`SAP`/`DiffusionVIT` only get a `tensor_par_size` cell each (neither has a
+free `do_ap` choice — `parse.py` hard-requires `do_ap:True` for `SAP` and
+`do_ap:False` for `DiffusionVIT`, and `SAP`'s own shipped baseline already
+proves its case), chosen because both have their own model-specific
+broadcast code in `training.py`'s `process_batch` (`SAP`: `seq_label`;
+`DiffusionVIT`: the diffusion noise terms `t`/`e`) that no other cell
+exercises.
+
+Every cell runs fresh-only except `imagenet/classification`'s solo
+tensor-parallel cell, which also resumes — closing a real, otherwise
+permanent coverage gap: no shipped config ships `tensor_par_size > 1`, so
+nothing else in this suite (Tier 1, 2, or baseline Tier 3) ever exercises
+the per-tensor-parallel-rank checkpoint file loop in `parse.py`'s
+pre-flight check or `model/utils.py`'s resume loading.
+
+The 6 multi-feature cells cover every pairwise combination among the 4 axes
+where it's architecturally meaningful (`do_ap`+`do_tiling`, `do_tiling`+
+`twoD`, `do_ap`+`tensor_par_size`, `do_ap`+`twoD`, `do_tiling`+
+`tensor_par_size`, `twoD`+`tensor_par_size`), each with a single fixed value
+per feature (one `tensor_par_size`, one `div`) rather than a sweep, so this
+stays as cheap as every single-feature cell. Two of them aren't
+hypothetical: `basic_ct/unetr`'s `do_ap`+`do_tiling` cell mirrors that
+config's actual pre-baseline settings (`do_ap:True, do_tiling:True, div:4,
+twoD:False`) — a combination that already passed real Frontier runs earlier
+this session, so it's a real regression check, not new territory.
+`basic_ct/mae`'s `twoD`+`do_tiling` cell mirrors the exact combination
+behind this session's original `basic_ct-mae` timeout that started the
+whole baseline reconfiguration effort — deliberately re-exercised here, but
+controlled (`div:2` instead of the original `div:4`, `min_files` pinned to
+the floor, `timeout:1800s`) rather than accidental.
+
+For iterating on a single failing cell:
+
+```bash
+cd launch/tests
+sbatch run_feature_matrix_smoke_single.sh basic_ct-unetr+twoD
+```
+
+`tests/integration/test_feature_matrix_smoke_helpers.py` sanity-checks
+`FEATURE_MATRIX` itself before any of this ever touches Frontier: unique
+labels, every `base_config_relpath` resolves to a real file, no
+accidentally-empty `overrides`, no accidentally-list-valued
+`tiling.tile_overlap` override (a real gotcha in
+`deep_merge_config_overrides` — see its docstring in
+`run_training_smoke.py`), and — the most valuable check — every cell's
+tiny-model config (real base config + `TINY_MODEL_OVERRIDES` + the cell's
+own overrides, exactly as `make_smoke_config` would build it) is fed
+through the real `UCF_VIT.parse.parse_config` with
+`load_balance_offline=True` (skips the `data_par_size*tensor_par_size==
+world_size` assertion, so even the `tensor_par_size:2` cells validate with
+zero real GPUs). All 19 cells pass this locally before ever touching real
+Frontier data.
+
+**Real runs on Frontier so far:**
+
+1. `basic_ct-unetr+twoD` (job 5337762), run single-cell first via
+   `run_feature_matrix_smoke_single.sh` as the deliberately highest-risk
+   cell (its `min_files:8`/`timeout:1800` were reasoned from historical
+   numbers, not measured): **PASS (280s)** — comfortably under its 1800s
+   timeout, no retuning needed. Confirms the z-slice-multiplication cost
+   estimate for this cell was accurate.
+2. Running the full matrix surfaced a real, previously-dormant bug in
+   `src/UCF_VIT/training.py`'s `train_step`, in the `MAE` + `do_ap:True`
+   branch — the exact code path `basic_ct-mae+do_ap` exercises for the
+   first time ever (no shipped config used `do_ap:True` for MAE before
+   Tier 3b). Two bugs stacked in one line:
+   `target = rearrange(seq, 'b c s p -> b s (p c)')` — `rearrange` was
+   never imported bare (the file only does `import einops`, not
+   `from einops import rearrange`, unlike `model/arch.py` which does), and
+   `seq` was never defined in this branch at all (the actual sequence data
+   is `batch["seq"]`, as used one line above to compute `output`). Fixed to
+   `target = einops.rearrange(batch["seq"], 'b c s p -> b s (p c)')`. A
+   real regression this session's Tier 1 tests couldn't catch (they don't
+   exercise `train_step` against real batch dicts), only findable by
+   actually running MAE with `do_ap:True` end to end — exactly what Tier 3b
+   is for.
+3. The same full-matrix run surfaced five more real, previously-dormant
+   bugs, all in code paths no shipped config ever exercised before (every
+   one requires either `do_ap:True` on `VIT`, or `tensor_par_size > 1`):
+   - `src/UCF_VIT/training.py`'s `train_step`, `VIT` branch: unconditionally
+     called `model.forward(batch["data"], ...)`, never checking
+     `conf["ap"]["do_ap"]` at all (unlike the `SAP`/`UNETR`/`MAE` branches,
+     which all correctly switch to `batch["seq"]` when adaptive patching is
+     on). `model/arch.py`'s `VIT.__init__` even documents
+     `#ASSUMES INPUT HAS ALREADY BEEN ADAPTIVELY PATCHED` when
+     `adaptive_patching` is set — feeding it raw image data instead produced
+     a token-count mismatch (`RuntimeError: The size of tensor a (257) must
+     match the size of tensor b (196)`) in `_pos_embed`, hit by both
+     `imagenet-classification+do_ap` and `catsdogs-classification+do_ap`.
+     Fixed to mirror the other branches: `batch["seq"]` when `do_ap:True`,
+     `batch["data"]` otherwise.
+   - `training_scripts/train.py`: `NativePytorchDataModule` was never passed
+     `ddp_group=ddp_group`, so it silently fell back to the *global* world
+     rank instead of this rank's position within its data-parallel
+     replica group — `NativePytorchDataModule` already supported a
+     `ddp_group` parameter for exactly this, it just was never wired up.
+     Broke as `IndexError: index 0 is out of bounds for axis 0 with size 0`
+     inside `datamodule.py`'s `train_dataloader()` for any rank whose world
+     rank exceeded `data_par_size` (e.g. ranks 4/6 with
+     `tensor_par_size:2`/`data_par_size:4`) — `basic_ct-mae+tensor_par` and
+     `basic_ct-unetr+twoD+tensor_par`.
+   - `training_scripts/train.py`: the `"dataloader"`-type (`catsdogs`)
+     branch's `DistributedSampler(..., rank=world_rank)` has the same bug --
+     `world_rank` only equals the correct data-parallel-relative rank when
+     `tensor_par_size:1`. Broke as `ValueError: Invalid rank 6, rank should
+     be in the interval [0, 3]` for `catsdogs-classification+tensor_par`.
+     Fixed both to `dist.get_rank(ddp_group)`, which reduces to `world_rank`
+     exactly when `tensor_par_size:1` (so no behavior change for any
+     existing config) but gives the correct per-replica rank otherwise.
+   - `training_scripts/train.py`: `train_dataloader`/`data_module` are only
+     ever constructed on `tensor_par_group`-rank-0 (by design --
+     `UCF_VIT.training.process_batch`'s docstring: only that rank reads
+     real data, then broadcasts it to the rest of its tensor-parallel
+     group), but `train_epoch(...)` references `train_dataloader`
+     unconditionally for *every* rank, and the per-epoch dataloader reset
+     did too. With `tensor_par_size:1` every rank trivially satisfies
+     `tensor_par_group`-rank-0, so this was never exercised. Broke as
+     `UnboundLocalError: cannot access local variable 'train_dataloader'`
+     on every non-tensor_par_group-rank-0 process, across every
+     `+tensor_par` cell. Fixed by explicitly binding
+     `train_dataloader = None` (and `data_module = None`) on the `else`
+     branch in both dataloader-type cases, and gating the per-epoch reset
+     the same way.
+   - `training_scripts/train.py`: for the `"dataloader"` type specifically,
+     `iterations_per_epoch = len(train_dataloader)` has the same
+     unconditional-reference problem, but unlike `train_dataloader` itself
+     (never touched by non-rank-0 processes inside `process_batch`), every
+     rank *does* need a valid `iterations_per_epoch` — it's the training
+     loop's iteration count, and `process_batch`'s per-tensor-parallel-group
+     broadcasts require every rank in a group to call it the same number of
+     times. Fixed by broadcasting it from each tensor-parallel group's
+     rank-0 to the rest of that group, reusing the exact
+     `dist.broadcast(..., src=(dist.get_rank()//tensor_par_size*
+     tensor_par_size), group=tensor_par_group)` idiom `process_batch`
+     already uses for batch tensors.
+
+   All five fixed locally (syntax + full Tier 1 suite, `pytest -q`); none
+   are exercisable without a real multi-rank `tensor_par_size > 1` launch,
+   so — like the `VIT`+`do_ap` fix above — not yet re-verified against a
+   real Frontier run.
+4. Auditing the matrix afterward found a real coverage gap: every cell used
+   `UNETR`, `MAE`, or `VIT` — `SAP` and `DiffusionVIT` never appeared
+   anywhere. Added one `tensor_par_size:2` cell each
+   (`basic_ct-sap+tensor_par`, `catsdogs-diffusion+tensor_par`) — the axis
+   most likely to matter for them specifically, since both have their own
+   model-specific broadcast code in `process_batch` (`SAP`'s `seq_label`,
+   `DiffusionVIT`'s `t`/`e` noise terms) that no other cell exercises;
+   `do_ap` doesn't apply to either (both hard-required to a fixed value by
+   `parse.py`). Now every dataset and every model type appears in at least
+   one of the matrix's 18 cells. Both new cells pass the local
+   `parse_config` dry-run; not yet run against real Frontier data.
+5. Reran the full matrix (job 5338382) against all the item-3 fixes: **8
+   PASS, 8 FAIL** — real progress (`basic_ct-mae+do_ap`,
+   `basic_ct-mae+tensor_par`, and `catsdogs-diffusion+tensor_par` now pass),
+   but surfaced a whole second wave of bugs, every one only reachable once
+   the item-3 fixes cleared the way to exercise it for the first time:
+   - `model/arch.py`'s `_pos_embed`: the item-3 `VIT`+`do_ap` fix was
+     necessary but not sufficient — `self.adaptive_pos_dep_emb(seq_ps)`
+     computes one position embedding per real patch (no cls-token row),
+     but `x` gets the cls token prepended before the add, so `VIT`
+     (the only model type with `class_token=True` — `UNETR`/`MAE`/`SAP`/
+     `DiffusionVIT` all construct with `class_token=False`, per
+     `model/utils.py`'s `get_model`) is one token short:
+     `RuntimeError: size of tensor a (197) must match size of tensor b
+     (196)`. Fixed by prepending a zero row to the adaptive `pos_embed` for
+     the cls token, mirroring `get_2d_sincos_pos_embed`/
+     `get_3d_sincos_pos_embed`'s own documented convention for the
+     non-adaptive case ("prepend a zero embedding row for a class token").
+   - `training.py`'s `process_batch`: the `VIT` classification `label`
+     placeholder (4 occurrences, `do_ap` x `twoD`) was
+     `torch.zeros(batch_size, 1, dtype=precision_dt)` -- shape
+     `(batch_size, 1)` float, but the real label (from `get_batch`) is
+     `(batch_size,)` int64 (a flat class index). `dist.broadcast` fills
+     values into the existing placeholder without reshaping/recasting it,
+     so non-rank-0 processes ended up with a 2D float target:
+     `RuntimeError: 0D or 1D target tensor expected, multi-target not
+     supported` from `nn.CrossEntropyLoss`. Fixed all 4 to
+     `torch.zeros(batch_size, dtype=torch.int64)`.
+   - `training.py`'s `process_batch`: `tile_size` was only assigned in the
+     `do_ap:False` branch of the setup code, but the `do_ap:True` branch's
+     placeholder construction still needs it to shape `data` (the raw,
+     pre-patchification image, needed regardless of `do_ap`) --
+     `UnboundLocalError: cannot access local variable 'tile_size'`. Fixed
+     by moving the assignment out of the `if`/`else` so it's unconditional.
+   - `training.py`'s `process_batch`: the `dict_key` broadcast passed a
+     bare Python `str` (e.g. `"ct1"`) as `dist.broadcast_object_list`'s
+     `object_list` argument on the source rank, while every receiver
+     correctly pre-allocated a real `list`. That API requires an actual
+     list on every rank -- the type mismatch corrupted the pickle framing:
+     `_pickle.UnpicklingError: invalid load key` and (on a different rank)
+     `torch.OutOfMemoryError: HIP out of memory. Tried to allocate more
+     than 1EB memory` (a garbage size read from the corrupted buffer).
+     Fixed by using `list(dict_key)` on the source rank too, matching the
+     receivers' `[None] * dict_key_len` placeholder exactly.
+   - `training.py`'s `process_batch`: `seq_size`/`seq_pos` were read
+     straight off `batch["seq_size"]`/`batch["seq_pos"]` with no
+     `.to(precision_dt).to(device)` on the source rank, unlike every other
+     broadcast field (`data`, `seq`, `label`) -- since NCCL has no CPU
+     backend, broadcasting a CPU tensor into GPU-resident receivers failed
+     outright: `RuntimeError: No backend type associated with device type
+     cpu`. Fixed to match `data`/`seq`'s existing pattern.
+   - `training.py`'s `process_batch`: found by inspection, not yet hit by
+     any real run -- the final "convert `seq_size`/`seq_pos` into `seq_ps`"
+     block (used for adaptive position embeddings) unconditionally read
+     `batch["seq_size"]`/`batch["seq_pos"]`, but `batch` is only ever
+     assigned on `tensor_par_group`-rank-0 when `tensor_par_size > 1` --
+     every other rank would hit `UnboundLocalError` here, even though the
+     correct, already-broadcast values were sitting right there in the
+     local `seq_size`/`seq_pos` variables. Fixed to read those locals
+     instead (and assigned them as locals in the `tensor_par_size == 1`
+     branch too, for consistency, since previously only the dict entries
+     existed there).
+   - `training.py`'s `process_batch`: also found by inspection --
+     `DiffusionVIT`'s `t` placeholder used `dtype=torch.int` (int32), but
+     `torch.randint`'s real default dtype is `int64` -- a byte-size
+     mismatch that should break an NCCL broadcast, though
+     `catsdogs-diffusion+tensor_par` passed anyway in job 5338382 (possibly
+     silent corruption rather than a hard failure, or NCCL tolerating it
+     for this particular tensor shape -- not fully understood). Fixed
+     defensively to `int64` regardless, since the mismatch is real either
+     way.
+
+   All fixed locally (syntax + full Tier 1 suite, `pytest -q`, 140 passed);
+   none exercisable without a real multi-rank `tensor_par_size > 1` launch
+   (or, for the `_pos_embed` fix, `VIT`+`do_ap:True`), so not yet
+   re-verified against a real Frontier run. Given how many of these were
+   only reachable after clearing an earlier one, expect this to need at
+   least one more real-run/fix cycle.
+6. Reran the full matrix (job 5339018) against item 5's fixes: **15 PASS, 3
+   FAIL** — the biggest jump yet, including `imagenet-classification+
+   tensor_par`'s resume cycle passing for the first time. The 3 remaining
+   failures reduced to two distinct, well-understood bugs:
+   - `training.py`'s `process_batch`: the `separate_channels=False`
+     placeholder for `seq_pos` was missing its trailing coordinate
+     dimension entirely (`torch.zeros(batch_size, 1, fixed_length, 1, 1,
+     ...)` instead of `torch.zeros(batch_size, 1, fixed_length, 2, ...)`
+     for `twoD`, `3` for 3D) — confirmed against the real per-sample
+     construction in `datamodule.py` (`np.expand_dims(batch[i][3],
+     axis=0)`, where the raw per-patch position is a 2- or 3-element
+     coordinate, not a scalar). The `seq_size` placeholder had the
+     opposite problem, one spurious extra trailing dim
+     (`(batch_size, 1, fixed_length, 1)` instead of `(batch_size, 1,
+     fixed_length)`, `seq_size` being a scalar per patch with no
+     coordinate dim at all). Broke as `RuntimeError: Tensors must have
+     same number of dimensions: got 3 and 2` in the final `seq_ps =
+     torch.concat([seq_size, seq_pos], dim=-1)` — hit by
+     `imagenet-classification+do_ap+tensor_par` and
+     `basic_ct-sap+tensor_par`. Fixed both placeholder blocks (`twoD` and
+     3D) to the correct shapes.
+   - `training.py`'s `process_batch`: all four `dist.broadcast_object_list`
+     calls (`dict_key_list` x2, `variables` x2) never passed a `device`
+     argument. `broadcast_object_list`'s own docs warn that for NCCL
+     groups its internal object-size/pickled-bytes tensors must live on
+     this rank's GPU, and without an explicit `device` it falls back to
+     the global `torch.cuda.current_device()` — relying on that
+     implicitly, rather than the `device` `process_batch` already has in
+     hand as a parameter, is exactly the kind of thing that can produce
+     the `torch.OutOfMemoryError: Tried to allocate more than 1EB memory`
+     corruption `basic_ct-unetr+twoD+tensor_par` hit here (the same
+     symptom as an earlier, different bug this session — that one was a
+     genuine `str`-vs-`list` type mismatch, already fixed; this is a
+     second, distinct cause producing the identical crash signature).
+     Fixed by passing `device=device` explicitly to all four calls.
+
+   Both fixed locally (full Tier 1 suite green, 153 passed); not yet
+   re-verified against a real Frontier run.
+
+7. Reran the full matrix (job 5339608) against item 6's fixes: **16 PASS, 2
+   FAIL** — both remaining failures reduced to real, previously-dormant
+   bugs, both now fixed (not yet re-verified against a real Frontier run):
+   - `basic_ct-unetr+twoD+tensor_par`: `KeyError: ''` at
+     `num_channels[dict_key]` — the 1EB-OOM crash from item 6 was gone
+     (confirming that fix helped), but `dict_key` still arrived empty on
+     the receiving rank. Root cause: the previous `dict_key` broadcast
+     scheme (broadcast its length as a separate tensor, then broadcast a
+     `[None]*length` list of individual characters via `list(dict_key)`,
+     then `''.join(...)` to reconstruct) was fragile — even with the
+     `str`-vs-`list` and missing-`device` bugs already fixed, it still
+     occasionally produced an empty string for reasons never fully
+     isolated. Replaced entirely with a much simpler design in both the
+     `do_ap:True` and `do_ap:False` branches: broadcast `dict_key` itself
+     as a single-element list (`dict_key_holder = [dict_key] if
+     dist.get_rank(tensor_par_group) == 0 else [None]`) via one
+     `broadcast_object_list` call — `broadcast_object_list` already
+     natively supports a variable-length pickled object directly, so the
+     separate length-broadcast-then-characters dance was never needed.
+   - `basic_ct-sap+tensor_par`: `TIMEOUT (600s)`, no crash. Traced to a
+     real sender/receiver `dtype` mismatch on the `label` broadcast in the
+     Segmentation (`UNETR`/`SAP`) branch of `process_batch`: the real
+     `batch["label"]` is `uint8` (do_ap:True, basic_ct — see `dataset.py`'s
+     `np.asarray(np_label, dtype=np.uint8)`) or `int64` (do_ap:False — see
+     `dataset.py`'s `np.array(label.dataobj).astype(np.int64)`), never
+     cast to `precision_dt` on the sender side, but the non-rank-0
+     placeholder declared `dtype=precision_dt` (a float type) in all four
+     spots (`do_ap:True`/`twoD`, `do_ap:True`/3D, `do_ap:False`/`twoD`,
+     `do_ap:False`/3D). NCCL requires identical dtype/byte-size across
+     ranks for a collective to complete (the same reasoning already
+     documented next to the `DiffusionVIT` `t`/`e` placeholders); a
+     mismatch here manifests as a hang until the watchdog times out,
+     rather than an immediate crash — consistent with the observed
+     `TIMEOUT` instead of a `RuntimeError`. This exact code path
+     (do_ap:True + Segmentation + `tensor_par_size > 1`) had never been
+     exercised before `basic_ct-sap+tensor_par` (`SAP` is the only model
+     requiring `do_ap:True`), and `basic_ct-unetr+twoD+tensor_par`
+     (do_ap:False + Segmentation) never reached this broadcast either,
+     since it was crashing earlier on the `dict_key` bug above. Fixed all
+     four placeholders to the correct integer dtype (`torch.uint8` for
+     do_ap:True, `torch.int64` for do_ap:False). While auditing this,
+     also fixed a related latent bug one step earlier: the rank-0 sender's
+     `seq_label = batch["seq_label"].to(device)` was missing a
+     `.to(precision_dt)` cast (its receiver placeholder is
+     `dtype=precision_dt`) — harmless today only because `basic_ct/sap`'s
+     baseline happens to use `data_type: float32` already (matching
+     `seq_label`'s native `float32` from `datamodule.py`'s
+     `seq_mask.permute(2, 0, 1).float()`), but would hit the identical
+     hang under a `bfloat16` config. `run_feature_matrix_smoke.py`'s
+     `basic_ct-sap+tensor_par` cell also picked up `min_files_override=8`/
+     `timeout_override=1800` (mirroring `basic_ct-unetr+twoD`'s existing
+     margin) as a safety buffer while this fix gets its first real run —
+     not because SAP's baseline has any known sample-count multiplication
+     cost (`twoD` stays `False`).
+
+   Both fixed locally (full Tier 1 suite green, 153 passed); not yet
+   re-verified against a real Frontier run.
+
+8. Reran the full matrix (job 5340104) against item 7's fixes: **17 PASS, 1
+   FAIL**. Both item 7 fixes verified working on real Frontier data:
+   `basic_ct-unetr+twoD+tensor_par` now passes (`dict_key` broadcast
+   redesign fixed), and `basic_ct-sap+tensor_par` no longer times out —
+   it now fails fast at 22s instead of hanging for 600s, confirming the
+   `label`-dtype broadcast fix resolved the hang. But it still failed, with
+   a new, different error: `ZeroDivisionError: division by zero` at
+   `datamodule.py`'s `setup()` (`keys_to_add =
+   int(np.ceil(self.max_balance/self.batches_per_rank_epoch[k]))`), coming
+   from `calculate_load_balancing_on_the_fly` (`misc.py`) computing
+   `batches_per_rank_epoch["ct1"] = 0`. Root cause was a mistake in item
+   7's own `run_feature_matrix_smoke.py` change, not `training.py`:
+   `basic_ct-sap+tensor_par` had copied `min_files_override=8` from
+   `basic_ct-unetr+twoD`, but that value only works there because
+   `twoD:True` multiplies each real file into up to `div*div*img_size[2]`
+   tiles — SAP has `twoD:False` and no tiling, so `tiles_per_image` is `1`.
+   With only 8 real files split across `data_par_size:4` ranks, each rank
+   gets just 2 images (`tiles_per_image:1`, so 2 samples) — far below
+   the baseline's `batch_size:32` — so `calculate_load_balancing_on_the_fly`
+   floors `batches_per_rank` to `0`. This cell previously ran fine at
+   `DEFAULT_MIN_FILES:256` (64 images/rank, well above `batch_size:32`);
+   the fix is simply to drop the `min_files_override` for this cell
+   (kept `timeout_override=1800` as a harmless safety margin — the actual
+   failure now surfaces in 22s, well under even the shared 600s default).
+
+   Fixed locally (full Tier 1 suite green, 153 passed); not yet
+   re-verified against a real Frontier run.
+
+9. Reran the full matrix (job 5341029) against item 8's fix: **17 PASS, 1
+   FAIL**. The `min_files` fix worked — `basic_ct-sap+tensor_par` got well
+   past `setup()` this time (180s in, well into real training) — but still
+   failed, with yet another new, different error:
+   `einops.EinopsError: Shape mismatch, 512 != 64` in `training.py`'s
+   `train_step` (`seq_label = einops.rearrange(batch["seq_label"], 'b c
+   (ps1 ps2 ps3) (s1 s2 s3)-> ...')`), on a non-rank-0 process, with
+   `batch["seq_label"].shape == (32, 4, 512, 64)` where the pattern expected
+   `(..., 64, 512)` (`ps1*ps2*ps3=4*4*4=64`, `s1*s2*s3=8*8*8=512`) — the
+   last two dims were transposed. Traced to yet another placeholder-shape
+   bug in `process_batch`, in the exact same never-before-exercised
+   do_ap:True + Segmentation + `tensor_par_size>1` code path as items 7/8:
+   the `seq_label` placeholder (both `twoD` and 3D variants) declared shape
+   `(batch_size, num_classes, fixed_length, patch_size**N)`, but the real
+   per-sample construction (`dataset.py`'s `np.reshape(seq_label,
+   [patch_size**N, -1, 1])` composed with `datamodule.py`'s
+   `seq_mask.permute(2, 0, 1)` stacking) actually produces
+   `(batch_size, num_classes, patch_size**N, fixed_length)` — the two
+   trailing dims swapped. Since both orderings have the same total element
+   count, `dist.broadcast` (which fills a tensor's existing memory without
+   reshaping) copied the bytes without erroring, and the corruption only
+   surfaced later, downstream in `train_step`'s `einops.rearrange` (which
+   is why this bug survived items 7/8's local Tier 1 checks and the earlier
+   `label`/`seq_label` dtype fixes — dtype matched, only the shape was
+   wrong). Fixed both placeholders (`twoD`: `patch_size*patch_size,
+   fixed_length`; 3D: `patch_size*patch_size*patch_size, fixed_length`) to
+   match the real dim order.
+
+   Fixed locally (full Tier 1 suite green, 153 passed); not yet
+   re-verified against a real Frontier run.
+
+10. Reran the full matrix (job 5341245), now against `get_model`'s
+    `tensor_par_size`/`tensor_par_group` wiring fix (see "Major finding"
+    above) actually shipping: **16 PASS, 2 FAIL** — `imagenet-
+    classification+tensor_par`, `basic_ct-mae+tensor_par`, `catsdogs-
+    classification+tensor_par`, `imagenet-classification+do_ap+tensor_par`,
+    `imagenet-classification+do_tiling+tensor_par`, and `catsdogs-
+    diffusion+tensor_par` all still passed with real sharding actually
+    active for the first time — a good sign for the sharding logic itself
+    (consistent with `test_tensor_parallel_correctness.py`/
+    `test_fsdp_correctness.py` already passing on real data). But two
+    cells that were previously passing under the old (never-sharded)
+    behavior broke: `basic_ct-unetr+twoD+tensor_par` (regression) and
+    `basic_ct-sap+tensor_par` (still unresolved), both with the identical
+    error: `ValueError: Tensors must be contiguous` in `arch.py`'s
+    `forward_features`, at `dist.broadcast(x, src_rank,
+    group=self.tensor_par_group)` right after `_pos_embed`/`patch_drop`.
+
+    Root cause: `_pos_embed`'s `torch.cat` step (prepending the class
+    token), which happens to also produce a fresh contiguous tensor as a
+    side effect, only runs when `self.cls_token is not None` — i.e. only
+    for `model_type == "VIT"` (`get_model`'s `class_token=True if
+    conf["model"]["type"] == "VIT" else False`). For every other model
+    type (`UNETR`, `SAP`, `MAE`, `DiffusionVIT`), that step is skipped, so
+    `x`'s contiguity depends entirely on `self.token_embeds(x)`'s raw
+    output — typically `PatchEmbed`'s own flatten+transpose, which is
+    non-contiguous. This code path was dead until item "Major finding"'s
+    `get_model` fix, so it had never been exercised by any real run
+    before. One instance of this exact bug (`DiffusionVIT.forward_features`)
+    had apparently already been found and fixed at some earlier point
+    (`dist.broadcast(x.contiguous(), ...)`), but the identical pattern was
+    never applied to the other four analogous broadcasts.
+
+    Audited every `dist.broadcast(x, ...)`/`dist.broadcast(x.contiguous(),
+    ...)` call in `arch.py` (6 total) rather than patching only the two
+    confirmed failures, checking each one's actual upstream contiguity:
+    - `VIT.forward_features` (shared by `VIT`/`SAP`/`UNETR`) and
+      `UNETR.forward_intermediates`: same `_pos_embed` → `patch_drop` →
+      broadcast shape with no cleanup step in between — fixed.
+    - `DiffusionVIT.forward_features`: `x = x + time_emb` right before the
+      broadcast does *not* reliably produce a contiguous result (an
+      elementwise op can preserve a non-contiguous input's memory layout)
+      — already had `.contiguous()`, but as an unassigned inline copy (see
+      below) — fixed properly.
+    - `MAE.random_masking`'s noise broadcast, `MAE.mask_head`'s decoder
+      broadcast, and `DiffusionVIT.forward_head`'s decoder broadcast: `x`
+      immediately before each is the output of `torch.rand`/`torch.cat`/
+      `torch.gather` (always produces a fresh, contiguous tensor) or a
+      full-range slice of an already-contiguous tensor — confirmed safe
+      both by this reasoning and empirically (both `basic_ct-mae+
+      tensor_par` and `catsdogs-diffusion+tensor_par` passed in this same
+      job with `linear_decoder: False`, i.e. their decoder-broadcast
+      branches were genuinely exercised). Left unchanged.
+
+    Also fixed a latent correctness bug while doing this, present in both
+    the already-shipped `DiffusionVIT` instance and my own first pass at
+    the `VIT`/`UNETR` fixes: `dist.broadcast` fills its tensor argument in
+    place, but `.contiguous()` returns a *new* tensor whenever the input
+    isn't already contiguous — passing `x.contiguous()` inline without
+    reassigning `x = x.contiguous()` first would broadcast-fill that
+    throwaway copy while leaving the original `x` variable (used by the
+    very next line) silently un-updated on every non-src rank. This never
+    caused a visible failure only because every rank already computes an
+    (almost) bit-identical `x` independently from identical
+    data/weights, so the broadcast's result and each rank's own local
+    value coincide in practice — but it defeats the broadcast's actual
+    purpose (forcing bit-identical values before the sharded blocks) and
+    is a real latent bug if that assumption ever doesn't hold exactly
+    (e.g. kernel-level floating-point non-determinism). All fixed
+    instances now do `x = x.contiguous()` then `dist.broadcast(x, ...)`.
+
+    Fixed locally (full Tier 1 suite green, 156 passed); not yet
+    re-verified against a real Frontier run.
+
+11. Reran the full matrix (job 5341294) against item 10's contiguous-
+    broadcast fixes: **18 PASS, 0 FAIL — every cell passes.** Both
+    `basic_ct-unetr+twoD+tensor_par` and `basic_ct-sap+tensor_par` (the
+    two that broke when `get_model`'s `tensor_par_size` wiring fix first
+    made real sharding active) now pass. This closes out the whole chain
+    of bugs surfaced by that fix — `get_model` now genuinely wires
+    `tensor_par_size`/`tensor_par_group` into the model, real sharded
+    `Attention`/`Mlp` layers run end-to-end through the full `train.py`
+    pipeline for every model type, and the full feature matrix is clean
+    again.
+12. Reran the full matrix (job 5347454) after the `interp_size` refactor
+    (`patch_size` retired under `do_ap:True`) and the new
+    `catsdogs-classification+do_tiling` cell (19 cells total, up from 18):
+    **19 PASS, 0 FAIL — every cell passes**, including every `do_ap:True`
+    cell with its new `interp_size` override, `basic_ct-sap+tensor_par`
+    (`SAP`'s shipped `interp_size:4`), and `catsdogs-classification+
+    do_tiling` (74s) on its first-ever real Frontier run. Confirms the
+    `interp_size` model-sizing refactor (`VIT.effective_patch_size`,
+    `SAP.neck`, `UNETR`'s linear-decoder upsample, the sin-cos pos-embed
+    grid calc, `training.py`'s SAP/UNETR sequence reshapes) and the
+    catsdogs tiling addition both work correctly end to end, not just
+    through `parse_config`.
+
+## Running the pretrained-checkpoint smoke test (Tier 3c)
+
+```bash
+cd launch/tests
+sbatch run_pretrained_smoke.sh
+```
+
+The real, maximally-realistic end-to-end proof of the pretrained-loading
+workflow: `tests/integration/run_pretrained_smoke.py` runs two real training
+phases against `configs/catsdogs/classification/base_config.yaml` (reusing
+`run_training_smoke.py`'s own `make_smoke_config`/`run_fresh_phase`/
+`run_training` directly, the same reuse pattern `run_feature_matrix_smoke.py`
+already uses, rather than reimplementing them):
+
+1. **Phase 1 (fresh)**: an unmodified real training run, producing a real
+   `epoch_0_rank_0.ckpt` via the real training loop — not a hand-built
+   checkpoint fixture.
+2. **Phase 2 (pretrained)**: a second run against the *same* base config,
+   with `dataset_options.resize.catsdogs` overridden to `[128, 192]` — a
+   different, non-square size than the shipped `[256, 256]`, not a uniform
+   rescale (same shape as `tests/model/test_pretrained_loading.py`'s Tier 1
+   cases). `resize`, not `data.img_size`, is what actually controls both the
+   real data pipeline's resize step and `tile_size`'s computation for
+   `catsdogs` (`parse.py`'s `effective_size = resize_conf.get(dataset,
+   img_size)`), so overriding it keeps the two consistent automatically —
+   verified locally before ever spending real Frontier time on it
+   (`tile_size` came back `(128, 192)`, `img_size` unchanged at `[256,
+   256]`). `trainer.use_pretrained_model:True` and
+   `pretrained_checkpoint_filename:"epoch_0"` point it at phase 1's
+   checkpoint via `train.py`'s own `--pretrained_config` argument (a new
+   optional parameter on `run_training`, additive — every existing caller
+   is unaffected).
+
+Prints a PASS/FAIL/TIMEOUT summary for both phases, same style as the other
+two Tier 3 scripts; exits nonzero if either phase fails.
+
+**Real runs on Frontier so far:**
+
+First run (job 5348717): phase 1 **PASS (66s)** — real training completed
+and wrote `epoch_0_rank_0.ckpt` normally. Phase 2 **FAIL (17s)**,
+`"Checkpoint file does not exist"` — this is exactly the checkpoint-
+existence-check bug described in the Tier 2 section's item 3 above; this
+run is what actually caught it (the Tier 1/Tier 2 tests had worked around
+it without realizing it was a real, blocking bug for genuine end-to-end
+usage). Fixed the same way described there.
+
+Second run (job 5348773), after that fix: phase 1 **PASS (66s)** again.
+Phase 2 got past the checkpoint-existence check this time and reached the
+real forward pass for the first time ever — where it hit item 5 above
+(`AssertionError: Input height (192) doesn't match model (128)`), **FAIL
+(21s)**. This run is what actually caught that bug — `[128, 192]`
+(non-square, chosen deliberately to prove ratio-independence) is the first
+resize this repo has ever used in a real training run that wasn't square.
+Fixed the same way described there. Needs another rerun to confirm phase 2
+now passes for real.
+
+Third run (job 5350108), after that fix: phase 1 **PASS (76s)**, phase 2
+**PASS (49s)** — full end-to-end pass, confirming both bugs above are
+actually fixed and the pretrained-loading workflow genuinely works for a
+non-square resolution change (`[256, 256]` → `[128, 192]`).
+
+**Note:** this run was against the `[width, height]` convention described
+above (`NEW_RESIZE = [128, 192]` meant width=128, height=192 at the time).
+That convention was later flipped to `[height, width]` (see "Flipped
+`img_size`/`resize`/`tile_size` to `[height, width]`" earlier in this
+file) — `NEW_RESIZE`'s literal value is unchanged in
+`run_pretrained_smoke.py`, but it now means height=128, width=192, still
+a genuinely non-square case.
+
+Fourth run (job 5350429), under the new `[height, width]` convention:
+phase 1 **PASS (64s)**, phase 2 **PASS (48s)** — reconfirms the
+end-to-end pretrained-loading workflow still works correctly after the
+convention flip.
+
+## Validating a config file by hand
+
+`utils/validate_config.py` is a standalone utility — the same one
+`tests/test_config_validation.py` uses under the hood — for checking a single
+config file without going through pytest:
+
+```bash
+python utils/validate_config.py configs/basic_ct/unetr/base_config.yaml
+
+# also validate a pretrained-model config
+python utils/validate_config.py configs/basic_ct/unetr/base_config.yaml \
+    --pretrained-config configs/basic_ct/mae/base_config.yaml
+```
+
+It initializes its own single-process `torch.distributed` group, so it runs
+standalone from a login node or laptop — no SLURM allocation needed. On
+success it prints a short summary (model type, dataset, parallelism sizes);
+on failure it prints the exact exception instead of a raw traceback.
+
+All 10 shipped configs currently pass. This test caught three real,
+previously-undiscovered bugs when it was first added (all since fixed):
+`tiling.tile_overlap` given as a YAML float instead of an int (now guarded
+against in `parse.py` directly, not just in the affected configs);
+`dataset_options.imagenet_resize` never renamed to `resize` in the three
+`configs/imagenet/*` files after the code was; and
+`configs/basic_ct/sap/base_config.yaml`'s `ap.fixed_length` not satisfying
+the constraints 2D adaptive patching requires. If this test starts failing
+again after a config or `parse.py` change, that's a real regression, not a
+flaky test.
+
+## Added `trainer.reset_scheduler_on_resume` for continuing training past its original `max_epochs`
+
+Motivated by a real run (`unetr_token_selection_experiment/adaptive_cross_attention.yaml`,
+174-183 real epochs on Frontier, jobs 5421840/5445353): `trainer.max_epochs:
+200` was just a first guess at how long training might need, and inference
+quality at that point suggested it wasn't enough -- the fix under
+consideration is to keep training much longer (e.g. up to 1000 epochs), not
+to treat 200 as a real budget that was reached.
+
+Before this, `resume_from_checkpoint:True` always called
+`scheduler.load_state_dict(checkpoint['scheduler_state_dict'])`
+unconditionally in `load_optimizer_scheduler_from_checkpoint` (`training.py`)
+-- which restores the checkpointed schedule's own `max_epochs` (200) along
+with everything else, so simply bumping `trainer.max_epochs` in the config
+and resuming would silently keep the *old* schedule shape: the LR stays
+pinned wherever the old, already-mostly-decayed-to-`eta_min` cosine schedule
+left it, never running a real schedule over the new, larger budget.
+
+New `trainer.reset_scheduler_on_resume` (default `False`, only meaningful
+alongside `resume_from_checkpoint:True` -- rejected explicitly in
+`parse_config` otherwise, same "reject the nonsensical combination" pattern
+as the existing `resume_from_checkpoint`+`use_pretrained_model` check).
+When `True`, `load_optimizer_scheduler_from_checkpoint` skips loading the
+checkpointed scheduler state and instead rebuilds one fresh via
+`configure_scheduler`, using `conf["scheduler"]` (whose `max_epochs` is
+always derived from `trainer.max_epochs` -- see `parse_config`) --
+attached to the optimizer *after* `optimizer.load_state_dict` has already
+restored its (near-`eta_min`) state, since `_LRScheduler.__init__` applies
+its own epoch-0 LR to the optimizer's param groups as the very last step of
+construction. Building fresh in that order is what makes the new schedule
+actually take effect, with no need to reach into the scheduler's private
+internals. Model weights and optimizer momentum are still restored from the
+checkpoint as normal -- only the LR schedule resets.
+
+To use: bump `trainer.max_epochs` to the new target and set
+`trainer.reset_scheduler_on_resume: True` alongside the existing
+`resume_from_checkpoint: True`/`checkpoint_filename` pointing at the
+checkpoint to continue from.
+
+**Tier 1 coverage:** new `tests/test_load_optimizer_scheduler_from_checkpoint.py`
+-- builds a real optimizer/scheduler pair, steps it most of the way through
+a 200-epoch schedule (LR decayed near `eta_min`), checkpoints it, then
+confirms `reset_scheduler_on_resume:True` resumes at the checkpointed epoch
+but with a fresh scheduler (new `max_epochs`, LR back at `warmup_start_lr`),
+while `reset_scheduler_on_resume:False` (the default) still restores the
+checkpointed schedule exactly as before (regression check that the existing
+path is unchanged). `test_config_validation.py` gained a test confirming
+`reset_scheduler_on_resume:True` without `resume_from_checkpoint:True` fails
+clearly instead of being silently ignored.
+
+## Added a fourth dataset: "sst" (CFD regression, UNETR + `model.loss_fn:"MSE"`)
+
+Ported from the old `SST` branch, which had diverged 51 commits before a
+major refactor (`fsdp`/`simple` split -> unified `model/`; the whole config
+schema changed shape) -- not a mergeable diff, so this is a from-scratch
+re-implementation guided by the old branch's actual on-disk data format and
+task, not a code port. Repurposes `UNETR` for real-valued regression
+(predicting pressure `p` from velocity/density `r`/`u`/`v`/`w`) instead of
+its usual classification/segmentation task, via two new, purely additive
+pieces: a new dataset type ("sst") in the data-loading layer, and a new
+`model.loss_fn:"MSE"` option for `UNETR` in the training layer. Every
+existing dataset/config is unaffected -- confirmed by the full local suite
+staying green throughout (no existing test's behavior changed).
+
+**Data format:** one flat `np.memmap` binary file per variable per
+timestamp (e.g. `r_29.960000`, `p_29.960000`), all in one directory per
+dataset key -- not one self-contained file per sample the way
+`basic_ct`/`imagenet` are. `UCF_VIT.utils.misc.process_root_dirs` gained an
+`"sst"` branch that lists real files, skips the auxiliary `"global"` file,
+and dedupes on everything after each file's first `"_"` (the timestamp,
+shared across every variable's file for one snapshot) to build synthetic
+`"<root_dir>/<timestamp>"` sample identifiers; `FileReader.read_process_file`
+expands each back into per-variable file paths by re-attaching the
+variable's own prefix.
+
+**Chunk splitting, kept from the old branch on request** (not present in
+any config shipped so far, but a deliberate, explicit capability): real
+volumes (e.g. 512x512x256, 4 input channels) are too large to fully
+materialize before tiling, so `data.img_size` is repurposed as the
+per-sample/per-*chunk* size for `"sst"` specifically (not the true
+on-disk extent), and a new `dataset_options.full_domain_size` holds that
+true extent -- `num_chunks[i] = full_domain_size[i] // img_size[i]`. When
+`num_chunks == [1,1,1]` (every case so far), sample identifiers are
+unchanged plain `"<root_dir>/<timestamp>"` strings; otherwise each chunk
+gets a `"__chunk<z>_<y>_<x>"` suffix, keeping every entry a *string* (not
+e.g. a tuple) specifically so `FileReader`'s existing `epoch_shuffle_seed`
+reshuffle -- which round-trips entries through
+`numpy.random.RandomState.choice`, needing a clean 1-D array -- and every
+other generic list operation (`sorted`, slicing, `bucket_file_list`) keep
+working completely unchanged; `read_process_file` is the only place that
+ever parses the suffix back out. This also turns out to be the natural way
+to reconcile a non-cubic real domain (512x512x256) with `tiling.div`'s
+single shared divisor across all 3 axes -- see the new
+`configs/sst/unetr/base_config.yaml`'s own header comment for a real
+worked example (a 256^3 chunk size divides cleanly by `div:4` into 64^3
+tiles, where the raw 512x512x256 domain doesn't).
+
+**Memory safety:** `FileReader.read_process_file`'s `"sst"` branch returns
+a *list* of per-channel `np.memmap` views, not a stacked ndarray (unlike
+every other dataset) -- stacking would force-materialize the whole,
+potentially many-GB chunk immediately. `TileDataIter` gained a new
+`_slice_tile` static method, used by its 3D (non-`twoD`) branches (the only
+ones `"sst"` -- always 3D, never `twoD` -- ever reaches), that transparently
+handles both cases: a single already-stacked ndarray (every other dataset,
+byte-identical behavior to before) or a list of memmap views (`"sst"`
+only), in which case only the one small tile actually being cut is ever
+read from disk (`np.stack`/`np.asarray` is what forces the read, and it
+only ever sees that one tile).
+
+**A real, caught-before-running bug:** the raw files have a fixed `+2`
+padding on the x axis (confirmed with the user: real ghost cells, not a
+tunable value) that the tiling grid never reaches (every chunk/tile bound
+is computed from the true, unpadded `nx`) -- initially implemented as a
+symmetric `[..., 1:-1]` trim under an explicit, flagged assumption; the
+user corrected this before any real run happened -- it's actually a
+trailing-only `[..., :nx]` trim, no offset at all. Fixed in
+`FileReader.read_process_file` and the corresponding test's reference
+slice before either was ever exercised against real data.
+
+**`training.py`:** `forward_step`'s `UNETR` branch now checks
+`conf["model"]["loss_fn"] == "MSE"` and, if so, uses plain `nn.MSELoss()`
+against `batch["label"]` directly instead of `DiceCELoss`'s
+one-hot/softmax classification machinery (meaningless -- and shape-
+incompatible -- for a `num_classes:1` continuous target). `train_epoch`/
+`eval_epoch`'s accuracy reporting gained the same dispatch: `AsDiscrete`/
+`DiceMetric` are classification-only (`argmax` over `num_classes:1` is
+trivially always index 0), so regression reports plain MSE instead, the
+same quantity the loss itself is. Every existing `UNETR` config has
+`loss_fn` omitted (defaults to `None`, unchanged), so this is purely
+additive.
+
+**`UCF_VIT.utils.inference_output.save_inference_batch`** (the `test.py`/
+`val.py` NIfTI-dump feature) previously always `argmax`'d the model output
+-- meaningless for `num_classes:1` regression (always index 0). Now
+dispatches on `output.shape[1] == 1` (a real segmentation task never has
+exactly 1 class): classification keeps the existing argmax-to-int16 path
+and `_pred_label.nii.gz` filename (the `"_label"` suffix exists specifically
+so viewers like Slicer auto-load it as a discrete Labelmap); regression
+saves the raw continuous prediction as float32, named plain `_pred.nii.gz`
+(no `"_label"` suffix -- a continuous field should render as an ordinary
+Scalar Volume, not get a categorical Labelmap color table applied to it).
+
+**Known, deliberately out-of-scope gaps, not attempted here:**
+- Adaptive patching (`ap.do_ap:True`) -- the old branch's config used it,
+  but `Patchify_3D`'s edge-detection (Canny) is tuned around image-like
+  data, not raw CFD float fields with arbitrary value ranges, and hasn't
+  been checked against this data at all. `configs/sst/unetr/base_config.yaml`
+  is deliberately non-adaptive as a first, lower-risk pass -- a real,
+  separate follow-up if wanted.
+- `save_inference_batch` only ever dumps `batch["data"][:, 0]` (the first
+  input channel) -- fine for every existing single-channel dataset, but
+  `"sst"` has 4 real input channels (r/u/v/w); only the first is currently
+  visualized.
+- `nx_skip`/`ny_skip`/`nz_skip` (present, but never implemented -- the old
+  branch's own `#TODO: Fix Logic...` -- in the branch this was ported from)
+  were dropped entirely rather than carried over as more dead config surface.
+- The old branch's `dev_scripts/train_pred_fsdp.py`-style two-phase
+  MAE-pretrain-then-finetune workflow, and the `SAP`-model config
+  (`configs/sst/sap/base_config3D.yaml` in the old branch) -- deferred;
+  the user is undecided on whether the `SAP` path is wanted at all.
+
+**Tier 1 coverage:** new `tests/dataloaders/test_sst.py` -- `process_root_dirs`'s
+timestamp enumeration/dedup/`"global"`-skip and chunk expansion (including
+an uneven-division rejection test), `FileReader.read_process_file`'s actual
+memmap slicing against real on-disk files with known, distinct values per
+variable (catches offset/transpose bugs as a value mismatch, not just a
+shape mismatch) for both the single- and multi-chunk cases, a cross-check
+that `TileDataIter`'s list-of-memmaps path produces byte-identical tiles to
+the equivalent already-stacked-ndarray path, and one full end-to-end test
+building real memmap files on disk and running them all the way through
+`NativePytorchDataModule.setup`/`train_dataloader`/`collate_fn` with real
+chunk-splitting engaged (2 timestamps x 2 chunks = 4 independent samples),
+checking real, distinguishable per-chunk content survives the whole
+pipeline. `tests/test_forward_step.py` and `tests/utils/
+test_inference_output.py` each gained regression-mode tests alongside
+existing classification-mode ones (confirming the existing, unchanged
+default path still dispatches correctly). `test_config_validation.py`'s
+existing glob-based `test_shipped_config_parses` picked up the new
+`configs/sst/unetr/base_config.yaml` automatically.
+
+Not yet run against real Frontier data -- `dict_root_dirs` points at a real
+path from the old branch's own config
+(`/lustre/orion/stf006/world-shared/muraligm/CFD135/data_iso/super_res/
+binary_data/P1F4R32_nx512ny512nz256_6vars`); needs a real run to confirm
+end to end, especially the `+2`-padding fix.
+
+#### Follow-up: Tier 2 real-pipeline coverage, and a real narrowing gap it found before ever running
+
+Before trying a real Frontier training run, added
+`tests/distributed/test_sst_real_pipeline.py` -- same idea as this
+directory's own `test_dataloader_real_pipeline.py`
+(basic_ct/imagenet/catsdogs), real `srun -n 8`, real `parse_config` +
+`calculate_load_balancing_on_the_fly` + `NativePytorchDataModule`
+construction (train.py's own, including the new `dict_out_variables`/
+`img_size`/`full_domain_size` kwargs), pulling real batches and checking
+shape/dtype (`float32`, not the usual `int64` class-index label -- this is
+a regression target). `configs/sst/unetr/base_config.yaml`'s
+`parallelism.simple_ddp_size:"auto"` (so the same config works at any real
+node count) is overridden to a fixed `8` in this file specifically, to
+match the real 8-rank launch the same way `test_dataloader_real_
+pipeline.py`'s basic_ct/imagenet configs already do.
+
+Writing this surfaced a real gap that would have crashed the very first
+narrowing attempt: `tests/integration/run_training_smoke.py`'s
+`compute_narrow_dict_idx` calls `process_root_dirs` directly, without ever
+passing `img_size`/`full_domain_size` through -- harmless for every
+dataset that predates "sst" (those two parameters default to `None` and are
+only ever read inside `process_root_dirs`'s own `"sst"` branch), but for
+"sst" itself `process_root_dirs` unconditionally subscripts `img_size`,
+so omitting it would raise a `TypeError` on the very first real narrowing
+attempt. Fixed by threading both through from the raw config the same way
+`conf["data"]["img_size"]` is already read elsewhere in that file. This
+same fix is what makes `tests/dataloaders/test_dataset_speed_real_data.py`'s
+and `tests/distributed/test_dataloader_speed_real_pipeline.py`'s generic,
+`--speed-config`-driven tests (see their own "Running the dataloader speed
+tests" section above) work for `--speed-config
+../../configs/sst/unetr/base_config.yaml` too -- both narrow via this same
+`compute_narrow_dict_idx` call.
+
+**Tier 1 coverage:** none needed beyond what `test_sst.py` already covers
+-- this fix is exercised for real the moment `test_real_pipeline_sst_unetr`
+(or the speed tests, pointed at the sst config) actually run on Frontier.
+Confirmed locally: collects and skips cleanly (no real `srun` launch
+present), and the rest of the local suite is unaffected.
+
+#### Follow-up: real Frontier confirmation, then adaptive patching
+
+`configs/sst/unetr/base_config.yaml` ran cleanly against real Frontier
+data (job 5455196, non-adaptive) -- real 8-rank init, "Train from
+scratch.", no errors/NaN anywhere, 4 full epochs completed before hitting
+the (deliberately short, first-attempt) time limit, `epoch_loss` trending
+sharply down (12.59 -> 11.85 -> 5.36 -> 1.86). `it_loss`/`it_acc` print
+identically on every batch, exactly as designed -- regression's "accuracy"
+is the same plain MSE the loss itself is (see `train_epoch`'s `UNETR`
+branch). Confirmed both the memmap `+2`-padding trim and the `MSE`
+regression path work correctly against real data, not just synthetic
+files.
+
+With the non-adaptive path confirmed, added adaptive patching
+(`configs/sst/unetr/adaptive_config.yaml`) as its own follow-up, not
+folded into `base_config.yaml` -- this needed a real fix, not just
+flipping `ap.do_ap:True`. `Patchify_3D`'s `SimpleITK.CannyEdgeDetection`
+call uses *absolute* hysteresis thresholds (`canny_thresholds`, default
+`(0.05, 0.15)`) tuned for roughly `[0,1]`-scaled data -- true for
+`basic_ct` only because it's min-max normalized once at file-read time
+(`FileReader.read_process_file`'s own `(data-data.min())/(data.max()-
+data.min())`); `"sst"`'s raw CFD fields (density/velocity/pressure) are in
+arbitrary physical units with no such normalization anywhere in their
+pipeline. Plugging those straight into the existing thresholds would
+silently either miss real features (raw gradient magnitude far below the
+absolute threshold) or flag everything (far above it), depending on the
+field's real scale -- not a hypothetical: `test_patchify_3d_sst_detects_
+edge_too_small_for_raw_scale` (below) reproduces the miss case directly
+with a real step of magnitude `0.001`, ~50x smaller than
+`canny_thresholds`' own lower bound.
+
+Fixed by normalizing *only* the array fed into `CannyEdgeDetection` for
+`dataset:"sst"` specifically (per channel, locally, inside `Patchify_3D.
+forward`) -- the real patch content (`octree.serialize`, what the model
+actually trains against) still gets the real, un-normalized `img`
+unchanged, so training still happens on real physical values, only the
+edge-detection *input* is rescaled. Scoped strictly to `"sst"` -- every
+other dataset's edge-detection input is completely untouched (`Patchify_3D`'s
+`dataset` parameter was previously "kept for interface compatibility"
+only, never actually branched on).
+
+`adaptive_config.yaml`'s `ap.fixed_length:729`/`ap.interp_size:8` are
+translated from the old SST branch's config (`fixed_length:729`,
+`patch_size:8` -- that codebase had no separate `interp_size` concept,
+`patch_size` served both roles); `729 == 9^3` exactly, so UNETR's
+reconstructed canvas (`sqrt_len=9`) loses zero adaptive tokens (doesn't
+trigger `parse.py`'s own "UNETR's decoder bottleneck..." warning). Not yet
+run against real Frontier data.
+
+**Tier 1 coverage:** `tests/dataloaders/test_transform.py` gained three
+tests: `test_patchify_3d_sst_normalizes_only_edge_detection_input_not_real_
+patch_content` (the core equivalence property -- `dataset:"sst"` on raw,
+arbitrary-scale data must produce the *exact same* edge map a manually
+pre-normalized `[0,1]` volume gets on the default path, while the real
+patch content stays at real physical values, not the normalized proxy),
+`test_patchify_3d_non_sst_dataset_unaffected` (regression check that
+`basic_ct`'s own edge-detection input is untouched), and
+`test_patchify_3d_sst_detects_edge_too_small_for_raw_scale` (the direct,
+concrete failure-mode reproduction described above). `test_config_
+validation.py`'s existing glob-based test picked up the new
+`configs/sst/unetr/adaptive_config.yaml` automatically. Confirmed the full
+local suite is unaffected.
+
+#### Follow-up: MAE pretrain -> UNETR finetune, and a real bug it found first
+
+New `configs/sst/mae/base_config.yaml` -- MAE pretraining on "sst"'s input
+fields (unsupervised; `decoder_embed_dim:576`/`decoder_depth:8`/
+`decoder_num_heads:16`/`decoder_mlp_ratio:4`/`mask_ratio:0.75` translated
+directly from the old SST branch's own MAE-phase config values). Phase 2
+(`configs/sst/unetr/base_config.yaml`) already had `trainer.
+use_pretrained_model`/`pretrained_checkpoint_filename` fields (every
+shipped config does, off by default) -- just needed a comment explaining
+the real steps (flip `use_pretrained_model:True`, point
+`pretrained_checkpoint_filename` at a real MAE epoch, launch with
+`--pretrained_config ../../configs/sst/mae/base_config.yaml`), not a new
+config file, since `NativePytorchDataModule`/`get_model`'s existing
+pretrained-loading mechanism (encoder-only state-dict transplant, already
+exercised for `basic_ct` earlier this session) turned out to be already
+dataset-agnostic -- no "sst"-specific code needed for the transplant
+itself.
+
+Writing a real MAE+"sst" config surfaced a real bug first, before ever
+running it: `NativePytorchDataModule.__init__`'s `"sst"` branch
+unconditionally asserted `dict_out_variables is not None` -- fine for
+`UNETR` regression (`return_label:True`, genuinely needs it), but MAE
+pretraining has `return_label:False` (unsupervised, same as MAE against
+any other dataset -- never reads `dict_out_variables`/`"p"` at all) and
+would have failed that assert on every MAE+"sst" config, including this
+new one. Fixed to only require it when `return_label` is actually `True`,
+matching `parse.py`'s own already-conditional requirement exactly.
+
+`launch/sst/mae.sh` added (mirrors `unetr.sh`, not yet run against real
+data); `launch/sst/unetr.sh` now forwards `"$@"` to `train.py` so
+`--pretrained_config` can be appended for the finetune run once a real MAE
+checkpoint exists.
+
+**Tier 1 coverage:** new `test_native_pytorch_data_module_sst_mae_
+pretraining_needs_no_dict_out_variables` in `tests/dataloaders/test_sst.py`
+-- builds a real `NativePytorchDataModule` with `return_label:False` and
+`dict_out_variables:None` (deliberately no `"p"` file on disk at all, so
+the test would fail loudly with `FileNotFoundError` if `return_label`'s
+path were ever mistakenly reached), confirming it constructs and pulls a
+real batch successfully -- the direct regression test for the bug above.
+`test_config_validation.py`'s existing glob-based test picked up the new
+`configs/sst/mae/base_config.yaml` automatically. Confirmed the full local
+suite is unaffected.
+
+#### Follow-up: ported the sst-relevant auxiliary dev tools that were still cleanly portable
+
+From the old SST branch's dev tools -- ported what has zero coupling to
+anything the architecture/config-schema refactor changed:
+
+- `src/UCF_VIT/utils/plotting.py` (new): `plot_learning_curve`,
+  `get_1Dgrid`, `plot_contour_box` -- plain `numpy`/`matplotlib`
+  functions, no model/dataloader imports at all, so nothing to actually
+  port beyond a straight copy (light cleanup: dropped dead commented-out
+  alternate lines, added real docstrings).
+- `UCF_VIT.utils.misc.get_test_data`/`stitch_data` (new): real
+  full-volume "sst" inference tiling + overlap-averaged reassembly --
+  unlike the training pipeline's `FileReader`/`TileDataIter` (real
+  training/eval samples, not necessarily an exhaustive covering),
+  these extract *every* tile covering one entire real timestamp and
+  stitch per-tile predictions back into one dense volume, for genuine
+  scientific evaluation/visualization of a checkpoint's real predictions.
+  Also memmap-based, same on-disk layout and same `+2` x-axis padding
+  handling as `FileReader.read_process_file`'s `"sst"` branch (every
+  tile offset is bounded by the true `nx`, so the padding is never read
+  here either, same reasoning). Fixed one real, if minor, bug while
+  porting: `stitch_data`'s final `np.divide` had no `out=`, leaving
+  uninitialized memory (not zero) in any region no tile ever covers --
+  harmless in practice (the tile grid always covers the domain
+  edge-to-edge by construction) but worth not shipping regardless.
+
+**Not ported -- genuinely new capabilities, not mechanical ports, not
+attempted here:**
+- `dev_scripts/find_model_size.py` -- the old version was ~300 lines of
+  old-architecture (`fsdp.arch`) FSDP/training boilerplate just to
+  construct a model and print its size; a lean replacement using this
+  codebase's current `parse_config`/`get_model` would be maybe 20 lines,
+  but wasn't built this pass.
+- `utils/visualize_adaptive.py`'s old SST branch usage was still 2D-only
+  (quadtree) -- unchanged from what's already shipped here. Extending it
+  to "sst" (3D, octree) needs a real new feature (`FixedOctTree` has no
+  `draw()` method at all -- `Patchify`'s 2D quadtree visualization relies
+  entirely on `FixedQuadTree.draw()`), not a port.
+- A driver script actually combining `get_test_data`/`stitch_data`/
+  `plotting.py` end-to-end (load a real checkpoint, run real full-volume
+  inference, reassemble, plot) -- the old branch's
+  `dev_scripts/inference_sap_simple.py`/`inference_pred_fsdp.py`
+  equivalent, translated to this codebase's current `test.py`/`val.py`
+  conventions. The pieces it would call are now all ported and tested;
+  wiring them together into one script is a real, separate follow-up.
+
+**Tier 1 coverage:** `tests/utils/test_misc.py` gained
+`test_get_test_data_and_stitch_data_round_trip_no_overlap` (real memmap
+files with known, distinct per-variable content -- extracts tiles, stitches
+them back, and confirms an exact match against the true domain, catching
+any axis/variable mix-up as a value mismatch) and
+`test_stitch_data_averages_overlapping_tiles` (a constant field must
+reconstruct to the same constant even where multiple overlapping tiles
+land, the actual behavior `overlap > 0` exists for). No test added for
+`plotting.py` -- pure `matplotlib` rendering helpers with no return-value
+logic to assert against, consistent with how this repo doesn't test other
+purely-visual helpers either. Confirmed the full local suite is unaffected.
+
+#### Fixed a real regression the `TileDataIter._slice_tile` refactor introduced
+
+Real Frontier run (job 5455940, `test.py`) crashed immediately with
+`IndexError: too many indices for array: array is 3-dimensional, but 4
+were indexed`, on every rank -- this session's own `_slice_tile` refactor
+(added for `"sst"`'s list-of-memmaps case) unified `data`'s and `label`'s
+tile-slicing under one shared helper that always sliced with a leading
+`[:, ...]` channel dimension. That's correct for `data` (always
+channel-first, every dataset), but wrong for `label`: `basic_ct`'s real
+segmentation label is a bare `(X, Y, Z)` array with *no* channel dimension
+at this point in the pipeline (`ProcessChannels` adds it later) -- the
+*original* code sliced `label` without the leading `:,` specifically for
+this reason, and the refactor silently dropped that distinction. This
+broke every non-`"sst"` 3D dataset's real segmentation label immediately
+(`div:1` or not -- `_slice_tile` still runs once per sample either way),
+including `basic_ct`/`UNETR`'s already-shipped, real-data-tested config --
+not a hypothetical, the real crash above is direct proof.
+
+Fixed by adding a `channel_first` parameter to `_slice_tile` (default
+`True`, matching `data`'s own convention), with the label call site
+passing `channel_first=False` explicitly -- irrelevant for `"sst"`'s own
+list-of-memmaps case (that branch is checked first and always produces a
+channel-first stack regardless), so `"sst"`'s existing tests needed no
+changes and were re-confirmed passing.
+
+**Tier 1 coverage:** the real gap that let this ship in the first place --
+`tests/dataloaders/test_dataset.py` had `test_tiledataiter_3d_twod_false_
+full_3d_tiles` (3D, non-`twoD`, no label) but no equivalent test *with* a
+real segmentation label at all, the exact branch that broke. Added
+`test_tiledataiter_3d_twod_false_with_segmentation_label` (a bare,
+channel-less `(X, Y, Z)` label, matching `basic_ct`'s real convention) --
+confirmed it reproduces the exact same `IndexError` against the pre-fix
+code (verified directly, `git stash`-ing just the source change back in)
+and passes cleanly against the fix. Full local suite confirmed unaffected.
+
+## Added time-stepping to the `"sst"` dataloader (dataloader/schema layer)
+
+First stage of a 3-stage feature: given N past timesteps of some
+variable(s), predict some (possibly different) variable(s) at a future
+timestep. This stage covers only the dataloader/schema layer -- listing,
+reading, load-balancing, and config plumbing -- since everything else
+(adaptive-patching's octree-reuse-across-T, and the model's new
+`time_embed`/cross-attention aggregation) depends on knowing the exact
+shapes/semantics this layer produces. Deliberately designed so every
+`"sst"` config shipped before this (plain-string `dict_in_variables`/
+`dict_out_variables`, no offsets) parses and runs byte-identically to
+before -- confirmed by dedicated tests, not just by inspection.
+
+**Schema:** `dict_in_variables`/`dict_out_variables` entries stay plain
+variable-name strings (implicit offset 0) *or* become a `[variable,
+offset]` YAML pair (e.g. `["p", -2]`), normalized in `parse.py`
+(`_normalize_sst_variable_entry`) to a real `(var, offset)` tuple.
+`FileReader.read_process_file` dispatches on `isinstance(entry, tuple)`
+to know whether an entry carries an explicit offset. `time_offsets` (the
+sorted set of every offset actually referenced across both variable
+dicts) is derived once in `parse.py` and threaded through
+`calculate_load_balancing_on_the_fly`/`NativePytorchDataModule` down to
+`UCF_VIT.utils.misc.process_root_dirs`, which turns each real timestamp
+into a synthetic *window* -- a `"__t<off1>=<ts1>,<off2>=<ts2>,..."`-suffixed
+entry bundling the real timestamp resolved for every offset, composable
+with the existing `"__chunk<z>_<y>_<x>"` chunk-splitting suffix. Windows
+near either end of the sorted timestamp list, without enough real
+neighbors to cover the full offset span, are dropped -- the only
+load-balancing impact of time-stepping is this fixed, small reduction in
+sample count at the tail, confirmed directly by comparing
+`calculate_load_balancing_on_the_fly`'s output with and without offsets in
+`test_calculate_load_balancing_on_the_fly_sst_time_offsets_shrinks_sample_
+count`.
+
+**Two real bugs found and fixed along the way, both about temporal order:**
+
+- `process_root_dirs`'s own timestamp listing sorted timestamps as plain
+  strings (`"10.0" < "2.0"`) -- harmless while order only mattered for
+  deduplication, but a real correctness bug the moment offsets/window
+  order matters at all. Fixed with `key=float`.
+- A second, separate instance of the same bug one level up:
+  `calculate_load_balancing_on_the_fly` and `NativePytorchDataModule.
+  __init__` each independently re-sort `process_root_dirs`'s (already
+  correctly time-ordered) output via a plain `sorted()` on the full path
+  string, silently re-scrambling it -- meaningless before time-stepping
+  (order just needed to be deterministic), but load-bearing now: it's
+  what makes the existing train/val/test ratio-slice put earlier real
+  time in train and later real time in val/test (no future-to-past
+  leakage in evaluation). Fixed by adding `sst_temporal_sort_key`
+  (`misc.py`) -- resolves any `"sst"` entry (plain or windowed, chunked or
+  not) to its earliest real timestamp as a float -- and passing it as
+  `sorted()`'s `key=` at both call sites.
+
+**Tier 1 coverage** (`tests/dataloaders/test_sst.py`,
+`tests/test_config_validation.py`): numeric-vs-lexicographic timestamp
+sorting; window construction with correct boundary truncation; `time_
+offsets:[0]` producing output identical to no-timestepping; windowing
+composed with chunk-splitting; `read_process_file` resolving each
+`(var, offset)` entry to its real, distinguishable timestamp's file
+(caught as a value mismatch, not just a shape check) alongside a
+plain-string backward-compatibility test; a full `NativePytorchDataModule`
+end-to-end run (real memmap files, `setup` -> `train_dataloader` ->
+collate) proving input/label read genuinely different real timestamps 100
+apart; `sst_temporal_sort_key` unit tests (plain timestamps, windows,
+chunk-suffixed); `calculate_load_balancing_on_the_fly`'s time_offsets
+threading and sample-count shrinkage; and `parse.py` schema tests
+confirming `[var, offset]` pairs normalize to tuples, `default_vars`
+contains only variable names (no offsets), and `time_offsets` derives
+correctly from both `dict_in_variables` and `dict_out_variables` --
+alongside a matching test that plain-string-only configs still resolve
+`time_offsets` to `[0]` and leave every entry as a plain string. Every
+`"sst"` config shipped before this stage re-confirmed parsing/passing
+unchanged. Full local suite (339 passed, 4 skipped) confirmed no
+regressions elsewhere.
+
+**Not yet done** (next two stages): adaptive patching's "build the octree
+from one reference past timestep, reuse across all T" mode in
+`Patchify_3D`/`ProcessChannels`; and the two target UNETR configs (the
+existing u,v,w,r->p config needs no changes; a new N-past-steps->future-
+step config predicting all 5 variables still needs to be created).
+
+## Added the model-architecture piece: `time_embed`/cross-attention aggregation for time-stepped input (`arch.py`)
+
+Second stage of the time-stepping feature (see the dataloader/schema
+stage above). Confirmed first (with the user) that this is genuinely
+needed regardless of adaptive patching: even the plain, non-adaptive
+UNETR path tokenizes each input channel separately once
+`model.use_channel_aggregation:True` (`arch.py`'s `use_varemb`), and with
+time-stepped input, multiple channels are now the *same* variable at
+different offsets -- something has to decide how those get combined into
+one token stream before the shared transformer encoder. Confirmed by
+direct code reading (not guessed) that every shipped config -- including
+both existing `"sst"` configs -- actually has `use_channel_aggregation:
+False` today, so this whole mechanism (old and new) is currently inactive
+in production; the new time-stepped config (still to be created) will be
+the first to turn it on.
+
+**Design, as agreed with the user:** variable-aggregation runs first,
+*within* each timestep independently (collapsing that timestep's V
+variables to 1 token, via the existing `aggregate_variables`); time-
+aggregation runs second, *across* the resulting per-timestep tokens
+(collapsing T timesteps to 1, via a new `aggregate_times`) -- mirroring
+`var_embed`/`aggregate_variables` with a new `time_embed`/`time_query`/
+`time_agg` (reusing `VariableMapping_Attention` as-is; it's already fully
+generic over what it's cross-attending over). `time_map` (in
+`create_time_embedding`) is keyed by the real offset *value*, not list
+position -- exactly like `time_offsets` itself, this is what makes
+irregular strides (e.g. `[-5, -3, -1]`) work with zero special-casing.
+`use_timeemb` (new, mirrors `use_varemb`) gates the entire mechanism off
+by construction whenever there's only one real timestep -- not a
+degenerate one-token cross-attention, the code path is never entered at
+all -- so every existing `use_varemb` config (time-stepped or not) is
+provably unaffected. Wired into the two real call sites that matter for
+`"sst"`: `VIT.forward_features` (shared base, used whenever
+`skip_connection:False`) and `UNETR.forward_intermediates` (its own
+near-identical copy, used by every shipped UNETR config since they all
+have `skip_connection:True`) -- deliberately not touched in `MAE`/
+`DiffusionVIT`'s own near-identical copies, since time-stepped `"sst"`
+never uses either model type.
+
+`variables` entries (already normalized to plain strings or `(variable,
+offset)` tuples by the dataloader/schema stage) flow straight through to
+the model unchanged -- `get_var_ids` now extracts just the name half
+(`_variable_name`) before looking up `var_map`, so a tuple entry still
+resolves to the right row. Per-variable `token_embeds`/`var_embed` are
+keyed by variable name only (offset-agnostic) with no changes needed at
+all: the same variable at different offsets already shares one token-
+embed module and one `var_embed` row, which is exactly the desired
+"one shared patch-embed across all T timesteps" behavior the user wanted
+(simpler than the per-variable case, which does use separate weights).
+
+`aggregate_variables`'s cross-attention body was factored out into a
+shared `_cross_attend_aggregate` helper (grouping dimension generalized
+from "variable" to "group") so `aggregate_times` isn't a copy-pasted
+duplicate -- confirmed byte-identical to the original, unrefactored
+`aggregate_variables` (same random weights, same input, `torch.equal`)
+before trusting it.
+
+**Verification note:** `tests/model/test_arch.py` (and `arch.py`/
+`building_blocks.py` generally) can't actually execute in this session's
+shell -- `building_blocks.py`'s unconditional `from xformers.components.
+attention.core import ...` fails here (`ModuleNotFoundError`, this
+environment's xformers build doesn't match its torch/Python version), the
+same pre-existing gap the file's own `importorskip` already guards
+against for every other test in it. Added real Tier 1 tests anyway
+(`test_use_timeemb_requires_use_varemb`, `test_time_map_is_keyed_by_real_
+offset_value_not_position`, `test_get_time_emb_selects_correct_rows_
+regardless_of_query_order`, `test_aggregate_variables_then_times_is_
+invariant_to_channel_order` -- permutes which channel index holds which
+`(variable, offset)` and confirms the output doesn't change, the direct
+regression test that grouping is driven by the `variables` labels and not
+by position -- `test_aggregate_variables_then_times_matches_manual_two_
+stage_computation`, `test_forward_features_with_use_timeemb_matches_no_
+timeemb_output_shape`, `test_unetr_forward_intermediates_with_use_timeemb_
+runs_end_to_end`), all skip cleanly here via the existing `importorskip`
+guard, matching this file's established convention.
+
+Before reporting this stage done, additionally verified for real (not
+just by inspection) by stubbing the three broken `xformers.components.*`
+submodules with empty placeholder modules in a scratch-only script
+(`FusedAttn.NONE` is the default here, so the actual broken xformers ops
+are never called, only imported) -- this let the real `VIT`/`UNETR`
+classes import and run under this session's CPU-only torch. Every one of
+the new tests' assertions, replayed directly against the real classes
+this way, passed, including a real end-to-end `UNETR.forward_intermediates`
+forward pass with `use_timeemb:True`. This scratch verification is not
+part of the committed test suite (masking a real environment gap for
+every other developer here would be worse than leaving it to
+`importorskip`) -- it's this session's own substitute for `pytest`
+actually running `test_arch.py`'s new cases, not a replacement for a real
+run in a working environment (or on Frontier) confirming the same.
+
+**Not yet done** (still pending): adaptive patching's "build the octree
+from one reference past timestep, reuse across all T" mode.
+
+## Added the two target UNETR configs, and two more real bugs found while building them
+
+Third and final stage of the time-stepping feature. Target 1 ("a UNETR
+setup like I have already with inputs u,v,w,r and predict p") already
+existed as `configs/sst/unetr/base_config.yaml` and needed zero changes,
+per the whole feature's backward-compatibility design -- re-confirmed by
+`test_shipped_config_parses[configs/sst/unetr/base_config.yaml]` still
+passing unchanged. Target 2 (new: N past timesteps of u,v,w,r,p predicting
+u,v,w,r,p at a future timestep) is `configs/sst/unetr/timestep_config.yaml`
+-- `dict_in_variables` lists u,v,w,r,p at offsets -2 and -1 (`[variable,
+offset]` pairs, `num_channels:10`), `dict_out_variables` lists them at
+offset 0 (`num_classes:5`), and `model.use_channel_aggregation:True` (new
+-- every other shipped config leaves this `False`) turns on the per-
+variable tokenization + `time_embed`/cross-attention aggregation from the
+previous stage. Deliberately non-adaptive (`ap.do_ap:False`), same as
+`base_config.yaml` was before its own `adaptive_config.yaml` follow-up --
+the octree-time-reuse mode isn't implemented yet.
+
+Validating this real config (not just a synthetic test fixture) surfaced
+two more real bugs, both pre-existing (not introduced this session) but
+newly *reachable* because this is the first config to actually exercise
+the code paths they're in:
+
+- **`default_vars` never deduplicated a single dataset key's own variable
+  list**, only a *merge across multiple keys* (via `set()`) did. Harmless
+  before time-stepping (a variable name never repeated within one key's
+  list), but `timestep_config.yaml`'s real `dict_in_variables` lists "u"
+  (and every other variable) twice -- once per offset -- which produced a
+  10-entry `default_vars` with duplicates, corrupting `create_var_
+  embedding`'s row count/sizing in `arch.py`. Fixed with an order-
+  preserving dedup (first-occurrence, not `set()`) in both `parse_config`
+  and the mirrored derivation in `parse_pretrained_config` -- deliberately
+  *not* `list(set(...))`: `set()`'s per-process string hash randomization
+  would make `var_map`'s name->row assignment inconsistent across separate
+  process launches (different DDP ranks, or a training run vs. a later
+  eval run), a real correctness bug the original `set()`-based multi-key
+  merge branch already had latent, now fixed for both. Caught immediately
+  by running the new config through `validate_config` and inspecting the
+  real parsed `default_vars` before ever writing a test for it.
+- **`save_inference_batch` dispatched classification-vs-regression off
+  `output.shape[1] == 1`** -- wrong the moment a real regression task has
+  more than 1 output channel, exactly `timestep_config.yaml`'s
+  `num_classes:5` (predicting 5 variables at once). Fixed by making
+  `regression` an explicit parameter the caller (`training.py`'s
+  `eval_epoch`, which already has `conf["model"]["loss_fn"]`) passes in,
+  instead of inferring it from the output shape.
+
+**Tier 1 coverage:** `test_sst_default_vars_dedupes_variable_repeated_
+across_offsets` (`test_config_validation.py`) -- the same variable at two
+different offsets in one `dict_in_variables` list, confirming `default_
+vars` comes out deduped and in first-occurrence order, not `set()`-shuffled.
+`test_save_inference_batch_multi_channel_regression_not_argmaxed`
+(`test_inference_output.py`) -- a 5-channel regression output, confirming
+it saves the raw continuous first channel instead of getting argmaxed.
+Every existing `save_inference_batch` test updated to pass `regression`
+explicitly. `configs/sst/unetr/timestep_config.yaml` itself is covered by
+the existing `test_shipped_config_parses` glob (auto-discovers every real
+config under `configs/`) with no test changes needed.
+
+**Verification beyond parsing:** constructed a small-scale `UNETR` with
+the config's exact real flag combination (`in_chans=10`, `num_classes=5`,
+`use_varemb`+`use_timeemb` both True with 3 real offsets, `skip_
+connection:True` -- the same path every shipped UNETR config takes) via
+the same scratch xformers-stub technique as the previous stage, and ran a
+full real forward pass end to end: `model(x, variables, seq_ps=None,
+x_seq=None)` produced the expected `(B, num_classes, *img_size)` output
+with no shape errors anywhere in the encoder, skip-connection decoder, or
+output head. Not a substitute for a real Frontier run at the config's
+actual scale, but real evidence beyond "the YAML parses."
+
+This completes all three stages of the "sst" time-stepping feature.
+Nothing here has been run on Frontier yet -- that's the natural next
+step, at whatever scale/data the user has available.
+
+## Confirmed one-shot multi-future-step prediction already works; extended `timestep_config.yaml` to use it
+
+Follow-up ask: predict *multiple* future timesteps, not just 1 (the user
+correctly pointed out `timestep_config.yaml` only predicted offset 0).
+Checked first whether this needed real new code -- clarified with the
+user that "one-shot" (all future offsets predicted in a single forward
+pass from the same past window, as opposed to autoregressive rollout,
+which would be a genuinely new mechanism) is what was meant.
+
+Investigated directly (code reading + real execution, not just
+inspection) and found the dataloader/schema layer already supports this
+with zero code changes: `dict_out_variables`/`variables_out` were never
+tied to a single distinct offset anywhere -- `process_root_dirs`'s window
+construction, `read_process_file`'s per-entry offset resolution, and the
+model's output head are all already generic over however many `(var,
+offset)` entries `dict_out_variables` lists, in any mix of offsets.
+Confirmed with a real end-to-end run (`NativePytorchDataModule`, real
+memmap files, `dict_out_variables={"P1F4R32": [("r", 0), ("r", 1)]}`) --
+both output channels resolved their own distinct real timestamps
+correctly. Added this as permanent Tier 1 coverage: `test_read_process_
+file_sst_predicts_multiple_future_offsets_at_once` and `test_native_
+pytorch_data_module_sst_predicts_multiple_future_offsets_end_to_end`
+(`tests/dataloaders/test_sst.py`).
+
+Updated `configs/sst/unetr/timestep_config.yaml` itself to actually use
+this: `dict_out_variables` now lists u,v,w,r,p at *both* offset 0 and
+offset 1 (`num_classes:10`, `time_offsets` becomes `[-2,-1,0,1]`), instead
+of only offset 0. Re-validated the updated config parses correctly (real
+`default_vars`/`time_offsets`/`num_classes` inspected, not just "no
+exception") and re-ran the same small-scale real-`UNETR`-forward-pass
+scratch verification from the previous stage with the new 10-channel
+output -- correct shape, no errors.
+
+## Added an opt-in `trainer.profile_dataloader` timing diagnostic
+
+Motivated by a real observation: two real Frontier runs of `configs/sst/
+unetr/base_config.yaml` (job 5455196, non-adaptive) and `adaptive_config.
+yaml` (job 5460602, adaptive) hit the *same* 15-minute SLURM time limit
+(`launch/sst/unetr.sh`, same 1 node/8 GPU/`batch_size:2` setup) -- the
+non-adaptive run completed 6,628 batches in that window, the adaptive run
+only 526 (roughly 12.6x fewer). Adaptive patching's `fixed_length:729` is
+actually *larger* than non-adaptive's 512-token sequence here too (kept to
+match an old codebase's constraint, see `adaptive_config.yaml`'s own
+header comment), so the gap can't be attention-compute-cost-driven in
+either direction -- pointing squarely at `Patchify_3D`'s real per-sample
+CPU work (`SimpleITK.CannyEdgeDetection` + `FixedOctTree` build/serialize,
+all on CPU, with `dataloader.num_workers:1` in both configs leaving no
+room to overlap it with GPU compute) as the actual bottleneck.
+
+Added `trainer.profile_dataloader` (default `False`, every shipped config
+unaffected) to `UCF_VIT.training.train_epoch` to confirm this directly
+instead of by inference from overall throughput: when `True`, each batch
+is timed in pieces -- `data_time` (`process_batch`'s own wall clock: the
+dataloader fetch, including any real per-sample decode cost, plus the
+host->device transfer), `forward_time` (`forward_step` alone: the model
+forward pass plus loss), `backward_time` (`backward()` alone), and
+`compute_time` (everything non-`data_time` in the loop body -- `forward_
+time` + `backward_time` plus the accuracy metric and optimizer step, so
+`compute_time` is always >= the other two combined) -- printed per batch
+and summed per epoch (`"epoch_data_time" ... "epoch_forward_time" ...
+"epoch_backward_time" ... "epoch_compute_time" ... "data_time_fraction"
+...`). Requires a real `torch.cuda.synchronize()` at each timing boundary
+for any of these numbers to mean anything (CUDA ops are async -- a bare
+`time.time()` around them would mostly measure how fast Python enqueues
+kernels, not how long they actually take), which is why this is opt-in
+rather than always-on: it's a real, if modest, overhead not worth paying
+on every training run, only when actually diagnosing a throughput
+question like this one. Not wired into `eval_epoch` -- the observation
+motivating this was from real training runs specifically.
+
+To use it on Frontier: add `profile_dataloader: True` under `trainer:` in
+whichever config is being compared (not committed into the shipped `sst`
+configs themselves, since it's a temporary diagnostic, not a production
+setting). `data_time_fraction` close to 1.0 on each epoch's summary line
+means the dataloader is essentially the entire wall-clock cost, confirming
+this session's hypothesis directly; `epoch_forward_time`/`epoch_backward_
+time` additionally show whether adaptive patching's shorter/longer
+sequence length is actually moving the needle on the model side at all,
+however small a share of the total it turns out to be.
+
+**Tier 1 coverage:** `test_profile_dataloader_defaults_to_false_when_
+omitted`/`test_profile_dataloader_threads_through_when_set`
+(`test_config_validation.py`), mirroring `inference_output`'s own
+default-off/threads-through test pair. `train_epoch` itself isn't unit-
+tested anywhere locally (no fixture builds a real CUDA-backed model/
+dataloader for it) -- the profiling code path is otherwise unverified
+here beyond `py_compile` and manual review; a real Frontier run with
+`profile_dataloader:True` is what actually exercises it.
+
+## Split `profile_dataloader` into forward_time/backward_time; added a complementary in-worker timer
+
+Two follow-ups to the diagnostic above.
+
+First, `compute_time` was too coarse to see whether adaptive patching's
+sequence-length difference (shorter *or* longer) is actually moving the
+needle on the model side at all -- split it into `forward_time`
+(`forward_step` alone) and `backward_time` (`backward()` alone), each with
+its own `torch.cuda.synchronize()` pair. Required splitting the grad-
+scaler/optimizer-step `if` block into two stages (backward, then step) so
+`backward_time` doesn't include the optimizer step.
+
+Second, a real conceptual gap in `data_time` itself: with `persistent_
+workers:True` and `num_workers:1`, one background worker process really
+does prepare the *next* batch while the main loop runs forward/backward on
+the *current* one (PyTorch's own default `prefetch_factor` -- see below --
+lets it queue ahead). `process_batch`'s `next(it_loader)` call -- what
+`data_time` times -- therefore measures how long the main loop sat
+*waiting* for a ready batch, not the worker's raw per-sample cost: if the
+worker keeps up, `data_time` reads near-zero even though real CPU work is
+still happening, just fully hidden behind GPU compute. That's actually the
+right thing to measure for "is the dataloader the bottleneck" (a stall
+there is definitionally the throughput cost, whatever the worker's
+absolute cost is) -- but it can't answer the complementary question of
+how expensive the raw per-sample work actually is in isolation.
+
+Added a second, complementary timer for that: `Patchify_3D` (3D adaptive
+patching only) takes a new `profile` param (diagnostic only, off by
+default, mirroring `profile_dataloader`) and, when True, times its 3 real
+per-sample CPU stages -- the per-channel Canny loop, the `FixedOctTree`
+build, and `serialize` -- printing each (plus their sum, `patchify_time`)
+every call, tagged with `os.getpid()` and the `DataLoader` worker's own
+`id` (`torch.utils.data.get_worker_info()`) since this runs *inside* the
+worker process(es), not the main training process `train_epoch`'s own
+timers see. Threaded through as `profile` on `ProcessChannels` and
+`profile_dataloader` on `NativePytorchDataModule` (reusing `conf["trainer"]
+["profile_dataloader"]` end to end -- one flag now turns on both the
+main-process and in-worker timers together), and into `train.py`/`val.py`/
+`test.py`'s `NativePytorchDataModule(...)` calls.
+
+**Tier 1 coverage:** unlike `train_epoch`, this piece *is* directly
+testable locally -- `transform.py` has no `building_blocks.py`/xformers
+dependency, so `tests/dataloaders/test_transform.py` runs for real here.
+Added `test_patchify_3d_profile_prints_edge_octree_serialize_timings`
+(parses the actual printed line via `capsys`, confirms all 3 timings are
+non-negative and sum to `patchify_time` -- not just "no exception") and
+`test_patchify_3d_profile_defaults_to_false_and_prints_nothing`.
+`test_processchannels_threads_profile_through_to_patchify_3d`
+(`test_dataset.py`, parametrized over `separate_channels`) confirms the
+wiring reaches the real `Patchify_3D` instance `ProcessChannels` builds.
+While adding that last test, caught and fixed a self-inflicted mistake
+before it landed: an earlier edit's `old_string` match didn't include a
+sibling test's trailing 2 assertions, silently orphaning them outside any
+function -- caught immediately by running the file's tests right after
+(`NameError: name 'seq_size' is not defined`), not left for later.
+
+### On `dataloader.num_workers`/`prefetch_factor` for this workflow
+
+Asked in the same conversation: is the current setup (both shipped `sst`
+UNETR configs use `num_workers:1`, `prefetch_factor` left at PyTorch's own
+default) reasonable, or worth tuning?
+
+`prefetch_factor` defaults to 2 per worker whenever `num_workers > 0`
+(confirmed directly against the installed `torch` (2.13.0)'s own
+`DataLoader.__init__` source, not assumed) -- it controls how many batches
+*one* worker is allowed to queue ahead of the consumer, which only smooths
+*transient* bursts in GPU compute time; it doesn't add any parallelism,
+since a single worker process still prepares batches strictly one at a
+time regardless of how deep its queue is allowed to get. The real evidence
+from the earlier throughput comparison (526 vs. 6,628 batches in the same
+window) looks like a *sustained* rate mismatch, not a transient burst --
+with only 1 worker, no queue depth fixes a producer that's consistently
+slower than the consumer, once that queue runs dry (which happens almost
+immediately under a sustained mismatch). So `prefetch_factor` is very
+unlikely to be the lever that matters here.
+
+`num_workers` is the actual lever: it adds real parallelism (multiple
+worker *processes*, each independently running `Patchify_3D`'s CPU work on
+separate cores), directly increasing the aggregate production rate --
+`launch/sst/unetr.sh`'s `--cpus-per-task=7` leaves real headroom above
+today's `num_workers:1`. Not changed in this session (no shipped config
+touched) -- a real Frontier comparison across a few `num_workers` values,
+with `profile_dataloader:True` on to see `data_time` actually drop, is the
+natural next real-data experiment once the timing pieces above are
+confirmed working.
+
+## Fixed a real O(N^2) inefficiency in `FixedOctTree`/`FixedQuadTree`'s node selection
+
+Discussed and confirmed (both by direct code reading and by profiling) in
+the same conversation as the two diagnostics above: `FixedOctTree.
+_build_tree` (`octree.py`) and `FixedQuadTree._build_tree` (`quadtree.py`)
+both grew a plain Python list of `[node, score]` pairs and, every one of
+the O(fixed_length) iterations, did a `max(self.nodes, key=...)` scan
+(O(N)), a redundant `.index()` re-scan to relocate that same max (O(N)),
+and rebuilt the whole list via slicing (`nodes[:idx] + [...] +
+nodes[idx+1:]`, another O(N), copies nearly the whole list) -- three
+separate O(N) operations per iteration, giving O(fixed_length^2) overall.
+Confirmed empirically before touching the code: doubling `fixed_length`
+cost ~3.3-4x the wall time on the original implementation (matches
+O(N^2)), and profiling attributed 93% of total time to these three
+bookkeeping operations (vs. the real per-child `contains()` numpy work) at
+`fixed_length=14337`, up from 45% at `fixed_length=3585` -- the bigger
+`fixed_length` gets, the more this dominates over the "real" work.
+
+Fixed by replacing the list-based selection with a `heapq` max-heap (keyed
+on the negated score) in both files -- `heappop`/`heappush` are O(log N),
+so the whole build is now O(fixed_length log fixed_length). A plain
+`itertools.count()` tie-breaker in each heap entry means `heapq` never
+needs to compare `Cube`/`Rect` objects directly (no `__lt__` added to
+either). `self.nodes` is only ever materialized once, at the very end,
+by draining whatever's left in the heap (every node that got popped-and-
+split was already replaced by its children in the heap, so whatever
+remains *is* exactly the final leaf set) -- no per-iteration list mutation
+at all.
+
+Confirmed on the real, committed code (not just a throwaway prototype):
+doubling `fixed_length` now costs ~1.9-2.0x the wall time (matching
+O(N log N)), not the ~3.3-4x measured before. Absolute numbers at
+`fixed_length=28673`/`28801`: `FixedOctTree` **2.89s -> 0.16s (~18x
+faster)**, `FixedQuadTree` **6.70s -> 0.18s (~37x faster)**.
+
+Nothing about the node-selection *outcome* changed -- still always splits
+the true highest-scoring current leaf, same stopping condition (a node
+whose side length has shrunk to 2), same total-volume/-area conservation.
+Only the final iteration order of `self.nodes` can differ from before
+(the heap doesn't drain in the same order the old list-slicing happened
+to produce) -- confirmed this doesn't matter to any consumer:
+`serialize`/`deserialize` (octree.py) and `encode_nodes`/`decoder_nodes`
+(quadtree.py) only ever read `self.nodes` by walking it in whatever order
+it's actually in, never assume a specific one, and no existing test
+asserts an exact node ordering (`test_fixedquadtree_encode_decode_
+roundtrip` compares two trees' orders *against each other*, not against a
+hardcoded sequence, and passes unchanged since it only needs encode/decode
+to preserve whatever order `self.nodes` ends up in).
+
+**Tier 1 coverage:** all 16 existing tests in `tests/dataloaders/
+test_octree.py`/`test_quadtree.py` passed unchanged against the rewrite
+with no test changes needed -- they already checked node count, total
+volume/area, and (sorted, order-independent) node sizes, which is exactly
+the right invariant set for a change that's meant to alter performance,
+not behavior.
+
+**Not done in this session:** the GPU/level-parallel tree construction and
+Gumbel-softmax-based differentiable edge-map work discussed at length in
+this same conversation -- those depend on the user's own existing
+level-parallel GPU implementation (kept elsewhere, not yet in this repo)
+being shared/ported in before any of that can actually be built here.
+
+## Ported the GPU/level-parallel adaptive patching core module (`GPUPatchify2D`), Stage 1 of that follow-up
+
+The user's own level-parallel GPU implementation, read directly from its
+real location (`~/bayes-cast/src/climate_learn/models/hub/components/
+adaptive_patching_vectorized.py`, plus `edm.py` for the calling convention),
+turned out to be a genuinely different algorithm from `FixedOctTree`/
+`FixedQuadTree`, not a GPU port of the same one -- confirmed by reading it
+in full (953 lines) rather than assuming from the name:
+
+- **UCF-VIT-claude (top-down split):** grow from 1 root node, splitting the
+  highest-*edge-density* node each time, up to `fixed_length`.
+- **bayes-cast (bottom-up, level-parallel merge):** shrink from the finest
+  possible grid, merging the 4 children with the lowest *merge cost*
+  (variance/SSE-based -- how much block-uniformity information would be
+  lost by flattening 4 children into 1 parent) into their parent each time,
+  down to exactly `fixed_length`. Every iteration considers *every*
+  mergeable candidate across every level and every image in the batch at
+  once (`torch.topk` + a vectorized per-image cumsum budget check) -- no
+  Python loop over nodes or images in the hot path.
+- Confirmed (background-agent grep across the whole `bayes-cast` repo, not
+  assumed) this is 2D-only everywhere -- no octree/volumetric/3D adaptive
+  patching exists there at all. Decided with the user: port 2D first,
+  generalize to 3D (needed for `sst`) as a separate follow-up -- this entry
+  covers only the 2D core module, not yet wired into any model/config.
+
+Researched (real web search, not assumed from training data) the
+region-detection backend question: `kornia.contrib.connected_components`
+(bayes-cast's own optional GPU-native alternative to its default
+`scipy.ndimage.label`) takes a `[1,1,H,W]` image-shaped input with no 3D
+equivalent -- confirmed it would only ever help the 2D case, never `sst`.
+`cupyx.scipy.ndimage.label` (CuPy's GPU port of `scipy.ndimage.label`) is
+the better fit for this project specifically: it mirrors scipy's own
+N-D-capable API (3D "just works" later, no separate 3D implementation
+needed) *and* has official ROCm support (`cupy-rocm-7-0` on PyPI), matching
+this codebase's real AMD (Frontier) target -- unlike kornia (2D-only
+regardless of GPU vendor) or cuCIM (RAPIDS/NVIDIA-only). Not implemented
+yet; `scipy.ndimage.label` (already a dependency, correctness reference) is
+what `GPUPatchify2D._detect_regions` uses now, structured so swapping in
+`cupyx` later only touches that one method.
+
+Added `src/UCF_VIT/model/gpu_adaptive_patching.py` (model-side, not
+dataloader-side, since this is meant to run inside a model's `forward()` --
+see the still-deferred wiring step below), a faithful port of the core
+algorithm (`_pad_tensor`, `_compute_all_levels_batch`/`_compute_level_
+stats_batch`, `_border_mask`, `RegionTensors`/`_labeled_to_region_tensors`/
+`_detect_regions`, `run_merge_batch`, `_serialize_batch`) -- deliberately
+skipping `_detect_regions_kornia` (not a dependency here), the single-image/
+EDM-temporal-history variants (`run_merge`, `_serialize_batch_time`,
+`forward_single`), and `_deserialize_batch` (confirmed by reading `UNETR.
+proj_feat`/`_adaptive_token_grid_index` in `arch.py` that this codebase's
+own decoder-side reconstruction is already generic over any `seq_ps`
+source, so it isn't needed once this is wired into `UNETR` -- a follow-up
+step, not this one). Also skipped the `device.type in ('cuda','hip')` /
+external `merge_ops` custom-CUDA-kernel branch in bayes-cast's own
+`forward_batch` -- it references a package that isn't part of `bayes-cast`
+itself, and in the source is immediately followed by an unconditional
+second call to the plain-torch `run_merge_batch` regardless of which branch
+ran, which looks like leftover/WIP code, not something to faithfully
+replicate.
+
+Added a real, load-bearing correctness check while designing this that the
+reference implementation doesn't have: `_serialize_batch` assumes every
+image in a batch lands on exactly the same region count (`N = all_regions
+[0].N`, used to size the one whole-batch `grid_sample` call), which
+`run_merge_batch`'s stopping condition (each merge removes exactly 3
+leaves) only guarantees when `(max_blocks**2 - fixed_length) % 3 == 0`.
+Added this as an explicit, clearly-worded assertion in `GPUPatchify2D.
+__init__` -- mirrors the existing `fixed_length % 3 == 1 % 3` / `% 7 == 1 %
+7` congruence assertions already in `parse.py` for the CPU quadtree/octree
+(same modulus for the 2D case, different reference point: CPU checks
+growth-from-1, this checks shrinkage-from-`max_blocks**2`).
+
+#### Found and fixed a real row/column transpose bug -- present in the reference implementation, not introduced by this port
+
+Writing real, position-aware tests for `_serialize_batch` (not just shape
+checks) caught a genuine coordinate-axis bug: `RegionTensors.x0s`/`x1s` are
+column (W-axis) bounds and `y0s`/`y1s` are row (H-axis) bounds (unambiguous
+from `_labeled_to_region_tensors`'s own `row_idx`/`col_idx` construction),
+but the original `_serialize_batch` normalized the column bounds by `H`
+(not `W`) and the row bounds by `W` (not `H`), then fed the row-derived
+values into `grid_sample`'s x/width channel and the column-derived values
+into its y/height channel -- a genuine transpose of the extracted region
+relative to the real detected bbox. Numerically silent on a square image
+(no out-of-range error, since both axes share one denominator range), which
+is exactly why a real multi-quadrant, *distinctly-valued* test caught it
+immediately (`test_serialize_batch_extracts_each_regions_true_content`
+failed with the *wrong quadrant's* value, not a shape or NaN error) where a
+generic shape-only test would have passed silently. Fixed by normalizing
+each bound by its own true axis extent and assigning `grid_x`/`grid_y` to
+their real matching channel; added a dedicated non-square regression test
+(`test_serialize_batch_non_square_image_does_not_transpose_regions`) since
+a rectangular image is the one case where the wrong denominator alone
+(independent of the axis swap) would also produce a visibly wrong value,
+not just a transposed position -- confirming both halves of the fix, not
+just the one the first failure happened to surface.
+
+**Tier 1 coverage** (`tests/model/test_gpu_adaptive_patching.py`, new file,
+10 tests, runs fully on CPU here -- no CUDA, no dataset-specific
+dependency): padding (aligned and needs-padding cases), the `fixed_length`
+congruence assertion (valid and invalid), the non-square `H > W` rejection,
+merge cost being exactly 0 for a flat region and strictly positive for a
+deterministic step-edge (not noise -- see that test's own docstring for why
+noise is a bad choice here: unbiased variance's `n-1` correction can make a
+genuinely-detailed small block's SSE come out *below* its children's summed
+SSE purely from the denominator differing by block size, an occasional
+real, surprising property of this cost formula caught by hand-checking
+values directly, not a bug), per-image-independent convergence to
+`fixed_length` in a mixed-content batch, and the two `_serialize_batch`
+regression tests above (single- and multi-channel, square and non-square).
+
+**Explicitly not done yet** (tracked in the approved plan at
+`~/.claude/plans/swirling-crunching-widget.md`): wiring `GPUPatchify2D` into
+`VIT`/`UNETR`'s `forward()` behind a new `ap.do_gpu_ap` flag, `parse.py`
+validation, `training.py`'s calling convention, the pluggable Canny-vs-
+variance scoring option (both CPU and GPU sides), the 3D generalization
+itself, and the `cupyx.scipy.ndimage.label` region-detection upgrade.
+
+## Wired GPUPatchify2D into every model type, found two more real bugs by actually running it
+
+Stage 2 of the GPU adaptive-patching effort: wires the Stage 1 module into
+the model, per the user's explicit request to cover every model type that
+already supports CPU `ap.do_ap` -- `VIT`, `SAP` (via inheritance, since it
+has no `forward()` override), `MAE`, and `UNETR` -- not just `VIT`/`UNETR`
+as the plan had assumed.
+
+`VIT.__init__` gains `do_gpu_ap: bool = False` and `gpu_ap_min_size: int = 2`
+and, when set, constructs `self.gpu_patchify = GPUPatchify2D(...)`.
+`self.adaptive_patching` keeps meaning "model structured for adaptive
+patching" (token embed/pos embed sizing); `do_gpu_ap` is an orthogonal axis
+-- *where* the patchify computation happens (on-device inside `forward()`,
+given the raw image, vs. in the dataloader, already-patchified). A shared
+`_maybe_gpu_patchify(self, x)` helper (returns `(None, None)` when
+`do_gpu_ap` is off) is called once at the top of `VIT.forward` (covering
+`SAP` too), `MAE.forward`, and `UNETR.forward` (careful there to keep the
+raw `x` intact for `encoder1`'s convolutional skip connection, only
+replacing the transformer's own input). `parse.py` threads through
+`ap.do_gpu_ap`/`ap.gpu_ap_min_size`, validates 2D-only and the
+`initial_leaves % 3` congruence at config-parse time (mirroring the
+existing octree/quadtree checks), and rejects `separate_channels`.
+`training.py` and `train.py`/`val.py`/`test.py` gain a
+`dataloader_do_ap = conf["ap"]["do_ap"] and not conf["ap"]["do_gpu_ap"]`
+derived flag -- the dataloader must stop adaptively patching once the model
+does it instead, while `conf["ap"]["do_ap"]` itself keeps its original,
+model-structural meaning everywhere else.
+
+**A real limitation found, not yet resolved:** `SAP`'s
+`native_resolution_dice_loss` and *every* `MAE` loss variant (not just the
+`nativeRes*` ones -- plain `MSE`/`maskMSE` too, since MAE's reconstruction
+target is the patchified sequence itself) need `seq`/`seq_ps` computed
+*outside* `forward()`, for the loss function to consume directly. `do_gpu_ap`
+only computes these *inside* `forward()` and doesn't expose them. Rather than
+silently produce wrong losses, `parse.py` now asserts `do_gpu_ap` can't be
+combined with `SAP` (any config) or `MAE` (any `loss_fn`) at all, with a
+message pointing at this exact gap. Resolving it for real needs a design
+decision -- extend `forward()`'s return signature to also expose `seq_ps`
+under `do_gpu_ap`, or have `forward_step` call `GPUPatchify2D` directly from
+`training.py` (partially contradicting the original "patchify happens
+inside forward()" design) -- not decided yet.
+
+**Two more real bugs found by actually running the wired code**, not just by
+inspection (`arch.py`/`building_blocks.py` can't import in this session's
+shell -- see the earlier `use_timeemb` stage's own note on the same gap --
+so verification used the same scratch xformers-stub technique to construct
+real `VIT`/`SAP`/`MAE`/`UNETR` instances with `do_gpu_ap:True` and run a
+real forward+backward pass on each):
+
+- **`GPUPatchify2D.__init__`'s `fixed_length` congruence assertion checked
+  the wrong grid.** It computed `initial_leaves` from
+  `img_size[0] // min_size` -- the *unpadded* grid -- but `forward()` runs
+  on `_pad_tensor`'s *padded* grid, which is strictly larger whenever
+  `img_size` isn't already a multiple of `_pad_size()` (e.g. `img_size=
+  (12,12)`, `min_size=2` pads to `(16,16)`: a real 8x8=64-leaf grid, not the
+  6x6=36 the old assertion checked). A `fixed_length` that satisfied the
+  stale check but not the real one didn't error or misbehave -- it hung
+  forever: `run_merge_batch`'s per-image merge budget
+  (`(leaves_remaining - fixed_length) // 3`) permanently floors to 0 once
+  `leaves_remaining` can never land exactly on `fixed_length`, so the
+  `while (leaves_remaining > end_leaves).any()` loop never exits for that
+  image. Caught directly -- the scratch verification script's first `VIT`
+  construction ran for minutes at 100% CPU with no output, not a crash with
+  a traceback, which is what made it worth tracing rather than assuming a
+  slow import. Fixed by deriving `initial_leaves` from the real padded grid
+  size; added `test_forward_terminates_when_img_size_needs_padding`
+  (`tests/model/test_gpu_adaptive_patching.py`) using exactly this
+  padding-changes-the-grid scenario, since a reappearance of this bug would
+  hang the test rather than fail it.
+- **`_serialize_batch` squeezed the channel axis for `C == 1`,** matching
+  `UCF_VIT.dataloaders.transform.Patchify.forward`'s own per-*sample*
+  (no batch dim yet) `C == 1` squeeze -- the right contract for the CPU
+  path, where a later collation step adds the batch (and channel) dim back,
+  but wrong here: `GPUPatchify2D` already operates on a full batch and its
+  output is consumed directly by `forward_features`'s
+  `rearrange(x, 'b c s p -> b s (p c)')`, which requires a real `C` axis
+  with no collation step to restore it. Surfaced immediately as a shape
+  error the moment `VIT.forward` actually ran (not caught by Stage 1's own
+  tests, which only exercised `GPUPatchify2D` standalone, never through a
+  real model). Fixed by always keeping the channel axis in `_serialize_batch`
+  /`forward`'s return value (`[B, C, N, interp_size**2]` unconditionally);
+  updated the two affected Stage 1 tests
+  (`test_serialize_batch_extracts_each_regions_true_content`,
+  `test_serialize_batch_non_square_image_does_not_transpose_regions`) to
+  index the now-explicit channel axis.
+
+Also fixed `parse.py`'s own `ap.fixed_length` congruence check for
+`do_gpu_ap`, which duplicated the same padding-unaware formula (it's a
+config-parse-time mirror of `GPUPatchify2D.__init__`'s assertion, so it
+inherited the identical bug) -- now derives `real_max_blocks` from the
+padded grid the same way. In practice this was never wrong for any config
+reachable through today's power-of-2 `tile_size` constraint plus the
+default `gpu_ap_min_size:2` (both powers of 2 always pad to a no-op), but
+a non-power-of-2 `gpu_ap_min_size` would have silently disagreed with the
+real module.
+
+**Verification:** full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 361 passed / 4 skipped. Real forward+backward passes
+(scratch xformers-stub construction, `do_gpu_ap:True`, `img_size=(16,16)`,
+`fixed_length=16`) confirmed for `VIT`, `SAP`, `MAE`, and `UNETR` -- each
+produced the expected output shape and a clean `loss.backward()` with no
+shape or gradient errors. Not a substitute for a real Frontier run at real
+config scale, but real evidence the wiring (and the two bugs above) are
+fixed, not just plausible by inspection.
+
+**A known test gap, not filled here:** `parse.py`'s `do_gpu_ap`
+validation (the congruence check above, the `twoD`/`separate_channels`
+rejections) has no dedicated `test_config_validation.py` coverage yet --
+every config that file's tests mutate-and-reparse from (`SAP_CONFIG`,
+`UNETR_CONFIG`, `SST_UNETR_CONFIG`, and every other shipped config with
+`ap.do_ap:True`) is 3D, and `do_gpu_ap` is 2D-only, so there's no real
+shipped config to base a test on without hand-writing a full synthetic
+2D+`do_ap` config from scratch (this repo's own tests avoid that -- they
+all start from a real shipped file). Exercised indirectly today via
+`GPUPatchify2D`'s own direct tests (same formula) and the real
+model-level forward/backward verification above; revisit once a real
+2D+`do_gpu_ap` config exists to build a test on, or if a bug surfaces.
+
+## Resolved the SAP/MAE do_gpu_ap gap: extended forward()'s return signature
+
+Follow-up to the previous entry's open design question, resolved with the
+user's explicit choice ("extend `forward()`'s return signature" over "have
+`forward_step` call `GPUPatchify2D` directly" or "leave blocked") --
+`SAP` and `MAE` now support `ap.do_gpu_ap:True`.
+
+`VIT.forward` (covering `SAP` via inheritance) now returns `(output,
+seq_ps)` instead of just `output` when `self.do_gpu_ap` is True --
+`seq_ps` is otherwise unavailable outside `forward()` (it's computed
+on-device, inside the call, from the raw image), and `SAP`'s
+`native_resolution_dice_loss` needs it. `MAE.forward` returns `(output,
+mask, x_seq, seq_ps)` instead of `(output, mask)` -- `x_seq` (the
+on-device-patchified sequence itself) is needed too, since *every* MAE
+loss variant reconstructs against the patchified sequence as its target,
+not just the `nativeRes*` ones. Every other model type's return signature
+is unchanged (`do_gpu_ap` is only True for `VIT`/`SAP`/`MAE`/`UNETR`
+instances that opt in; `UNETR.forward` itself needs no change at all --
+its loss already compares against `batch["label"]`, a genuine external
+target that was never affected by this gap). `training.py`'s
+`forward_step` unpacks the extra return value(s) in the `VIT`, `SAP`, and
+`MAE` branches when `conf["ap"]["do_gpu_ap"]` is set (mirroring the
+existing `ap.do_ap:True`/`False` branch structure, just against a third,
+new case), and the two `parse.py` assertions blocking `SAP`/`MAE` from
+`do_gpu_ap` are removed.
+
+**Tier 1 coverage** (`tests/test_forward_step.py`, 8 new tests, extending
+the file's existing fake-model-stub pattern to a 2-arg
+`.forward(data, variables)` stub matching `do_gpu_ap`'s real calling
+convention -- no `seq_ps` argument, unlike every other path in this file):
+`test_forward_step_vit_do_gpu_ap_uses_only_the_returned_output` (confirms
+the `(output, seq_ps)` tuple unpacks correctly and `seq_ps` doesn't leak
+into `VIT`'s own loss), `test_forward_step_sap_do_gpu_ap_matches_native_
+resolution_dice_loss` (reuses `test_metrics.py`'s own confident-correct-
+prediction fixture, dispatched through `forward_step` this time), and four
+MAE tests mirroring the existing `ap.do_ap:True` ones exactly (`maskMSE`,
+`MSE`, `nativeResMSE`, `nativeResMaskMSE`) but through the new `do_gpu_ap`
+branch, reusing the same expected-value machinery so a real dispatch bug
+(wrong tensor, wrong branch) would show up as a wrong number, not just a
+wrong shape.
+
+**Verification beyond the fake-model tests:** real `SAP` and `MAE`
+instances (same scratch xformers-stub technique as the earlier stages),
+run through the *real* `forward_step` (not a fake model) end to end --
+`SAP` with `native_resolution_dice_loss`, `MAE` with `maskMSE` and
+`nativeResMSE` -- each produced a real loss number and a clean
+`loss.backward()` with no shape or gradient errors. Full local suite
+(`pytest tests/ --ignore=tests/distributed`) passes, 367 passed / 4
+skipped.
+
+## Added a Canny-based scoring option to GPUPatchify2D
+
+Follow-up ask: `GPUPatchify2D` only supported variance/SSE-based merge-cost
+scoring; the CPU/dataloader-side path (`Patchify`/`Patchify_3D`) defaults to
+Canny edge-density scoring instead, and the user wanted the GPU side to
+support Canny too (CPU-side variance scoring is a separate, not-yet-built
+follow-up). Two design questions were resolved with the user before writing
+any code:
+
+- **Custom pure-`torch` Canny, not `kornia.filters.canny`.** `kornia.
+  contrib.connected_components` was already rejected for `_detect_regions`
+  specifically because it's 2D-only with no 3D equivalent (`sst` needs 3D
+  eventually) -- the identical argument applies to `kornia.filters.canny`.
+  A custom implementation built from `conv2d`/`max_pool2d`/elementwise ops
+  needs no new dependency and generalizes to `conv3d` later; confirmed with
+  the user that these ops run entirely on-device (CPU or CUDA/ROCm), no
+  CPU round-trip.
+- **Hysteresis is approximated via a few binary-dilation passes**, not
+  exact flood-fill connectivity (true hysteresis is a graph/connectivity
+  problem that doesn't vectorize cleanly). After double-thresholding into
+  strong/weak edges, the strong mask is grown by one pixel (`F.max_pool2d`
+  as binary dilation) and absorbs any weak edges it now touches, a small
+  fixed number of iterations (`canny_hysteresis_iters`, default 2). Spot-
+  checked against `skimage.feature.canny` on the same synthetic square
+  image: both agree on roughly where the edges are (IoU ~0.53 on the edge
+  pixels themselves), with the custom version's edges consistently ~1px
+  thicker -- expected from the coarser 4-direction non-max suppression and
+  the dilation-based hysteresis approximation, not a bug.
+
+**A real correctness subtlety, not just a style choice:** the existing
+variance formula (`merge_costs[level] = errors[level] - sum_children`)
+extracts the *between-group* component of variance (law of total variance --
+a coarse block's own SSE-from-its-mean minus its children's own internal
+SSEs is exactly the part caused by the children genuinely differing from
+each other). That subtraction is meaningless for edge-pixel counts, which
+are already purely additive -- `errors[level]` would always exactly equal
+`sum_children`, making every Canny merge cost come out zero if the same
+formula were reused verbatim. Instead, for `score_fn == "canny"`, a block's
+own edge count is used *directly* as its merge cost (no subtraction) --
+flat/edge-free blocks (any level) get near-zero cost (cheap to merge),
+edge-rich blocks resist merging, the same greedy intent as variance
+scoring, just measured differently. This was derived and confirmed via
+direct experimentation (`_compute_all_levels_batch` on a small step-edge
+fixture) before writing the corresponding test.
+
+Multi-channel input runs Canny per channel (each call already batched over
+`B`) and sums the resulting binary edge masks into one per-pixel edge
+count -- mirrors `Patchify_3D`'s own "weight a voxel by how many channels
+independently flag it as an edge" convention, rather than the 2D CPU
+`Patchify.forward`'s stricter `C == 1`-only limitation.
+
+New `GPUPatchify2D.__init__` params: `score_fn` (`"variance"` default or
+`"canny"`), and, only meaningful under `"canny"`: `canny_sigma`,
+`canny_low_threshold`, `canny_high_threshold`, `canny_hysteresis_iters`.
+New private methods: `_gaussian_kernel2d`, `_sobel_gradients_batch`,
+`_non_max_suppression_batch`, `_canny_edge_map_batch`, `_box_sum_batch`
+(the `.sum()` analog of `_compute_level_stats_batch`'s `.var()*area`, since
+Canny's per-level "error" is just a box-sum of one base edge map, unlike
+variance which genuinely needs recomputing from raw pixels at each level).
+`_compute_all_levels_batch` dispatches on `self.score_fn`; every other
+method (`run_merge_batch`, `_border_mask`, `_detect_regions`,
+`_serialize_batch`, `forward`) needed zero changes, exactly as anticipated
+when the module was first ported.
+
+Config plumbing mirrors how `do_gpu_ap`/`gpu_ap_min_size` were threaded
+through in the previous stage: `parse.py` gains `ap.score_fn` (default
+`"variance"`) and the four `ap.canny_*` keys, validated (only meaningful
+under `do_gpu_ap:True`; explicitly rejects `score_fn:"canny"` when
+`do_gpu_ap:False`, since CPU-side Canny-vs-variance-vs-anything-else isn't
+pluggable yet -- the CPU path always scores via Canny, unconditionally) and
+threaded through `arch.py`'s `VIT.__init__` and `model/utils.py`'s
+`get_model`. Also fixed a real, pre-existing gap surfaced while auditing
+every hand-built `conf["ap"]` dict in the test suite:
+`tests/distributed/test_eval_real_pipeline.py` and `tests/distributed/
+test_pretrained_loading_real.py` (both call `get_model` directly) were
+missing `do_gpu_ap`/`gpu_ap_min_size` entirely -- a latent bug from the
+`do_gpu_ap` stage two entries above, never caught because these are
+Frontier-only distributed tests this session can't run locally. Fixed
+alongside the new `score_fn`/`canny_*` keys.
+
+**Tier 1 coverage** (`tests/model/test_gpu_adaptive_patching.py`, 8 new
+tests): `score_fn` construction-time validation; `_canny_edge_map_batch`
+on a flat image (zero edges) and a deterministic step edge (nonzero only
+in a thin band at the boundary); multi-channel summing (two channels
+flagging the same location sum to count 2, matching `Patchify_3D`'s
+convention -- checked directly against calling the same method on a
+single channel); `_compute_all_levels_batch(score_fn="canny")`'s merge
+cost being exactly 0 for a flat region and strictly highest at the block
+actually containing a small test square (away from every block boundary,
+so Gaussian smoothing can't bleed the signal across a block edge and
+produce a flaky near-tie); and an end-to-end `forward(score_fn="canny")`
+direct analog of the existing `test_run_merge_batch_reaches_fixed_length_
+independently_per_image`, confirming edge-containing regions stay at the
+finer level through the Canny path too. Every existing variance-scoring
+test stays unchanged and passing (`score_fn` defaults to `"variance"`).
+
+**Verification beyond the new tests:** a real `VIT` instance (scratch
+xformers-stub technique) constructed with `do_gpu_ap:True`, `gpu_ap_score_
+fn:"canny"` end to end through `arch.py`'s real construction path (not
+`GPUPatchify2D` directly) -- confirmed `vit.gpu_patchify.score_fn ==
+"canny"` and ran a real forward+backward pass with no errors. Full local
+suite (`pytest tests/ --ignore=tests/distributed`) passes, 374 passed / 4
+skipped.
+
+**Explicitly not done yet** (per the approved plan): CPU-side variance
+scoring (the other half of the user's original ask, a separate follow-up
+pass); 3D generalization of Canny scoring (the ops chosen already
+generalize to `conv3d`, but not built now); wiring `score_fn`/`canny_*`
+into a real shipped 2D+`do_gpu_ap` config (none exist yet, same gap
+already noted for `do_gpu_ap` itself); randomizing Canny parameters
+per-forward-call (the CPU path randomizes smoothing/thresholds per sample
+as a light augmentation -- the GPU version stays deterministic).
+
+## Added a variance-based scoring option to the CPU adaptive-patching path
+
+Second half of the two-part score_fn ask: `Patchify`/`Patchify_3D`
+(`transform.py`, backing `FixedQuadTree`/`FixedOctTree`) previously always
+scored via Canny edge density, with no alternative. Adds `score_fn=
+"variance"` there too, symmetric with the GPU side above.
+
+**A correction to an assumption made in the GPU-side plan:** that plan
+assumed `Rect.contains`/`Cube.contains` (`quadtree.py`/`octree.py`) were
+"already generic over how `domain` was built" and would need no changes.
+True only for purely-additive measures (an edge-count domain, precomputed
+once and just summed per candidate rectangle -- exactly what `contains`
+already did). Not true for variance: a region's variance can't be
+reconstructed from independent per-pixel "variance contributions"
+precomputed ahead of time, it genuinely depends on that specific
+rectangle's own mean. So `contains` itself needed a real, if small,
+change: a `score_fn` parameter (`"canny"` default, or `"variance"` --
+`np.var(patch, axis=(0,1)).sum() * patch.shape[0] * patch.shape[1]` for
+`Rect`, `axis=(0,1,2)` for `Cube`), threaded from `FixedQuadTree`/
+`FixedOctTree.__init__` through every `contains()` call site. `np.var`'s
+own `axis` argument reduces only the spatial dims and leaves a trailing
+channel axis untouched if `domain` has one, so one formula handles both
+the single- and multi-channel case, and scaling by pixel/voxel count
+recovers the *SSE* (not raw variance) so differently-sized candidates in
+the same heap comparison stay comparable -- mirroring `GPUPatchify2D`'s
+own variance scoring in spirit (though not its exact merge-cost formula,
+which serves a different bottom-up-merge decision -- see this file's own
+"Added a Canny-based scoring option to GPUPatchify2D" entry above for that
+derivation). `_build_tree`/`deserialize` in both files also needed a
+one-line fix (`self.domain.shape` -> `self.domain.shape[:2]`/`[:3]`) to
+stop assuming `domain` never carries a trailing channel axis -- caught
+immediately by the first end-to-end variance-mode test, which crashed on
+construction before this fix, not silently mis-scored.
+
+A real, unplanned generalization fell out of this for free: multi-channel
+variance scoring has no equivalent to Canny's `skimage.feature.canny`-path
+`C == 1` restriction (`Patchify.forward`, every dataset except `imagenet`/
+`catsdogs`) -- `np.var` handles any channel count directly, no restriction
+needed. For `Patchify_3D` specifically, variance mode also skips the
+per-channel `SimpleITK.CannyEdgeDetection` loop entirely (not just an
+alternative -- genuinely cheaper), since `Cube.contains`'s own
+per-channel-variance-sum handles multi-channel input at query time instead
+of a precomputed per-channel loop; confirmed directly by monkeypatching
+`sitk.CannyEdgeDetection` to raise if ever called under `score_fn=
+"variance"`.
+
+**Config surface:** `ap.score_fn` (added last stage, GPU-only until now)
+becomes the single key governing whichever adaptive-patching path is
+active -- mirrors how `ap.fixed_length`/`ap.interp_size` already aren't
+path-specific. The two paths keep *different backward-compatible
+defaults* when `ap.score_fn` is unset, since each has only ever behaved
+one specific way until now: `"canny"` for the CPU path (every existing
+shipped `do_ap:True` config keeps behaving exactly as today -- confirmed
+directly against `SAP_CONFIG`, a real shipped config, not just by
+inspection), `"variance"` for the GPU path (unchanged from last stage). An
+explicit `ap.score_fn` always wins over that default. This also meant
+relaxing last stage's `parse.py` assertion that rejected any `score_fn`
+other than `"variance"` when `do_gpu_ap:False` -- it was written
+explicitly anticipating this exact follow-up. `score_fn` threads through
+five more construction sites the same way `fixed_length`/`interp_size`
+already do: `dataset.py`'s `ProcessChannels`, `datamodule.py`'s
+`NativePytorchDataModule`, `catsdogs.py`'s `CatsDogsDataset`, and both
+construction patterns in each of `train.py`/`val.py`/`test.py` (the
+`iterative_dataloader` branch's `NativePytorchDataModule(...)` and the
+`dataloader` branch's `conf["dataloader"]["dataset_module"](...)`).
+
+**Tier 1 coverage:** `test_quadtree.py`/`test_octree.py` gain
+`Rect.contains`/`Cube.contains` `score_fn="variance"` tests (flat region
+scores exactly 0, a region with real variance matches `np.var(patch)*area`
+computed directly, multi-channel domain sums per-channel variance) plus a
+`FixedQuadTree`/`FixedOctTree`-level test mirroring the existing
+Canny-favors-detail tests exactly, just with `score_fn="variance"` and a
+checkerboard region instead of a flat-vs-dense edge map.
+`test_transform.py` gains 6 new tests: `Patchify`/`Patchify_3D` variance
+mode uses `img` itself as the domain deterministically (no smoothing/Canny
+call), favors a genuinely higher-variance region over flat ones (direct
+analog of the tree-level tests, through the full pipeline), allows
+multi-channel input on `basic_ct` (impossible under `score_fn="canny"`),
+and (3D only) never calls `SimpleITK.CannyEdgeDetection` at all.
+`test_config_validation.py` gains 3 tests: an existing shipped `do_ap:True`
+config's parsed `score_fn` is `"canny"` (backward-compat confirmation),
+explicit `score_fn:"variance"` with `do_gpu_ap:False` now parses instead of
+raising, and an invalid `score_fn` value raises clearly.
+
+**Verification:** full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 391 passed / 4 skipped (17 new tests, no
+regressions). Real `Patchify`/`Patchify_3D` instances run directly (not
+just through pytest) on synthetic checkerboard-in-one-quadrant images,
+confirming the patch layout concentrates around the genuinely
+higher-variance region in both 2D and 3D. A real shipped config
+(`SAP_CONFIG`) parsed through `parse_config` end to end confirms the
+backward-compatible default.
+
+## Added GPUPatchify3D and a cupyx.scipy.ndimage.label region-detection upgrade
+
+Two remaining items from `GPUPatchify2D`'s original deferred list, done
+together since the region-detection backend swap is dimension-agnostic
+(both `scipy.ndimage.label` and `cupyx.scipy.ndimage.label` already work
+on N-D arrays unchanged) -- naturally shared code between `GPUPatchify2D`
+and the new `GPUPatchify3D`. Two design questions resolved with the user
+before writing code: 3D Canny non-max suppression uses the full
+13-direction generalization (not a cheaper 6-direction or no-NMS
+approximation), and the region-detection backend is an **explicit opt-in**
+constructor param (`region_backend="scipy"` default, `"cupyx"` opt-in --
+not auto-detected), since the `"cupyx"` path can't be verified on real GPU
+hardware in this dev environment (no CUDA/ROCm device, `cupy` not
+installed) and silent, environment-dependent behavior differences would be
+worse than an explicit choice.
+
+Three concrete technical risks were checked empirically before writing any
+3D code, not assumed: `F.pad` (`reflect`/`replicate`), `F.conv3d`, `F.
+max_pool3d`, and `F.grid_sample` all confirmed working on 5D (volumetric)
+tensors in this environment's torch build; `grid_sample`'s 5D grid
+last-dim `(x,y,z)` confirmed via a direct probe (not documentation-reading
+alone) to map to `(W,H,D)` respectively -- the natural extension of the
+2D `(x,y)=(W,H)` convention `_serialize_batch` already relies on.
+
+**`GPUPatchify3D`** (same file, `gpu_adaptive_patching.py`) mirrors
+`UCF_VIT.dataloaders.transform`'s own `Patchify`/`Patchify_3D` convention
+-- a separate class per dimensionality, not a unified N-D class, so
+`GPUPatchify2D` itself is untouched. Every method generalizes mechanically
+except two:
+- **Non-max suppression** discretizes gradient direction into the 13
+  canonical directions of a 3x3x3 voxel neighborhood (the antipodal pairs
+  among its 26 non-zero integer offsets), picked via cosine-similarity
+  argmax against the gradient vector (`abs()` of the cosine removes sign
+  ambiguity, the 3D analog of 2D's `angle_deg % 180`), then compared
+  against that direction's own antipodal voxel-shift pair -- direct
+  generalization of 2D's 4-entry `neighbor_shifts` dict to 13 entries.
+- **`_face_mask`** (3D analog of `_border_mask`) stamps all 6 faces of
+  each alive block (2D planes, not 1D lines) onto a `[D+1,H+1,W+1]`
+  boundary volume, via the same vectorized-indexing style (`arange` +
+  `expand` + advanced indexing, no Python loop over blocks) extended to a
+  third axis.
+
+Everything else follows the same 4-way-to-8-way generalization
+mechanically: `run_merge_batch`'s children view/merge/clear (8 children,
+not 4; `-7` leaves per merge, not `-3`), `_compute_all_levels_batch`'s
+variance/canny dispatch and merge-cost formulas (identical reasoning, one
+more block-size axis), `_labeled_to_region_tensors`'s bounding-box
+extraction (adds a depth index to the existing INF-masked min/max trick),
+and `_serialize_batch`'s one batched 5D `grid_sample` call. `__init__`
+requires `img_size` sorted `D <= H <= W` (extends `GPUPatchify2D`'s own
+`H <= W` requirement to two ratios, `H/D` and `W/D`, each truncated to
+`int` exactly like the 2D case already is); the `fixed_length` congruence
+becomes `% 7` (8 children merge into 1 parent, matching `FixedOctTree`'s
+own modulus) instead of `% 3`.
+
+**A real bug found and fixed while hand-verifying the merge-cost formula**
+(not a 3D-specific bug -- an instance of the same documented `torch.var`
+unbiased-correction property `GPUPatchify2D`'s own tests already flagged,
+caught here by a naive first manual check): a step-cube fixture placed at
+`img[0,0,2:6,2:6,2:6]` (straddling the level-1 block boundary at index 4
+in all three axes) produced a *negative* merge cost -- mathematically
+impossible for a correctly-computed between-group SSE (law of total
+variance guarantees non-negativity), immediately suspicious. Root cause
+confirmed by direct brute-force comparison against a manual per-child SSE
+sum (both computed the *same*, correct `sum_children` value -- the
+reshape/permute logic itself was right): the fixture itself straddled a
+block boundary, letting `torch.var`'s `n-1` correction inflate the small
+children's SSE (fewer voxels, larger `n/(n-1)` factor) past the parent's
+own -- exactly the phenomenon `GPUPatchify2D`'s own tests already
+documented and deliberately avoid with boundary-aligned fixtures. Not a
+code defect; every test in the new 3D file uses boundary-aligned "detail"
+regions for this exact reason, confirmed correct (positive, and exactly
+zero everywhere else) once re-tested with a properly aligned fixture.
+
+**Shared `_label_regions`** (new module-level helper, used by both
+classes' own `_detect_regions`): `region_backend="scipy"` (default,
+today's exact behavior, a CPU round-trip); `"cupyx"` converts `~border_
+mask` to/from `cupy` via the modern DLPack protocol (`cupy.from_dlpack`/
+`torch.from_dlpack`, both already implement `__dlpack__` directly --
+confirmed `torch.from_dlpack` accepts a plain `torch.Tensor` unchanged, no
+manual `to_dlpack`/`toDlpack` dance needed), calling `cupyx.scipy.ndimage.
+label` (same `(labeled, num_features)` signature as `scipy.ndimage.
+label`), never leaving the GPU. Raises clearly if `cupy` isn't importable
+or the tensor isn't on a CUDA device, rather than silently falling back.
+`GPUPatchify2D` gains the same `region_backend` param, wired into its own
+already-existing `_detect_regions`.
+
+**Tier 1 coverage:** new `tests/model/test_gpu_adaptive_patching_3d.py`
+(19 tests), mirroring `test_gpu_adaptive_patching.py`'s structure exactly
+(padding, the `% 7` congruence assertion, the padding-induced-hang
+regression test's 3D analog, non-cuboid-ordering rejection, merge cost
+zero/positive with boundary-aligned fixtures, per-image-independent
+convergence, an 8-octant content-correctness test -- the same class of
+test that already caught a real axis-transpose bug in `GPUPatchify2D`'s
+own `_serialize_batch` -- a non-cuboid-volume variant of that test,
+multi-channel channel-scrambling checks, and the Canny-specific tests).
+`test_gpu_adaptive_patching.py` gains 4 `region_backend` tests: `"cupyx"`
+without `cupy` installed raises a real (not simulated) `ImportError` in
+this environment; `"cupyx"` on a CPU tensor raises clearly even with
+`cupy`/`cupyx` faked as installed (isolating that specific check); a fully
+mocked-`cupy` dispatch test confirming the `"cupyx"` branch is actually
+reached and its result wrapped back into `RegionTensors` correctly --
+honestly scoped as dispatch-logic verification, not real-numerics
+verification. `test_gpu_adaptive_patching_3d.py` gains the `ImportError`
+version of the same check for `GPUPatchify3D`.
+
+**Verification:** full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 414 passed / 4 skipped (23 new tests, no
+regressions). Direct manual checks (matching this module's established
+practice) of the 3D edge map on flat/step-plane fixtures, real
+forward+backward-free forward-only runs on an 8-octant synthetic volume
+confirming exact per-octant content, and a non-cuboid-volume run
+confirming no axis transposition.
+
+**Explicitly not done yet (at the time):** wiring `GPUPatchify3D` into
+`arch.py`'s `ap.do_gpu_ap` (currently asserts `twoD` by construction) --
+a separate follow-up, matching how `GPUPatchify2D` itself was staged;
+randomized 3D Canny parameters; real GPU-hardware verification of the
+`"cupyx"` path (not possible in this session's environment).
+
+## Wired GPUPatchify3D into ap.do_gpu_ap -- the twoD restriction was staging, not a limitation
+
+Follow-up ask, prompted by the user asking directly why `do_gpu_ap` was
+2D-only: the restriction was never a technical limitation of `do_gpu_ap`
+as a concept -- `GPUPatchify3D` already existed, fully built and tested,
+from the entry immediately above. `arch.py`'s `do_gpu_ap` dispatch just
+hadn't been updated to also construct it, deferred as its own explicit
+staging step at the time (matching how `GPUPatchify2D` itself was staged
+before its own wiring pass).
+
+The fix is small because `training.py`'s `do_gpu_ap` dispatch
+(`dataloader_do_ap`, the `VIT`/`SAP`/`MAE`/`UNETR` branches) was already
+dimension-agnostic -- it only ever checks `conf["ap"]["do_gpu_ap"]`, never
+`twoD`, so it needed zero changes. Only two real changes:
+- `arch.py`'s `VIT.__init__` drops the `assert self.twoD` and picks
+  `GPUPatchify2D` or `GPUPatchify3D` at construction time based on
+  `self.twoD` (`gpu_patchify_cls = GPUPatchify2D if self.twoD else
+  GPUPatchify3D`) -- everything downstream of that (`_maybe_gpu_patchify`,
+  `forward`/`MAE.forward`/`UNETR.forward`) already only calls `self.
+  gpu_patchify(...)` generically, so needed no changes either.
+- `parse.py`'s `do_gpu_ap` fixed_length congruence check (previously
+  2D-only, asserting `twoD` explicitly) now branches its exponent/modulus
+  on `twoD` too (`exponent = 2 if twoD else 3`, `modulus = 3 if twoD else
+  7`), mirroring `GPUPatchify2D`/`GPUPatchify3D.__init__`'s own identical
+  computation -- same padded-grid derivation either way, just the final
+  power/modulus differs.
+
+`model/utils.py`'s `get_model` construction call needed no changes at all
+-- it already passed `gpu_ap_*` kwargs through generically (only its
+comment claiming "sst/2D-only currently" was stale, now fixed).
+
+**Tier 1 coverage:** `tests/test_config_validation.py` gains 2 tests using
+`configs/sst/unetr/adaptive_config.yaml` -- a real shipped 3D (`twoD:
+False`) config that already has `ap.do_ap:True` -- as the base: `ap.
+do_gpu_ap:True` parses successfully against this config's own real
+`fixed_length` (729, already `% 7`-congruent by coincidence -- confirmed,
+not assumed), and an off-by-one `fixed_length` (728) is correctly rejected
+by the *new*, `twoD`-dispatched check (`% 7`, not the old unconditional
+`% 3`) with a message naming `GPUPatchify3D` specifically. This closes the
+"no real shipped 2D+do_gpu_ap config to test against" gap noted in the
+`do_gpu_ap` stage's own entry above -- for the 2D case that gap still
+exists (no shipped 2D config tiles at all yet), but the 3D case now has
+real coverage.
+
+**Verification beyond the new tests:** real `VIT`, `SAP`, `MAE`, and
+`UNETR` instances (the same scratch xformers-stub technique as every
+earlier `do_gpu_ap` stage) constructed with `twoD:False`, `do_gpu_ap:
+True`, a cubic `img_size` -- confirmed each one's `self.gpu_patchify` is
+actually a `GPUPatchify3D` (not silently still `GPUPatchify2D`), and ran
+real forward+backward passes through `training.py`'s real `forward_step`
+for all four model types, matching the exact verification pattern used
+when `do_gpu_ap` first shipped for 2D. Full local suite (`pytest tests/
+--ignore=tests/distributed`) passes, 416 passed / 4 skipped.
+
+**Still not done:** no shipped config actually ships with `do_gpu_ap:True`
+turned on by default anywhere (the new tests mutate a copy in a tempfile);
+`SAP`/`MAE` were already unblocked for `do_gpu_ap` in an earlier stage
+(extending `forward()`'s return signature) and that continues to work
+unchanged for 3D, verified above -- no new gap there. Randomized 3D Canny
+parameters and real GPU-hardware verification of `region_backend="cupyx"`
+remain not possible in this session's environment.
+
+## Documented the new GPU-adaptive-patching options in every shipped config
+
+Follow-up ask: the new `ap.do_gpu_ap`/`gpu_ap_min_size`/`score_fn`/`canny_*`
+keys existed only in code and in the two test fixtures that override them
+-- no shipped config showed them at all. Added all six keys to every
+config that has an `ap:` section (23 files, right after the existing
+`interp_size` line -- the exact spot `interp_size` itself already used for
+this same "shown even when unused, so it's easy to find" convention),
+`do_gpu_ap:False` everywhere (identical parsed behavior to before in every
+config -- confirmed by the full local suite, not assumed). This also
+answers a real question raised while scoping the work: `do_gpu_ap`'s
+`twoD`-only restriction (fixed in the entry above) was never a fundamental
+limitation of the *feature*, just of *wiring* -- once that was fixed,
+adding these keys "everywhere" became meaningful for the 3D configs too
+(`sst`, `basic_ct`), not just a hypothetical for some future 2D dataset
+that tiles.
+
+One real, if narrow, test regression surfaced immediately by running the
+full suite after the config edits (not assumed safe): `configs/sst/unetr/
+adaptive_config.yaml` previously had no `ap.score_fn` key at all, so
+`test_do_gpu_ap_works_on_a_real_3d_config` (added in the entry above) got
+`score_fn`'s `do_gpu_ap`-dependent *default* (`"variance"`) when it
+flipped `do_gpu_ap` on. Now that the config sets `score_fn: canny`
+explicitly (matching its own real pre-existing behavior, `do_gpu_ap` was
+`False` when that default was chosen), the *explicit* value correctly
+wins over the default, and the test's incidental assertion on which
+one that was needed to be dropped -- the test's real point (does
+`do_gpu_ap:True` parse against this real config) still holds.
+
+**Verification:** every one of the 23 edited files re-parses with `yaml.
+safe_load` (syntax valid) and, for the ones already covered by `test_
+shipped_config_parses`/`test_config_validation.py`'s other tests, parses
+through `parse_config` with no behavior change. Full local suite (`pytest
+tests/ --ignore=tests/distributed`) passes, 416 passed / 4 skipped -- same
+count as before this change, confirming zero functional impact anywhere.
+
+## Two new real-hardware tests for do_gpu_ap/region_backend, neither runnable in this session
+
+Follow-up ask: does `do_gpu_ap` need distributed-test coverage, and can
+`region_backend="cupyx"` be verified for real anywhere? Both answered yes,
+for different reasons -- one is a genuine multi-rank correctness question
+(added to `tests/distributed/`, real hardware needed but no new
+dependency), the other needs a real `cupy` install that isn't a project
+dependency at all (a new single-GPU test, real hardware *and* an optional
+package needed). Neither could be executed in this session (no GPU, no
+`cupy`) -- both are written to skip cleanly here and are meant to be run
+for real on Frontier.
+
+**`tests/distributed/test_do_gpu_ap_real_pipeline.py`** (new file):
+`process_batch`'s own comment on `do_gpu_ap` states a real design
+assumption directly -- under `do_gpu_ap:True`, every rank in a tensor-
+parallel group independently calls the model's on-device patchify on its
+own (already-broadcast) copy of the raw image, "redundantly but
+deterministically identically," rather than computing it once and
+broadcasting the result. That assumption was never checked against real
+(and possibly physically different) GPU hardware in one job -- a local
+single-process run can't tell you whether two different physical GPUs,
+given bit-identical input, produce bit-identical output from the same ops
+(e.g. non-deterministic reduction order in a fused kernel). The new test
+constructs `GPUPatchify2D` directly (no model, no FSDP -- the property
+under test is about `GPUPatchify2D`'s own cross-device determinism, not
+attention/MLP's tensor-parallel sharding, already covered by `test_
+tensor_parallel_correctness.py`), runs a real `process_batch` under
+`tensor_par_size > 1` with `do_gpu_ap:True`, and confirms (via the same
+MIN/MAX-`all_reduce`-fingerprint technique `test_tensor_parallel_
+correctness.py`'s own determinism canary uses, scoped to `group=
+tensor_par_group` since different tensor-parallel groups are expected to
+get different batches) that every rank in the group ends up with an
+identical broadcast image *and* an identical patchify result. Picked up
+automatically by the existing `launch/tests/run_distributed_tests.sh` --
+no new launch script needed.
+
+**`tests/model/test_gpu_adaptive_patching_cupyx_real.py`** (new file):
+every existing `region_backend="cupyx"` test fakes `cupy`/`cupyx` out
+entirely -- real coverage of the *dispatch* logic, but none of them can
+say anything about whether `cupyx.scipy.ndimage.label`'s real numerics
+actually match `scipy.ndimage.label`'s on real hardware, the thing the
+whole upgrade is trusting. This file skips cleanly (module-level) unless a
+real CUDA/ROCm device *and* a real `cupy` install are both present, then
+runs `GPUPatchify2D`/`GPUPatchify3D` with `region_backend="cupyx"` and
+`"scipy"` on the identical input and asserts the outputs match exactly
+(not approximately -- `region_backend` only changes the final connected-
+components step, not the merge decisions that precede it, so an exact
+match is the right bar). New `launch/tests/run_cupyx_smoke.sh` (single
+GPU, no `srun`/distributed launch needed) runs it -- includes a note on
+which `cupy` package matches the `rocm/6.2.4` module already loaded there,
+since `cupy` isn't a project dependency and needs installing once in the
+`forge-vit` conda env before this can run for real.
+
+#### Follow-up: the `cupy` install note above was wrong -- corrected against a real Frontier install on a newer ROCm build
+
+The `pip install cupy-rocm-6-2` guess above was never verified against
+real hardware in this session (no GPU, no `cupy`, stated explicitly at the
+time) -- and it turns out that package doesn't actually exist. Real
+current state, confirmed via `docs.cupy.dev` and OLCF's own Frontier docs:
+CuPy dropped prebuilt ROCm wheels entirely after v13.4.0; AMD now hosts a
+ROCm-matched build (`amd-cupy`) at `pypi.amd.com` instead, versioned per
+ROCm release path (`/rocm-X.Y.Z/simple`).
+
+The user built a new Frontier environment on a newer ROCm release
+(`rocm/7.13`, `UCF-rocm7.13` conda env -- also picking up matching AMD-
+hosted `torch`/`torchvision`/`torchaudio` wheels from `repo.amd.com`,
+since the standard `download.pytorch.org` ROCm wheel builds don't cover
+this release yet) and confirmed this actually installs and works:
+```
+module load rocm/7.13
+export ROCM_HOME=${ROCM_PATH}
+pip install amd-cupy --extra-index-url https://pypi.amd.com/rocm-7.13.0/simple
+```
+`ROCM_HOME` must be exported at runtime too, not just at install time --
+`run_cupyx_smoke.sh` now does this before its `python -m pytest` line.
+`README.md`'s AMD/Conda install section and `run_cupyx_smoke.sh` (env name
+`forge-vit` -> `UCF-rocm7.13`, `module load rocm/6.2.4` -> `rocm/7.13`) are
+both updated to match -- this is the first real, hardware-confirmed
+install path for `region_backend="cupyx"` in this project, replacing an
+unverified guess. `test_gpu_adaptive_patching_cupyx_real.py` itself
+hasn't been run yet (that's the natural next step now that the
+environment exists) -- only the `cupy` install itself has been confirmed
+so far.
+
+#### Follow-up: the `amd-cupy`/`rocm-7.13.0` install above was *also* wrong -- the real fix is a source build, now confirmed by an actual passing run
+
+Running `test_gpu_adaptive_patching_cupyx_real.py` for real (job 5498540)
+immediately exposed that the previous entry's "confirmed this actually
+installs and works" was premature -- `import cupy` failed with
+`ModuleNotFoundError` inside the batch job despite `pip install` reporting
+success. Root cause, found by checking `pypi.amd.com` directly: AMD's
+index has no `rocm-7.13.0` path at all (`AccessDenied` browsing it, vs. a
+real wheel listing at `rocm-7.0.2`) -- `pip install --extra-index-url
+<url that 404s/denies>` doesn't error, it silently falls through to
+regular PyPI, where an unrelated placeholder package also happens to be
+named `amd-cupy` (version `0.0.2`, no dependencies, no real content).
+`pip show`/`pip list` looked completely normal; only `import cupy`
+actually surfaced the gap.
+
+Trying the real `rocm-7.0.2` wheel (`amd_cupy==13.5.1`, pinned so pip
+couldn't repeat the silent-fallback trick) got further -- it imports
+cleanly, which is *not* sufficient evidence it works (only proves the
+dynamic loader found matching symbols, not that GPU kernels compiled
+against a different ROCm's HIPRTC/`comgr` actually execute correctly) --
+and indeed the real smoke test (job 5499091) failed during
+`cupyx.scipy.ndimage.label`'s runtime kernel JIT compile:
+`fatal error: 'stddef.h' file not found`, `comgr` picking up an unrelated,
+incomplete system GCC 14 install rather than the `module load gcc/12.2.0`
+toolchain the job actually loads. Diagnosed by checking `which g++`/
+`g++ --version` (SUSE gcc 7.5.0) against the failing trace's actual header
+path (gcc 14) -- confirmed a real mismatch, not a guess.
+
+**The actual fix**: build `cupy` from source against the real `rocm/7.13`
+install (`CUPY_INSTALL_USE_HIP=1`, `ROCM_HOME=${ROCM_PATH}`,
+`HCC_AMDGPU_TARGET=gfx90a` for MI250X, `pip install cupy` -- plain
+upstream `cupy`, not `amd-cupy`), so the JIT compiler dynamically links
+against this environment's own complete, self-consistent ROCm toolchain
+instead of a wheel's vendored one built for a different release. One more
+real issue surfaced immediately after (job 5499848): `cupy`'s JIT kernel
+cache defaults to `$HOME/.cupy/kernel_cache`, which blew Frontier's
+`$HOME` disk quota (`OSError: [Errno 122] Disk quota exceeded`) --
+`CUPY_CACHE_DIR` redirects it, set in `run_cupyx_smoke.sh` to the same
+node-local `/tmp/$JOBID` scratch `MIOPEN_USER_DB_PATH` already uses.
+
+**Verification:** job 5500276 -- `test_gpu_patchify_2d_cupyx_matches_scipy`
+and `test_gpu_patchify_3d_cupyx_matches_scipy` both **passed** for real,
+`region_backend="cupyx"`'s output exactly matching `region_backend=
+"scipy"`'s on identical input, on real MI250X hardware. This is the first
+real confirmation (not a mocked dispatch test) that the `cupyx.scipy.
+ndimage.label` region-detection upgrade actually works. `README.md` and
+`run_cupyx_smoke.sh` are updated to the source-build steps above,
+replacing the wrong `amd-cupy`/`pypi.amd.com` instructions entirely.
+`region_backend` stays test-only for now (not wired into `parse.py`/any
+config) -- the user wants to do further testing with it before deciding
+whether to expose it as a real, config-driven option.
+
+**Verification:** both new files compile and collect cleanly; both
+correctly skip (not error) in this session's environment (no SLURM launch,
+no CUDA, no `cupy`) -- confirmed directly, not assumed. Full local suite
+(`pytest tests/ --ignore=tests/distributed`) still passes, 416 passed / 5
+skipped (one more skip than before, from the new cupyx-real test file;
+the new distributed test isn't part of this count at all, excluded by
+`--ignore=tests/distributed`). Neither new test's real pass/fail behavior
+has been observed -- that requires an actual Frontier `sbatch` run, the
+natural next step whenever convenient.
+
+## Renamed gpu_ap_min_size to min_size and made it a shared CPU/GPU floor
+
+Follow-up ask: `FixedQuadTree`/`FixedOctTree._build_tree` (`quadtree.py`
+line ~298, `octree.py`'s identical line) hardcoded `2` as the smallest leaf
+side length they'd ever split down to -- the exact same concept
+`GPUPatchify2D`/`GPUPatchify3D`'s own `min_size` already covers for the GPU
+path, just not exposed as a parameter on the CPU side, and not shared
+under one name. `ap.gpu_ap_min_size` (GPU-only until now) is renamed to
+`ap.min_size` and threaded through both paths.
+
+**The actual new capability**, in `quadtree.py`/`octree.py`:
+`FixedQuadTree`/`FixedOctTree.__init__` gain a `min_size=2` parameter
+(default preserves today's exact behavior); `_build_tree`'s stopping
+condition changes from `bbox.get_size()[0] == 2` to `bbox.get_size()[0] <=
+self.min_size` -- a node this size (or smaller) is never split further,
+regardless of how much it still dominates every other candidate's score.
+`<=` rather than `==` for robustness (defensive against any node size
+ever landing strictly below `min_size` in one step, though in practice
+sizes only ever halve cleanly from a power-of-two starting point).
+
+**A real, if narrow, thing found while testing this** (not a code bug --
+a wrong test assumption caught by actually running it): a first attempt at
+a 3D `Patchify_3D` test used `fixed_length=100, min_size=4` on a 16-cube
+volume and asserted the tree "stops early" (can't reach `fixed_length`
+without violating `min_size`) -- but `(16//4)**3 = 64` distinct 4x4x4
+leaves are actually reachable from that volume, and with `score_fn=
+"variance"`'s particular score distribution on this fixture, the tree
+legitimately reached exactly the target count without ever violating
+`min_size`. Not a bug: `FixedOctTree`'s own analogous canny-scored test
+(same volume, same `fixed_length`/`min_size`) genuinely stops much earlier
+(15 nodes) purely from a different tie-breaking pattern in a very
+score-dependent greedy algorithm -- confirming a "stops early" assertion
+needs a `fixed_length` provably *above* the true achievable ceiling
+((`img_size`/`min_size`)`**ndim`) to be a robust regression check
+regardless of `score_fn`/tie-breaking specifics, not just intuitively
+"large." Fixed by choosing `fixed_length=100` specifically because it's
+above that 64-leaf ceiling for *any* score distribution, not by relaxing
+the assertion.
+
+**Threading**: `Patchify`/`Patchify_3D.__init__` (`transform.py`) gain
+`min_size=2`, forwarded to `FixedQuadTree`/`FixedOctTree` in every branch
+(canny and variance). From there, threaded through the same five
+construction sites `score_fn` already flows through: `dataset.py`'s
+`ProcessChannels`, `datamodule.py`'s `NativePytorchDataModule`,
+`catsdogs.py`'s `CatsDogsDataset`, and both construction patterns in each
+of `train.py`/`val.py`/`test.py`. `parse.py`'s `ap_conf` entry is now
+available whenever `do_ap:True` (not just `do_gpu_ap:True` as
+`gpu_ap_min_size` was), defaulting to `2`; the `do_gpu_ap` fixed_length
+congruence check's own reference to it is renamed to match, no logic
+change. `arch.py`'s `VIT.__init__` parameter is renamed `gpu_ap_min_size`
+-> `min_size` too (still only consumed there for constructing `self.
+gpu_patchify` -- `arch.py` has no CPU-side `Patchify` construction of its
+own); `model/utils.py`'s `get_model` call site renamed to match.
+
+Two real, pre-existing test fixtures needed the same rename applied
+(`tests/distributed/test_eval_real_pipeline.py`, `tests/distributed/
+test_pretrained_loading_real.py` -- both call `get_model` directly with a
+hand-built `conf["ap"]` dict, which now needs `"min_size"` instead of
+`"gpu_ap_min_size"` or `get_model` would `KeyError` immediately). All 23
+shipped configs' `ap.gpu_ap_min_size: 2` lines (added two stages ago) are
+renamed to `ap.min_size: 2` with an updated comment describing the shared
+meaning.
+
+**Tier 1 coverage**: `test_quadtree.py`/`test_octree.py` gain a
+`min_size` test each (default `min_size=2` behavior unchanged; an explicit
+`min_size=4` both limits the smallest leaf produced and correctly stops
+short of a `fixed_length` chosen above the true achievable ceiling).
+`test_transform.py` gains the same two tests through the full `Patchify`/
+`Patchify_3D` pipeline (not just at the tree level). `test_config_
+validation.py` gains a real-config test confirming `ap.min_size` parses
+with its default and an explicit override, regardless of `do_gpu_ap`.
+
+**Verification:** full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 421 passed / 5 skipped (5 new tests, no
+regressions). Direct manual checks confirm `Patchify`'s real end-to-end
+output respects a custom `min_size` (only padding-zero entries in
+`seq_size` fall below it, real leaf sizes never do).
+
+## Removed the CPU adaptive-patching `data.tile_size`-must-be-a-power-of-2 restriction
+
+Follow-up ask, prompted by asking why the CPU path (`Patchify`/
+`Patchify_3D`, backed by `FixedQuadTree`/`FixedOctTree`) needed
+`data.tile_size` to be a power of two when the GPU path
+(`GPUPatchify2D`/`GPUPatchify3D`) already accepts any size via padding.
+The restriction exists because `_build_tree` splits a node using one
+integer midpoint (`int((x1+x2)/2)`) applied to both children --
+repeatedly halving a power-of-two size always stays exact, but starting
+from any other size eventually hits an odd intermediate value, and
+truncating division there produces *unequal* children (e.g. `3 -> 1, 2`),
+silently violating the tree's own quad/oct-split assumption rather than
+raising. `parse.py`'s `is_power_of_two(tile_size[i])` assertion was the
+simplest sufficient (not tightest necessary) guard against this.
+
+**The fix**: pad the input up to the next power of two per spatial axis,
+independently, before building the tree -- mirroring `GPUPatchify2D`/
+`GPUPatchify3D`'s own already-shipped `_pad_tensor`, but via `numpy.pad(
+..., mode="edge")` instead of `F.pad(..., mode="replicate")`, since
+`Patchify`/`Patchify_3D.forward` operate on real `numpy` arrays, not
+`torch.Tensor`s (same edge-replication semantics either way). Unlike
+`GPUPatchify2D`/`GPUPatchify3D` -- which build a *fixed* grid of
+`min_size` blocks and so need `H<=W`/an integer axis ratio to pad
+correctly -- `Patchify`/`Patchify_3D`'s root is always a single node
+covering the whole image, no fixed grid, so each axis can be padded to
+its own next power of two with no cross-axis constraint at all.
+
+**Edge-replication, not zero-padding, was a deliberate choice**:
+zero-padding would create a hard discontinuity exactly at the real image
+boundary -- a false edge for `score_fn="canny"`, and spuriously high
+variance for `score_fn="variance"` on any block straddling that boundary
+-- both would waste patches on a meaningless boundary instead of staying
+coarse there. Edge-replication keeps the border flat/continuous with real
+content, so it scores low and stays coarse, matching intent.
+
+**No clipping/trimming machinery was added**: a leaf near the padded edge
+may cover some replicated (not real) content, exactly like
+`GPUPatchify2D`/`GPUPatchify3D`'s own identical tradeoff -- intersecting
+each leaf's bounding box with the real image bounds before extracting
+content was considered and deliberately not built, since it wasn't asked
+for and the GPU path already accepts this same tradeoff.
+
+**New shared utility**: `UCF_VIT.utils.misc.next_power_of_two(n)` (`1 <<
+(n - 1).bit_length()`) -- smallest power of two `>= n`, already-a-power-
+of-two `n` maps to itself. `UCF_VIT.dataloaders.transform._pad_to_power_
+of_two(img, ndim)` uses it to pad `img`'s first `ndim` axes (`2` for
+`Patchify`, `3` for `Patchify_3D`) via `numpy.pad(..., mode="edge")`; a
+no-op (returns `img` unchanged, not a copy) when every axis is already a
+power of two. Called as the very first line of both classes' `forward()`
+-- every branch below (canny's imagenet/catsdogs/skimage-canny/random-
+noise sub-branches, and variance) operates on the already-padded array
+with no other code changes needed.
+
+**`parse.py`**: the `is_power_of_two(tile_size[i])` loop is now gated
+behind `ap_conf["do_gpu_ap"]` -- still enforced for the GPU path (its
+fixed block grid still needs it, and relaxing it wasn't asked for here),
+removed entirely for the CPU path (`do_gpu_ap:False`), which now pads
+internally regardless of `tile_size`. (Follow-up below removes it for
+the GPU path too.)
+
+**A real regression caught by actually running the suite** (not assumed
+safe): `test_transform.py`'s existing `test_patchify_3d_shape_and_dtype`
+used `D=H=W=24` -- not a power of two, previously allowed only because
+that test constructs `Patchify_3D` directly, bypassing `parse.py`'s
+assertion entirely -- and asserted `edges.shape == (24, 24, 24)`. With
+padding now wired in, 24 pads up to 32, so the assertion needed updating
+to `(32, 32, 32)`; this is the real, expected consequence of the new
+behavior, not a bug.
+
+**Tier 1 coverage**: `test_transform.py` gains direct unit tests on
+`_pad_to_power_of_two` (no-op when already a power of two, returning the
+same object; independent per-axis padding e.g. `(12, 20) -> (16, 32)`;
+edge-replication confirmed pixel-exact, not zero, including the
+replicated-corner case; trailing non-spatial axes like a channel
+dimension left untouched), plus one end-to-end test per class
+(`Patchify`/`Patchify_3D`) confirming a non-power-of-2 input no longer
+needs rejecting upstream and the returned `edges` reflect the padded
+(not original) size. `test_config_validation.py` gains two tests: a
+non-power-of-2 `data.img_size` (so `tile_size` derives to the same)
+parses cleanly under `do_gpu_ap:False`, and still raises with "must be a
+power of 2" under `do_gpu_ap:True`.
+
+**Verification:** full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 439 passed / 5 skipped (10 new tests, one existing
+test updated for the real shape change above, no other regressions).
+
+#### Follow-up: removed the power-of-2 restriction for `do_gpu_ap:True` too, replaced the assertion with a warning
+
+Immediate follow-up ask: the GPU path's own `is_power_of_two` assertion,
+left in place above, isn't actually necessary either --
+`GPUPatchify2D`/`GPUPatchify3D`'s `_pad_tensor` already pads up to the
+next multiple of the coarsest `min_size` block regardless, and the
+`fixed_length` congruence check right below it already computes against
+`real_max_blocks` (derived from the *padded* reference size, `padded_
+ref`), not the raw `tile_size` -- so the congruence math was already
+correct for a non-power-of-2 `tile_size` even while the assertion above
+it was needlessly rejecting one.
+
+**The change**: removed the `is_power_of_two` assertion for both paths
+entirely. In its place, `parse.py` now prints a warning (matching the
+existing `print(f"Warning: ...")` convention already used for UNETR's
+token-capacity check) whenever any checked dimension of `tile_size`
+isn't a power of two, naming the actual `Patchify`/`Patchify_3D` or
+`GPUPatchify2D`/`GPUPatchify3D` class that will pad it and explaining
+why this isn't a no-op: patches/blocks near the padded edge may cover
+replicated (not real) content. A warning, not a rejection -- padding is
+real, correct behavior now for both paths, just worth surfacing since it
+does change the output.
+
+**Tier 1 coverage**: `test_config_validation.py`'s two tests from above
+are replaced with: a non-power-of-2 `tile_size` no longer rejected under
+either `do_gpu_ap:False` or `do_gpu_ap:True` (both now parse cleanly,
+confirmed via `capsys`); the warning actually fires and names the right
+class for each path; a power-of-2 `tile_size` (`SAP_CONFIG`'s own
+shipped `img_size:256`) prints no such warning, confirming it's
+conditional, not unconditional noise on every `do_ap:True` config.
+
+**Verification:** full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 441 passed / 5 skipped, no regressions.
+
+## Fixed a real Frontier regression: removed `building_blocks.py`'s dead `xformers.components` import
+
+A long-standing gap, flagged repeatedly earlier in this file (see the
+"Verification note" above the `test_arch.py` coverage, and the
+`get_kwargs`/`Block_diffusion` fix above that) as a *dev-environment*
+problem -- `building_blocks.py`'s unconditional `from xformers.components.
+attention.core import scaled_dot_product_attention as xformers_sdpa`
+importing a deprecated `xformers` submodule this session's own sandbox
+didn't have a matching build for, worked around at the test level
+(`importorskip`) rather than fixed at the source, since it never actually
+broke a real run. It just did, for real, on Frontier's `run_distributed_
+tests.sh` job 5498539 (`ModuleNotFoundError: No module named "xformers.
+components"`, 5 test modules under `tests/distributed/` failing to import)
+-- the newly-rebuilt `xformers` (installed from the `rocm7.1` wheel index
+against the new `rocm/7.13` environment) dropped the module entirely, not
+just changed its API.
+
+Checked directly (`grep -rn xformers_sdpa`) before touching anything:
+`xformers_sdpa` is imported and never referenced anywhere else in
+`building_blocks.py` or the rest of the codebase -- genuinely dead code,
+not a real dependency masked by a bad import path. Deleted the one import
+line; `import xformers` itself stays (real, used lines below for
+`xformers.ops.memory_efficient_attention`). No behavior change, since
+nothing ever called the removed name.
+
+**Verification:** `python -m py_compile` on the changed file, plus a full
+local suite run (`pytest tests/ --ignore=tests/distributed`) -- passes,
+490 passed / 2 skipped here (this sandbox's own counts differ from the
+441/5 baseline logged throughout this file; `tests/model/*` and other
+xformers-touching tests that used to report an environment-mismatch skip
+now import and run for real in whatever session environment this fix
+happened to land in -- not evidence of anything to do with this change
+itself). Not yet confirmed on Frontier with a real rerun of `run_
+distributed_tests.sh` -- that's the natural next step to close this out.
+
+## Fixed a second real Frontier regression: `make_smoke_config` crashed on `parallelism.simple_ddp_size: "auto"`
+
+Job 5500491 (Tier 3, `run_training_smoke.py`) crashed for real on
+`sst-mae` (`configs/sst/mae/base_config.yaml`, the first `sst` config
+`discover_configs()` reaches alphabetically) with `TypeError: '<' not
+supported between instances of 'str' and 'int'`, inside `make_smoke_
+config`'s `min_files = min(min_files, conf["dataloader"]["batch_size"] *
+data_par_size)`. Root cause: `conf` here is a raw `yaml.load` -- `parse_
+config` (which resolves `parallelism.simple_ddp_size: "auto"` into a real
+integer from a live process group's `world_size`) never runs on it -- so
+`data_par_size = conf["parallelism"]["fsdp_size"] * conf["parallelism"]
+["simple_ddp_size"]` silently computed `1 * "auto"` (Python string
+repetition, not an error) instead of raising immediately; the real crash
+only surfaced one line later, comparing that string against an int in
+`min()`.
+
+Tracing further (before writing any fix) found this was actually two
+latent bugs sharing one root cause, not one: `compute_narrow_dict_idx`,
+called right after inside the same function, independently reads
+`conf["parallelism"]["simple_ddp_size"]` off the same raw config for its
+own `data_par_size` -- fixing only the `min_files` cap line would have
+just moved the crash one step later. This second occurrence was already
+known and documented, just never fixed at the source: `tests/distributed/
+test_sst_real_pipeline.py`'s own docstring explains hardcoding `conf
+["parallelism"]["simple_ddp_size"] = 8` specifically because `compute_
+narrow_dict_idx` "can't itself resolve `"auto"` the way `parse_config`
+does" -- a real, working workaround for that one Tier 2 test, but not a
+fix for the shared function every other caller (Tier 3's `make_smoke_
+config`, several Tier 2 real-pipeline tests) still has to route around
+too.
+
+**The fix**: `make_smoke_config` now resolves `conf["parallelism"]
+["simple_ddp_size"]` from `"auto"` to a real int *in place*, immediately
+after loading the config (before anything else reads it) -- `ntasks //
+(fsdp_size * tensor_par_size)`, the identical formula `parse.py` itself
+uses, with `ntasks` (a new parameter, threaded through from both `run_
+training_smoke.py`'s and `run_feature_matrix_smoke.py`'s own `args.
+ntasks`) standing in for the live process group's `world_size`, since
+that's exactly what the real `srun -n ntasks python train.py` subprocess
+this config gets handed to will use. Baking in the resolved int (rather
+than trying to write `"auto"` back out unresolved) is exactly equivalent
+to what `"auto"` would resolve to for this specific job anyway -- and
+fixes both crash sites in one place, since every downstream read
+(`compute_narrow_dict_idx` included) now sees a real int from the start.
+An explicit integer `simple_ddp_size` (every non-`sst`/non-experimental
+shipped config) is left completely untouched.
+
+**Tier 1 coverage**: `tests/integration/test_run_training_smoke_helpers.py`
+gains two direct tests against `make_smoke_config` itself (previously only
+its narrowing/merge helpers were unit-tested, not this function) --
+`simple_ddp_size:"auto"` resolves to the expected int (`ntasks //
+(fsdp_size * tensor_par_size)`, using a real fake-`imagesTr` fixture,
+same style as `test_compute_narrow_dict_idx_real_data_found`), and an
+explicit int is left untouched.
+
+**Verification:** full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 492 passed / 2 skipped, no regressions. Directly
+reproduced the original crash against the real `configs/sst/mae/base_
+config.yaml` file before the fix (confirmed the exact `TypeError`), and
+confirmed after the fix `make_smoke_config` runs cleanly past both
+former crash sites, now failing only on this sandbox's expected
+`NoRealDataFoundError` (no Frontier data mount here) -- not yet
+confirmed with a real Frontier rerun of `run_training_smoke.py`, the
+natural next step.
+
+## A real, unresolved Tier 3b finding: `basic_ct-unetr+do_ap`'s default `token_selection` (`"point"`) timed out at 600s
+
+Job 5500492 (Tier 3b, `run_feature_matrix_smoke.py`) found `basic_ct-
+unetr+do_ap` -- the plain `do_ap:True` cell, default `model.token_
+selection` (`"point"`), no `min_files_override` -- hit `TIMEOUT (600s)`
+for the first time recorded in this file. Its 4 sibling cells (identical
+config, only `token_selection` differs) behaved very differently on the
+same run: `+smallest_overlap` `PASS (352s)` (close to the same timeout,
+but under it), `+area_weighted`/`+area_weighted_alpha`/`+cross_attention`
+all `PASS (~70s)`. `arch.py`'s `_adaptive_token_grid_index` (backing both
+`"point"` and `"smallest_overlap"`) is fully vectorized -- broadcasts a
+`(B, G, S)` boolean tensor via `ndims` (2 or 3) Python-level iterations,
+no loop over batch/tokens/grid-cells -- so there's no obvious O(N^2)-style
+algorithmic reason `"point"`/`"smallest_overlap"` should be ~5-8x slower
+than `"area_weighted"`/`"cross_attention"` on the same input size; not
+diagnosed further here (would need real GPU profiling on Frontier itself,
+which this session's dev sandbox can't do). Not investigated deeper
+per the user's own direction -- flagged as an open, unresolved finding
+rather than guessed at. No code changed for this one.
+
+#### Follow-up: worked around the timeout by swapping this cell's `token_selection`, profiling left for later
+
+The user asked to change `basic_ct-unetr+do_ap`'s `token_selection` to a
+different (working) value for now, rather than block on the profiling
+work above. Overridden to `"area_weighted"` (alpha left at its default,
+`0`) -- the fastest passing sibling (`~70s`), and the most neutral choice
+(no size bias, no extra trainable parameters) as a stand-in for `"point"`
+specifically.
+
+This made the override byte-identical to the existing `+area_weighted`
+sibling cell (`{"ap": {"do_ap": True, "interp_size": 32}, "model":
+{"token_selection": "area_weighted"}}` on both) -- running both would
+just repeat the exact same training run twice, spending real Frontier
+allocation time for zero additional coverage. Removed the now-redundant
+`+area_weighted` cell rather than leave a silent duplicate; `FEATURE_
+MATRIX` drops from 5 `do_ap`-token_selection cells to 4
+(`basic_ct-unetr+do_ap`, `+smallest_overlap`, `+area_weighted_alpha`,
+`+cross_attention`).
+
+Real consequence, called out directly in both cells' own comments now:
+`"point"` -- the actual shipped default every `do_ap:True` UNETR config
+uses unless overridden -- has **no real-Frontier coverage at all** in
+this file until the profiling work above happens and either fixes its
+slowness or this cell's timeout is bumped back up specifically to cover
+it. Not a regression introduced here (the finding above already
+established `"point"` was broken/marginal on this environment) --
+just making that gap explicit rather than silently papering over it with
+a passing cell that no longer actually exercises `"point"`.
+
+**Verification:** `python -m py_compile` on the changed file; full local
+suite (`pytest tests/ --ignore=tests/distributed`) passes, 491 passed / 2
+skipped (one fewer than the prior 492 -- the removed cell's own
+parametrized `test_feature_matrix_smoke_helpers.py` case, not a
+regression). Not yet confirmed with a real Frontier rerun of `run_
+feature_matrix_smoke.py` -- that's the natural next step.
+
+## Added a new Tier 3b cell: `ap.do_gpu_ap:True`'s first real end-to-end training coverage
+
+Asked directly: does it make sense to add `do_gpu_ap` coverage to Tier
+3/3b? `do_gpu_ap` (adaptive patching running on-device inside the model's
+own `forward()`, `GPUPatchify2D`/`GPUPatchify3D`, instead of in the
+dataloader) already had two kinds of real coverage -- unit-level (`test_
+gpu_adaptive_patching.py`/`_3d.py`) and, since this session's own real-
+hardware runs, cross-rank determinism (`tests/distributed/test_do_gpu_ap_
+real_pipeline.py`, which deliberately constructs `GPUPatchify2D` directly,
+no model or `train.py` involved, by design, to isolate that one property)
+-- but nothing had ever run it through a real model end to end: forward,
+backward, optimizer step, checkpoint save/resume, `process_batch`'s own
+broadcast-then-redundantly-patchify design all working together for
+real. `training-smoke` (Tier 3) doesn't fit -- it proves the 10 shipped
+baseline configs work unmodified, and none of them ship `do_gpu_ap:True`.
+`feature-matrix-smoke` (Tier 3b) is exactly the right venue -- the same
+"flip one advanced feature on for a representative config" role `do_ap`
+(the CPU-side path) already has cells for.
+
+**New cell**: `basic_ct-unetr+do_gpu_ap` (`{"ap": {"do_ap": True,
+"do_gpu_ap": True, "interp_size": 32}}`, right after the existing
+`basic_ct-unetr+do_ap` cell). Unlike `do_ap`, `do_gpu_ap` has no hard
+model-type restriction in `parse.py`/`arch.py` (no SAP-requires/
+DiffusionVIT-forbids equivalent) -- so one representative cell is enough;
+this isn't proving a free choice per model type, just that the on-device
+path itself works end to end. `score_fn` is left at this config's own
+explicit `"canny"` (not overridden to `do_gpu_ap`'s own path-dependent
+default of `"variance"` -- `parse.py`: an explicit `ap.score_fn` always
+wins) specifically so this cell also exercises `GPUPatchify3D`'s Canny
+path, not just its simpler variance path. `fixed_length:512` (this
+config's own existing value) already satisfies `do_gpu_ap`'s own
+`fixed_length` congruence check for this `tile_size`/`min_size` (verified
+directly: `real_max_blocks` comes out to `128` here, same as the `do_ap`
+cell's own congruence check, `(128**3 - 512) % 7 == 0`) -- no override
+needed.
+
+**Verification:** the new cell's merged config confirmed to actually
+parse cleanly through the real `parse.py`/`validate_config` (not just
+constructed and assumed valid) -- `do_gpu_ap: True`, `score_fn: "canny"`,
+`fixed_length: 512` all come back as expected. `make_smoke_config` (Tier
+3b's own config-generation step) confirmed to run cleanly all the way to
+this sandbox's expected `NoRealDataFoundError` (no real Frontier data
+mount here) -- the same "gets exactly as far as it can without real
+hardware/data, then fails for the right, already-handled reason" bar used
+throughout this session. Full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 492 passed / 2 skipped (one more than the prior
+491 -- this cell's own new parametrized `test_feature_matrix_smoke_
+helpers.py` case). Not yet confirmed with a real Frontier rerun of `run_
+feature_matrix_smoke.py` -- that's the natural next step.
+
+## Switched `Patchify`'s `imagenet`/`catsdogs` Canny path off `cv2.Canny`, onto per-channel `SimpleITK.CannyEdgeDetection`
+
+Investigated at the user's own request, after they asked why the CPU
+adaptive-patching path uses `cv2.Canny` for 2D and `SimpleITK.
+CannyEdgeDetection` for 3D, and whether `cv2`'s own multi-channel handling
+had real accuracy tradeoffs. Confirmed directly against OpenCV's real C++
+source (`modules/imgproc/src/canny.cpp`, `parallelCanny::operator()`, two
+independent fetches of the same file): `cv2.Canny`'s multi-channel
+handling is a per-pixel **argmax across channels** -- for each pixel, it
+computes a separate Sobel gradient per channel, then picks whichever
+single channel has the largest magnitude *at that exact pixel* and uses
+only that channel's gradient for every downstream step (NMS, threshold,
+hysteresis), discarding the other channels' gradients entirely there. Not
+a joint/combined gradient -- winner-take-all. Tolerable for RGB (similar
+per-channel scales), not something that generalizes to arbitrary
+multi-channel data with different physical units/scales (which is exactly
+the axis the user cares about beyond RGB photos).
+
+**The fix**: `Patchify`'s `imagenet`/`catsdogs` branch now runs
+`SimpleITK.CannyEdgeDetection` once per channel and sums the results into
+a per-pixel edge *count* -- the same "weight a pixel by how many channels
+independently flag it as an edge" convention `Patchify_3D` already uses
+(forced on it anyway, since `SimpleITK.CannyEdgeDetection` doesn't support
+multi-channel/vector images directly either way). Each channel is
+independently min-max normalized to `[0,1]` before Canny runs (edge-
+detection input only, real patch content untouched) so the shared
+`canny_thresholds` default stays meaningful regardless of a dataset's
+real intensity range (`imagenet`/`catsdogs` are uint8 `[0,255]`, not the
+`~[0,1]` scale `canny_thresholds` otherwise assumes).
+
+**The normalization step itself was generalized, not just added**:
+`Patchify_3D`'s own edge-detection-input normalization used to be scoped
+to `dataset == "sst"` only (its raw CFD fields being in arbitrary physical
+units) -- the same justification applies to *any* dataset whose raw scale
+isn't already near `[0,1]`, so the `if dataset == "sst":` guard was
+removed entirely; normalization now runs unconditionally, for every
+dataset, in both `Patchify` (the new `imagenet`/`catsdogs` branch) and
+`Patchify_3D`. `cv2` remains a real, imported dependency elsewhere in this
+codebase regardless of this change (`cv.resize`, used for real image/patch
+resizing) -- this change couldn't have dropped it as a dependency either
+way.
+
+**A real, measured tradeoff, not hand-waved**: benchmarked directly (not
+assumed) on a synthetic 256x256x3 image, the exact size `imagenet/
+classification`'s shipped config resizes to -- `cv2.Canny` (old): ~0.6ms/
+call; the new per-channel `SimpleITK.CannyEdgeDetection` loop: ~15.5ms/
+call, a ~25x slowdown. That config ships `num_workers:1, batch_size:32`,
+so one worker doing this serially per sample is roughly 20ms -> ~500ms of
+Canny-only cost per batch. Committed anyway at the user's explicit
+direction (the algorithmic correctness gain was judged worth it), with
+this tradeoff documented directly in `Patchify`'s own class docstring:
+`cv2.Canny` remains a real, faster option worth reaching for specifically
+as a last resort if this ever becomes a genuine dataloader-throughput
+bottleneck in practice -- not the default, because of the winner-take-all
+issue above.
+
+**Test impact**: `test_patchify_imagenet_branch_uses_cv2_canny_unchanged`
+rewritten as `test_patchify_imagenet_branch_uses_per_channel_simpleitk_
+canny` (now asserts a real per-channel-count property: 3 byte-identical
+channels must produce a count of exactly 0 or 3 per pixel, never in
+between) plus a new `test_patchify_imagenet_branch_normalizes_input_
+before_canny`. `Patchify_3D`'s own `test_patchify_3d_sst_normalizes_only_
+edge_detection_input_not_real_patch_content`/`test_patchify_3d_non_sst_
+dataset_unaffected`/`test_patchify_3d_sst_detects_edge_too_small_for_raw_
+scale` (all premised on `"sst"` normalizing and `"basic_ct"` not)
+rewritten to reflect every dataset now normalizing identically --
+`test_patchify_3d_non_sst_dataset_unaffected`'s own premise (adding "sst"
+normalization mustn't touch other datasets) is fully obsolete now that
+normalization isn't dataset-scoped at all, so it was replaced rather than
+patched.
+
+**Verification:** full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 492 passed / 2 skipped, no regressions.
+
+## Shared `ap.canny_sigma`/`canny_low_threshold`/`canny_high_threshold` between the CPU and GPU adaptive-patching paths
+
+Follow-up ask, prompted by noticing these three config keys already exist
+in every shipped config (added for `do_gpu_ap:True`'s own `GPUPatchify2D`/
+`GPUPatchify3D` Canny scoring) but had no effect at all on the CPU path
+(`Patchify`/`Patchify_3D`, `do_gpu_ap:False`) -- asked whether the same
+knobs could control both. `canny_hysteresis_iters` was deliberately left
+out of this sharing: it's specific to `GPUPatchify2D`/`GPUPatchify3D`'s
+own dilation-based hysteresis *approximation* -- `SimpleITK`/`skimage` do
+real hysteresis internally on the CPU side, with no equivalent knob to
+share.
+
+**The mechanism**: `Patchify`/`Patchify_3D` gain three new optional
+constructor parameters -- `canny_sigma`, `canny_low_threshold`,
+`canny_high_threshold` -- all `None` by default, meaning "leave my own
+existing `sths`/`canny_thresholds` defaults untouched." When `canny_sigma`
+is given, it overrides `sths` with a *single* fixed value (no more per-
+call randomization) -- for `Patchify_3D` and `Patchify`'s `imagenet`/
+`catsdogs` branch (both `SimpleITK`-backed), converted to `SimpleITK.
+CannyEdgeDetection`'s own `variance` parameter as `canny_sigma ** 2` (ITK's
+real Gaussian variance-vs-sigma convention, confirmed against `Discrete
+GaussianImageFilter`'s own docs before assuming it -- `CannyEdgeDetection
+ImageFilter` reuses that same filter for its smoothing internally); for
+`Patchify`'s `skimage.feature.canny` branch, used directly as `sigma` (no
+conversion needed, already the same meaning `GPUPatchify2D`'s own `canny_
+sigma` uses). When both `canny_low_threshold`/`canny_high_threshold` are
+given, they override `canny_thresholds` directly (`canny_quantiles`,
+`skimage`'s own quantile-based threshold, is deliberately not
+overridable this way -- a genuinely different kind of threshold, no
+shared knob makes sense there).
+
+`parse.py`'s own gate (`use_canny`) changed from `do_gpu_ap and score_fn
+== 'canny'` to just `score_fn == 'canny'` (`score_fn` can only be
+`"canny"` when `do_ap` is already `True`, so no separate `do_ap` check
+needed) -- `canny_hysteresis_iters` keeps its own, narrower `do_gpu_ap`-
+gated check. The three shared keys' *baked-in numeric defaults* were
+removed from `parse.py` entirely (bare `conf['ap'].get(key)`, `None` when
+unset) -- deliberately, so each backend keeps its own already-tuned
+default when a config doesn't set these explicitly, rather than parse.py
+silently imposing one shared default on both. Threaded through the full
+real call chain: `training_scripts/train.py` (both the `NativePytorch
+DataModule` and `dataset_module`/`CatsDogsDataset`-style construction
+sites), `val.py`, `test.py` -> `NativePytorchDataModule` -> `ProcessChannels`
+-> `Patchify`/`Patchify_3D`, and `CatsDogsDataset` -> `Patchify`/
+`Patchify_3D` directly.
+
+**Two real bugs found by actually testing this, not assumed safe:**
+
+1. **10 shipped configs would have been silently retuned.** `configs/
+   basic_ct/sap/base_config.yaml`, `configs/sst/unetr/adaptive_config.
+   yaml`, and 8 files under `configs/unetr_token_selection_experiment/`
+   all have `do_ap:True, do_gpu_ap:False` *and* already carried explicit
+   `canny_sigma: 1.0`/`canny_low_threshold: 0.1`/`canny_high_threshold:
+   0.2` values in their YAML -- written purely for `do_gpu_ap:True`
+   discoverability (a "not used here" comment, shown so it's easy to find
+   if you turn `do_gpu_ap` on), never meant to actually govern these
+   configs' real CPU-side Canny behavior. Once `use_canny` stopped
+   requiring `do_gpu_ap:True`, those previously-inert values would have
+   started silently overriding `Patchify`/`Patchify_3D`'s own randomized-
+   smoothing class defaults with a fixed value, and their own class
+   `canny_thresholds` default (`(0.05, 0.15)`) with `(0.1, 0.2)` -- a real
+   training-behavior change to 10 real configs, caught by a test written
+   against the real `SAP_CONFIG` (`test_canny_sigma_and_thresholds_stay_
+   none_when_unset`), not by inspection. Fixed by removing those 3 keys
+   from all 10 files (confirmed via a script scanning every shipped
+   config for `do_ap:True, do_gpu_ap:False` with a non-`None` `canny_
+   sigma`/`canny_low_threshold`) -- restores their exact original
+   behavior, while leaving the new shared mechanism itself fully
+   available to any config (these 10 included) that deliberately wants to
+   opt in going forward. The remaining 13 configs that still carry these
+   keys are all `do_ap:False` baselines (no behavior risk at all, `use_
+   canny` never fires when `do_ap` is `False`) -- their now-inaccurate
+   "GPU path only" comment text was updated to describe the shared
+   reality instead, purely a documentation fix.
+2. **`parse.py`'s own `do_gpu_ap:True` validation crashed on `None <
+   None`.** Removing `canny_low_threshold`/`canny_high_threshold`'s
+   baked-in parse.py defaults (see above) broke an existing assertion,
+   `assert ap_conf["canny_low_threshold"] < ap_conf["canny_high_
+   threshold"]`, gated behind `do_gpu_ap:True` -- a real `TypeError`
+   (`'<' not supported between instances of 'NoneType' and 'NoneType'`)
+   the moment a `do_gpu_ap:True` config left these unset, caught by the
+   existing `test_do_gpu_ap_works_on_a_real_3d_config`/`test_do_gpu_ap_3d_
+   fixed_length_congruence_uses_modulus_7_not_3` tests actually failing,
+   not by inspection. Fixed by comparing against the same effective
+   defaults (`0.1`/`0.2`) `model/utils.py`'s own `get_model` already
+   applies downstream, computed locally for this one comparison -- `ap_
+   conf` itself still stores `None` when unset, so `Patchify`/`Patchify_
+   3D`'s own independent "unset means use my own default" logic is
+   unaffected.
+
+**Tier 1 coverage**: `test_config_validation.py` gains `test_canny_sigma_
+and_thresholds_now_populate_for_do_gpu_ap_false` (explicit values now
+reach `ap_conf` for a `do_gpu_ap:False` config, `canny_hysteresis_iters`
+stays `None` regardless) and `test_canny_sigma_and_thresholds_stay_none_
+when_unset` (the real regression test against `SAP_CONFIG`, above).
+`test_transform.py` gains direct unit tests on `Patchify`/`Patchify_3D`'s
+new parameters: `canny_sigma` squares for the `SimpleITK`-backed branches,
+passes through unsquared for `skimage`; `None` leaves `sths` untouched;
+`canny_low_threshold`/`canny_high_threshold` only override together, never
+partially; plus one end-to-end `forward()` smoke test per class confirming
+the overridden values actually drive a real Canny call, not just get
+stored as attributes.
+
+**Verification:** full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 500 passed / 2 skipped, no regressions. `test_
+config_validation.py`'s own `test_shipped_config_parses` (parses every
+real config under `configs/`) confirmed green after both the 10-file key
+removal and the 13-file comment update. Not yet confirmed with a real
+Frontier training run exercising an explicit `canny_sigma`/`canny_low_
+threshold` override on either path -- that's the natural next step.
+
+#### Follow-up: removed the now-redundant `canny_thresholds` tuple parameter, found and fixed a real `None`-propagation bug while doing it
+
+The user noticed `Patchify`/`Patchify_3D` still carried a `canny_
+thresholds` tuple parameter alongside the new `canny_low_threshold`/
+`canny_high_threshold` -- genuinely redundant now (both express the exact
+same "one fixed low/high pair," no capability gap), unlike `sths`/`canny_
+sigma`, which stay separate because `sths` supports real per-call
+randomization a single `canny_sigma` value can't express. Removed `canny_
+thresholds` entirely; `canny_low_threshold`/`canny_high_threshold` are now
+the only threshold parameters.
+
+**A real bug caught by testing the real call chain, not assumed safe**:
+naively giving `canny_low_threshold`/`canny_high_threshold` real numeric
+defaults (`0.05`/`0.15`) directly in `Patchify`/`Patchify_3D`'s own
+signatures would have broken every real caller -- `dataset.py`/
+`catsdogs.py` unconditionally pass `canny_low_threshold=canny_low_
+threshold` through the whole chain from `ap_conf` (which is `None` for
+every existing config, by design -- see the entry above), so a literal
+`None` would have overridden the real default with `None` itself, crashing
+`SimpleITK.CannyEdgeDetection(lowerThreshold=None, ...)` for every real
+`do_ap:True` config. Fixed by keeping `None` as the constructor default
+(matching `canny_sigma`'s own existing pattern) and resolving to the real
+default internally, independently per parameter (no more "only overrides
+when both given together" -- each of `canny_low_threshold`/`canny_high_
+threshold` now resolves on its own, since there's no separate tuple to
+protect). Verified directly against the real call chain, not just
+`Patchify`/`Patchify_3D` in isolation: constructed `ProcessChannels` (both
+2D and 3D) and `CatsDogsDataset` with `canny_low_threshold=None` (matching
+every existing config's real value) and confirmed `self.patchify.canny_
+low_threshold`/`canny_high_threshold` resolve to `0.05`/`0.15`, not `None`.
+
+**Tier 1 coverage**: `test_patchify_canny_thresholds_override_requires_
+both`/`test_patchify_3d_canny_thresholds_override_requires_both` (testing
+behavior that no longer exists) replaced with `test_patchify_canny_low_
+and_high_threshold_resolve_independently`/`test_patchify_3d_canny_low_
+and_high_threshold_resolve_independently` (each threshold resolves to its
+own real default when the other is set, and when neither is set). Every
+other test's now-invalid `canny_thresholds=(0.05, 0.15)` kwarg removed
+(that value was always the default anyway, so removing it changes
+nothing).
+
+**Verification:** full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 500 passed / 2 skipped, no regressions.
+
+## Fixed a real Frontier `OutOfMemoryError` in `GPUPatchify2D`/`GPUPatchify3D`'s own region-detection code
+
+Job 5505235 (Tier 3b, `run_feature_matrix_smoke.py`) ran the `basic_ct-
+unetr+do_gpu_ap` cell added earlier this session for the first time ever
+on real hardware, and it crashed: `torch.OutOfMemoryError: HIP out of
+memory. Tried to allocate 64.00 GiB`, inside `GPUPatchify3D.
+_labeled_to_region_tensors`'s `bounds()` helper.
+
+**Root cause, traced directly (not guessed):** `_labeled_to_region_
+tensors` (both `GPUPatchify2D` and `GPUPatchify3D` -- the identical
+pattern existed in both) built a `[num_features, D*H*W]` (or `[num_
+features, H*W]` for 2D) one-hot **membership matrix** -- `flat.
+unsqueeze(0) == label_ids.unsqueeze(1)` -- to find each labeled region's
+min/max coordinate via `torch.where(membership, ...).min/max(dim=1)`.
+Memory cost is `O(num_features * num_voxels)`, which is trivial for every
+existing test's tiny synthetic volumes (a handful of regions, a 16-cube
+image) but explodes at real `basic_ct` scale (a 256-cube volume's finest
+`min_size`-scaled grid level, with correspondingly many regions) --
+exactly the kind of bug only a real end-to-end run at production scale
+could ever surface, which is the whole reason the new Tier 3b cell was
+worth adding.
+
+**The fix**: replaced the one-hot membership matrix with `torch.
+scatter_reduce_` (`reduce="amin"`/`"amax"`), a proper segmented reduction
+-- `O(num_voxels + num_features)` memory instead of their product. For
+each coordinate axis, scatter that axis's per-voxel index into a
+`[num_features + 1]`-sized accumulator, keyed by each voxel's own label,
+reducing via min/max as collisions land on the same label. Verified
+directly (not assumed) that this produces numerically identical results
+to the old approach on hand-built fixtures with distinctly-bounded
+regions, before touching the real class -- confirmed both value and
+correctness with `scatter_reduce_`'s own `include_self=True` semantics.
+
+**Scope**: fixed both `GPUPatchify2D` and `GPUPatchify3D` -- `GPUPatchify
+2D`'s own `_labeled_to_region_tensors` had the exact same `[num_features,
+H*W]` pattern, just never observed to OOM for real yet (2D images being
+smaller than 3D volumes at the sizes exercised so far). Left unfixed, it
+would have been a ticking time bomb for any future `do_gpu_ap:True` run
+on a large enough 2D image with enough detected regions.
+
+**Tier 1 coverage**: `test_labeled_to_region_tensors_scales_to_many_
+regions` added to both `test_gpu_adaptive_patching.py` (256 regions, a
+16x16 grid of 4x4 blocks in a 64-square image) and `test_gpu_adaptive_
+patching_3d.py` (512 regions, an 8x8x8 grid of 4x4x4 blocks in a 32-cube
+volume) -- the largest region count any test in either file uses,
+specifically to guard against a regression back to the `O(num_features *
+num_voxels)` approach. Correctness checked against an independent,
+brute-force per-label min/max (`(labeled == lbl).nonzero()`), not the
+class's own `bounds()` formula reused, so the test can't trivially pass
+by construction. Every existing test in both files (including the region-
+extraction/no-axis-transpose tests that would most likely catch a
+bounding-box regression) still passes unchanged.
+
+**Verification:** full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 502 passed / 2 skipped (2 more than the prior 500 --
+the two new tests), no regressions. Not yet re-confirmed with a real
+Frontier rerun of the `basic_ct-unetr+do_gpu_ap` cell -- that's the
+natural next step.
+
+#### Follow-up: the region-tensors fix above surfaced a second, previously-masked OOM in `_serialize_batch`
+
+Rerunning `basic_ct-unetr+do_gpu_ap` (job 5505572) after the fix above
+got past `_labeled_to_region_tensors` cleanly, but crashed further along
+with a different `torch.OutOfMemoryError` (`Tried to allocate 128.00
+GiB`, a different rank) -- a second, real, previously-masked bug in
+`_serialize_batch`, the same shape of problem as the one just fixed:
+something scaling with the full data size times the region count,
+instead of just the small patch size.
+
+**Root cause**: `F.grid_sample` requires its input tensor's batch
+dimension to match the sampling grid's -- there's one real image per
+batch item, but `N` (`fixed_length`) separate sampling grids per image.
+The old code satisfied this by replicating the *entire* `imgs_batch`
+`N` times up front (`.repeat_interleave(N, dim=0)`) before ever calling
+`grid_sample` -- `O(B * N * D*H*W)` memory. Trivial at every existing
+test's tiny scale; for `basic_ct/unetr`'s real `fixed_length=512` at
+real `256^3` volume scale, tens of GB even for a small batch size.
+`GPUPatchify2D` has the identical pattern (confirmed by inspection) --
+never observed to OOM yet only because 2D images are far smaller than 3D
+volumes at the same side length (`256^2` vs `256^3`, a 256x difference).
+
+**The fix**: chunk the flattened `B*N` region dimension instead of
+processing it all in one `grid_sample` call. Each chunk *indexes* (via
+`imgs_batch[img_idx[start:end]]`, `img_idx` precomputed once as `torch.
+arange(B).repeat_interleave(N)`) only `serialize_chunk_size` images,
+rather than pre-replicating all `B*N` up front -- peak memory becomes
+`O(B * serialize_chunk_size * D*H*W)`, independent of how large `N`
+gets. New `serialize_chunk_size=16` constructor parameter on both
+classes (a conservative default, not threaded through `parse.py`/config
+-- an internal performance knob, not something asked for as a user-
+facing feature). Produces exactly the same values as the original single
+call, just computed across `N / serialize_chunk_size` smaller ones.
+
+**A real gap in the existing tests, closed deliberately**: every existing
+`_serialize_batch` test uses a `fixed_length` smaller than the new
+default `serialize_chunk_size` (16), so the chunking loop only ever ran
+one iteration in any of them -- none actually exercised chunk boundaries
+at all. Added `test_serialize_batch_chunking_does_not_mix_up_images_or_
+regions` to both test files, forcing `serialize_chunk_size=3` against a
+2-image batch (2D: `fixed_length=4`, chunk boundaries fall mid-image;
+3D: `fixed_length=8`, same) so at least one chunk straddles the boundary
+between one image's own regions and the next image's -- exactly the case
+that would silently swap which image a region's patch comes from if
+`img_idx`'s indexing were wrong. Each image uses a disjoint value range
+(1-4/1-8 vs 101-104/101-108) so any cross-image bleed is immediately
+visible, not coincidentally correct. Every pre-existing test in both
+files still passes unchanged.
+
+**Verification:** full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 504 passed / 2 skipped (2 more than the prior 502),
+no regressions. Not yet re-confirmed with a real Frontier rerun of
+`basic_ct-unetr+do_gpu_ap` -- that's the natural next step, and the
+reason to suspect (not yet confirm) this closes the cell out: two
+independent OOM sources, both now fixed with the same class of change.
+
+#### Follow-up: `basic_ct-unetr+do_gpu_ap` rerun no longer OOMs, now times out; added a 2D `do_gpu_ap` cell too
+
+Rerunning `basic_ct-unetr+do_gpu_ap` after both OOM fixes above no
+longer crashes -- it now times out instead (real progress: neither of
+the two fixed OOM sources fires anymore). Not yet root-caused -- could be
+genuinely slow (this cell now does real work no run has reached before:
+level-by-level Canny/variance scoring and `region_backend="scipy"`'s own
+CPU round-trip for connected-components labeling, once per merge level,
+against a real `256^3` volume) or a real hang; distinguishing the two
+needs a real run with a larger timeout budget, not more static analysis.
+
+Also added `imagenet-classification+do_gpu_ap`, a 2D counterpart to the
+existing 3D `basic_ct-unetr+do_gpu_ap` cell -- `GPUPatchify2D`/
+`GPUPatchify3D` are different classes with genuinely different code
+paths (2D `grid_sample` vs 5D, 4-direction Canny NMS vs 13-direction,
+etc.), so one cell per dimensionality is the right scope here, not "one
+representative cell overall" the way `do_ap`'s own free-model-type cells
+are scoped. Deliberately given `score_fn:"variance"` (overriding this
+config's own explicit `score_fn:"canny"`, which would otherwise win
+regardless of `do_gpu_ap`) so the two `do_gpu_ap` cells together cover
+both `score_fn` options across both dimensionalities, rather than
+duplicating the 3D cell's own Canny exercise. `fixed_length:196`
+(`imagenet/classification`'s own existing value) already satisfies
+`do_gpu_ap`'s congruence check for this `tile_size`/`min_size` (verified
+directly: real_max_blocks comes out to 128 here, `(128**2 - 196) % 3 ==
+0`) -- no override needed.
+
+**Verification:** the new cell's merged config confirmed to parse
+cleanly through real `parse.py`/`validate_config` (`do_gpu_ap: True`,
+`score_fn: "variance"`, `fixed_length: 196`, as expected), and `make_
+smoke_config` confirmed to run cleanly through it to this sandbox's
+expected `NoRealDataFoundError`. Full local suite (`pytest tests/
+--ignore=tests/distributed`) passes, 505 passed / 2 skipped, no
+regressions. Neither `do_gpu_ap` cell has a confirmed real Frontier pass
+yet -- the 3D cell's timeout above and this new 2D cell are both
+pending real runs.
+
+#### Follow-up: `basic_ct-unetr+do_gpu_ap` passed for real (851s) -- added a `region_backend` environment-variable override to test `"cupyx"` against it
+
+A real Frontier rerun (with a bumped `--timeout 1800`) confirmed `basic_
+ct-unetr+do_gpu_ap` **passes**, in 851s -- the first-ever real end-to-end
+confirmation of `do_gpu_ap:True` working through an actual model,
+following the two OOM fixes above. Genuinely slow, not hung, consistent
+with the `region_backend="scipy"` hypothesis above (a CPU round-trip for
+connected-components labeling, once per merge level, against a real
+`256^3` volume).
+
+To let the user test whether `region_backend="cupyx"` (GPU-native
+labeling, avoiding that CPU round-trip) is meaningfully faster on this
+exact cell -- without committing to a real `parse.py`/config feature
+before knowing whether it's worth it -- `GPUPatchify2D`/`GPUPatchify3D`'s
+own `region_backend` constructor parameter now defaults to `None`,
+resolving to the `UCF_VIT_GPU_AP_REGION_BACKEND` environment variable if
+set, else `"scipy"` (today's exact behavior, unchanged when the env var
+isn't set). Explicitly passing `region_backend=` (every existing test
+already does) always wins over the environment variable -- confirmed by
+a new dedicated test per class. This is deliberately *less* commitment
+than a real config key: no `parse.py` wiring, no shipped-config decision,
+nothing that changes what any real config file says -- exactly matching
+the "test-only for now" scope this option has had since it was added.
+
+`launch/tests/run_feature_matrix_smoke.sh`/`run_feature_matrix_smoke_
+single.sh` gain the same `ROCM_HOME`/`CUPY_CACHE_DIR` runtime exports
+`run_cupyx_smoke.sh` already has -- needed the moment `cupy` actually
+gets imported from these scripts for the first time (via the new env
+var), not just from the dedicated `cupyx` smoke test. `run_feature_
+matrix_smoke_single.sh`'s own "Known labels" usage comment updated to
+include the two `do_gpu_ap` cells added in the entries above (previously
+went stale when those cells were added).
+
+**Tier 1 coverage**: `test_region_backend_defaults_to_scipy_with_no_env_
+var`/`test_region_backend_reads_env_var_when_not_passed_explicitly`/
+`test_region_backend_explicit_value_wins_over_env_var` added to both
+`test_gpu_adaptive_patching.py` and `test_gpu_adaptive_patching_3d.py`
+(via `monkeypatch.setenv`/`delenv`, no real environment pollution across
+tests).
+
+**Verification:** full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 511 passed / 2 skipped (6 more than the prior 505
+-- the six new tests), no regressions. To actually try `"cupyx"` on this
+cell:
+```
+cd launch/tests
+UCF_VIT_GPU_AP_REGION_BACKEND=cupyx sbatch run_feature_matrix_smoke_single.sh basic_ct-unetr+do_gpu_ap --timeout 1800
+```
+
+#### Follow-up: `region_backend="cupyx"` really is faster -- 395s vs `"scipy"`'s 851s, ~2.15x, on the exact same cell
+
+Run for real via the env var above: `basic_ct-unetr+do_gpu_ap` passed in
+**395s** with `region_backend="cupyx"`, against the **851s** `"scipy"`
+(the default) took on the identical cell -- confirms the CPU-round-trip
+hypothesis above was a real, significant bottleneck, not just a
+plausible-sounding guess. `"cupyx"` is not a full explanation of the
+remaining 395s either (real level-by-level Canny/variance scoring and
+`_serialize_batch`'s own chunked `grid_sample` calls still run
+regardless of `region_backend`) -- but the connected-components
+labeling step alone accounts for roughly half the total wall time on
+this workload.
+
+Not yet decided whether this should become a real default (`cupy` is
+still not a project dependency -- making `"cupyx"` the *default* rather
+than opt-in would need a real fallback design, e.g. auto-detecting
+whether `cupy` is importable and falling back to `"scipy"` when it
+isn't, rather than requiring every user to build `cupy` from source
+first). Left as-is (env-var opt-in, `"scipy"` default) pending that
+decision -- this entry just records the real comparison now that it
+exists.
+
+## Added `region_backend="auto"`, made it the real default -- opportunistic `cupyx`, safe everywhere it isn't available
+
+Follow-up: given the real ~2.15x speedup confirmed above, asked to look
+into the auto-detect/fallback design this needed before it could become
+a real default. Implemented and made real, since it's provably safe to
+default on: `region_backend="auto"` resolves to `"cupyx"` only when both
+a real CUDA/ROCm device *and* a real `cupy` install are present for
+*this specific call* (`_cupyx_available(border_mask)`, checked fresh
+every call against the real tensor actually passed in -- not decided
+once at construction time, since a single instance could reasonably see
+both CPU tensors, e.g. every CPU-only Tier 1 test in this file, and real
+CUDA ones across its lifetime), else `"scipy"` -- today's exact
+behavior, byte-identical, whenever either condition isn't met.
+
+`GPUPatchify2D`/`GPUPatchify3D`'s own `region_backend=None` default now
+resolves (via the existing `UCF_VIT_GPU_AP_REGION_BACKEND` environment
+variable mechanism) to `"auto"` instead of a hardcoded `"scipy"` -- the
+real default changed, but provably without behavior risk: `_cupyx_
+available` checks `border_mask.is_cuda` *first*, before ever attempting
+a `cupy` import, so every CPU-only environment (every Tier 1 test in
+this file, any CPU inference/testing use) resolves to `"scipy"`
+unconditionally, regardless of whether `cupy` happens to be importable
+there. Only a real CUDA/ROCm device with a real, working `cupy` install
+actually changes behavior -- exactly the case already confirmed (above)
+to be both correct (identical regions to `"scipy"`) and meaningfully
+faster. `export UCF_VIT_GPU_AP_REGION_BACKEND=scipy` still forces the
+old behavior back (e.g. for a controlled comparison, or if `"cupyx"` is
+ever suspected of a real problem); `=cupyx` still forces it on and
+raises clearly rather than silently falling back if unavailable.
+
+**Tier 1 coverage**: `test_region_backend_auto_resolves_to_scipy_on_a_
+cpu_tensor` (real, not mocked -- confirms identical output to explicit
+`"scipy"` on a genuine CPU tensor), `test_region_backend_auto_resolves_
+to_scipy_when_cupy_unavailable_even_on_a_cuda_tensor` (real, not mocked
+either -- `cupy` genuinely isn't installed in this environment, only
+`is_cuda` is faked, isolating this exact case), and `test_region_
+backend_auto_resolves_to_cupyx_when_both_cuda_and_cupy_are_available`
+(the one case that does need faking both, a dispatch-logic test mirroring
+the existing explicit-`"cupyx"` dispatch test) added to `test_gpu_
+adaptive_patching.py`. The two existing `region_backend_defaults_to_
+scipy_with_no_env_var` tests (one per file) renamed/updated to assert
+`"auto"` (the new real default), not `"scipy"` (the old one).
+
+**Verification:** full local suite (`pytest tests/ --ignore=tests/
+distributed`) passes, 514 passed / 2 skipped (3 more than the prior 511
+-- three new tests; two others renamed, not added), no regressions.
+`test_gpu_adaptive_patching_cupyx_real.py` (the real-hardware test)
+already passes explicit `region_backend=` at every call site, so it's
+completely unaffected by this default change. Not yet confirmed with a
+real Frontier rerun using the new default (no explicit `region_backend`,
+no environment variable) to confirm "auto" itself -- as opposed to an
+explicit `"cupyx"` -- actually resolves to the faster path on real
+hardware; that's the natural next step.

@@ -1,0 +1,784 @@
+"""Correctness tests for the iterable-dataset pipeline in UCF_VIT.dataloaders.dataset.
+
+Covers TileDataIter, ShuffleIterableDataset, ProcessChannels, and FileReader's
+worker-sharding math -- all against small, synthetic, in-memory data, so these
+run anywhere in well under a second with no GPU/SLURM/real dataset needed.
+
+TileDataIter gets the deepest coverage here because it's where real, live
+bugs have been found and fixed this session (see tests/README.md):
+- A 3D basic_ct volume being twoD-sliced into 2D z-planes was silently
+  treated as genuinely-2D data, leaving the whole z-axis untouched on
+  every tile and producing a 5D batch several layers downstream. The
+  regression tests below (`test_tiledataiter_3d_twod_true_*`) exercise
+  exactly that path.
+- The 2D branch's height/width axis mapping was swapped relative to the
+  real array imagenet produces (`tile_size`/`img_size` are now `[height,
+  width]`, matching the array after `cv.resize`+`np.moveaxis`, `(C, H,
+  W)`, directly) -- invisible with square dimensions (every shipped config is
+  square), which is exactly why `test_tiledataiter_2d_non_square_tile_size_axes_arent_swapped`
+  deliberately uses `H != W`.
+"""
+
+import itertools
+
+import nibabel as nib
+import numpy as np
+import pytest
+from PIL import Image
+from torch.utils.data import IterableDataset
+
+from UCF_VIT.dataloaders.dataset import (
+    FileReader,
+    ProcessChannels,
+    ShuffleIterableDataset,
+    TileDataIter,
+)
+
+
+class _FakeSource(IterableDataset):
+    """Yields pre-built samples, standing in for FileReader/TileDataIter/etc.
+
+    in tests that only care about exercising one class in isolation.
+    """
+
+    def __init__(self, samples):
+        self.samples = samples
+
+    def __iter__(self):
+        yield from self.samples
+
+
+# ---------------------------------------------------------------------------
+# TileDataIter
+# ---------------------------------------------------------------------------
+
+
+def test_tiledataiter_2d_full_coverage_no_overlap():
+    H, W = 12, 12
+    div = 3
+    tile_h, tile_w = H // div, W // div
+    data = np.arange(H * W, dtype=np.float32).reshape(1, H, W)
+    source = _FakeSource([(data, ("v0",))])
+    tdi = TileDataIter(source, tile_size=(tile_h, tile_w), twoD=True, return_label=False, div=div, tile_overlap=(0, 0), classification=False)
+
+    results = list(tdi)
+    assert len(results) == div * div
+
+    covered = np.zeros((H, W), dtype=bool)
+    for (tile, variables), (x_idx, y_idx) in zip(results, itertools.product(range(div), range(div))):
+        sx, ex = x_idx * tile_h, (x_idx + 1) * tile_h
+        sy, ey = y_idx * tile_w, (y_idx + 1) * tile_w
+        np.testing.assert_array_equal(tile, data[:, sx:ex, sy:ey])
+        assert variables == ("v0",)
+        covered[sx:ex, sy:ey] = True
+    assert covered.all()  # every pixel covered; disjoint by construction since overlap=0
+
+
+def test_tiledataiter_2d_non_square_tile_size_axes_arent_swapped():
+    """Regression test for a real height/width axis-order bug (found while
+    reviewing img_size auto-detection): img_size/tile_size are stored
+    [height, width], matching the real array imagenet produces directly
+    (C, H, W) -- see dataset.py's FileReader.read_process_file. tile_size[0]
+    (height) bounds the array's H axis, and tile_size[1] (width) bounds its
+    W axis. Every *other* TileDataIter test in this file uses square
+    dimensions, which can't tell the two index-to-axis mappings apart --
+    this uses H != W specifically so a swapped mapping would produce
+    truncated/incomplete tiles (numpy silently clips an out-of-bounds slice
+    end rather than raising) instead of full coverage.
+    """
+    H, W = 8, 12  # deliberately unequal
+    div = 2
+    # img_size/tile_size convention: index 0 is height, index 1 is width --
+    # matches what parse.py's own tile_size computation would produce from
+    # an [H, W] img_size of [8, 12].
+    tile_w, tile_h = W // div, H // div
+    data = np.arange(H * W, dtype=np.float32).reshape(1, H, W)
+    source = _FakeSource([(data, ("v0",))])
+    tdi = TileDataIter(source, tile_size=(tile_h, tile_w), twoD=True, return_label=False, div=div, tile_overlap=(0, 0), classification=False)
+
+    results = list(tdi)
+    assert len(results) == div * div
+
+    covered = np.zeros((H, W), dtype=bool)
+    for (tile, variables), (x_idx, y_idx) in zip(results, itertools.product(range(div), range(div))):
+        sx, ex = x_idx * tile_h, (x_idx + 1) * tile_h
+        sy, ey = y_idx * tile_w, (y_idx + 1) * tile_w
+        assert tile.shape == (1, tile_h, tile_w)
+        np.testing.assert_array_equal(tile, data[:, sx:ex, sy:ey])
+        covered[sx:ex, sy:ey] = True
+    assert covered.all()  # every pixel covered; would fail under the swapped-axis bug
+
+
+def test_tiledataiter_2d_segmentation_label_tiled_same_as_data():
+    H, W = 8, 8
+    div = 2
+    tile_h, tile_w = H // div, W // div
+    data = np.arange(H * W, dtype=np.float32).reshape(1, H, W)
+    label = np.arange(H * W, dtype=np.int64).reshape(H, W) + 1000
+    source = _FakeSource([(data, label, ("v0",))])
+    tdi = TileDataIter(source, tile_size=(tile_h, tile_w), twoD=True, return_label=True, div=div, tile_overlap=(0, 0), classification=False)
+
+    results = list(tdi)
+    assert len(results) == div * div
+    for (tile, tile_label, variables), (x_idx, y_idx) in zip(results, itertools.product(range(div), range(div))):
+        sx, ex = x_idx * tile_h, (x_idx + 1) * tile_h
+        sy, ey = y_idx * tile_w, (y_idx + 1) * tile_w
+        np.testing.assert_array_equal(tile, data[:, sx:ex, sy:ey])
+        np.testing.assert_array_equal(tile_label, label[sx:ex, sy:ey])
+
+
+def test_tiledataiter_2d_classification_label_passed_through_whole():
+    H, W = 8, 8
+    div = 2
+    data = np.arange(H * W, dtype=np.float32).reshape(1, H, W)
+    label = 3  # a whole-image class index, as used for classification
+    source = _FakeSource([(data, label, ("v0",))])
+    tdi = TileDataIter(source, tile_size=(H // div, W // div), twoD=True, return_label=True, div=div, tile_overlap=(0, 0), classification=True)
+
+    results = list(tdi)
+    assert len(results) == div * div
+    assert all(tile_label == label for _, tile_label, _ in results)
+
+
+def test_tiledataiter_3d_twod_true_slices_into_2d_tiles_no_leftover_z_axis():
+    """Regression test for the 5D-batch bug (see module docstring).
+
+    3D data with twoD=True must be sliced one z-index at a time into plain
+    2D tiles -- not left with the untouched z-axis still attached.
+    """
+    C, X, Y, Z = 1, 8, 8, 3
+    div = 2
+    tile_x, tile_y = X // div, Y // div
+    data = np.arange(C * X * Y * Z, dtype=np.float32).reshape(C, X, Y, Z)
+    source = _FakeSource([(data, ("v0",))])
+    # tile_size must stay a 3-tuple (z entry = full, untiled depth) -- this is
+    # what parse.py now produces for twoD=True 3D data; see its tile_size
+    # computation and TileDataIter's own len(self.tile_size) == 3 dispatch.
+    tdi = TileDataIter(source, tile_size=(tile_x, tile_y, Z), twoD=True, return_label=False, div=div, tile_overlap=(0, 0), classification=False)
+
+    results = list(tdi)
+    assert len(results) == Z * div * div
+    for tile, _ in results:
+        assert tile.shape == (C, tile_x, tile_y)  # no leftover z axis
+
+    covered = np.zeros((X, Y, Z), dtype=bool)
+    for (tile, _), (z_idx, x_idx, y_idx) in zip(results, itertools.product(range(Z), range(div), range(div))):
+        sx, ex = x_idx * tile_x, (x_idx + 1) * tile_x
+        sy, ey = y_idx * tile_y, (y_idx + 1) * tile_y
+        np.testing.assert_array_equal(tile, data[:, sx:ex, sy:ey, z_idx])
+        covered[sx:ex, sy:ey, z_idx] = True
+    assert covered.all()
+
+
+def test_tiledataiter_3d_twod_true_with_segmentation_label():
+    C, X, Y, Z = 1, 8, 8, 2
+    div = 2
+    tile_x, tile_y = X // div, Y // div
+    data = np.arange(C * X * Y * Z, dtype=np.float32).reshape(C, X, Y, Z)
+    label = np.arange(X * Y * Z, dtype=np.int64).reshape(X, Y, Z) + 1000
+    source = _FakeSource([(data, label, ("v0",))])
+    tdi = TileDataIter(source, tile_size=(tile_x, tile_y, Z), twoD=True, return_label=True, div=div, tile_overlap=(0, 0), classification=False)
+
+    results = list(tdi)
+    assert len(results) == Z * div * div
+    for (tile, tile_label, _), (z_idx, x_idx, y_idx) in zip(results, itertools.product(range(Z), range(div), range(div))):
+        assert tile.shape == (C, tile_x, tile_y)
+        assert tile_label.shape == (tile_x, tile_y)
+        sx, ex = x_idx * tile_x, (x_idx + 1) * tile_x
+        sy, ey = y_idx * tile_y, (y_idx + 1) * tile_y
+        np.testing.assert_array_equal(tile, data[:, sx:ex, sy:ey, z_idx])
+        np.testing.assert_array_equal(tile_label, label[sx:ex, sy:ey, z_idx])
+
+
+def test_tiledataiter_3d_twod_false_full_3d_tiles():
+    C, X, Y, Z = 1, 8, 8, 8
+    div = 2
+    t = X // div
+    data = np.arange(C * X * Y * Z, dtype=np.float32).reshape(C, X, Y, Z)
+    source = _FakeSource([(data, ("v0",))])
+    tdi = TileDataIter(source, tile_size=(t, t, t), twoD=False, return_label=False, div=div, tile_overlap=(0, 0, 0), classification=False)
+
+    results = list(tdi)
+    assert len(results) == div ** 3
+
+    covered = np.zeros((X, Y, Z), dtype=bool)
+    for (tile, _), (x_idx, y_idx, z_idx) in zip(results, itertools.product(range(div), range(div), range(div))):
+        assert tile.shape == (C, t, t, t)
+        sx, ex = x_idx * t, (x_idx + 1) * t
+        sy, ey = y_idx * t, (y_idx + 1) * t
+        sz, ez = z_idx * t, (z_idx + 1) * t
+        np.testing.assert_array_equal(tile, data[:, sx:ex, sy:ey, sz:ez])
+        covered[sx:ex, sy:ey, sz:ez] = True
+    assert covered.all()
+
+
+def test_tiledataiter_3d_twod_false_with_segmentation_label():
+    """Regression test: basic_ct's real segmentation label is a bare
+    (X, Y, Z) array with *no* channel dimension at this point in the
+    pipeline (ProcessChannels adds it later) -- unlike `data`, which is
+    always channel-first. A prior refactor (_slice_tile, added for "sst"'s
+    own list-of-memmaps case) briefly unified label slicing with data's
+    always-channel-first `[:, ...]` convention, which crashed immediately
+    ("too many indices for array: array is 3-dimensional, but 4 were
+    indexed") the moment a real 3D, non-"sst" label reached it -- this is
+    exactly basic_ct/UNETR's real, already-shipped case.
+    """
+    C, X, Y, Z = 1, 8, 8, 8
+    div = 2
+    t = X // div
+    data = np.arange(C * X * Y * Z, dtype=np.float32).reshape(C, X, Y, Z)
+    label = np.arange(X * Y * Z, dtype=np.int64).reshape(X, Y, Z)  # no channel dim -- basic_ct's real convention
+    source = _FakeSource([(data, label, ("v0",))])
+    tdi = TileDataIter(source, tile_size=(t, t, t), twoD=False, return_label=True, div=div, tile_overlap=(0, 0, 0), classification=False)
+
+    results = list(tdi)
+    assert len(results) == div ** 3
+
+    for (data_tile, label_tile, _), (x_idx, y_idx, z_idx) in zip(results, itertools.product(range(div), range(div), range(div))):
+        sx, ex = x_idx * t, (x_idx + 1) * t
+        sy, ey = y_idx * t, (y_idx + 1) * t
+        sz, ez = z_idx * t, (z_idx + 1) * t
+        assert data_tile.shape == (C, t, t, t)
+        assert label_tile.shape == (t, t, t)  # no channel dim, matching the input label's own shape
+        np.testing.assert_array_equal(data_tile, data[:, sx:ex, sy:ey, sz:ez])
+        np.testing.assert_array_equal(label_tile, label[sx:ex, sy:ey, sz:ez])
+
+
+def test_tiledataiter_div_one_returns_full_image():
+    C, H, W = 1, 6, 6
+    data = np.arange(C * H * W, dtype=np.float32).reshape(C, H, W)
+    source = _FakeSource([(data, ("v0",))])
+    tdi = TileDataIter(source, tile_size=(H, W), twoD=True, return_label=False, div=1, tile_overlap=(0, 0), classification=False)
+
+    results = list(tdi)
+    assert len(results) == 1
+    tile, variables = results[0]
+    np.testing.assert_array_equal(tile, data)
+    assert variables == ("v0",)
+
+
+def test_tiledataiter_2d_overlap_tiles_have_configured_shape_and_reach_edges():
+    H, W = 12, 12
+    div = 3
+    overlap = (2, 2)
+    base = H // div
+    tile_h = tile_w = base + overlap[0]  # matches parse.py's tile_size = img_size//div + overlap
+    data = np.arange(H * W, dtype=np.float32).reshape(1, H, W)
+    source = _FakeSource([(data, ("v0",))])
+    tdi = TileDataIter(source, tile_size=(tile_h, tile_w), twoD=True, return_label=False, div=div, tile_overlap=overlap, classification=False)
+
+    results = list(tdi)
+    assert len(results) == div * div
+    for tile, _ in results:
+        assert tile.shape == (1, tile_h, tile_w)
+
+    # the first tile starts exactly at the image origin and the last tile
+    # ends exactly at the image's far edge -- overlap only extends inward
+    # between tiles, never off the edge of the source array
+    first_tile, _ = results[0]  # x_idx=0, y_idx=0
+    np.testing.assert_array_equal(first_tile, data[:, 0:tile_h, 0:tile_w])
+    last_tile, _ = results[-1]  # x_idx=div-1, y_idx=div-1
+    np.testing.assert_array_equal(last_tile, data[:, H - tile_h:H, W - tile_w:W])
+
+
+# ---------------------------------------------------------------------------
+# ShuffleIterableDataset
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("buffer_size", [1, 5, 30, 1000])
+def test_shuffle_iterable_dataset_no_data_loss_or_duplication(buffer_size):
+    items = list(range(30))
+    shuffled = ShuffleIterableDataset(_FakeSource(items), buffer_size=buffer_size)
+    assert sorted(shuffled) == items
+
+
+def test_shuffle_iterable_dataset_buffer_size_one_preserves_order():
+    # With buffer_size=1 the reservoir always holds exactly one item and
+    # immediately swaps it out for the next, so output order == input order.
+    items = list(range(20))
+    shuffled = ShuffleIterableDataset(_FakeSource(items), buffer_size=1)
+    assert list(shuffled) == items
+
+
+def test_shuffle_iterable_dataset_requires_positive_buffer_size():
+    with pytest.raises(AssertionError):
+        ShuffleIterableDataset(_FakeSource([1, 2, 3]), buffer_size=0)
+
+
+# ---------------------------------------------------------------------------
+# ProcessChannels
+# ---------------------------------------------------------------------------
+
+
+def test_processchannels_no_ap_no_label_passes_tiles_through():
+    batch_size = 4
+    tiles = [np.full((1, 2, 2), float(i), dtype=np.float32) for i in range(batch_size * 2)]
+    source = _FakeSource([(tile, ("v0",)) for tile in tiles])
+    pc = ProcessChannels(
+        source, num_channels=1, batch_size=batch_size, return_label=False,
+        adaptive_patching=False, separate_channels=False, interp_size=4,
+        fixed_length=16, twoD=True, _dataset="basic_ct", return_qdt=False,
+    )
+    results = list(pc)
+    assert len(results) == len(tiles)
+    got_values = sorted(float(tile[0, 0, 0]) for tile, _ in results)
+    expected_values = sorted(float(tile[0, 0, 0]) for tile in tiles)
+    assert got_values == expected_values
+
+
+def test_processchannels_drops_incomplete_trailing_internal_batch():
+    """Documents current behavior: ProcessChannels buffers `batch_size`
+    samples before draining, so a trailing group smaller than `batch_size`
+    (because the upstream source ran out) is silently never yielded.
+    """
+    batch_size = 4
+    tiles = [np.zeros((1, 2, 2), dtype=np.float32) for _ in range(batch_size + 2)]
+    source = _FakeSource([(tile, ("v0",)) for tile in tiles])
+    pc = ProcessChannels(
+        source, num_channels=1, batch_size=batch_size, return_label=False,
+        adaptive_patching=False, separate_channels=False, interp_size=4,
+        fixed_length=16, twoD=True, _dataset="basic_ct", return_qdt=False,
+    )
+    results = list(pc)
+    assert len(results) == batch_size
+
+
+def test_processchannels_no_ap_with_label_basic_ct():
+    batch_size = 3
+    tiles = [np.full((1, 2, 2), float(i), dtype=np.float32) for i in range(batch_size)]
+    labels = [np.full((2, 2), i + 100, dtype=np.int64) for i in range(batch_size)]
+    source = _FakeSource([(t, l, ("v0",)) for t, l in zip(tiles, labels)])
+    pc = ProcessChannels(
+        source, num_channels=1, batch_size=batch_size, return_label=True,
+        adaptive_patching=False, separate_channels=False, interp_size=4,
+        fixed_length=16, twoD=True, _dataset="basic_ct", return_qdt=False,
+    )
+    results = list(pc)
+    assert len(results) == batch_size
+    got = {(float(t[0, 0, 0]), float(l[0, 0])) for t, l, v in results}
+    expected = {(float(i), float(i + 100)) for i in range(batch_size)}
+    assert got == expected
+
+
+def test_processchannels_adaptive_patching_produces_fixed_length_sequence():
+    interp_size = 4
+    fixed_length = 16
+    img = np.random.RandomState(0).uniform(0, 1, size=(1, 32, 32)).astype(np.float32)
+    source = _FakeSource([(img, ("ct_res1",))])
+    pc = ProcessChannels(
+        source, num_channels=1, batch_size=1, return_label=False,
+        adaptive_patching=True, separate_channels=False, interp_size=interp_size,
+        fixed_length=fixed_length, twoD=True, _dataset="basic_ct", return_qdt=False,
+    )
+    (np_image, seq_image, seq_size, seq_pos, variables), = list(pc)
+    assert np_image.shape == img.shape
+    assert seq_image.shape == (fixed_length, interp_size * interp_size)
+    assert seq_size.shape[0] == fixed_length
+    assert seq_pos.shape[0] == fixed_length
+    assert variables == ("ct_res1",)
+
+
+def test_processchannels_separate_channels_does_not_crash():
+    """Regression test: adaptive_patching=True + separate_channels=True with
+    return_label=False used to raise UnboundLocalError -- the per-channel
+    patchify loop discarded the quadtree object into `_` instead of `qdt`,
+    then immediately referenced the never-assigned `qdt` name to build
+    qdt_list. Fixed to assign `qdt` like the (already-correct) return_label=
+    True sibling branch does.
+    """
+    num_channels = 2
+    interp_size = 4
+    fixed_length = 16
+    img = np.random.RandomState(0).uniform(0, 1, size=(num_channels, 16, 16)).astype(np.float32)
+    source = _FakeSource([(img, ("ct_res1", "ct_res2"))])
+    pc = ProcessChannels(
+        source, num_channels=num_channels, batch_size=1, return_label=False,
+        adaptive_patching=True, separate_channels=True, interp_size=interp_size,
+        fixed_length=fixed_length, twoD=True, _dataset="basic_ct", return_qdt=False,
+    )
+    (np_image, seq_image, seq_size, seq_pos, variables), = list(pc)
+    assert seq_image.shape == (num_channels, fixed_length, interp_size * interp_size)
+    assert seq_size.shape == (num_channels, fixed_length)
+    assert seq_pos.shape[:2] == (num_channels, fixed_length)
+
+
+@pytest.mark.parametrize("separate_channels", [False, True])
+def test_processchannels_threads_profile_through_to_patchify_3d(separate_channels):
+    """profile is diagnostic-only, off by default -- confirms ProcessChannels
+    actually forwards it to the real Patchify_3D instance it builds (3D
+    adaptive patching only), in both separate_channels modes, rather than
+    silently dropping it.
+    """
+    pc_profiling_off = ProcessChannels(
+        _FakeSource([]), num_channels=2, batch_size=1, return_label=False,
+        adaptive_patching=True, separate_channels=separate_channels, interp_size=4,
+        fixed_length=8, twoD=False, _dataset="basic_ct", return_qdt=False,
+    )
+    assert pc_profiling_off.patchify.profile is False
+
+    pc_profiling_on = ProcessChannels(
+        _FakeSource([]), num_channels=2, batch_size=1, return_label=False,
+        adaptive_patching=True, separate_channels=separate_channels, interp_size=4,
+        fixed_length=8, twoD=False, _dataset="basic_ct", return_qdt=False, profile=True,
+    )
+    assert pc_profiling_on.patchify.profile is True
+
+
+# ---------------------------------------------------------------------------
+# FileReader worker sharding
+# ---------------------------------------------------------------------------
+
+
+class _FakeWorkerInfo:
+    def __init__(self, num_workers, id):
+        self.num_workers = num_workers
+        self.id = id
+
+
+def test_filereader_worker_shards_are_disjoint_and_cover_the_file_list(monkeypatch):
+    # Stub out actual file I/O so __iter__'s real sharding logic can run
+    # against a fake file_list without touching disk -- each "sample" is just
+    # the path itself, tagged with the variables it was read with.
+    monkeypatch.setattr(FileReader, "read_process_file", lambda self, path: path)
+
+    file_list = [f"/fake/path/{i}.jpg" for i in range(20)]
+    num_workers = 4
+
+    shards = []
+    for worker_id in range(num_workers):
+        monkeypatch.setattr(
+            "torch.utils.data.get_worker_info",
+            lambda worker_id=worker_id: _FakeWorkerInfo(num_workers=num_workers, id=worker_id),
+        )
+        reader = FileReader(
+            file_list, start_idx=0.0, end_idx=1.0, variables=("v0",), gx="1",
+            ddp_group=None, data_par_size=1, dataset="imagenet",
+        )
+        shard = {path for path, variables in reader}
+        shards.append(shard)
+
+    # disjoint
+    for a, b in itertools.combinations(shards, 2):
+        assert a.isdisjoint(b)
+    # every file covered by exactly one shard (evenly divides here: 20 / 4 == 5)
+    covered = set().union(*shards)
+    assert covered == set(file_list)
+    assert all(len(shard) == len(file_list) // num_workers for shard in shards)
+
+
+def test_filereader_keys_to_add_walks_each_replicated_copy_once(monkeypatch):
+    """In production, `file_list` arriving at FileReader has *already* been
+    replicated `keys_to_add` times by the caller
+    (NativePytorchDataModule.set_iterative_dataloader/reset), to balance
+    epoch length across differently-sized dict_root_dirs keys. FileReader's
+    own keys_to_add loop then walks the same per-worker slice within each of
+    those `keys_to_add` copies -- it does not itself repeat a shorter
+    file_list.
+    """
+    monkeypatch.setattr(FileReader, "read_process_file", lambda self, path: path)
+    monkeypatch.setattr("torch.utils.data.get_worker_info", lambda: _FakeWorkerInfo(num_workers=1, id=0))
+
+    copy_size = 4
+    keys_to_add = 3
+    file_list = [f"/fake/copy{c}/{i}.jpg" for c in range(keys_to_add) for i in range(copy_size)]
+    reader = FileReader(
+        file_list, start_idx=0.0, end_idx=1.0, variables=("v0",), gx="1",
+        ddp_group=None, data_par_size=1, dataset="imagenet", keys_to_add=keys_to_add,
+    )
+    seen = [path for path, variables in reader]
+    assert sorted(seen) == sorted(file_list)  # every file in every copy visited exactly once
+    assert len(seen) == len(set(seen))  # no duplicates
+
+
+def test_filereader_keys_to_add_with_no_dataloader_workers(monkeypatch):
+    """Regression test: keys_to_add > 1 combined with num_workers=0 (no
+    DataLoader multiprocessing workers, so torch.utils.data.get_worker_info()
+    is None) used to walk past the end of file_list and raise IndexError --
+    __iter__'s no-worker-info branch didn't divide iter_end by keys_to_add
+    before the repetition loop, unlike the real-worker-info branch. Fixed by
+    routing num_workers=0 through the same sharding math as num_workers >= 1
+    (see test_filereader_num_workers_zero_shards_by_ddp_rank below for the
+    closely-related bug this shared a root cause with).
+    """
+    monkeypatch.setattr(FileReader, "read_process_file", lambda self, path: path)
+    monkeypatch.setattr("torch.utils.data.get_worker_info", lambda: None)
+
+    copy_size = 4
+    keys_to_add = 3
+    file_list = [f"/fake/copy{c}/{i}.jpg" for c in range(keys_to_add) for i in range(copy_size)]
+    reader = FileReader(
+        file_list, start_idx=0.0, end_idx=1.0, variables=("v0",), gx="1",
+        ddp_group=None, data_par_size=1, dataset="imagenet", keys_to_add=keys_to_add,
+    )
+    seen = [path for path, variables in reader]
+    assert sorted(seen) == sorted(file_list)
+    assert len(seen) == len(set(seen))
+
+
+def test_filereader_num_workers_zero_shards_by_ddp_rank(monkeypatch):
+    """Regression test for a real bug: FileReader.__iter__'s num_workers=0
+    (torch.utils.data.get_worker_info() is None) branch used to skip
+    DDP-rank sharding entirely -- iter_start=0, iter_end=len(file_list)
+    unconditionally -- so *every* DDP rank read the whole file_list instead
+    of its own shard. Any shipped config with num_workers: 0 and
+    simple_ddp_size > 1 would hit this live, not just as a landmine -- kept
+    as a permanent regression test even though no shipped config currently
+    uses num_workers: 0.
+    """
+    monkeypatch.setattr(FileReader, "read_process_file", lambda self, path: path)
+    monkeypatch.setattr("torch.utils.data.get_worker_info", lambda: None)
+
+    file_list = [f"/fake/{i}.jpg" for i in range(24)]
+    data_par_size = 4
+
+    shards = []
+    for ddp_rank in range(data_par_size):
+        monkeypatch.setattr("torch.distributed.get_rank", lambda ddp_rank=ddp_rank: ddp_rank)
+        reader = FileReader(
+            file_list, start_idx=0.0, end_idx=1.0, variables=("v0",), gx=str(data_par_size),
+            ddp_group=None, data_par_size=data_par_size, dataset="imagenet",
+        )
+        shards.append({path for path, variables in reader})
+
+    for a, b in itertools.combinations(shards, 2):
+        assert a.isdisjoint(b)  # previously every shard == the full file_list
+    covered = set().union(*shards)
+    assert covered == set(file_list)
+    assert all(len(shard) == len(file_list) // data_par_size for shard in shards)
+
+
+@pytest.mark.parametrize("num_dataloader_workers", [1, 2, 7])
+def test_filereader_shards_combine_ddp_rank_and_dataloader_workers(monkeypatch, num_dataloader_workers):
+    """The real Frontier setup: data_par_size DDP ranks, each with its own
+    DataLoader running num_workers subprocess workers (up to 7 here, matching
+    Frontier's cores/node). The two axes combine multiplicatively via
+    num_shards = group_size * num_workers_per_ddp, and every (ddp_rank,
+    worker_id) pair must get a disjoint slice that together cover the whole
+    file_list.
+    """
+    monkeypatch.setattr(FileReader, "read_process_file", lambda self, path: path)
+
+    data_par_size = 2
+    total_shards = data_par_size * num_dataloader_workers
+    files_per_shard = 3
+    file_list = [f"/fake/{i}.jpg" for i in range(total_shards * files_per_shard)]
+
+    shards = []
+    for ddp_rank in range(data_par_size):
+        monkeypatch.setattr("torch.distributed.get_rank", lambda ddp_rank=ddp_rank: ddp_rank)
+        for worker_id in range(num_dataloader_workers):
+            monkeypatch.setattr(
+                "torch.utils.data.get_worker_info",
+                lambda worker_id=worker_id: _FakeWorkerInfo(num_workers=num_dataloader_workers, id=worker_id),
+            )
+            reader = FileReader(
+                file_list, start_idx=0.0, end_idx=1.0, variables=("v0",), gx=str(data_par_size),
+                ddp_group=None, data_par_size=data_par_size, dataset="imagenet",
+            )
+            shards.append({path for path, variables in reader})
+
+    for a, b in itertools.combinations(shards, 2):
+        assert a.isdisjoint(b)
+    covered = set().union(*shards)
+    assert covered == set(file_list)
+    assert all(len(shard) == files_per_shard for shard in shards)
+
+
+def test_filereader_raises_when_not_enough_files_and_reuse_disabled(monkeypatch):
+    monkeypatch.setattr(FileReader, "read_process_file", lambda self, path: path)
+    monkeypatch.setattr("torch.utils.data.get_worker_info", lambda: _FakeWorkerInfo(num_workers=1, id=0))
+
+    file_list = [f"/fake/{i}.jpg" for i in range(3)]  # 3 files, 5 DDP ranks -> some shard empty
+    reader = FileReader(
+        file_list, start_idx=0.0, end_idx=1.0, variables=("v0",), gx="5",
+        ddp_group=None, data_par_size=5, dataset="imagenet",
+    )
+    with pytest.raises(AssertionError, match="doesn't have at least one unique file"):
+        list(reader)
+
+
+def test_filereader_reuses_files_round_robin_when_allowed(monkeypatch):
+    monkeypatch.setattr(FileReader, "read_process_file", lambda self, path: path)
+
+    file_list = [f"/fake/{i}.jpg" for i in range(3)]  # 3 files, 5 DDP ranks
+    data_par_size = 5
+
+    shards = []
+    for ddp_rank in range(data_par_size):
+        monkeypatch.setattr("torch.distributed.get_rank", lambda ddp_rank=ddp_rank: ddp_rank)
+        monkeypatch.setattr("torch.utils.data.get_worker_info", lambda: _FakeWorkerInfo(num_workers=1, id=0))
+        reader = FileReader(
+            file_list, start_idx=0.0, end_idx=1.0, variables=("v0",), gx=str(data_par_size),
+            ddp_group=None, data_par_size=data_par_size, dataset="imagenet", allow_file_reuse=True,
+        )
+        shard = [path for path, variables in reader]
+        assert len(shard) == 1  # every shard still gets exactly one file, not zero
+        shards.append(shard[0])
+
+    # Round-robin reuse: rank i gets file_list[i % len(file_list)] -- every
+    # file covered, some files claimed by more than one rank since there are
+    # more ranks (5) than files (3).
+    assert shards == [file_list[i % len(file_list)] for i in range(data_par_size)]
+    assert set(shards) == set(file_list)
+
+
+def test_filereader_raises_on_zero_files_even_with_reuse_allowed(monkeypatch):
+    monkeypatch.setattr(FileReader, "read_process_file", lambda self, path: path)
+    monkeypatch.setattr("torch.utils.data.get_worker_info", lambda: _FakeWorkerInfo(num_workers=1, id=0))
+
+    reader = FileReader(
+        [], start_idx=0.0, end_idx=1.0, variables=("v0",), gx="1",
+        ddp_group=None, data_par_size=1, dataset="imagenet", allow_file_reuse=True,
+    )
+    with pytest.raises(AssertionError, match="zero files at all"):
+        list(reader)
+
+
+# ---------------------------------------------------------------------------
+# FileReader epoch_shuffle_seed -- moves the per-epoch reshuffle/replicate
+# that NativePytorchDataModule.setup()/reset() used to do (in the main
+# process, once per epoch) inside __iter__ itself, so a single persistent-
+# worker DataLoader can be reused for a whole run instead of being rebuilt
+# (and its workers re-forked) every epoch. See dataset.py's own docstring.
+# ---------------------------------------------------------------------------
+
+
+def test_filereader_epoch_shuffle_seed_none_leaves_file_list_unchanged_across_iterations(monkeypatch):
+    """Default (None) behavior must stay exactly as before: file_list used
+    as-is, unchanged across repeated __iter__ calls -- the contract every
+    other FileReader test in this file already relies on.
+    """
+    monkeypatch.setattr(FileReader, "read_process_file", lambda self, path: path)
+    monkeypatch.setattr("torch.utils.data.get_worker_info", lambda: _FakeWorkerInfo(num_workers=1, id=0))
+
+    file_list = [f"/fake/{i}.jpg" for i in range(10)]
+    reader = FileReader(
+        file_list, start_idx=0.0, end_idx=1.0, variables=("v0",), gx="1",
+        ddp_group=None, data_par_size=1, dataset="imagenet",
+    )
+    first = [path for path, variables in reader]
+    second = [path for path, variables in reader]
+    assert first == second == file_list
+
+
+def test_filereader_epoch_shuffle_seed_replicates_without_ballooning_across_epochs(monkeypatch):
+    """Regression test: _reshuffled_and_replicated_file_list must always
+    reshuffle from the stable master_file_list, not from the previous
+    epoch's already-replicated self.file_list -- otherwise each successive
+    __iter__ call would replicate keys_to_add times *again*, growing
+    unboundedly instead of staying at keys_to_add * len(master list) every
+    epoch.
+    """
+    monkeypatch.setattr(FileReader, "read_process_file", lambda self, path: path)
+    monkeypatch.setattr("torch.utils.data.get_worker_info", lambda: _FakeWorkerInfo(num_workers=1, id=0))
+
+    file_list = [f"/fake/{i}.jpg" for i in range(5)]
+    keys_to_add = 3
+    reader = FileReader(
+        file_list, start_idx=0.0, end_idx=1.0, variables=("v0",), gx="1",
+        ddp_group=None, data_par_size=1, dataset="imagenet", keys_to_add=keys_to_add,
+        epoch_shuffle_seed=42,
+    )
+    for epoch in range(4):
+        seen = [path for path, variables in reader]
+        assert len(seen) == keys_to_add * len(file_list)
+        # every replicated copy still only ever draws from the real file_list
+        assert set(seen) == set(file_list)
+
+
+def test_filereader_epoch_shuffle_seed_deterministic_across_separate_instances(monkeypatch):
+    """The actual correctness property this exists for: two separate
+    FileReader instances (standing in for two different ranks/workers, each
+    running in its own process with its own independent Python/numpy state)
+    constructed with the same epoch_shuffle_seed over the same master file
+    list must compute the *identical* shuffled+replicated order for a given
+    epoch, with no communication between them -- otherwise __iter__'s
+    disjoint-window sharding across ranks/workers would break.
+    """
+    monkeypatch.setattr(FileReader, "read_process_file", lambda self, path: path)
+    monkeypatch.setattr("torch.utils.data.get_worker_info", lambda: _FakeWorkerInfo(num_workers=1, id=0))
+
+    file_list = [f"/fake/{i}.jpg" for i in range(20)]
+
+    def make_reader():
+        return FileReader(
+            file_list, start_idx=0.0, end_idx=1.0, variables=("v0",), gx="1",
+            ddp_group=None, data_par_size=1, dataset="imagenet", epoch_shuffle_seed=7,
+        )
+
+    reader_a = make_reader()
+    reader_b = make_reader()
+
+    for epoch in range(3):
+        seen_a = [path for path, variables in reader_a]
+        seen_b = [path for path, variables in reader_b]
+        assert seen_a == seen_b
+
+
+def test_filereader_epoch_shuffle_seed_differs_across_epochs(monkeypatch):
+    monkeypatch.setattr(FileReader, "read_process_file", lambda self, path: path)
+    monkeypatch.setattr("torch.utils.data.get_worker_info", lambda: _FakeWorkerInfo(num_workers=1, id=0))
+
+    file_list = [f"/fake/{i}.jpg" for i in range(20)]
+    reader = FileReader(
+        file_list, start_idx=0.0, end_idx=1.0, variables=("v0",), gx="1",
+        ddp_group=None, data_par_size=1, dataset="imagenet", epoch_shuffle_seed=7,
+    )
+    epoch0 = [path for path, variables in reader]
+    epoch1 = [path for path, variables in reader]
+    assert epoch0 != epoch1  # different permutation -- not the same shuffle replayed
+    assert set(epoch0) == set(epoch1) == set(file_list)  # same underlying files either way
+
+
+# ---------------------------------------------------------------------------
+# FileReader.read_process_file -- z-score normalization via normalize_stats
+# ---------------------------------------------------------------------------
+
+
+def test_filereader_read_process_file_basic_ct_applies_normalize_stats(tmp_path):
+    raw = np.arange(2 * 2 * 2, dtype=np.float32).reshape(2, 2, 2)
+    path = tmp_path / "image1.nii"
+    nib.save(nib.Nifti1Image(raw, affine=np.eye(4)), str(path))
+
+    stats = {"ct1": {"mean": 3.5, "std": 2.0}}
+    reader = FileReader(
+        [str(path)], start_idx=0.0, end_idx=1.0, variables=("ct1",), gx="1",
+        ddp_group=None, data_par_size=1, dataset="basic_ct", normalize_stats=stats,
+    )
+    data = reader.read_process_file(str(path))
+
+    assert data.shape == (1, 2, 2, 2)  # channel-first, expand_dims applied before normalize
+    np.testing.assert_allclose(data[0], (raw - 3.5) / 2.0)
+
+
+def test_filereader_read_process_file_basic_ct_passthrough_without_stats(tmp_path):
+    raw = np.arange(2 * 2 * 2, dtype=np.float32).reshape(2, 2, 2)
+    path = tmp_path / "image1.nii"
+    nib.save(nib.Nifti1Image(raw, affine=np.eye(4)), str(path))
+
+    reader = FileReader(
+        [str(path)], start_idx=0.0, end_idx=1.0, variables=("ct1",), gx="1",
+        ddp_group=None, data_par_size=1, dataset="basic_ct",
+    )
+    data = reader.read_process_file(str(path))
+
+    np.testing.assert_allclose(data[0], raw)  # numerically unchanged (just float32, not uint8-era min-max)
+
+
+def test_filereader_read_process_file_imagenet_applies_normalize_stats(tmp_path):
+    raw = np.arange(4 * 4 * 3, dtype=np.uint8).reshape(4, 4, 3)
+    path = tmp_path / "img.png"
+    Image.fromarray(raw).save(str(path))
+
+    stats = {"r": {"mean": 50.0, "std": 10.0}}  # only the "r" channel configured
+    reader = FileReader(
+        [str(path)], start_idx=0.0, end_idx=1.0, variables=("r", "g", "b"), gx="1",
+        ddp_group=None, data_par_size=1, dataset="imagenet", normalize_stats=stats,
+    )
+    data = reader.read_process_file(str(path))
+
+    raw_chw = np.moveaxis(raw, -1, 0).astype(np.float32)
+    np.testing.assert_allclose(data[0], (raw_chw[0] - 50.0) / 10.0)
+    np.testing.assert_allclose(data[1], raw_chw[1])  # "g"/"b" untouched -- no stats configured for them
+    np.testing.assert_allclose(data[2], raw_chw[2])

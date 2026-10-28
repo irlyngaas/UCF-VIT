@@ -1,186 +1,139 @@
-import os
+import functools
 from typing import Dict, Optional
 
 import numpy as np
 import torch
-import torchdata.datapipes as dp
 from torch.utils.data import DataLoader
-from pathlib import Path
-import glob
-import torch.nn.functional as F
 import torch.distributed as dist
 
 from .dataset import (
     FileReader,
-    ImageBlockDataIter_2D,
-    ImageBlockDataIter_3D,
+    TileDataIter,
     ShuffleIterableDataset,
     ProcessChannels,
 )
+from UCF_VIT.utils.misc import bucket_file_list, slice_file_list, sst_temporal_sort_key
+from UCF_VIT.utils.misc import process_root_dirs as process_root_dirs_shared
 
-def collate_fn(batch, return_label, single_channel, adaptive_patching, separate_channels, dataset, num_classes, num_labels, return_qdt, dict_key):
+def collate_fn(batch, return_label, adaptive_patching, separate_channels, dataset, num_labels, return_qdt, dict_key):
+    """Collate function for `NativePytorchDataModule`'s iterative dataloaders.
+
+    Stacks per-sample numpy arrays into batched tensors, handling several
+    combinations of adaptive patching, labeling, and dataset type.
+
+    Args:
+        batch: List of samples as yielded by the underlying `ProcessChannels`
+            iterable dataset.
+        return_label: Whether samples include a label and whether it should be
+            included in the returned tuple.
+        adaptive_patching: Whether samples include adaptive-patching sequence data
+            (patch sequence, size, and position) in addition to the raw tile.
+        separate_channels: Whether adaptive patching was done per channel
+            (True) or jointly across channels (False); affects how `size`/`pos`
+            are stacked.
+        dataset: Dataset name, e.g. "imagenet" or "basic_ct"; determines label
+            handling.
+        num_labels: Number of per-channel label tensors to stack for non-"basic_ct"
+            segmentation datasets.
+        return_qdt: Whether to also collect and return the list of quadtree/octree
+            objects for each sample.
+        dict_key: Dataset key to attach to the batch, returned as the final tuple
+            element.
+
+    Returns:
+        A tuple of batched tensors/values whose exact composition depends on
+        `adaptive_patching`, `return_label`, `dataset`, and `return_qdt`; always ends
+        with `dict_key`.
+    """
     if adaptive_patching:
         if return_label:
-            if single_channel:
-                inp = torch.stack([torch.from_numpy(np.expand_dims(batch[i][0],axis=0)) for i in range(len(batch))])
-                seq = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
+            inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
 
-                size = torch.stack([torch.from_numpy(np.expand_dims(batch[i][2],axis=0)) for i in range(len(batch))])
-                pos = torch.stack([torch.from_numpy(np.expand_dims(batch[i][3],axis=0)) for i in range(len(batch))])
-                if dataset == "imagenet":
-                    label = torch.stack([torch.tensor(batch[i][4]) for i in range(len(batch))])
-                    variables = []
-                    variables.append(batch[0][5])
-                    if return_qdt:
-                        qdt_list = []
-                        for i in range(len(batch)):
-                            qdt_list.append(batch[i][6])
+            #TODO: Generalize this
+            if dataset == "basic_ct":
+                if separate_channels:
+                    seq = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
                 else:
-                    label = torch.stack([torch.from_numpy(batch[i][4]) for i in range(len(batch))])
-                    seq_label_list = []
-                    for i in range(len(batch)):
-                        if dataset == "basic_ct":
-                            seq_mask = torch.from_numpy(batch[i][5][0]).long()
-                            seq_mask = F.one_hot(seq_mask.squeeze(-1), num_classes=num_classes)
-                            seq_label_list.append(seq_mask.permute(2, 0, 1).float())
-                        else:
-                            seq_label_list.append([])
-                            for j in range(num_labels):
-                                seq_label_list[i].append(torch.from_numpy(batch[i][5][j]))
-                    if dataset == "basic_ct":
-                        seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
-                    else:
-                        channel_list = []
-                        for i in range(len(batch)):
-                            channel_list.append(torch.stack([seq_label_list[i][j] for j in range(num_labels)]))
-                        seq_label = torch.stack([channel_list[i] for i in range(len(batch))])
-
-                    variables = []
-                    variables.append(batch[0][6])
-                    if return_qdt:
-                        qdt_list = []
-                        for i in range(len(batch)):
-                            qdt_list.append(batch[i][7])
+                    seq = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
             else:
-                inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
                 seq = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
 
-                #TODO: Finish and Test separate_channels implementation
-                if separate_channels:
-                    size = torch.stack([torch.from_numpy(batch[i][2]) for i in range(len(batch))])
-                    pos = torch.stack([torch.from_numpy(batch[i][3]) for i in range(len(batch))])
-                else:
-                    size = torch.stack([torch.from_numpy(np.expand_dims(batch[i][2],axis=0)) for i in range(len(batch))])
-                    pos = torch.stack([torch.from_numpy(np.expand_dims(batch[i][3],axis=0)) for i in range(len(batch))])
-
-                if dataset == "imagenet":
-                    label = torch.stack([torch.tensor(batch[i][4]) for i in range(len(batch))])
-                    variables = batch[0][5]
-                    if return_qdt:
-                        qdt_list = []
-                        for i in range(len(batch)):
-                            qdt_list.append(batch[i][6])
-                else:
-                    label = torch.stack([torch.from_numpy(batch[i][4]) for i in range(len(batch))])
-                    seq_label_list = []
-                    for i in range(len(batch)):
-                        if dataset == "basic_ct":
-                            seq_mask = torch.from_numpy(batch[i][5][0]).long()
-                            seq_mask = F.one_hot(seq_mask.squeeze(-1), num_classes=num_classes)
-                            seq_label_list.append(seq_mask.permute(2, 0, 1).float())
-                        else:
-                            seq_label_list.append([])
-                            for j in range(num_labels):
-                                seq_label_list[i].append(torch.from_numpy(batch[i][5][j]))
-                    if dataset == "basic_ct":
-                        seq_label = torch.stack([seq_label_list[i] for i in range(len(seq_label_list))])
-                    else:
-                        channel_list = []
-                        for i in range(len(batch)):
-                            channel_list.append(torch.stack([seq_label_list[i][j] for j in range(num_labels)]))
-                        seq_label = torch.stack([channel_list[i] for i in range(len(batch))])
-
-                    variables = batch[0][6]
-                    if return_qdt:
-                        qdt_list = []
-                        for i in range(len(batch)):
-                            qdt_list.append(batch[i][7])
-            if dataset == "imagenet":                
-                if return_qdt:
-                    return (inp, seq, size, pos, label, variables, qdt_list, dict_key)
-                    #return (seq, label, variables, qdt_list, dict_key)
-                else:
-                    return (inp, seq, size, pos, label, variables, dict_key)
-                    #return (seq, label, variables, dict_key)
+            #TODO: Finish and Test separate_channels implementation
+            if separate_channels:
+                size = torch.stack([torch.from_numpy(batch[i][2]) for i in range(len(batch))])
+                pos = torch.stack([torch.from_numpy(batch[i][3]) for i in range(len(batch))])
             else:
+                size = torch.stack([torch.from_numpy(np.expand_dims(batch[i][2],axis=0)) for i in range(len(batch))])
+                pos = torch.stack([torch.from_numpy(np.expand_dims(batch[i][3],axis=0)) for i in range(len(batch))])
+
+            if dataset == "imagenet":
+                label = torch.stack([torch.tensor(batch[i][4]) for i in range(len(batch))])
+                variables = batch[0][5]
                 if return_qdt:
-                    return (inp, seq, size, pos, label, seq_label, variables, qdt_list, dict_key)
-                    #return (seq, seq_label, variables, qdt_list, dict_key)
-                else:
-                    return (inp, seq, size, pos, label, seq_label, variables, dict_key)
-                    #return (seq, seq_label, variables, dict_key)
+                    qdt_list = []
+                    for i in range(len(batch)):
+                        qdt_list.append(batch[i][6])
+            else:
+                label = torch.stack([torch.from_numpy(batch[i][4]) for i in range(len(batch))])
+                variables = batch[0][5]
+                if return_qdt:
+                    qdt_list = []
+                    for i in range(len(batch)):
+                        qdt_list.append(batch[i][6])
+
+            if return_qdt:
+                return (inp, seq, size, pos, label, variables, qdt_list, dict_key)
+            else:
+                return (inp, seq, size, pos, label, variables, dict_key)
         else:
-            if single_channel:
-                inp = torch.stack([torch.from_numpy(np.expand_dims(batch[i][0],axis=0)) for i in range(len(batch))])
-                seq = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
+            inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
+            #TODO: Generalize this
+            if dataset == "basic_ct":
+                if separate_channels:
+                    seq = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
+                else:
+                    seq = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
+            else:
+                seq = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
+            #TODO: Finish and Test separate_channels implementation
+            if separate_channels:
+                size = torch.stack([torch.from_numpy(batch[i][2]) for i in range(len(batch))])
+                pos = torch.stack([torch.from_numpy(batch[i][3]) for i in range(len(batch))])
+            else:
                 size = torch.stack([torch.from_numpy(np.expand_dims(batch[i][2],axis=0)) for i in range(len(batch))])
                 pos = torch.stack([torch.from_numpy(np.expand_dims(batch[i][3],axis=0)) for i in range(len(batch))])
-                variables = []
-                variables.append(batch[0][4])
-            else:
-                inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
-                seq = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
-                #TODO: Finish and Test separate_channels implementation
-                if separate_channels:
-                    size = torch.stack([torch.from_numpy(batch[i][2]) for i in range(len(batch))])
-                    pos = torch.stack([torch.from_numpy(batch[i][3]) for i in range(len(batch))])
-                else:
-                    size = torch.stack([torch.from_numpy(np.expand_dims(batch[i][2],axis=0)) for i in range(len(batch))])
-                    pos = torch.stack([torch.from_numpy(np.expand_dims(batch[i][3],axis=0)) for i in range(len(batch))])
-                variables = batch[0][4]
+            variables = batch[0][4]
 
             if return_qdt:
                 qdt_list = []
                 for i in range(len(batch)):
                     qdt_list.append(batch[i][5])
                 return (inp, seq, size, pos, variables, qdt_list, dict_key)
-                #return (seq, variables, qdt_list, dict_key)
             else:
                 return (inp, seq, size, pos, variables, dict_key)
-                #return (seq, variables, dict_key)
     else:
         if return_label:
-            if single_channel:
-                inp = torch.stack([torch.from_numpy(np.expand_dims(batch[i][0],axis=0)) for i in range(len(batch))])
-                if dataset == "imagenet":
-                    label = torch.stack([torch.tensor(batch[i][1]) for i in range(len(batch))])
-                else:
-                    if num_labels == 1:
-                        label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
-                    else:
-                        label = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
-                variables = []
-                variables.append(batch[0][2])
+            inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
+            if dataset == "imagenet":
+                label = torch.stack([torch.tensor(batch[i][1]) for i in range(len(batch))])
+            elif dataset == "sst":
+                # Already channel-first (stacked over dict_out_variables in
+                # FileReader.read_process_file/TileDataIter._slice_tile),
+                # unlike basic_ct's raw (no channel dim) class-index label --
+                # no expand_dims needed here even when there's only one
+                # output variable.
+                label = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
             else:
-                inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
-                if dataset == "imagenet":
-                    label = torch.stack([torch.tensor(batch[i][1]) for i in range(len(batch))])
+                if num_labels == 1:
+                    label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
                 else:
-                    if num_labels == 1:
-                        label = torch.stack([torch.from_numpy(np.expand_dims(batch[i][1],axis=0)) for i in range(len(batch))])
-                    else:
-                        label = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
-                variables = batch[0][2]
+                    label = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
+            variables = batch[0][2]
                 
             return (inp, label, variables, dict_key)
         else:
-            if single_channel:
-                inp = torch.stack([torch.from_numpy(np.expand_dims(batch[i][0],axis=0)) for i in range(len(batch))])
-                variables = []
-                variables.append(batch[0][1])
-            else:
-                inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
-                variables = batch[0][1]
+            inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
+            variables = batch[0][1]
 
             return (inp, variables, dict_key)
 
@@ -191,22 +144,118 @@ class NativePytorchDataModule(torch.nn.Module):
         dict_root_dirs (Dict): Dictionary of root directories for each source.
         dict_start_idx (Dict): Dictionary of start indices ratio (between 0.0 and 1.0) for each source.
         dict_end_idx (Dict): Dictionary of end indices ratio (between 0.0 and 1.0) for each source.
+        dict_buffer_sizes (Dict): Dictionary of shuffle-buffer sizes for each source, used by
+            `ShuffleIterableDataset`.
         dict_in_variables (Dict): Dictionary of input modality variables for each source
-        dict_buffer_sizes (Dict): Dictionary of buffer sizes for each source.
         num_channels_used (Dict): Dictionary of number of channels used from each source.
         batch_size (int, optional): Batch size.
         num_workers (int, optional): Number of workers.
         pin_memory (bool, optional): Whether to pin memory.
-        data_par_size (int, optional): the size of the data parallelism
-        tile_size_x (int, optional): the tile size in the x dimension
-        tile_size_y (int, optional): the tile size in the y dimension
-        tile_size_z (int, optional): the tile size in the z dimension
+        interp_size (int, optional): Side length each adaptive leaf patch is
+            interpolated to, used by the adaptive-patching transform
+            (`Patchify`/`Patchify_3D`), when `adaptive_patching` is True.
+        tile_size (tuple[int,...], optional): the tile size in each dimension
         twoD (bool, optional): Variable for indicating two or three dimensionsal input, if False, three dimensional input.
-        return_label (bool, optional): Whether or not the dataloader returns segmentation labels 
-        single_channel (bool, optional): Variable for indicating that multiple modalities will be used, but the model will be fed with modalities separated into batches only containing a single modality
         dataset_group_list (string, optional): How to split available GPUs amongst the available datasets, run "python utils/preprocess_load_balancing.py CONFIG_FILE NUM_GPUS" to obtain
-        tile_overlap (float, optional): Amount of tile overlapping to use, takes decimal values, multiples tile_size by tile_overlap to determine step size. Use 0.0 for no overlapping
-        use_all_data (bool, optional): Whether or not to use all data in dataloading. Including if tile size doesn't evenly split images. If tile size splits an image unevenly on last tile of a dimension go from last pixel backwards to get a full tile
+        batches_per_rank_epoch (Dict, optional): Dict mapping each dataset key to the number of
+            batches per rank per epoch (as returned by `calculate_load_balancing_on_the_fly`),
+            used in `setup` to determine how many times each dataset's file listing
+            needs to be replicated to balance dataset sizes.
+        div (int, optional): How many tiles to divide each image into
+        tile_overlap (tuple[int,...], optional): Amount of tile overlapping to use in each dimension. Use 0 in each dimension for no overlapping
+        adaptive_patching (bool, optional): Whether to adaptively patchify each sample via a
+            quadtree/octree instead of returning fixed-size tiles.
+        fixed_length (int, optional): Fixed output sequence length for adaptive patching, when
+            `adaptive_patching` is True.
+        separate_channels (bool, optional): Whether adaptive patching is done independently per
+            channel (True) or jointly across all channels (False).
+        score_fn (str, optional): `"canny"` (default) or `"variance"` --
+            forwarded to `Patchify`/`Patchify_3D`, when `adaptive_patching`
+            is True. See their own `score_fn` docstring entries for what
+            each means.
+        min_size (int, optional): Smallest leaf side length the adaptive-
+            patching transform will ever produce -- forwarded to
+            `Patchify`/`Patchify_3D`'s own `min_size`, when
+            `adaptive_patching` is True.
+        canny_sigma (float, optional): Forwarded to `Patchify`/`Patchify_3D`'s
+            own `canny_sigma`, when `adaptive_patching` is True -- the same
+            `ap.canny_sigma` config knob `UCF_VIT.model.gpu_adaptive_
+            patching.GPUPatchify2D`/`GPUPatchify3D`'s own Canny scoring
+            uses, shared here rather than being GPU-only. `None` (default)
+            leaves `Patchify`/`Patchify_3D`'s own smoothing default
+            untouched.
+        canny_low_threshold (float, optional): Forwarded to `Patchify`/
+            `Patchify_3D`'s own `canny_low_threshold`, when
+            `adaptive_patching` is True -- see `canny_sigma` above; must be
+            given together with `canny_high_threshold` to take effect.
+        canny_high_threshold (float, optional): See `canny_low_threshold`.
+        data_par_size (int, optional): the size of the data parallelism
+        dataset (str, optional): Dataset name, e.g. "imagenet" or "basic_ct"; determines how
+            files are listed and how samples are processed/collated.
+        return_label (bool, optional): Whether or not the dataloader returns segmentation labels
+        return_qdt (bool, optional): Whether to also yield the quadtree/octree object(s) used for
+            each adaptively-patched sample.
+        ddp_group (ProcessGroup, optional): Process group used to determine this rank's assigned
+            dataset in `train_dataloader`; defaults to the default world group if None.
+        num_classes (int, optional): Number of segmentation classes; required when `dataset` is
+            "basic_ct" and `return_label` is True, to one-hot encode masks in `collate_fn`.
+        resize (Dict, optional): Dict mapping "imagenet" to the `[height, width]` size to resize
+            images to (cv2's own `dsize` convention is `(width, height)`; `dataset.py`'s
+            `FileReader.read_process_file` swaps locally right before its `cv.resize` call);
+            only used when `dataset` is "imagenet". If absent or has no "imagenet" entry,
+            images are left at their native size.
+        allow_file_reuse (bool, optional): If False (default), a dataset key with fewer
+            files than its assigned DDP ranks/workers fails loudly instead of silently
+            training some ranks on no data. If True, every rank/worker gets at least one
+            file, reusing (duplicating) files round-robin, with a printed warning. Relevant
+            at scale too, not just small datasets -- `data_par_size` can exceed a real
+            dataset's file count. See `FileReader.__iter__` for the reuse mechanism.
+        bucket_shuffle_seed (int, optional): Imagenet only -- seeds the shuffle applied
+            before dividing the sliced image list into per-rank buckets. Without it,
+            bucketing is a contiguous split of a class-sorted list, so each rank only sees
+            a narrow range of classes (skews BatchNorm stats, correlates gradients within a
+            rank). Deterministic regardless of `data_par_size`/restarts. `None` disables
+            shuffling (original contiguous ordering).
+        epoch_shuffle_seed (int, optional): Seeds each dataset key's per-epoch file-order
+            reshuffle (see `UCF_VIT.dataloaders.dataset.FileReader`'s own docstring entry
+            for the mechanism). `None` disables the internal reshuffle -- `FileReader`
+            then reads `dict_lister_trains[k]` in fixed, unchanging order every epoch.
+            Passing a real seed here (any config using `train_dataloader()`'s
+            `persistent_workers:True` effectively must) is what lets `train_dataloader()`
+            be built once and reused for an entire run: since `FileReader.__iter__`
+            itself now handles reshuffling, deterministically, every worker/rank
+            independently reproduces the identical order for a given epoch with no
+            cross-process communication needed -- no more rebuilding the `DataLoader`
+            (and re-forking its workers) between epochs the way `reset()` used to.
+        dict_out_variables (Dict, optional): "sst" only -- regression-target variable
+            names per dataset key, e.g. `{"P1F4R32": ["p"]}`. Required (and only
+            meaningful) when `dataset` is "sst" and `return_label` is True.
+        img_size (list, optional): "sst" only -- this dataset's per-sample/per-chunk
+            size `[nz, ny, nx]` (see `UCF_VIT.utils.misc.process_root_dirs`'s own
+            docstring for why "sst" repurposes img_size as the chunk size, not the
+            true full on-disk domain size).
+        full_domain_size (Dict, optional): "sst" only -- per dataset key, the true
+            full on-disk domain size `[nz, ny, nx]` of one raw file, if different
+            from `img_size` (i.e. more than 1 chunk per file). A key missing from
+            this dict (or the dict being entirely absent) means 1 chunk for that
+            key.
+        time_offsets (list, optional): "sst" only -- sorted list of every
+            distinct timestep offset referenced across `dict_in_variables`/
+            `dict_out_variables` (see `UCF_VIT.utils.misc.process_root_dirs`'s
+            own docstring). `None` or `[0]` means no real timestepping.
+        profile_dataloader (bool, optional): Diagnostic only, off by default --
+            forwarded to `ProcessChannels`/`Patchify_3D` (3D adaptive patching
+            only). Times the real per-sample Canny/octree-build/serialize
+            cost from inside the `DataLoader` worker process(es) -- see
+            `UCF_VIT.dataloaders.transform.Patchify_3D`'s own `profile`
+            docstring entry, and `UCF_VIT.training.train_epoch`'s
+            `profile_dataloader` handling for the complementary main-process
+            timing this is meant to be compared against.
+        normalize_stats (Dict, optional): `{dataset_key: {variable_name:
+            {"mean":..., "std":...}}}`, forwarded per-key to `FileReader`'s
+            own `normalize_stats` -- see its docstring entry. `None`
+            (default) or a key/variable missing from it means that data
+            stays unnormalized.
     """
 
     def __init__(
@@ -220,16 +269,13 @@ class NativePytorchDataModule(torch.nn.Module):
         batch_size: int = 64,
         num_workers: int = 0,
         pin_memory: bool = False,
-        patch_size: int = 16,
-        tile_size_x: int = 64,
-        tile_size_y: int = 64,
-        tile_size_z: int = None,
+        interp_size: int = 16,
+        tile_size: tuple[int, ...] = (64, 64),
         twoD: bool = True,
-        single_channel: bool = False,
         dataset_group_list: str = '',
         batches_per_rank_epoch: Dict = None,
-        tile_overlap: float = 0.0,
-        use_all_data: bool = False,
+        div: int = 1,
+        tile_overlap: tuple[int, ...] = (0, 0),
         adaptive_patching: bool = False,
         fixed_length: int = 4096,
         separate_channels: bool = False,
@@ -239,13 +285,30 @@ class NativePytorchDataModule(torch.nn.Module):
         return_qdt: Optional[bool] = False,
         ddp_group: Optional[dist.ProcessGroup] = None,
         num_classes: Optional[int] = None,
-        imagenet_resize: Optional[Dict] = None,
+        resize: Optional[Dict] = None,
+        allow_file_reuse: bool = False,
+        bucket_shuffle_seed: Optional[int] = None,
+        epoch_shuffle_seed: Optional[int] = None,
+        dict_out_variables: Optional[Dict] = None,
+        img_size: Optional[list] = None,
+        full_domain_size: Optional[Dict] = None,
+        time_offsets: Optional[list] = None,
+        profile_dataloader: bool = False,
+        score_fn: str = "canny",
+        min_size: int = 2,
+        canny_sigma: Optional[float] = None,
+        canny_low_threshold: Optional[float] = None,
+        canny_high_threshold: Optional[float] = None,
+        normalize_stats: Optional[Dict] = None,
     ):
+        """Initializes the data module and builds the per-dataset file listings.
+
+        See the class docstring for a description of each argument. Splits
+        data-parallel ranks across datasets according to `dataset_group_list` (or
+        evenly if not given) and calls `process_root_dirs` to list each dataset's
+        files.
+        """
         super().__init__()
-        if num_workers > 1:
-            raise NotImplementedError(
-                "num_workers > 1 is not supported yet. Performance will likely degrage too with larger num_workers."
-            )
 
         assert len(dict_root_dirs) <= data_par_size, "the number of data parallel GPUs (data_par_size) needs to be at least equal to the number of datasets. Try to increase data_par_size"
 
@@ -263,23 +326,29 @@ class NativePytorchDataModule(torch.nn.Module):
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.pin_memory = pin_memory
-        self.patch_size = patch_size
-        self.tile_size_x = tile_size_x
-        self.tile_size_y = tile_size_y
-        self.tile_size_z = tile_size_z
+        self.allow_file_reuse = allow_file_reuse
+        self.bucket_shuffle_seed = bucket_shuffle_seed
+        self.epoch_shuffle_seed = epoch_shuffle_seed
+        self.interp_size = interp_size
+        self.tile_size = tile_size
         self.twoD = twoD
-        self.single_channel = single_channel
         self.return_label = return_label
         self.return_qdt = return_qdt
         self.batches_per_rank_epoch = batches_per_rank_epoch
+        self.div = div
         self.tile_overlap = tile_overlap
-        self.use_all_data = use_all_data
         self.adaptive_patching = adaptive_patching
         self.fixed_length = fixed_length
         self.separate_channels = separate_channels
+        self.score_fn = score_fn
+        self.min_size = min_size
+        self.canny_sigma = canny_sigma
+        self.canny_low_threshold = canny_low_threshold
+        self.canny_high_threshold = canny_high_threshold
         self.data_par_size = data_par_size
         self.ddp_group = ddp_group
         self.dataset = dataset
+        self.profile_dataloader = profile_dataloader
 
         #Optional Inputs
         self.num_classes = num_classes
@@ -288,7 +357,22 @@ class NativePytorchDataModule(torch.nn.Module):
                 assert num_classes != None, "If using segmentation with basic_ct need to pass the number of classes"
 
         if self.dataset == "imagenet":
-            self.imagenet_resize = imagenet_resize
+            self.resize = resize
+
+        if self.dataset == "sst":
+            assert img_size is not None, "img_size is required when dataset is \"sst\""
+            # dict_out_variables is only actually needed when this run reads
+            # a label at all (e.g. UNETR regression) -- MAE pretraining on
+            # "sst" has return_label:False (no dataset-specific label
+            # concept it needs at all, same as MAE against any other
+            # dataset) and never reaches read_process_file's variables_out
+            # path, so it's fine left unset there.
+            if return_label:
+                assert dict_out_variables is not None, "dict_out_variables is required when dataset is \"sst\" and return_label is True"
+            self.dict_out_variables = dict_out_variables
+            self.img_size = img_size
+            self.full_domain_size = full_domain_size or {}
+            self.time_offsets = time_offsets
 
         in_variables = {}
         for k, list_out in dict_in_variables.items():
@@ -298,148 +382,276 @@ class NativePytorchDataModule(torch.nn.Module):
             #in_variables[k] = [ x for x in in_variables[k] if x in DEFAULT_VARIABLE_LIST ]
             in_variables[k] = [ x for x in in_variables[k] ]
         self.dict_in_variables = in_variables
+        self.normalize_stats = normalize_stats or {}
 
         self.dict_lister_trains = self.process_root_dirs()
-           
+
+        # Slices train/val/test membership once (sorted, deterministic) before
+        # FileReader's own per-epoch reshuffle (see epoch_shuffle_seed) ever runs, so
+        # which files count as "train" vs held-out "val"/"test" doesn't drift across
+        # restarts or epochs. Sorting also avoids relying on process_root_dirs's own
+        # (unstable) listing order. set_iterative_dataloader passes a no-op
+        # start_idx=0.0/end_idx=1.0 to FileReader since slicing happens here.
+        # For "sst", plain string order scrambles real timestamp order (see
+        # sst_temporal_sort_key's own docstring) -- immaterial before time-
+        # stepping existed, but load-bearing now: it's what makes earlier real
+        # time land in train and later real time land in val/test.
+        sort_key = sst_temporal_sort_key if self.dataset == "sst" else None
+        for k in self.dict_lister_trains:
+            if self.dataset == "imagenet":
+                start_idx, end_idx = self.dict_start_idx["imagenet"], self.dict_end_idx["imagenet"]
+            else:
+                start_idx, end_idx = self.dict_start_idx[k], self.dict_end_idx[k]
+            self.dict_lister_trains[k] = slice_file_list(sorted(self.dict_lister_trains[k], key=sort_key), start_idx, end_idx)
+
+        if self.dataset == "imagenet":
+            # Buckets are purely a rank/GPU-group assignment mechanism (labels
+            # come from each image's parent directory at read time, not its
+            # bucket) -- bucketing after the slice above keeps train/val/test
+            # membership independent of data_par_size: only how it's divided
+            # across ranks depends on it. Must call bucket_file_list identically
+            # to calculate_load_balancing_on_the_fly's own call (same input, same
+            # data_par_size), or train_dataloader's gx-based bucket selection breaks.
+            k = next(iter(self.dict_lister_trains))
+            self.dict_lister_trains = bucket_file_list(self.dict_lister_trains[k], self.data_par_size, shuffle_seed=self.bucket_shuffle_seed)
 
         self.dict_data_train: Optional[Dict] = None
 
     def process_root_dirs(self):
-        if self.dataset == "imagenet":
-            dict_lister_trains = {}
-            for k, root_dir in self.dict_root_dirs.items():
-                #TODO: Add shuffling for data_par_size if it doesn't divide 1000 equally
-                classes = sorted(os.listdir(root_dir))
-                if len(classes) > self.data_par_size:
-                    classes_to_combine = int(len(classes) // self.data_par_size)
-                img_list = []
-                classes_counter = 0
-                num_data_roots = 0
-                for cls_name in classes: 
-                    if classes_counter == classes_to_combine:
-                        classes_counter = 0
-                        img_list = []
-                    cls_dir = os.path.join(root_dir, cls_name)
-                    for img_path in glob.glob(os.path.join(cls_dir,"*.JPEG")):
-                        img_list.append(img_path)
-                    classes_counter += 1
-                
-                    if classes_counter == classes_to_combine:
-                        img_dict = {num_data_roots: img_list}
-                        dict_lister_trains.update(img_dict)
-                        num_data_roots +=1
+        """Builds per-dataset-key lists of image file paths for `self.dataset`.
 
-                    if num_data_roots > self.data_par_size-1:
-                        break
-        else:
-            dict_lister_trains = { k: list(dp.iter.FileLister(os.path.join(root_dir, "imagesTr"))) for k, root_dir in self.dict_root_dirs.items() }
-        return dict_lister_trains
+        Thin wrapper over the shared `UCF_VIT.utils.misc.process_root_dirs`.
+        Delegating to one shared function (rather than a local reimplementation)
+        keeps this in sync with `calculate_load_balancing_on_the_fly`'s own
+        bucketing by construction -- both ultimately feed `train_dataloader`'s
+        `gx`-based rank-to-bucket selection, which requires the two to agree on
+        bucket count/order exactly. Bucketing itself (imagenet only) happens
+        later, in `__init__`, after `dict_start_idx`/`dict_end_idx` slicing --
+        see that code's own comment for why.
+
+        Returns:
+            Dict mapping each `self.dict_root_dirs` key to its (sorted) list of
+            file paths.
+        """
+        if self.dataset == "sst":
+            return process_root_dirs_shared(
+                self.dataset, self.dict_root_dirs, img_size=self.img_size, full_domain_size=self.full_domain_size,
+                time_offsets=self.time_offsets,
+            )
+        return process_root_dirs_shared(self.dataset, self.dict_root_dirs)
 
     def set_iterative_dataloader(self, dict_data_train, k, lister_train, keys_to_add):
+        """Builds the iterable dataset pipeline (file read -> tile -> shuffle -> channel processing) for one dataset key.
+
+        Args:
+            dict_data_train: Dict of dataset-key -> iterable dataset to update in
+                place with the new pipeline for `k`.
+            k: Dataset key to build the pipeline for.
+            lister_train: List of file paths for this dataset key -- unshuffled;
+                `FileReader` handles its own per-epoch shuffle/replication
+                internally now (see `epoch_shuffle_seed`).
+            keys_to_add: Number of times `FileReader` replicates `lister_train`
+                per epoch to balance dataset sizes; passed through as its own
+                `keys_to_add`.
+
+        Returns:
+            `dict_data_train`, with `dict_data_train[k]` set to the new
+            `ProcessChannels`-wrapped iterable dataset.
+        """
+        # start_idx/end_idx are a no-op [0.0, 1.0) here -- already applied once,
+        # deterministically, in __init__ (before FileReader's own per-epoch reshuffle
+        # could re-randomize membership; see __init__'s comment). FileReader still
+        # takes them as real parameters for its other direct callers/tests.
+        start_idx = 0.0
+        end_idx = 1.0
         if self.dataset == "imagenet":
-            start_idx = self.dict_start_idx["imagenet"]
-            end_idx = self.dict_end_idx["imagenet"]
             buffer_size = self.dict_buffer_sizes["imagenet"]
             variables = self.dict_in_variables["imagenet"]
             num_channels_used = self.num_channels_used["imagenet"]
-            imagenet_resize = self.imagenet_resize["imagenet"]
+            resize = self.resize.get("imagenet") if self.resize else None
         else:
-            start_idx = self.dict_start_idx[k]
-            end_idx = self.dict_end_idx[k]
             buffer_size = self.dict_buffer_sizes[k]
             variables = self.dict_in_variables[k]
             num_channels_used = self.num_channels_used[k]
-        single_channel = self.single_channel
         return_label = self.return_label
+        if self.dataset == "sst":
+            variables_out = self.dict_out_variables[k] if return_label else None
+            chunk_size = self.img_size
+            full_domain_size = self.full_domain_size.get(k, self.img_size)
+        else:
+            variables_out = None
+            chunk_size = None
+            full_domain_size = None
         if self.dataset == "imagenet":
             dict_data_train[k] = ProcessChannels(
                 ShuffleIterableDataset(
-                    ImageBlockDataIter_2D(
+                    TileDataIter(
                             FileReader(
                                 lister_train,
                                 gx = self.gx,
                                 start_idx=start_idx,
                                 end_idx=end_idx,
                                 variables=variables,
-                                multi_dataset_training=True,
                                 data_par_size=self.data_par_size,
                                 return_label=return_label,
                                 keys_to_add=keys_to_add,
                                 ddp_group=self.ddp_group,
                                 dataset=self.dataset,
-                                imagenet_resize=imagenet_resize,
+                                resize=resize,
+                                allow_file_reuse=self.allow_file_reuse,
+                                epoch_shuffle_seed=self.epoch_shuffle_seed,
+                                normalize_stats=self.normalize_stats.get(k, {}),
                             ),
-                        self.tile_size_x,
-                        self.tile_size_y,
-                        self.tile_size_z,
+                        self.tile_size,
+                        self.twoD,
                         return_label = return_label,
+                        div = self.div,
                         tile_overlap = self.tile_overlap,
-                        use_all_data = self.use_all_data,
                         classification = True,
                     ),
                     buffer_size
                 ),
                 num_channels_used,
-                single_channel,
                 self.batch_size,
                 return_label,
                 self.adaptive_patching,
                 self.separate_channels,
-                self.patch_size,
+                self.interp_size,
                 self.fixed_length,
                 self.twoD,
                 self.dataset,
                 self.return_qdt,
+                profile=self.profile_dataloader,
+                score_fn=self.score_fn,
+                min_size=self.min_size,
+                canny_sigma=self.canny_sigma,
+                canny_low_threshold=self.canny_low_threshold,
+                canny_high_threshold=self.canny_high_threshold,
             )
         else:
             dict_data_train[k] = ProcessChannels(
                 ShuffleIterableDataset(
-                    ImageBlockDataIter_3D(
+                    TileDataIter(
                             FileReader(
                                 lister_train,
                                 gx = self.gx,
                                 start_idx=start_idx,
                                 end_idx=end_idx,
                                 variables=variables,
-                                multi_dataset_training=True,
                                 data_par_size = self.data_par_size,
                                 return_label = return_label,
                                 keys_to_add = keys_to_add,
                                 ddp_group = self.ddp_group,
-                                dataset=self.dataset
+                                dataset=self.dataset,
+                                allow_file_reuse=self.allow_file_reuse,
+                                epoch_shuffle_seed=self.epoch_shuffle_seed,
+                                variables_out=variables_out,
+                                chunk_size=chunk_size,
+                                full_domain_size=full_domain_size,
+                                normalize_stats=self.normalize_stats.get(k, {}),
                             ),
-                        self.tile_size_x,
-                        self.tile_size_y,
-                        self.tile_size_z,
+                        self.tile_size,
                         self.twoD,
                         return_label = return_label,
+                        div = self.div,
                         tile_overlap = self.tile_overlap,
-                        use_all_data = self.use_all_data,
                     ),
                     buffer_size
                 ),
                 num_channels_used,
-                single_channel,
                 self.batch_size,
                 return_label,
                 self.adaptive_patching,
                 self.separate_channels,
-                self.patch_size,
+                self.interp_size,
                 self.fixed_length,
                 self.twoD,
                 self.dataset,
                 self.return_qdt,
+                profile=self.profile_dataloader,
+                score_fn=self.score_fn,
+                min_size=self.min_size,
+                canny_sigma=self.canny_sigma,
+                canny_low_threshold=self.canny_low_threshold,
+                canny_high_threshold=self.canny_high_threshold,
             )
         return dict_data_train
         
 
+    def _my_dataset_key(self):
+        """Determines which single `dict_lister_trains`/`dict_data_train` key this rank owns.
+
+        Uses the same `gx`-based `group_id` matching `train_dataloader` relies on --
+        factored out so `setup()` can build only *this* rank's own key's pipeline,
+        instead of every key's, keeping setup cost O(1) per rank rather than
+        O(number of keys) (O(`data_par_size`) for imagenet, since it has up to
+        `data_par_size` bucket keys -- O(`data_par_size`^2) cluster-wide if every
+        rank did this redundantly).
+
+        Returns:
+            The single `self.dict_lister_trains` key this rank's DDP-rank
+            group is assigned to.
+
+        Raises:
+            NotImplementedError: If `torch.distributed` is not initialized.
+        """
+        if not torch.distributed.is_initialized():
+            raise NotImplementedError("Only support distributed training")
+
+        if self.ddp_group == None:
+            ddp_rank = torch.distributed.get_rank()
+        else:
+            ddp_rank = torch.distributed.get_rank(group=self.ddp_group)
+
+        group_list = list(map(lambda x: int(x), self.gx.split(":")))
+        assert self.data_par_size == sum(group_list), "data_par_size, group_list: %d %d"%(self.data_par_size, sum(group_list))
+        group_id = np.where(np.cumsum(group_list) > ddp_rank)[0][0]
+
+        for idx, k in enumerate(self.dict_lister_trains.keys()):
+            if idx == group_id:
+                return k
+
+    def _compute_keys_to_add(self, k):
+        """Computes how many times `FileReader` should replicate key `k`'s file listing per epoch.
+
+        Args:
+            k: The dataset key to compute this for -- always `self._my_dataset_key()`'s
+                result in practice, but takes it as an argument rather than
+                recomputing it, since `setup()` also needs `k` for other things.
+
+        Returns:
+            `1` for imagenet (no replication -- see `set_iterative_dataloader`'s
+            imagenet branch), otherwise `ceil(self.max_balance / self.batches_per_rank_epoch[k])`
+            so a smaller joint dataset's effective epoch length still matches the
+            largest one's.
+        """
+        if self.dataset == "imagenet":
+            return 1
+        return int(np.ceil(self.max_balance/self.batches_per_rank_epoch[k]))
+
     def setup(self):
+        """Builds the iterable training dataset for this rank's own dataset key, if not already built.
+
+        Computes `self.max_balance`, the largest `batches_per_rank_epoch` across
+        every joint dataset (not just this rank's own -- a smaller joint
+        dataset's `keys_to_add` replication needs to know the largest one's
+        epoch length to match it), then builds *only this rank's own dataset
+        key's* pipeline via `set_iterative_dataloader`. No-op if
+        `self.dict_data_train` is already set. See `_my_dataset_key`'s own
+        docstring for why every other key is skipped entirely.
+
+        Per-epoch file-order reshuffling is no longer done here -- when
+        `self.epoch_shuffle_seed` is set, `FileReader.__iter__` (built by
+        `set_iterative_dataloader` below) handles that itself, fresh, every
+        epoch, so the same `dict_data_train`/`train_dataloader()` built here
+        can be reused for an entire run instead of being rebuilt every epoch.
+        """
         # load datasets only if they're not loaded already
         if not self.dict_data_train:
 
             #Choice to made at this point. Imagenet uses 1) The default option is to use 2)
             #1) Use the dataset with the smallest amount of data tiles. In this case dataloading stops once all tiles are yielded from the smallest dataset
-            #2) Add more files to each dataset. Allowing dataloading to continue reusing files from the dataset until all tiles are yielded from the largest dataset 
+            #2) Add more files to each dataset. Allowing dataloading to continue reusing files from the dataset until all tiles are yielded from the largest dataset
             self.max_balance = 0
             if self.dataset == "imagenet":
                 self.max_balance = self.batches_per_rank_epoch["imagenet"]
@@ -448,76 +660,47 @@ class NativePytorchDataModule(torch.nn.Module):
                     if self.batches_per_rank_epoch[k] > self.max_balance:
                           self.max_balance = self.batches_per_rank_epoch[k]
 
-            dict_data_train = {}
-            for i, k in enumerate(self.dict_lister_trains.keys()):
-                lister_train = self.dict_lister_trains[k]
-                if self.dataset == "imagenet":
-                    keys_to_add = 1
-                else:
-                    keys_to_add = int(np.ceil(self.max_balance/self.batches_per_rank_epoch[k]))
-                _lister_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
-                if keys_to_add > 1:
-                    for i in range(keys_to_add-1):
-                        _balance_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
-                        _lister_train.extend(_balance_train)
-
-                lister_train = _lister_train
-                
-                dict_data_train = self.set_iterative_dataloader(dict_data_train, k, lister_train, keys_to_add)
-
-            self.dict_data_train = dict_data_train
-
-    def reset(self):
-        #Reset data file list to randomize order of files. Needed in order to introduce data that was potentially missed in prior epochs. Some data files are missed when the number of files for each dataset is not divisible by the number of GPUs that's splitting up those files
-        dict_data_train = {}
-        for i, k in enumerate(self.dict_lister_trains.keys()):
-            lister_train = self.dict_lister_trains[k]
-            if self.dataset == "imagenet":
-                keys_to_add = 1
-            else:
-                keys_to_add = int(np.ceil(self.max_balance/self.batches_per_rank_epoch[k]))
-            _lister_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
-            if keys_to_add > 1:
-                for i in range(keys_to_add-1):
-                    _balance_train = np.random.choice(lister_train, size=len(lister_train), replace=False).tolist()
-                    _lister_train.extend(_balance_train)
-
-            lister_train = _lister_train
-            
-            dict_data_train = self.set_iterative_dataloader(dict_data_train, k, lister_train, keys_to_add)
-
-        self.dict_data_train = dict_data_train
+            k = self._my_dataset_key()
+            keys_to_add = self._compute_keys_to_add(k)
+            self.dict_data_train = self.set_iterative_dataloader({}, k, self.dict_lister_trains[k], keys_to_add)
 
     def train_dataloader(self):
+        """Builds the `DataLoader` for the dataset assigned to this rank's data-parallel group.
+
+        `setup()` already built `self.dict_data_train` for only this rank's own
+        dataset key (see `_my_dataset_key`), so this just wraps that single
+        pipeline in a `DataLoader` using `collate_fn`.
+
+        `persistent_workers` is set whenever `self.num_workers > 0`: combined
+        with `self.epoch_shuffle_seed` (see its own docstring entry) handling
+        per-epoch reshuffling internally, the `DataLoader` returned here is
+        meant to be built once and reused for an entire run -- its worker
+        pool then only ever forks once, rather than being torn down and
+        re-forked every epoch.
+
+        Returns:
+            A `torch.utils.data.DataLoader` over this rank's assigned dataset.
+
+        Raises:
+            NotImplementedError: If `torch.distributed` is not initialized, or
+                if `setup()` hasn't been called yet.
+        """
         if not torch.distributed.is_initialized():
             raise NotImplementedError("Only support distributed training")
-            
-        assert torch.distributed.is_initialized()
+        if not self.dict_data_train:
+            raise NotImplementedError("dict_data_train is empty -- call setup() first")
 
-        if self.ddp_group == None:
-            ddp_rank = torch.distributed.get_rank()
-        else:
-            ddp_rank = torch.distributed.get_rank(group=self.ddp_group)
+        k = next(iter(self.dict_data_train))
+        data_train = self.dict_data_train[k]
+        num_labels = 1
 
-        group_list = list(map(lambda x: int(x), self.gx.split(":")))
-
-        assert self.data_par_size == sum(group_list), "data_par_size, group_list: %d %d"%(self.data_par_size, sum(group_list))
-        group_id = np.where(np.cumsum(group_list) > ddp_rank)[0][0]
-        group_size = group_list[group_id]
-        group_rank = ddp_rank - ([0] + np.cumsum(group_list).tolist())[group_id]
-
-        for idx, k in enumerate(self.dict_data_train.keys()):
-            if idx == group_id:
-                data_train = self.dict_data_train[k]
-                num_labels = 1
-                break
-            
         return DataLoader(
             data_train,
             batch_size=self.batch_size,
             drop_last=True,
             num_workers=self.num_workers,
+            persistent_workers=self.num_workers > 0,
             pin_memory=self.pin_memory,
-            collate_fn=lambda batch: collate_fn(batch, return_label=self.return_label, single_channel=self.single_channel, adaptive_patching = self.adaptive_patching, separate_channels=self.separate_channels, dataset=self.dataset, num_classes=self.num_classes, num_labels=num_labels, return_qdt=self.return_qdt, dict_key=k),
+            collate_fn=functools.partial(collate_fn, return_label=self.return_label, adaptive_patching=self.adaptive_patching, separate_channels=self.separate_channels, dataset=self.dataset, num_labels=num_labels, return_qdt=self.return_qdt, dict_key=k),
         )
 

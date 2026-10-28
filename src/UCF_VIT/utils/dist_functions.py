@@ -360,8 +360,21 @@ def all_reduce(tensor, op=ReduceOp.SUM, group=group.WORLD):
 
 
 class _F_Broadcast_B_Identity(Function):
+    """Autograd function that broadcasts on the forward pass and is an identity on the backward pass."""
+
     @staticmethod
     def forward(ctx, src, group, tensor):
+        """Broadcasts `tensor` from rank `src` to every rank in `group`.
+
+        Args:
+            ctx: Autograd context.
+            src: Source rank to broadcast from.
+            group: Process group to broadcast within.
+            tensor: Tensor to broadcast (cloned before the in-place collective).
+
+        Returns:
+            The broadcast tensor.
+        """
         ctx.src = src
         ctx.group = group
         ctx.rank = dist.get_rank()
@@ -373,6 +386,15 @@ class _F_Broadcast_B_Identity(Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Passes the incoming gradient through unchanged on every rank.
+
+        Args:
+            ctx: Autograd context (unused).
+            grad_output: Gradient with respect to the forward output.
+
+        Returns:
+            A tuple of gradients matching `forward`'s inputs: `(None, None, grad_output.clone())`.
+        """
 
         return (None, None, grad_output.clone())
 
@@ -381,8 +403,21 @@ class _F_Broadcast_B_Identity(Function):
 
 
 class _Broadcast(Function):
+    """Autograd function that broadcasts on the forward pass and reduce-sums gradients back to `src` on the backward pass."""
+
     @staticmethod
     def forward(ctx, src, group, tensor):
+        """Broadcasts `tensor` from rank `src` to every rank in `group`, in place.
+
+        Args:
+            ctx: Autograd context.
+            src: Source rank to broadcast from.
+            group: Process group to broadcast within.
+            tensor: Tensor to broadcast.
+
+        Returns:
+            The broadcast tensor.
+        """
         ctx.src = src
         ctx.group = group
         ctx.rank = dist.get_rank()
@@ -394,6 +429,16 @@ class _Broadcast(Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Reduce-sums incoming gradients back to rank `src`, zeroing them elsewhere.
+
+        Args:
+            ctx: Autograd context holding `src`, `group`, and `rank`.
+            grad_output: Gradient with respect to the forward output.
+
+        Returns:
+            A tuple of gradients matching `forward`'s inputs: `(None, None, gx)`,
+            where `gx` is nonzero only on rank `src`.
+        """
         gx = _Reduce.apply(ctx.src, ReduceOp.SUM, ctx.group, grad_output)
         if ctx.src != ctx.rank:
             gx.zero_()
@@ -401,8 +446,20 @@ class _Broadcast(Function):
 
 
 class _F_Identity_B_AllReduce(Function):
+    """Autograd function that is an identity on the forward pass and all-reduce-sums gradients on the backward pass."""
+
     @staticmethod
     def forward(ctx, group, tensor):
+        """Returns `tensor` unchanged.
+
+        Args:
+            ctx: Autograd context.
+            group: Process group to use for the backward all-reduce.
+            tensor: Input tensor.
+
+        Returns:
+            `tensor`, unchanged.
+        """
         ctx.group = group
         # torch.distributed makes all the calls in place
         # we allocate new tensors to avoid this
@@ -412,6 +469,15 @@ class _F_Identity_B_AllReduce(Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """All-reduce-sums the incoming gradient across `ctx.group`.
+
+        Args:
+            ctx: Autograd context holding `group`.
+            grad_output: Gradient with respect to the forward output.
+
+        Returns:
+            A tuple of gradients matching `forward`'s inputs: `(None, gx)`.
+        """
 
         gx = _AllReduce.apply(ReduceOp.SUM, ctx.group, grad_output)
         return (None, gx)
@@ -419,8 +485,20 @@ class _F_Identity_B_AllReduce(Function):
 
 
 class _F_Identity_B_AllReduce_VariableMapping(Function):
+    """Variable-mapping variant of `_F_Identity_B_AllReduce`: identity forward, all-reduce-sum backward."""
+
     @staticmethod
     def forward(ctx, group, tensor):
+        """Returns `tensor` unchanged.
+
+        Args:
+            ctx: Autograd context.
+            group: Process group to use for the backward all-reduce.
+            tensor: Input tensor.
+
+        Returns:
+            `tensor`, unchanged.
+        """
         ctx.group = group
         # torch.distributed makes all the calls in place
         # we allocate new tensors to avoid thiis
@@ -432,6 +510,15 @@ class _F_Identity_B_AllReduce_VariableMapping(Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """All-reduce-sums the incoming gradient across `ctx.group`.
+
+        Args:
+            ctx: Autograd context holding `group`.
+            grad_output: Gradient with respect to the forward output.
+
+        Returns:
+            A tuple of gradients matching `forward`'s inputs: `(None, gx)`.
+        """
 
         gx = _AllReduce.apply(ReduceOp.SUM, ctx.group, grad_output)
         return (None, gx)
@@ -440,8 +527,21 @@ class _F_Identity_B_AllReduce_VariableMapping(Function):
 
 
 class _Gather(Function):
+    """Autograd function that gathers tensors onto `dst` on the forward pass and scatters gradients back on the backward pass."""
+
     @staticmethod
     def forward(ctx, dst, group, tensor):
+        """Gathers `tensor` from every rank in `group` onto rank `dst`.
+
+        Args:
+            ctx: Autograd context.
+            dst: Destination rank.
+            group: Process group to gather within.
+            tensor: This rank's contribution to gather; must be correctly sized.
+
+        Returns:
+            Tuple of gathered tensors, one per rank in `group`.
+        """
         ctx.dst = dst
         ctx.group = group
         # Need to create a list of tensors here to do the
@@ -461,12 +561,35 @@ class _Gather(Function):
 
     @staticmethod
     def backward(ctx, *grad_outputs):
+        """Scatters the incoming gradients from `dst` back to each rank.
+
+        Args:
+            ctx: Autograd context holding `dst` and `group`.
+            *grad_outputs: Gradients with respect to each gathered tensor.
+
+        Returns:
+            A tuple of gradients matching `forward`'s inputs: `(None, None, gx)`.
+        """
         return (None, None) + (_Scatter.apply(ctx.dst, ctx.group, *grad_outputs),)
 
 
 class _Scatter(Function):
+    """Autograd function that scatters tensors from `src` on the forward pass and gathers gradients back on the backward pass."""
+
     @staticmethod
     def forward(ctx, src, group, *tensors):
+        """Scatters one tensor per rank in `group` from rank `src`.
+
+        Args:
+            ctx: Autograd context.
+            src: Source rank holding the tensors to scatter.
+            group: Process group to scatter within.
+            *tensors: On rank `src`, the list of tensors to scatter (all the same
+                size), one per rank in `group`; ignored on other ranks.
+
+        Returns:
+            The tensor received by the current rank.
+        """
         ctx.src = src
         ctx.group = group
         assert all(t.size() == tensors[0].size() for t in tensors)
@@ -479,12 +602,36 @@ class _Scatter(Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Gathers the incoming per-rank gradients back onto rank `src`.
+
+        Args:
+            ctx: Autograd context holding `src` and `group`.
+            grad_output: Gradient with respect to the forward output on this rank.
+
+        Returns:
+            A tuple of gradients matching `forward`'s inputs: `(None, None,
+            *grad_tensors)`.
+        """
         return (None, None) + _Gather.apply(ctx.src, ctx.group, grad_output)
 
 
 class _Reduce(Function):
+    """Autograd function that reduces to `src` on the forward pass and broadcasts gradients from `src` on the backward pass."""
+
     @staticmethod
     def forward(ctx, src, op, group, tensor):
+        """Reduces `tensor` across `group` onto rank `src` using reduction `op`.
+
+        Args:
+            ctx: Autograd context.
+            src: Destination rank that receives the reduced result.
+            op: Reduction op from `torch.distributed.ReduceOp`.
+            group: Process group to reduce within.
+            tensor: Input tensor (cloned before the in-place collective).
+
+        Returns:
+            The reduced tensor (only meaningful on rank `src`).
+        """
         ctx.src = src
         ctx.group = group
         tensor = tensor.clone()
@@ -493,14 +640,36 @@ class _Reduce(Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Broadcasts the gradient from rank `src` to every rank in `group`.
+
+        Args:
+            ctx: Autograd context holding `src` and `group`.
+            grad_output: Gradient with respect to the forward output.
+
+        Returns:
+            A tuple of gradients matching `forward`'s inputs: `(None, None, None, gx)`.
+        """
         return (None, None, None) + (_Broadcast.apply(ctx.src, ctx.group, grad_output),)
 
 
 
 
 class _F_Identity_B_Broadcast(Function):
+    """Autograd function that is an identity on the forward pass and broadcasts gradients from `src` on the backward pass."""
+
     @staticmethod
     def forward(ctx, src, group, tensor):
+        """Returns `tensor` unchanged.
+
+        Args:
+            ctx: Autograd context.
+            src: Rank whose gradient is broadcast on the backward pass.
+            group: Process group to use for the backward broadcast.
+            tensor: Input tensor.
+
+        Returns:
+            `tensor`, unchanged.
+        """
         ctx.src = src
         ctx.group = group
         #tensor = tensor.clone()
@@ -508,13 +677,35 @@ class _F_Identity_B_Broadcast(Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Broadcasts the gradient on rank `src` to every rank in `group`.
+
+        Args:
+            ctx: Autograd context holding `src` and `group`.
+            grad_output: Gradient with respect to the forward output.
+
+        Returns:
+            A tuple of gradients matching `forward`'s inputs: `(None, None, gx)`.
+        """
         return (None,  None) + (_Broadcast.apply(ctx.src, ctx.group, grad_output.contiguous()),)
 
 
 
 class _F_AllReduce_B_Identity(Function):
+    """Autograd function that all-reduces on the forward pass and is an identity on the backward pass."""
+
     @staticmethod
     def forward(ctx, op, group, tensor):
+        """All-reduces `tensor` across `group` using reduction `op`.
+
+        Args:
+            ctx: Autograd context.
+            op: Reduction op from `torch.distributed.ReduceOp`.
+            group: Process group to reduce within.
+            tensor: Input tensor (cloned before the in-place collective).
+
+        Returns:
+            The all-reduced tensor, identical on every rank in `group`.
+        """
         ctx.group = group
 
         tensor = tensor.clone()
@@ -524,14 +715,36 @@ class _F_AllReduce_B_Identity(Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Passes the incoming gradient through unchanged.
+
+        Args:
+            ctx: Autograd context (unused).
+            grad_output: Gradient with respect to the forward output.
+
+        Returns:
+            A tuple of gradients matching `forward`'s inputs: `(None, None, grad_output.clone())`.
+        """
 #        return (None, None, None) + (_Broadcast.apply(ctx.src, ctx.group, grad_output),)
         return (None, None, grad_output.clone())
 
 
 
 class _F_AllReduce_B_Identity_VariableMapping(Function):
+    """Variable-mapping variant of `_F_AllReduce_B_Identity`: all-reduce forward, identity backward."""
+
     @staticmethod
     def forward(ctx, op, group, tensor):
+        """All-reduces `tensor` across `group` using reduction `op`.
+
+        Args:
+            ctx: Autograd context.
+            op: Reduction op from `torch.distributed.ReduceOp`.
+            group: Process group to reduce within.
+            tensor: Input tensor (cloned before the in-place collective).
+
+        Returns:
+            The all-reduced tensor, identical on every rank in `group`.
+        """
         ctx.group = group
 
         tensor = tensor.clone()
@@ -541,6 +754,15 @@ class _F_AllReduce_B_Identity_VariableMapping(Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Passes the incoming gradient through unchanged.
+
+        Args:
+            ctx: Autograd context (unused).
+            grad_output: Gradient with respect to the forward output.
+
+        Returns:
+            A tuple of gradients matching `forward`'s inputs: `(None, None, grad_output.clone())`.
+        """
 #        return (None, None, None) + (_Broadcast.apply(ctx.src, ctx.group, grad_output),)
 #        print("rank",dist.get_rank(),"B_Identity_VariableMapping grad_output[0,0,0]",grad_output[0,0,0],"grad_output[0,0,1]",grad_output[0,0,1],"grad_output[0,0,2]",grad_output[0,0,2],flush=True)
 
@@ -550,8 +772,22 @@ class _F_AllReduce_B_Identity_VariableMapping(Function):
 
 
 class _Reduce_Scatter(Function):
+    """Autograd function that reduces-then-scatters on the forward pass and all-gathers gradients on the backward pass."""
+
     @staticmethod
     def forward(ctx, op, group, tensor, *input_tensor_list):
+        """Reduces `input_tensor_list` across `group` with `op`, then scatters the result.
+
+        Args:
+            ctx: Autograd context.
+            op: Reduction op from `torch.distributed.ReduceOp`.
+            group: Process group to reduce/scatter within.
+            tensor: Output tensor to receive this rank's shard, in place.
+            *input_tensor_list: List of tensors to reduce and scatter, one per rank.
+
+        Returns:
+            `tensor`, holding this rank's shard of the reduced result.
+        """
         ctx.group = group
         input_tensor_list = tuple(t.contiguous() for t in input_tensor_list)
         dist.reduce_scatter(tensor, list(input_tensor_list), op=op, group=group)
@@ -559,12 +795,35 @@ class _Reduce_Scatter(Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """All-gathers the incoming per-shard gradient across `group`.
+
+        Args:
+            ctx: Autograd context holding `group`.
+            grad_output: Gradient with respect to this rank's shard of the output.
+
+        Returns:
+            A tuple of gradients matching `forward`'s inputs: `(None, None, None,
+            *grad_tensors)`.
+        """
         return (None, None, None) + _AllGather.apply(ctx.group, grad_output)
 
 
 class _AllGather(Function):
+    """Autograd function that all-gathers on the forward pass and reduce-scatters gradients on the backward pass."""
+
     @staticmethod
     def forward(ctx, group, tensor):
+        """Gathers `tensor` from every rank in `group` onto every rank.
+
+        Args:
+            ctx: Autograd context.
+            group: Process group to gather within.
+            tensor: This rank's contribution to gather.
+
+        Returns:
+            Tuple of gathered tensors, one per rank in `group`, identical on every
+            rank.
+        """
         # Need contiguous tensors for collectives.
         tensor = tensor.contiguous()
 
@@ -578,6 +837,18 @@ class _AllGather(Function):
 
     @staticmethod
     def backward(ctx, *grad_outputs):
+        """Reduce-scatters the incoming per-rank gradients back to this rank's shard.
+
+        Uses `reduce_scatter` on NCCL, or an all-to-all plus sum as a fallback on
+        backends that don't support reduce-scatter.
+
+        Args:
+            ctx: Autograd context holding `group`.
+            *grad_outputs: Gradients with respect to each gathered tensor.
+
+        Returns:
+            A tuple of gradients matching `forward`'s inputs: `(None, gx)`.
+        """
         if dist.get_backend(group=ctx.group) is dist.Backend.NCCL:
             rank = dist.get_rank(group=ctx.group)
             gx = torch.empty_like(grad_outputs[rank])
@@ -591,14 +862,44 @@ class _AllGather(Function):
         return (None, gx)
 
 class _AllGatherBase(Function):
+    """Autograd function wrapping `dist._all_gather_base`, with a reduce-scatter backward pass (NCCL only)."""
+
     @staticmethod
     def forward(ctx, output_tensor, input_tensor, group):
+        """Gathers `input_tensor` from every rank in `group` into a single `output_tensor`.
+
+        Args:
+            ctx: Autograd context.
+            output_tensor: Pre-sized tensor to receive the concatenated gathered
+                data, in place.
+            input_tensor: This rank's contribution to gather.
+            group: Process group to gather within.
+
+        Returns:
+            `output_tensor`, holding the concatenated gathered data.
+        """
         ctx.group = group
         dist._all_gather_base(output_tensor, input_tensor.contiguous(), group=group)
         return output_tensor
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Reduce-scatters the incoming gradient back to this rank's shard.
+
+        Only supported on the NCCL backend.
+
+        Args:
+            ctx: Autograd context holding `group`.
+            grad_output: Gradient with respect to `output_tensor`; its first
+                dimension must be divisible by the group's world size.
+
+        Returns:
+            A tuple of gradients matching `forward`'s inputs: `(None, gx, None)`.
+
+        Raises:
+            RuntimeError: If `grad_output`'s first dimension isn't divisible by the
+                world size, or the backend isn't NCCL.
+        """
         if dist.get_backend(group=ctx.group) is dist.Backend.NCCL:
             world_size = dist.get_world_size(group=ctx.group)
             out_size = list(grad_output.size())
@@ -615,8 +916,25 @@ class _AllGatherBase(Function):
         return (None, gx, None)
 
 class _AlltoAll(Function):
+    """Autograd function that all-to-all exchanges lists of tensors, with a matching backward pass."""
+
     @staticmethod
     def forward(ctx, group, out_tensor_list, *tensors):
+        """Scatters `tensors` (one per rank) to all ranks and gathers each rank's contribution.
+
+        Falls back to per-rank scatter calls on the GLOO backend, which doesn't
+        support `all_to_all` directly.
+
+        Args:
+            ctx: Autograd context.
+            group: Process group to exchange within.
+            out_tensor_list: Pre-sized list of tensors to receive the gathered
+                data, one per rank, in place.
+            *tensors: List of tensors to scatter, one per destination rank.
+
+        Returns:
+            Tuple of tensors received from each rank.
+        """
         ctx.group = group
         ctx.input_tensor_size_list = [
             tensors[i].size() for i in range(dist.get_world_size(group=group))
@@ -640,6 +958,16 @@ class _AlltoAll(Function):
 
     @staticmethod
     def backward(ctx, *grad_outputs):
+        """Runs another all-to-all exchange on the incoming gradients.
+
+        Args:
+            ctx: Autograd context holding `group` and `input_tensor_size_list`.
+            *grad_outputs: Gradients with respect to each received tensor.
+
+        Returns:
+            A tuple of gradients matching `forward`'s inputs: `(None, None,
+            *grad_tensors)`.
+        """
         tensor_list = [
             torch.empty(size, device=grad_outputs[0].device, dtype=grad_outputs[0].dtype)
             for size in ctx.input_tensor_size_list
@@ -648,8 +976,26 @@ class _AlltoAll(Function):
 
 
 class _AlltoAllSingle(Function):
+    """Autograd function wrapping `dist.all_to_all_single`, with a matching backward pass."""
+
     @staticmethod
     def forward(ctx, group, output, output_split_sizes, input_split_sizes, input):
+        """Splits `input` and all-to-all exchanges it into `output`.
+
+        Args:
+            ctx: Autograd context.
+            group: Process group to exchange within.
+            output: Pre-sized tensor to receive the concatenated exchanged data, in
+                place.
+            output_split_sizes: Split sizes for `output`'s dim 0, or None/empty to
+                split evenly by world size.
+            input_split_sizes: Split sizes for `input`'s dim 0, or None/empty to
+                split evenly by world size.
+            input: Input tensor to split and scatter.
+
+        Returns:
+            `output`, holding the concatenated exchanged data.
+        """
         ctx.group = group
         ctx.input_size = input.size()
         ctx.output_split_sizes = input_split_sizes
@@ -665,6 +1011,17 @@ class _AlltoAllSingle(Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Runs the inverse all-to-all exchange (split sizes swapped) on the incoming gradient.
+
+        Args:
+            ctx: Autograd context holding `group`, `input_size`, `output_split_sizes`,
+                and `input_split_sizes`.
+            grad_output: Gradient with respect to the forward `output`.
+
+        Returns:
+            A tuple of gradients matching `forward`'s inputs: `(None, None, None,
+            None, gx)`.
+        """
         tensor = torch.empty(ctx.input_size, device=grad_output.device, dtype=grad_output.dtype)
         return (None, None, None, None) + (
             _AlltoAllSingle.apply(
@@ -678,8 +1035,21 @@ class _AlltoAllSingle(Function):
 
 
 class _AllReduce(Function):
+    """Autograd function that all-reduces on both the forward and backward pass."""
+
     @staticmethod
     def forward(ctx, op, group, tensor):
+        """All-reduces `tensor` across `group` using reduction `op`, in place.
+
+        Args:
+            ctx: Autograd context.
+            op: Reduction op from `torch.distributed.ReduceOp`.
+            group: Process group to reduce within.
+            tensor: Input tensor.
+
+        Returns:
+            `tensor`, all-reduced in place, identical on every rank in `group`.
+        """
         ctx.group = group
         ctx.op = op
         #tensor = tensor.clone()
@@ -688,4 +1058,13 @@ class _AllReduce(Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """All-reduces the incoming gradient across `ctx.group` using the same op.
+
+        Args:
+            ctx: Autograd context holding `op` and `group`.
+            grad_output: Gradient with respect to the forward output.
+
+        Returns:
+            A tuple of gradients matching `forward`'s inputs: `(None, None, gx)`.
+        """
         return (None, None) + (_AllReduce.apply(ctx.op, ctx.group, grad_output),)

@@ -36,6 +36,8 @@ Training large ViT models at scale remains a major technical challenge in both A
 # Install
 Installation instruction are provide for running on systems with both AMD and NVIDIA GPU hardware. Instructions are included for systems ranging from a local DGX cluster to the Frontier Supercomputer.
 
+Every platform-independent package we depend on (`monai`, `nibabel`, `torchdata`, `einops`, `opencv-python-headless`, `matplotlib`, `scipy`, `scikit-image`, `SimpleITK`, `timm`) is declared in `pyproject.toml` and gets installed automatically by `pip install -e .`. `torch` and `xformers` are deliberately left out of `pyproject.toml` since the correct build depends on your GPU vendor (ROCm for AMD, CUDA for NVIDIA) -- install those manually first with the platform-specific commands below, then run `pip install -e .` to pull in everything else.
+
 ## Systems with AMD GPUs
 There are two options available for creating software environments for systems with AMD GPUs 1) creating Conda environment from scratch or 2) using an apptainer container (the installation instructions for this are currently limited to use on the Frontier supercomputer). Creating a Conda environment from scratch is recommended as the Apptainer containers currently only work in limited scenarios due to missing ROCM packages in the base apptainer image.
 
@@ -43,24 +45,14 @@ There are two options available for creating software environments for systems w
 Create Conda Environment from Scratch. Example below uses similar options from the corresponding Apptainer definition files
 ```
 PYTHON_VERSION=3.11
-conda create -n vit python=${PYTHON_VERSION} -y
-conda activate vit 
-ROCM_VERSION=6.2.4
-TORCH_URL="https://download.pytorch.org/whl/rocm${ROCM_VERSION}"
-TORCH_VERSION=2.7.0+rocm6.2.4
-TORCHVISION_VERSION=0.22.0
-TORCHAUDIO_VERSION=2.7.0
+conda create -n UCF-rocm7.13 python=${PYTHON_VERSION} -y
+conda activate UCF-rocm7.13
 
-pip install torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} torchaudio==${TORCHAUDIO_VERSION} --index-url ${TORCH_URL}
-pip install xformers==0.0.30 --extra-index-url=https://download.pytorch.org/whl/rocm${ROCM_VERSION}
-pip install timm \
- monai==1.4.0 \
- nibabel \
- torchdata==0.9.0 \
- einops \
- opencv-python-headless \
- matplotlib \
- scipy
+python -m pip install --index-url https://repo.amd.com/rocm/whl/gfx90a/ \
+  "torch==2.10.0+rocm7.13.0" \
+  "torchvision==0.25.0+rocm7.13.0" \
+  "torchaudio==2.10.0+rocm7.13.0"
+pip3 install -U xformers --index-url https://download.pytorch.org/whl/rocm7.1
 
 #If your system has an existing MPI installed use the proper mpi4py installation for your sytsem
 #Default install mpi4py 
@@ -73,6 +65,46 @@ MPICC="cc -shared" pip install --no-cache-dir --no-binary=mpi4py mpi4py
 cd UCF-VIT
 pip install -e .
 ```
+
+#### Optional: `cupy` for `region_backend="cupyx"`
+`cupy` is not installed by the steps above -- it's an opt-in dependency, only
+needed if you want `UCF_VIT.model.gpu_adaptive_patching.GPUPatchify2D`/
+`GPUPatchify3D`'s `region_backend="cupyx"` option (GPU-native connected-
+components labeling, vs. the default `"scipy"`, which round-trips through
+the CPU; currently test-only -- not wired into any config, see
+`launch/tests/run_cupyx_smoke.sh`). AMD hosts prebuilt ROCm-matched `cupy`
+wheels (`amd-cupy`) at `pypi.amd.com`, but only for specific ROCm releases
+(confirmed `rocm-7.0.2` has one, `rocm-7.13.0` does not -- `pip` silently
+falls back to an unrelated, non-functional `amd-cupy` package on regular
+PyPI if you point `--extra-index-url` at a release path that doesn't
+exist there, rather than erroring). Building from source against the
+exact `rocm/7.13` install avoids both that trap and a real toolchain
+mismatch hit when trying the `rocm-7.0.2` wheel anyway (its bundled HIPRTC
+picked up an incompatible system GCC's headers) -- confirmed working here:
+```
+conda activate UCF-rocm7.13
+module load PrgEnv-gnu
+module load gcc/12.2.0
+module load rocm/7.13
+export ROCM_HOME=${ROCM_PATH}
+
+export CUPY_INSTALL_USE_HIP=1
+export HCC_AMDGPU_TARGET=gfx90a   # MI250X's ISA
+
+pip install cupy --no-cache-dir -v 2>&1 | tee /tmp/cupy_build.log
+```
+`ROCM_HOME` needs to be set both at install time and at runtime (i.e.
+`module load rocm/7.13; export ROCM_HOME=${ROCM_PATH}` again in any job
+script before running code that imports `cupy`) -- not just once during
+this install. At runtime, also redirect `cupy`'s JIT kernel cache off
+`$HOME` (it defaults to `$HOME/.cupy/kernel_cache`, which hit a real disk
+quota error on Frontier) to node-local scratch instead:
+```
+export CUPY_CACHE_DIR=/tmp/$JOBID/cupy_kernel_cache
+mkdir -p $CUPY_CACHE_DIR
+```
+See `launch/tests/run_cupyx_smoke.sh` for both of these wired into a
+working example job.
 
 ### Apptainer (on Frontier)
 Use Apptainer container definition files (Only use this on Frontier)
@@ -95,15 +127,7 @@ conda create -n vit python=3.11 -y
 conda activate vit
 CUDA_DRIVER=cu128
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/${CUDA_DRIVER}
-pip install xformers \
-timm \
-monai==1.4.0 \
-nibabel \
-torchdata==0.9.0 \
-einops \
-opencv-python-headless==4.11.0.86 \
-matplotlib \
-scipy 
+pip install xformers
 
 #If your system has an existing MPI installed use the proper mpi4py installation for your sytsem
 #Default install mpi4py 
@@ -878,6 +902,15 @@ Starting indices ratio (between 0.0 and 1.0) to determine amount of files in dir
 - `dict_end_idx`: Dictionary of floats (0,1).
 Ending indices ratio (between 0.0 and 1.0) to determine amount of files in directory to use
 
+- `dict_val_root_dirs` / `dict_test_root_dirs`: Dictionary of paths, optional.
+Paths to directories with dedicated validation/test data files, for datasets that have their own real split. Only needs an entry for dataset keys that actually have a separate directory -- any key present in `dict_root_dirs` but absent here gets an automatic split instead (see below). None of the datasets shipped with this repo currently have a dedicated split, but the option exists for one that does.
+
+- `dict_val_start_idx` / `dict_val_end_idx` / `dict_test_start_idx` / `dict_test_end_idx`: Dictionary of floats (0,1), optional.
+Same idea as `dict_start_idx`/`dict_end_idx`, but for trimming a *separate* `dict_val_root_dirs`/`dict_test_root_dirs` directory. Only meaningful for keys that have one; defaults to the full `[0.0, 1.0)` range (the whole directory) when omitted.
+
+- `val_split_ratio` / `test_split_ratio`: Float (0,1), default `0.1` each.
+For any dataset key with **no** separate `dict_val_root_dirs`/`dict_test_root_dirs` entry, this fraction of that key's own `[dict_start_idx, dict_end_idx)` window is automatically carved out and reserved for validation/testing instead -- `train.py` itself only trains on the remaining share (`1 - val_split_ratio - test_split_ratio`). Set both to `0` to disable auto-splitting and use 100% of `[dict_start_idx, dict_end_idx)` for training, matching the behavior before this option existed. See [Training Scripts](#training-scripts) for `val.py`/`test.py`, which consume whichever split (dedicated or auto-split) ends up resolved.
+
 - `dict_buffer_sizes`: Dictionary of ints.
 Buffer Size to use when filling iterative dataloader with prospective tiles for creation of batches
 
@@ -937,6 +970,12 @@ Whether or not to separate channels and adaptively patch with different quadtree
 - `data_par_size`: Int.
 The amount of data parallel training ranks being used
 
+- `allow_file_reuse`: Bool, default `False`.
+A dataset key with fewer files than the DDP ranks/dataloader workers assigned to it normally fails loudly at startup, rather than silently letting some ranks/workers train on no data at all. Setting this `True` instead lets every rank/worker get at least one file, reusing (duplicating) files round-robin across ranks/workers as needed -- a printed warning quantifies how much reuse is actually happening. This isn't only a small/debug-dataset concern: at the scale this framework targets (potentially thousands of nodes), `data_par_size` can exceed a real dataset's file count too, not just a toy one. Only applies to `train.py` -- `val.py`/`test.py` always evaluate with it off, regardless of what the config says, since their whole point is a fixed, exact computation over the same files every time so results stay directly comparable across different amounts of training; reuse would make the aggregate loss/accuracy a distorted, weighted (not uniform) average instead.
+
+- `bucket_shuffle_seed`: Int or `null`, default `42`. Imagenet only.
+Imagenet's images are divided into `data_par_size`-many buckets (one per DDP-rank group), and arrive sorted class-by-class before that division happens -- without shuffling first, each bucket (and therefore each rank) ends up with a narrow, contiguous range of classes rather than a representative cross-section, which can skew BatchNorm statistics and correlate gradients within a rank's own step sequence. This seeds a deterministic shuffle applied before bucketing (same seed always gives the same shuffle, independent of `data_par_size`/checkpoint restarts, same as everything else about the train/val/test split) so each bucket gets a representative mix of classes instead. Set to `null` in the config to opt out and keep the original contiguous ordering.
+
 - `dataset`: String. 
 -Variable for telling dataloader how to handle data and how to break up root directories into files within source code (Each dataset potentially needs it's own code to do this depending on the data type and layout of files). See [Datset Integration](#dataset-integration)
 
@@ -966,13 +1005,18 @@ All of the currently existing architectures exist in 2 independent sub-folders, 
 The main building blocks for the VIT based archictectures are in the **Attention** and **Feed-forward** functions, provided in the Attention class and MLP class in `src/UCF_VIT/simple/building_blocks.py` and `src/UCF_VIT/fsdp/building_blocks.py`. We ask that you use these functions as is and do not modify them, as these common building blocks will be used across the different network architectures.
 
 ## Training Scripts
-We provide several example training scripts. These include all of the necessary things for running the main training loop, including utilities such as checkpoint loading and saving and mechanisms for launching across hardware for different systems. We leave it to the user to implement their own validation and testing routines in order to more closely fit their needs. Training scripts are provided for each of the training architectures for the simple mode. We also have several scripts to train architectures in the fdsp mode. To convert the simple scripts to use fsdp mode, implement the code changes that were done for, e.g. `training_scripts/train_masked_simple.py` to `training_scripts/train_masked_fsdp.py`. 
+We provide several example training scripts. These include all of the necessary things for running the main training loop, including utilities such as checkpoint loading and saving and mechanisms for launching across hardware for different systems. Training scripts are provided for each of the training architectures for the simple mode. We also have several scripts to train architectures in the fdsp mode. To convert the simple scripts to use fsdp mode, implement the code changes that were done for, e.g. `training_scripts/train_masked_simple.py` to `training_scripts/train_masked_fsdp.py`. 
+
+Alongside `training_scripts/train.py`, we also provide `training_scripts/val.py` and `training_scripts/test.py` -- forward-only counterparts that evaluate an already-trained checkpoint against a validation/test split (no backward pass, no optimizer/scheduler, `model.eval()` + `torch.no_grad()` throughout). Both take the *same* config file as the training run being evaluated (same `checkpoint_path`/`checkpoint_filename`) -- just invoked as `python val.py [CONFIG_FILE]`/`python test.py [CONFIG_FILE]` instead of `train.py`. Which data they evaluate against is controlled by `dict_val_root_dirs`/`dict_test_root_dirs` (and the `val_split_ratio`/`test_split_ratio` auto-split fallback) in the [Dataloader](#dataloader) config section -- see that section's own parameter descriptions for the full train/val/test split behavior.
 
 The training scripts have the capability to launch in different modes for compatibility with different systems. Each training script takes two arguments the first is the config file containing all the different parameters for the particular run and an argument for specifying the specific launching mechanism used to work across the hardware on the system. Currently we provide two launch modes: MPI and SLURM. 
 
 For a local DGX system specify `MPI` as the LAUNCHER, then we use the `mpi4py` library to instantiate an MPI communicator and launch jobs via `mpirun -n [NUM_GPUS] -u python [TRAINING_SCRIPT] [CONFIG_FILE] MPI' spawning enough tasks to correspond to the number of GPUs to be used. In this case each task will have it's own GPU for computing. In the case where a single GPU was to be used for training the mpirun can be omitted and a simple invocation of `python [TRAINING_SCRIPT] [CONFIG_FILE] MPI` can be used (be aware to set the device to be used via `CUDA_VISIBLE_DEVICES` environment variable).
 
 For systems that use resource schedulers to use multiple nodes acrossed a system, such as DGX Clusters or Frontier, specify `SLURM` as the launcher. In this case, SLURM environment variables are used to set up the distributed training across the resources. See some of the various examples in the `launch/` folder to see how this is done. Again in this case we assume that there this is one task per every GPU utilized for computing.
+
+### Writing your own script
+Config files store paths like `trainer.checkpoint_path`/`inference_output.output_dir` as relative paths (e.g. `"checkpoint/basic_ct/unetr/base"`), meant to be relative to the repo root -- not to wherever a launch script happens to invoke `python` from, and not to wherever `sbatch`/`python` was actually run from either. `parse_config` (`src/UCF_VIT/parse.py`) resolves both of these itself, joining them against `UCF_VIT.utils.misc.find_repo_root()` (computed from that helper's own fixed location in the package, not from the calling script's location, so it gives the right answer regardless of where a script lives or how deep it's nested) -- by the time your script sees `conf["trainer"]["checkpoint_path"]`, it's already an absolute path. If you write your own script around `parse_config`, you get this for free; you don't need to do anything extra, and the process's own working directory is never touched (so relative paths for anything *else* your script does -- reading a local file, writing a log -- still resolve exactly the way you'd expect, relative to wherever you actually ran it from).
 
 
 ## Config Files
@@ -988,7 +1032,7 @@ We store the arguments for each individual run in a yaml file. This config file 
 
 2. Parallelism (only used in fsdp mode and load balancing script)
 - fsdp_size: Number of Fully Sharded Data Parallel ranks to use, for sharding model states
-- simple_ddp_size: Number of Data Parallel ranks to use, for distributing different data to ranks
+- simple_ddp_size: Number of Data Parallel ranks to use, for distributing different data to ranks. Set to the literal string `"auto"` to derive this from however many ranks the current launch actually has instead of a fixed number -- `simple_ddp_size = world_size / (fsdp_size * tensor_par_size)`. Useful since fsdp_size/tensor_par_size are usually architecture choices that stay fixed while the node count a given launch uses varies (e.g. a training run using more nodes than the val.py/test.py run evaluating its checkpoints) -- the same config then works unmodified either way instead of needing simple_ddp_size hand-edited to match every time. Requires world_size to be evenly divisible by `fsdp_size * tensor_par_size`, and a live distributed process group (not available to `utils/load_balance.py`'s offline precompute step -- use an explicit integer there).
 - tensor_par_size: Number of Tensor Parallel ranks to use, for distributing tensor across multiple ranks
 - seq_par_size: Number of Sequence Parallel ranks to use, for distributing input sequence across multiple ranks (NOT IMPLEMENTED YET)
 
@@ -1028,6 +1072,12 @@ We store the arguments for each individual run in a yaml file. This config file 
 - [MODEL] is the type of model you want to use chose from those in [Model Architectures](#Model-Architectures)
 - [MODE] is the training mode you want to use. There are two options (simple and fsdp). See [Parallelism Modes](#Parallelism-Modes) for a more detailed description
 - [OPTIONAL] is an optional keyword for launch scripts using the apptainer method for installing containers on Frontier or the docker method for installing containers for running on DGX machines
+
+9. Evaluate a checkpoint with `training_scripts/val.py`/`test.py`
+- Unlike the training launch scripts above, `launch/eval/val.sh` and `launch/eval/test.sh` are generic across every dataset/model -- pass the config path as an argument instead of hardcoding it per-launch-script. They live one directory down (`launch/eval/`), matching the training launch scripts' own depth (`launch/[DATASET]/`), so the config path argument uses the same `../../` convention either way:
+  - `cd launch/eval && sbatch val.sh ../../configs/basic_ct/unetr/base_config.yaml`
+  - `cd launch/eval && sbatch test.sh ../../configs/basic_ct/unetr/base_config.yaml`
+- Use the same config as the training run being evaluated (same `checkpoint_path`/`checkpoint_filename`) -- `val.py`/`test.py` force `trainer.resume_from_checkpoint: True` in code regardless of what the config says.
 
 
 ## Datasets

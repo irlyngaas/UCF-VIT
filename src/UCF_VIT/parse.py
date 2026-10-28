@@ -1,0 +1,1486 @@
+import yaml
+import os
+import sys
+import math
+import numpy as np
+import torch.distributed as dist
+from UCF_VIT.utils.misc import detect_img_size, detect_num_channels, is_power_of_two, find_repo_root
+
+def _normalize_sst_variable_entry(entry):
+    """Normalizes one `dict_in_variables`/`dict_out_variables` entry for "sst".
+
+    A plain string (e.g. "r") means offset 0 -- no real timestepping,
+    identical to every "sst" config shipped before time-stepping existed.
+    A 2-element list (YAML's native pair syntax, e.g. `["p", -2]`) is a
+    `(variable, offset)` pair: `UCF_VIT.dataloaders.dataset.FileReader.
+    read_process_file` reads that variable at whatever real timestamp
+    resolves to that offset -- see `UCF_VIT.utils.misc.process_root_dirs`'s
+    own docstring. Returned as a real tuple (not left as a list) since
+    `read_process_file`'s own `isinstance(entry, tuple)` dispatch is what
+    tells it "this entry carries an explicit offset".
+    """
+    if isinstance(entry, (list, tuple)):
+        var, offset = entry
+        return (var, int(offset))
+    return entry
+
+def get_kwargs(model_type, conf):
+    """Build the architecture-specific keyword arguments for a given model type.
+
+    Reads the model-type-specific settings out of the parsed config dict (e.g.
+    `num_classes` for VIT, `mask_ratio`/decoder settings for MAE, `feature_size` for
+    UNETR, `num_time_steps`/decoder settings for DiffusionVIT), applying defaults and
+    exiting with an error message when a required setting is missing.
+
+    Args:
+        model_type: Model architecture type. One of "VIT", "SAP", "MAE", "UNETR",
+            "DiffusionVIT".
+        conf: Raw config dict loaded from the training YAML file.
+
+    Returns:
+        A dict of keyword arguments to be passed to the model architecture's
+        constructor (via `**kwargs`), specific to `model_type`.
+    """
+    kwargs = {}
+    #TODO: Add checking on each argument, e.g. > 0
+    if model_type == "VIT":
+        try:
+            num_classes = conf['model']['num_classes']
+        except KeyError:
+            #TODO: If not specified, get num_classes based on dataset used
+            sys.exit("num_classes is required")
+        kwargs.update({"num_classes": num_classes})
+
+    elif model_type == "SAP":
+        try:
+            num_classes = conf['model']['num_classes']
+        except KeyError:
+            #TODO: If not specified, get num_classes based on dataset used
+            sys.exit("num_classes is required")
+        kwargs.update({"num_classes": num_classes})
+
+        assert conf["ap"]["do_ap"], "SAP requires adaptive patching to be turned on"
+
+    elif model_type == "MAE":
+        try:
+            mask_ratio = conf["model"]["mask_ratio"]
+        except KeyError:
+            sys.exit("mask_ratio is required")
+        kwargs.update({"mask_ratio": mask_ratio})
+
+
+        try:
+            linear_decoder = conf["model"]["linear_decoder"]
+        except KeyError:
+            if dist.get_rank() == 0:
+                print("linear_decoder is not set, by default this is set to False")
+            linear_decoder = False
+        kwargs.update({"linear_decoder": linear_decoder})
+
+        if not linear_decoder:
+            try:
+                decoder_depth = conf['model']['decoder_depth']
+            except KeyError:
+                sys.exit("decoder_depth is required")
+            kwargs.update({"decoder_depth": decoder_depth})
+
+            try:
+                decoder_embed_dim = conf['model']['decoder_embed_dim']
+            except KeyError:
+                sys.exit("decoder_embed_dim is required")
+            kwargs.update({"decoder_embed_dim": decoder_embed_dim})
+
+            try:
+                decoder_num_heads = conf['model']['decoder_num_heads']
+            except KeyError:
+                sys.exit("decoder_num_heads is required")
+            kwargs.update({"decoder_num_heads": decoder_num_heads})
+
+            try:
+                decoder_mlp_ratio = conf['model']['decoder_mlp_ratio']
+            except KeyError:
+                if dist.get_rank() == 0:
+                    print("decoder_mlp_ratio not set, by default setting to mlp_ratio")
+                decoder_mlp_ratio = mlp_ratio
+            kwargs.update({"decoder_mlp_ratio": decoder_mlp_ratio})
+
+        else:
+            kwargs.update({"decoder_embed_dim": None})
+            kwargs.update({"decoder_depth": None})
+            kwargs.update({"decoder_num_heads": None})
+            kwargs.update({"decoder_mlp_ratio": None})
+
+    elif model_type == "UNETR":
+        try:
+            num_classes = conf['model']['num_classes']
+        except KeyError:
+            #TODO: If not specified, get num_classes based on dataset used
+            sys.exit("num_classes is required")
+        kwargs.update({"num_classes": num_classes})
+
+        try:
+            linear_decoder = conf["model"]["linear_decoder"]
+        except KeyError:
+            if dist.get_rank() == 0:
+                print("linear_decoder is not set, by default this is set to False")
+            linear_decoder = False
+        kwargs.update({"linear_decoder": linear_decoder})
+
+        try:
+            skip_connection = conf["model"]["skip_connection"]
+        except KeyError:
+            if dist.get_rank() == 0:
+                print("skip_connection is not set, by default this is set to True")
+            linear_decoder = True
+        kwargs.update({"linear_decoder": linear_decoder})
+
+        try:
+            feature_size = conf['model']['feature_size']
+        except KeyError:
+            sys.exit("feature_size is required")
+        kwargs.update({"feature_size": feature_size})
+
+        if conf["ap"]["do_ap"]:
+            try:
+                token_selection = conf["model"]["token_selection"]
+            except KeyError:
+                token_selection = "point"
+            assert token_selection in ("point", "smallest_overlap", "area_weighted", "cross_attention"), f"Unknown token_selection {token_selection!r}"
+            kwargs.update({"token_selection": token_selection})
+
+            try:
+                area_weighted_alpha = conf["model"]["area_weighted_alpha"]
+            except KeyError:
+                area_weighted_alpha = 0.0
+            kwargs.update({"area_weighted_alpha": area_weighted_alpha})
+
+            # decoder_grid_size (the decoder's reconstructed-canvas side
+            # length) is independent of fixed_length -- proj_feat's
+            # reconstruction is real geometric overlap, not a reshape, so
+            # decoder_grid_size**ndims need not equal (or be any root of)
+            # fixed_length at all. Optional: model.decoder_grid_size in the
+            # config explicitly sets it (e.g. to grow the decoder's canvas
+            # resolution -- cheap, since it's just conv work -- without also
+            # growing fixed_length, which would grow the encoder's attention
+            # cost). Defaults to the previous auto-derived heuristic
+            # (sqrt/cbrt of fixed_length) when omitted, so existing configs
+            # are unaffected.
+            try:
+                decoder_grid_size = conf["model"]["decoder_grid_size"]
+            except KeyError:
+                if conf["data"]["twoD"]:
+                    decoder_grid_size = int(math.sqrt(conf["ap"]["fixed_length"]))
+                else:
+                    decoder_grid_size = int(np.rint(math.pow(conf["ap"]["fixed_length"],1/3)))
+            token_capacity = decoder_grid_size**2 if conf["data"]["twoD"] else decoder_grid_size**3
+            # "area_weighted"/"cross_attention" both let every token overlapping
+            # a cell contribute (proportionally by area, or via a learned
+            # attention weight) rather than picking one winner -- every real
+            # token is guaranteed nonzero weight in some cell (leaves and cells
+            # both fully partition the domain), so neither can ever drop a
+            # token to zero contribution the way "point"/"smallest_overlap" can,
+            # and isn't subject to that specific warning below.
+            if token_capacity < conf["ap"]["fixed_length"]:
+                if token_selection not in ("area_weighted", "cross_attention"):
+                    if dist.get_rank() == 0:
+                        print(f"Warning: UNETR's decoder bottleneck (decoder_grid_size={decoder_grid_size}, {token_capacity} cells) is smaller than fixed_length ({conf['ap']['fixed_length']}) -- at least {conf['ap']['fixed_length'] - token_capacity} adaptive-patch tokens per sample will never reach the reconstructed feature map.")
+                else:
+                    # No token is ever fully excluded here, but fewer cells
+                    # than tokens still means real information loss of a
+                    # different kind: cells get blended/diluted from
+                    # multiple real tokens instead of representing one real
+                    # token distinctly -- this ratio is the average, not a
+                    # per-cell guarantee (canny-style scoring concentrates
+                    # many small tokens unevenly, so some cells blend far
+                    # more than this average suggests).
+                    if dist.get_rank() == 0:
+                        print(f"Warning: UNETR's decoder bottleneck (decoder_grid_size={decoder_grid_size}, {token_capacity} cells) is smaller than fixed_length ({conf['ap']['fixed_length']}) -- no token_selection=={token_selection!r} token is ever fully dropped, but cells will blend ~{conf['ap']['fixed_length'] / token_capacity:.2f} tokens each on average (unevenly, since adaptive patching concentrates small tokens in detail-dense regions), diluting exactly the detail adaptive patching was meant to preserve.")
+            kwargs.update({"decoder_grid_size": decoder_grid_size})
+        else:
+            kwargs.update({"decoder_grid_size": None})
+
+    elif model_type == "DiffusionVIT":
+        assert not conf["ap"]["do_ap"], "Adaptive patching is not implemented for Diffusion yet"            
+
+        try:
+            num_time_steps = conf['model']['num_time_steps']
+        except KeyError:
+            sys.exit("num_time_steps is required")
+        kwargs.update({"num_time_steps": num_time_steps})
+
+        try:
+            linear_decoder = conf["model"]["linear_decoder"]
+        except KeyError:
+            if dist.get_rank() == 0:
+                print("linear_decoder is not set, by default this is set to False")
+            linear_decoder = False
+        kwargs.update({"linear_decoder": linear_decoder})
+
+        if not linear_decoder:
+            try:
+                decoder_depth = conf['model']['decoder_depth']
+            except KeyError:
+                sys.exit("decoder_depth is required")
+            kwargs.update({"decoder_depth": decoder_depth})
+
+            try:
+                decoder_embed_dim = conf['model']['decoder_embed_dim']
+            except KeyError:
+                sys.exit("decoder_embed_dim is required")
+            kwargs.update({"decoder_embed_dim": decoder_embed_dim})
+
+            try:
+                decoder_num_heads = conf['model']['decoder_num_heads']
+            except KeyError:
+                sys.exit("decoder_num_heads is required")
+            kwargs.update({"decoder_num_heads": decoder_num_heads})
+
+            try:
+                decoder_mlp_ratio = conf['model']['decoder_mlp_ratio']
+            except KeyError:
+                if dist.get_rank() == 0:
+                    print("decoder_mlp_ratio not set, by default setting to mlp_ratio")
+                decoder_mlp_ratio = mlp_ratio
+            kwargs.update({"decoder_mlp_ratio": decoder_mlp_ratio})
+
+        else:
+            kwargs.update({"decoder_embed_dim": None})
+            kwargs.update({"decoder_depth": None})
+            kwargs.update({"decoder_num_heads": None})
+            kwargs.update({"decoder_mlp_ratio": None})
+    
+
+    return kwargs
+
+
+def _resolve_dataset_splits(dict_root_dirs, dict_start_idx, dict_end_idx,
+                             dict_val_root_dirs, dict_val_start_idx, dict_val_end_idx,
+                             dict_test_root_dirs, dict_test_start_idx, dict_test_end_idx,
+                             val_split_ratio, test_split_ratio):
+    """Resolves per-dataset-key train/val/test root dirs and start/end idx ratios.
+
+    For each dataset key in `dict_root_dirs`: if a separate `dict_val_root_dirs`/
+    `dict_test_root_dirs` entry exists for that key, val/test use that directory
+    with their own start/end idx (defaulting to the full [0.0, 1.0) range) and
+    train's own [dict_start_idx, dict_end_idx) window for that key is left
+    untouched. Otherwise, val/test reuse `dict_root_dirs`'s *same* directory for
+    that key, auto-splitting three contiguous, non-overlapping sub-ranges out of
+    train's own already-configured [dict_start_idx, dict_end_idx) window (not
+    assumed to be [0, 1) -- respects any existing narrowing): train keeps the
+    first `1 - val_split_ratio - test_split_ratio` portion, val the next
+    `val_split_ratio` portion, test the last `test_split_ratio` portion -- and
+    train's own start/end idx for that key is narrowed in place to reflect its
+    reduced share.
+
+    A ratio of 0.0 (with no separate root given) means that split has no data
+    for that key at all -- it's simply omitted from the returned val/test dicts,
+    rather than given a degenerate zero-width range.
+
+    Args:
+        dict_root_dirs: Training dataset-key -> root directory dict.
+        dict_start_idx: Training dataset-key -> start ratio dict (0.0-1.0).
+        dict_end_idx: Training dataset-key -> end ratio dict (0.0-1.0).
+        dict_val_root_dirs: Optional dataset-key -> val root directory dict --
+            keys present here get a real, separate val split, not auto-split.
+        dict_val_start_idx: Optional dataset-key -> val start ratio dict, only
+            meaningful for keys in `dict_val_root_dirs` (defaults to 0.0).
+        dict_val_end_idx: Optional dataset-key -> val end ratio dict, only
+            meaningful for keys in `dict_val_root_dirs` (defaults to 1.0).
+        dict_test_root_dirs: Same as `dict_val_root_dirs`, for test.
+        dict_test_start_idx: Same as `dict_val_start_idx`, for test.
+        dict_test_end_idx: Same as `dict_val_end_idx`, for test.
+        val_split_ratio: Fraction of each auto-split key's train window to
+            reserve for val (e.g. 0.1). Ignored for keys with a separate
+            `dict_val_root_dirs` entry.
+        test_split_ratio: Same as `val_split_ratio`, for test.
+
+    Returns:
+        An 8-tuple `(train_start_idx, train_end_idx, val_root_dirs,
+        val_start_idx, val_end_idx, test_root_dirs, test_start_idx,
+        test_end_idx)` of dataset-key -> value dicts.
+    """
+    train_start_idx = {}
+    train_end_idx = {}
+    val_root_dirs = {}
+    val_start_idx = {}
+    val_end_idx = {}
+    test_root_dirs = {}
+    test_start_idx = {}
+    test_end_idx = {}
+
+    for k in dict_root_dirs:
+        this_train_start = dict_start_idx.get(k, 0.0)
+        this_train_end = dict_end_idx.get(k, 1.0)
+        window = this_train_end - this_train_start
+
+        has_val_root = k in dict_val_root_dirs
+        has_test_root = k in dict_test_root_dirs
+
+        if has_val_root:
+            val_root_dirs[k] = dict_val_root_dirs[k]
+            val_start_idx[k] = dict_val_start_idx.get(k, 0.0)
+            val_end_idx[k] = dict_val_end_idx.get(k, 1.0)
+        if has_test_root:
+            test_root_dirs[k] = dict_test_root_dirs[k]
+            test_start_idx[k] = dict_test_start_idx.get(k, 0.0)
+            test_end_idx[k] = dict_test_end_idx.get(k, 1.0)
+
+        reserve_val = 0.0 if has_val_root else val_split_ratio
+        reserve_test = 0.0 if has_test_root else test_split_ratio
+        assert reserve_val >= 0.0 and reserve_test >= 0.0 and (reserve_val + reserve_test) < 1.0, (
+            f"val_split_ratio + test_split_ratio must be < 1.0 for dataset '{k}' "
+            f"(got {reserve_val} + {reserve_test})"
+        )
+
+        new_train_end = this_train_start + window * (1.0 - reserve_val - reserve_test)
+
+        if not has_val_root and reserve_val > 0.0:
+            val_root_dirs[k] = dict_root_dirs[k]
+            val_start_idx[k] = new_train_end
+            val_end_idx[k] = new_train_end + window * reserve_val
+        if not has_test_root and reserve_test > 0.0:
+            test_root_dirs[k] = dict_root_dirs[k]
+            test_start_idx[k] = new_train_end + window * reserve_val
+            test_end_idx[k] = this_train_end
+
+        train_start_idx[k] = this_train_start
+        train_end_idx[k] = new_train_end
+
+    return (train_start_idx, train_end_idx, val_root_dirs, val_start_idx, val_end_idx,
+            test_root_dirs, test_start_idx, test_end_idx)
+
+
+def get_split_conf(conf, split):
+    """Returns a shallow-copied `conf` pointed at the resolved val or test split.
+
+    Swaps `data["dict_root_dirs"]` and `dataloader["dict_start_idx"]`/
+    `["dict_end_idx"]` for the resolved `dict_val_root_dirs`/`dict_test_root_dirs`
+    (etc., see `parse_config`'s own DATA section, which calls
+    `_resolve_dataset_splits`) -- everything else in `conf` (num_channels,
+    dict_in_variables, img_size, tile_size, model kwargs, trainer settings,
+    etc.) passes through unchanged, since those describe the dataset/model, not
+    which split of it this is. The result feeds into
+    `calculate_load_balancing_on_the_fly`/`NativePytorchDataModule` exactly like
+    `conf` itself, completely unchanged -- val/test scripts just call those with
+    this instead of `conf`.
+
+    Args:
+        conf: Parsed training configuration dict, as returned by `parse_config`.
+        split: "val" or "test".
+
+    Returns:
+        A new conf dict (shallow copy of `conf`, `conf["data"]`, and
+        `conf["dataloader"]`) with `dict_root_dirs`/`dict_start_idx`/
+        `dict_end_idx` pointed at the requested split.
+
+    Raises:
+        AssertionError: If `split` isn't "val"/"test", or if that split
+            resolved to no data at all for every dataset key (no separate
+            root given and its split ratio is 0.0 for every key).
+    """
+    assert split in ("val", "test"), "split must be 'val' or 'test'"
+    root_dirs = conf["data"][f"dict_{split}_root_dirs"]
+    start_idx = conf["dataloader"][f"dict_{split}_start_idx"]
+    end_idx = conf["dataloader"][f"dict_{split}_end_idx"]
+    assert root_dirs, (
+        f"No {split} data available -- dict_{split}_root_dirs resolved empty. "
+        f"Either set data.dict_{split}_root_dirs in the config, or make sure "
+        f"dataloader.{split}_split_ratio is > 0 for at least one dataset key."
+    )
+
+    split_conf = dict(conf)
+    split_conf["data"] = dict(conf["data"])
+    split_conf["data"]["dict_root_dirs"] = root_dirs
+    split_conf["dataloader"] = dict(conf["dataloader"])
+    split_conf["dataloader"]["dict_start_idx"] = start_idx
+    split_conf["dataloader"]["dict_end_idx"] = end_idx
+    return split_conf
+
+
+def parse_config(args, load_balance_offline=False):
+    """Load and validate a training configuration YAML file into a structured dict.
+
+    Reads the YAML file at `args.config`, applies defaults for optional settings,
+    validates required settings and cross-field consistency (e.g. parallelism sizes
+    against world size, tile size divisibility by patch size, adaptive-patching
+    fixed-length constraints), and exits with an error message via `sys.exit` when a
+    required setting is missing or invalid.
+
+    Args:
+        args: Parsed command-line arguments; must have a `config` attribute giving
+            the path to the training config YAML file.
+        load_balance_offline: If True, skip checks that require a live distributed
+            process group (e.g. matching parallelism sizes to `dist.get_world_size()`),
+            for use when computing load balancing outside of a training run.
+
+    Returns:
+        A dict with keys "trainer", "parallelism", "optimizer", "scheduler",
+        "grad_scaler", "model", "tiling", "ap", "data", "dataloader", and
+        "dataset_options", each holding the validated configuration for that section.
+    """
+
+    with open(args.config,'r') as f:
+        conf = yaml.load(f,Loader=yaml.FullLoader)
+
+# ---------------------------- TRAINER -------------------------------------------
+    try:
+        save_frequency = conf['trainer']['save_frequency']
+    except KeyError:
+        if dist.get_rank() == 0:
+            print("Since no save_frequency was given in the config file, defaulting to saving every epoch")
+        save_frequency = 1
+
+    resume_from_checkpoint = conf['trainer']['resume_from_checkpoint']
+
+    # resume_from_checkpoint continues an existing run from its own checkpoint
+    # (optimizer/scheduler state, loss history, epoch included); use_pretrained_model
+    # starts a new run whose encoder is initialized from a *different* model's
+    # weights -- the two are mutually exclusive, rejected explicitly if both are
+    # True. .get (not a bare index) because use_pretrained_model is allowed to
+    # be omitted entirely when resume_from_checkpoint:True (trainer_conf's own
+    # ternary below never evaluates it in that case either).
+    if resume_from_checkpoint and conf['trainer'].get('use_pretrained_model', False):
+        sys.exit("trainer.resume_from_checkpoint and trainer.use_pretrained_model cannot both be True -- resume_from_checkpoint continues an existing training run from its own checkpoint, use_pretrained_model starts a new run initialized from a different model's weights. Set only one of them to True.")
+
+    # reset_scheduler_on_resume: for continuing a run past its original
+    # trainer.max_epochs (bump max_epochs to a larger value and keep training,
+    # under a fresh schedule sized to the new budget, instead of the checkpointed
+    # schedule -- already mostly decayed toward eta_min -- picking back up where
+    # it left off). Only meaningful alongside resume_from_checkpoint:True; .get
+    # (not a bare index) so every existing config that's never heard of this
+    # field keeps parsing exactly as before.
+    reset_scheduler_on_resume = conf['trainer'].get('reset_scheduler_on_resume', False)
+    if reset_scheduler_on_resume and not resume_from_checkpoint:
+        sys.exit("trainer.reset_scheduler_on_resume:True requires trainer.resume_from_checkpoint:True -- there's no checkpointed schedule to reset when not resuming from one.")
+
+    try:
+        optimizer_type = conf["optimizer"]["type"]
+        assert optimizer_type.lower() in ['sgd', 'adam', 'adamw'], "Optimizer type not supported. Choose optimizer type from the following choices: sgd, adam, adamw"
+    except KeyError:
+        if dist.get_rank() == 0:
+            print("Since no optimizer_type was given in the config file, defaulting to using SGD ")
+        optimizer_type = "sgd"
+
+    try:
+        scheduler_type = conf["scheduler"]["type"]
+        assert scheduler_type in ['constant', 'linear', 'exponential', 'linear-warmup-cosine-annealing', 'reduce-lr-on-plateau'], "Scheduler type not supported. Choose scheduler type from the following choices: constant, linear, exponential, linear-warmup-cosine-annealing, reduce-lr-on-plateau"
+    except KeyError:
+        if dist.get_rank() == 0:
+            print("Since no scheduler_type was given in the config file, defaulting to using linear")
+        scheduler_type = "linear"
+
+    trainer_conf = {
+        "max_epochs": conf['trainer']['max_epochs'],
+        "data_type": conf['trainer']['data_type'],
+        "gpu_type": conf['trainer']['gpu_type'],
+        # Config files write this relative to the repo root (e.g.
+        # "checkpoint/basic_ct/unetr/base"), not to wherever a launch script
+        # happens to invoke python from -- os.path.join with find_repo_root()
+        # makes that true regardless of the process's own current working
+        # directory. A no-op if checkpoint_path is already absolute (os.path.join
+        # discards the first argument whenever the second is itself absolute).
+        "checkpoint_path": os.path.join(find_repo_root(), conf['trainer']['checkpoint_path']),
+        "checkpoint_filename": conf['trainer']['checkpoint_filename'],
+        "resume_from_checkpoint": resume_from_checkpoint,
+        "reset_scheduler_on_resume": reset_scheduler_on_resume,
+        "use_pretrained_model": conf['trainer']['use_pretrained_model'] if not resume_from_checkpoint else False,
+        "pretrained_checkpoint_filename": conf['trainer'].get('pretrained_checkpoint_filename', ""),
+        "save_frequency": save_frequency,
+        "optimizer_type": optimizer_type,
+        "scheduler_type": scheduler_type,
+        # Diagnostic only, off by default -- see UCF_VIT.training.train_epoch's
+        # own profile_dataloader handling. When True, times how much of each
+        # batch's wall clock is spent waiting on the dataloader (process_batch,
+        # including any real per-sample decode cost like adaptive patching's
+        # Canny edge detection/octree build), in the forward pass, and in the
+        # backward pass, to answer "is the dataloader (or the forward/backward
+        # pass) the bottleneck" directly instead of by inference from overall
+        # throughput. Adds a torch.cuda.synchronize() at each timing boundary,
+        # which is real (if modest) overhead not present otherwise -- not
+        # meant to be left on for a real training run, just to A/B compare
+        # configs.
+        "profile_dataloader": conf['trainer'].get('profile_dataloader', False),
+    }
+
+
+# ---------------------------- PARALLELISM ---------------------------------------
+
+    #TODO: Add checking on each argument, e.g. > 0
+    fsdp_size = conf['parallelism']['fsdp_size']
+    tensor_par_size = conf['parallelism']['tensor_par_size']
+    simple_ddp_size = conf['parallelism']['simple_ddp_size']
+    # "auto": fsdp_size/tensor_par_size are architecture choices, generally fixed
+    # regardless of how many nodes a given launch happens to use; simple_ddp_size
+    # is what's left over to fill the rest of world_size with data-parallel
+    # replicas. Opt in with the literal string "auto" so the same config works
+    # unmodified across different node counts instead of needing simple_ddp_size
+    # hand-edited to match every time. Requires a live process group to read
+    # world_size from -- gated on dist.is_initialized() itself (not
+    # load_balance_offline, which just skips the *consistency* assert below and
+    # is also set by callers, like validate_config.py, that do have a live
+    # single-process group). utils/load_balance.py's offline precompute is the
+    # real no-group case -- set an explicit integer there instead.
+    if simple_ddp_size == "auto":
+        assert dist.is_initialized(), "parallelism.simple_ddp_size: \"auto\" requires a live distributed process group to read world_size from, and none is initialized here -- set an explicit integer instead (e.g. for utils/load_balance.py's offline precompute step)."
+        world_size = dist.get_world_size()
+        denom = fsdp_size * tensor_par_size
+        assert world_size % denom == 0, f"parallelism.simple_ddp_size: \"auto\" requires world_size ({world_size}) to be evenly divisible by fsdp_size * tensor_par_size ({denom})"
+        simple_ddp_size = world_size // denom
+    data_par_size = fsdp_size * simple_ddp_size
+    if not load_balance_offline:
+        assert (data_par_size * tensor_par_size) == dist.get_world_size(), "DATA_PAR_SIZE * TENSOR_PAR_SIZE must equal world_size"
+
+
+    parallelism_conf = {
+        "fsdp_size": fsdp_size,
+        "simple_ddp_size": simple_ddp_size,
+        "data_par_size": data_par_size,
+        "tensor_par_size": tensor_par_size,
+    }
+
+    #Check that every tensor-parallel rank's checkpoint file exists, matching the
+    #"<checkpoint_filename>_rank_<N>.ckpt" naming save_checkpoint (training.py)
+    #actually writes and get_model (model/utils.py) actually reads -- not a bare
+    #"<checkpoint_filename>" file, which is never created.
+    if resume_from_checkpoint:
+        for rank in range(tensor_par_size):
+            checkpoint_file = trainer_conf["checkpoint_path"]+"/"+trainer_conf["checkpoint_filename"]+"_rank_"+str(rank)+".ckpt"
+            if not os.path.isfile(checkpoint_file):
+                sys.exit(f"Checkpoint file does not exist: {checkpoint_file}")
+
+# ---------------------------- OPTIMIZER -----------------------------------------
+    #TODO: Add checking on each argument, e.g. > 0
+    optimizer_conf = {
+        "lr": float(conf['optimizer']['lr']),
+        "betas": (float(conf['optimizer']['beta_1']), float(conf['optimizer']['beta_2'])),
+        "weight_decay": float(conf['optimizer']['weight_decay']),
+    }
+
+# ---------------------------- SCHEDULER -----------------------------------------
+    #TODO: Add checking on each argument, e.g. > 0
+    scheduler_conf = {
+        "warmup_epochs": conf['scheduler']['warmup_epochs'],
+        "warmup_start_lr": float(conf['scheduler']['warmup_start_lr']),
+        "eta_min": float(conf['scheduler']['eta_min']),
+        "max_epochs": trainer_conf['max_epochs'],
+    }
+
+# ---------------------------- GRAD SCALER ---------------------------------------
+    try:
+        use_grad_scaler = conf["grad_scaler"]["use_grad_scaler"]
+        grad_scaler_conf = {
+            "use_grad_scaler": use_grad_scaler,
+            "init_scale": conf["grad_scaler"]["init_scale"] if use_grad_scaler else None,
+            "min_scale": conf["grad_scaler"]["min_scale"] if use_grad_scaler else None,
+            "growth_interval": conf["grad_scaler"]["growth_interval"] if use_grad_scaler else None,
+            }
+    except KeyError:
+        if dist.get_rank() == 0:
+            print("Since no grad_scaler_conf was given in the config file, defaulting to not using a grad_scaler ")
+        grad_scaler_conf = {"use_grad_scaler": False, "init_scale": None, "min_scale": None, "growth_interval": None}
+
+# ---------------------------- MODEL ---------------------------------------------
+    model_type = conf['model']['type']
+
+    assert model_type in ['VIT', 'SAP', 'MAE', 'UNETR', 'DiffusionVIT'], "Model architecture type not supported. Choose a model architecture from the following choices: VIT, SAP, MAE, UNETR, DiffusionVIT"
+
+
+    #Check Arguments that are required across all different architectures, the same transformer encoder is acrossed all.
+    #TODO: Add checking on each argument, e.g. > 0
+    try:
+        embed_dim = conf['model']['embed_dim']
+    except KeyError:
+        sys.exit("embed_dim is required")
+
+    try:
+        depth = conf['model']['depth']
+    except KeyError:
+        sys.exit("depth is required")
+
+    try:
+        num_heads = conf['model']['num_heads']
+    except KeyError:
+        sys.exit("num_heads is required")
+
+    try:
+        mlp_ratio = conf['model']['mlp_ratio']
+    except KeyError:
+        sys.exit("mlp_ratio is required")
+
+    try:
+        drop_path = conf['model']['drop_path']
+    except KeyError:
+        sys.exit("drop_path is required")
+
+    try:
+        drop_rate = conf['model']['drop_rate']
+    except KeyError:
+        sys.exit("drop_rate is required")
+
+    try:
+        use_channel_aggregation = conf['model']['use_channel_aggregation']
+    except KeyError:
+        if dist.get_rank() == 0:
+            print("use_channel_aggregation is not set, by default this is set to False")
+        use_channel_aggregation = False
+
+    try:
+        loss_fn = conf["model"]["loss_fn"]
+    except KeyError:
+        if not load_balance_offline:
+            if dist.get_rank() == 0:
+                print("loss_fn is not set, by default this is set to the default loss for your model")
+        if model_type == "MAE":
+            loss_fn = "MSE"
+        else:
+            loss_fn = None
+    
+    #Set model specific arguments via a model_kwarg config
+    kwargs = get_kwargs(model_type, conf)
+
+    model_conf = {
+        "type": model_type,
+        "embed_dim": embed_dim,
+        "depth": depth,
+        "num_heads": num_heads,
+        "mlp_ratio": mlp_ratio,
+        "drop_path": drop_path,
+        "drop_rate": drop_rate,
+        "use_channel_aggregation": use_channel_aggregation,
+        "loss_fn": loss_fn,
+        "kwargs": kwargs,
+    }
+
+
+# ---------------------------- TILING ------------------------------------------
+    #TODO: Add checking on each argument, e.g. > 0
+    try:
+        do_tiling = conf["tiling"]["do_tiling"]
+        tiling_conf = {
+            "do_tiling": do_tiling,
+            "div": conf["tiling"]["div"] if do_tiling else 1,
+            "tile_overlap": conf["tiling"]["tile_overlap"] if do_tiling else 0,
+        }
+    except KeyError:
+        if dist.get_rank() == 0:
+            print("Since no tiling_conf was given in the config file, this is defaulting to be ran without tiling")
+        tiling_conf = {"do_tiling": False, "div": 1, "tile_overlap": 0}
+        
+# ---------------------------- AP ------------------------------------------------
+    #TODO: Add checking on each argument, e.g. > 0
+    try:
+        do_ap = conf['ap']['do_ap']
+        # do_gpu_ap: adaptive patching runs on-device inside the model's own
+        # forward() (UCF_VIT.model.gpu_adaptive_patching.GPUPatchify2D, given
+        # the raw image) instead of in the dataloader (Patchify/Patchify_3D,
+        # already-patchified sequence). Requires do_ap (the model still needs
+        # to be *structured* for adaptive patching either way) -- see
+        # arch.py's own do_gpu_ap docstring entry for the full design.
+        do_gpu_ap = conf['ap'].get('do_gpu_ap', False) if do_ap else False
+        # score_fn: which measure decides where to concentrate patches --
+        # "canny" (edge density) or "variance" -- shared by both adaptive-
+        # patching paths (mirrors how ap.fixed_length/ap.interp_size
+        # already aren't path-specific), same as GPUPatchify2D.__init__'s
+        # own score_fn (do_gpu_ap:True) or Patchify/Patchify_3D's own
+        # score_fn (do_gpu_ap:False) actually consume. The *default* when
+        # unset is path-dependent for backward compatibility: each path has
+        # only ever behaved one specific way until now -- "canny" for the
+        # CPU path (every existing shipped do_ap:True config keeps behaving
+        # exactly as today), "variance" for the GPU path (unchanged from
+        # when do_gpu_ap was introduced). An explicit ap.score_fn always
+        # wins over that default, whichever path is active.
+        default_score_fn = "variance" if do_gpu_ap else "canny"
+        score_fn = conf['ap'].get('score_fn', default_score_fn) if do_ap else "variance"
+        # use_canny: shared by both adaptive-patching paths -- canny_sigma/
+        # canny_low_threshold/canny_high_threshold now control Patchify/
+        # Patchify_3D's own Canny scoring too (do_gpu_ap:False), not just
+        # GPUPatchify2D/3D's (do_gpu_ap:True) -- see Patchify/Patchify_3D's
+        # own canny_sigma/canny_low_threshold/canny_high_threshold docstring
+        # entries for exactly how each is consumed (a real sigma-squared-to-
+        # variance conversion for the SimpleITK-backed branches, direct
+        # pass-through everywhere else). canny_hysteresis_iters stays GPU-
+        # only below -- GPUPatchify2D/3D's own dilation-based hysteresis
+        # approximation has no CPU-side equivalent (SimpleITK/skimage do
+        # real hysteresis internally, no such knob to share).
+        use_canny = score_fn == 'canny'
+        use_gpu_canny = do_gpu_ap and use_canny
+        ap_conf = {
+            "do_ap": do_ap,
+            "fixed_length": conf['ap']['fixed_length'] if do_ap else None,
+            "separate_channels": conf['ap']['separate_channels'] if do_ap else False,
+            "use_adaptive_pos_emb": conf['ap']['use_adaptive_pos_emb'] if do_ap else False,
+            "do_gpu_ap": do_gpu_ap,
+            # min_size: smallest leaf/patch side length either adaptive-
+            # patching path will ever produce -- shared by the CPU
+            # (FixedQuadTree/FixedOctTree's own min_size, a floor on
+            # _build_tree's splitting) and GPU (GPUPatchify2D/3D's own
+            # min_size, the finest starting block size for run_merge_batch)
+            # paths, same "not path-specific" reasoning as fixed_length/
+            # score_fn above. Not called gpu_ap_min_size any more -- that
+            # name predates this being usable on the CPU side too.
+            "min_size": conf['ap'].get('min_size', 2) if do_ap else None,
+            "score_fn": score_fn,
+            # No baked-in numeric default here (unlike min_size above) --
+            # None (unset) must reach every real consumer (get_model's own
+            # "or 1.0"/"or 0.1"/etc for GPUPatchify2D/3D, Patchify/
+            # Patchify_3D's own None-means-"use my own sths/canny_low_
+            # threshold/canny_high_threshold default" resolution, each
+            # independently) so each path keeps its own already-existing,
+            # independently-tuned default when this isn't set explicitly --
+            # baking a shared default in here would silently retune every
+            # existing shipped do_ap:True config's CPU-side Canny sensitivity
+            # the first time this gate started covering do_gpu_ap:False too.
+            "canny_sigma": conf['ap'].get('canny_sigma') if use_canny else None,
+            "canny_low_threshold": conf['ap'].get('canny_low_threshold') if use_canny else None,
+            "canny_high_threshold": conf['ap'].get('canny_high_threshold') if use_canny else None,
+            "canny_hysteresis_iters": conf['ap'].get('canny_hysteresis_iters') if use_gpu_canny else None,
+        }
+    except KeyError:
+        if dist.get_rank() == 0:
+            print("Since no ap_conf was given in the config file, this is defaulting to be ran with standard patching")
+        ap_conf = {
+            "do_ap": False, "fixed_length": None, "separate_channels": False, "use_adaptive_pos_emb": False,
+            "do_gpu_ap": False, "min_size": None, "score_fn": "variance", "canny_sigma": None,
+            "canny_low_threshold": None, "canny_high_threshold": None, "canny_hysteresis_iters": None,
+        }
+
+    if ap_conf["do_ap"]:
+        if ap_conf["separate_channels"]:
+            assert not ap_conf["use_adaptive_pos_emb"], "Capability to use separate channels and adaptive pos_emb not implemented yet"
+
+        assert ap_conf["score_fn"] in ("variance", "canny"), f"ap.score_fn must be 'variance' or 'canny', got {ap_conf['score_fn']!r}"
+
+        if ap_conf["do_gpu_ap"]:
+            assert not ap_conf["separate_channels"], "do_gpu_ap (GPUPatchify2D) does not support separate_channels yet"
+            if ap_conf["score_fn"] == "canny":
+                # ap_conf's own canny_low_threshold/canny_high_threshold are
+                # None when unset (see above -- no baked-in default there,
+                # so a do_gpu_ap:False config's Patchify/Patchify_3D can
+                # keep their own defaults instead of silently inheriting
+                # GPU's). This check only fires for do_gpu_ap:True, where
+                # get_model's own "0.1"/"0.2" fallback is what actually
+                # applies when unset -- compare against that same effective
+                # default here too, rather than crashing on None < None.
+                effective_low = ap_conf["canny_low_threshold"] if ap_conf["canny_low_threshold"] is not None else 0.1
+                effective_high = ap_conf["canny_high_threshold"] if ap_conf["canny_high_threshold"] is not None else 0.2
+                assert effective_low < effective_high, (
+                    "ap.canny_low_threshold must be less than ap.canny_high_threshold"
+                )
+            
+# ---------------------------- DATA ----------------------------------------------
+    #TODO: Add checking on each argument, e.g. > 0
+
+    dataset = conf['data']['dataset']
+    assert dataset in ["imagenet", "catsdogs", "basic_ct", "sst"], "This training script only supports the following datasets: imagenet, catsdogs, basic_ct, sst"
+
+    #img_size is always the real/native size of the data. If omitted,
+    #auto-detect it by reading one real file (see detect_img_size's own
+    #docstring). Resizing to a *different* size than native is a separate,
+    #optional step -- see resize_conf below -- not what img_size means.
+    if dataset == "sst":
+        # No cheap header to auto-detect img_size from (raw flat binary
+        # files, no metadata) -- required explicitly rather than attempting
+        # detect_img_size (which assumes an imagesTr/ listing convention
+        # this dataset doesn't use at all). Also doubles as the per-chunk
+        # size -- see UCF_VIT.utils.misc.process_root_dirs's own docstring.
+        try:
+            img_size = conf['data']['img_size']
+        except KeyError:
+            sys.exit("data.img_size is required for dataset:\"sst\" (no auto-detection is possible)")
+    else:
+        try:
+            img_size = conf['data']['img_size']
+        except KeyError:
+            if dist.get_rank() == 0:
+                print("img_size is not set, auto-detecting from the real data files under dict_root_dirs...")
+            img_size = detect_img_size(dataset, conf['data']['dict_root_dirs'])
+            if dist.get_rank() == 0:
+                print(f"Detected img_size: {img_size}")
+
+    assert len(img_size) == 2 or len(img_size) == 3, "Img_size needs to be 2D or 3D"
+    if len(img_size) == 2:
+        twoD = True
+    elif len(img_size) == 3:
+        twoD = conf['data']['twoD']
+
+    #resize is an optional, separate step -- for imagenet/catsdogs, resizes the
+    #real data from its native img_size to a different target size before
+    #training. Not supported for basic_ct (no resize step in its read path).
+    #Computed here, not with the rest of dataset_options_conf, because
+    #tile_size below must be computed from whatever size the data actually is
+    #once resize (if any) has been applied.
+    resize_conf = conf.get('dataset_options', {}).get('resize', {}) or {}
+    assert "basic_ct" not in resize_conf, "resize is not supported for basic_ct -- it has no resize step (dataset.py reads NIfTI volumes at native resolution). Remove it from dataset_options.resize."
+    effective_size = resize_conf.get(dataset, img_size)
+
+    if not isinstance(tiling_conf["tile_overlap"], tuple):
+        if twoD:
+            tiling_conf["tile_overlap"] = (tiling_conf["tile_overlap"], tiling_conf["tile_overlap"])
+        else:
+            tiling_conf["tile_overlap"] = (tiling_conf["tile_overlap"], tiling_conf["tile_overlap"], tiling_conf["tile_overlap"])
+    else:
+        if twoD:
+            assert len(tiling_conf["tile_overlap"]) == 2, "Tile overlap dimension doesn't match the dimensions of the data"
+        else:
+            assert len(tiling_conf["tile_overlap"]) == 3, "Tile overlap dimension doesn't match the dimensions of the data"
+
+    #Require overlap values to be ints (not e.g. a YAML float like 0.0), since a
+    #float would otherwise silently turn tile_size into floats downstream
+    assert all(isinstance(v, int) for v in tiling_conf["tile_overlap"]), "tiling.tile_overlap must be an int (or tuple of ints) in the config, not a float"
+
+    if len(img_size) == 2:
+        # Genuinely 2D data (imagenet/catsdogs): a 2-tuple tile_size is both
+        # correct and, via TileDataIter's `len(self.tile_size) == 3` check,
+        # the signal that tells it there's no z-axis to slice at all.
+        tile_size = (effective_size[0]//tiling_conf["div"]+tiling_conf["tile_overlap"][0], effective_size[1]//tiling_conf["div"]+tiling_conf["tile_overlap"][1])
+    elif twoD:
+        # 3D data (basic_ct) sliced into 2D z-planes: tile_size must still be a
+        # 3-tuple -- collapsing it to 2D (as if genuinely 2D data) would make
+        # TileDataIter's `len(self.tile_size) == 3` dispatch take the wrong
+        # branch, keeping the full, untouched z-axis on every tile and producing
+        # a 5D batch. The z entry itself isn't tiled (every z-index is walked one
+        # at a time in TileDataIter's twoD branch), so it's the raw, undivided depth.
+        tile_size = (effective_size[0]//tiling_conf["div"]+tiling_conf["tile_overlap"][0], effective_size[1]//tiling_conf["div"]+tiling_conf["tile_overlap"][1], effective_size[2])
+    else:
+        tile_size = (effective_size[0]//tiling_conf["div"]+tiling_conf["tile_overlap"][0], effective_size[1]//tiling_conf["div"]+tiling_conf["tile_overlap"][1], effective_size[2]//tiling_conf["div"]+tiling_conf["tile_overlap"][2])
+
+    if tiling_conf["do_tiling"]:
+        for i in range(len(tile_size)):
+            assert effective_size[0] // tiling_conf["div"], "The image cannot be evenly divided into tiles. This assertion can be commented out and ignored if this was intended, however be aware not all of the image will be used in training"
+        
+    #patch_size is unused when do_ap:True (interp_size takes over its role
+    #entirely, see below), so it's only required in the config in that case.
+    if not ap_conf["do_ap"]:
+        patch_size = conf['data']['patch_size']
+        #If doing standard patching, check if img_size/tile_size is divisible by patch_size
+        checkDims = 2 if twoD else 3
+        for i in range(checkDims):
+            assert tile_size[i] % patch_size == 0, "img_size/tile_size not divisible by patch_size which is required when doing standard patching"
+    else:
+        patch_size = conf['data'].get('patch_size')
+
+    #interp_size replaces patch_size as the size every adaptive (quadtree/octree)
+    #leaf patch is interpolated to, and the size every dependent model-layer
+    #calculation is based on -- required whenever do_ap:True so patch_size is
+    #never silently reused for that purpose; unused/absent otherwise.
+    if ap_conf["do_ap"]:
+        try:
+            interp_size = conf['ap']['interp_size']
+        except KeyError:
+            sys.exit("ap.interp_size is required when adaptive patching (ap.do_ap) is turned on")
+    else:
+        interp_size = None
+
+
+    #num_channels required because we aren't requiring dict_in_variables to be specified.
+    #If omitted, auto-detect it by reading one real file per dataset key
+    #(see detect_num_channels's own docstring for per-dataset-type behavior
+    #and why basic_ct raises rather than guessing for multi-channel files).
+    if dataset == "sst":
+        # No cheap header to auto-detect from either -- see img_size's
+        # identical treatment above.
+        try:
+            num_channels = conf['data']['num_channels']
+        except KeyError:
+            sys.exit("data.num_channels is required for dataset:\"sst\" (no auto-detection is possible)")
+    else:
+        try:
+            num_channels = conf['data']['num_channels']
+        except KeyError:
+            if dist.get_rank() == 0:
+                print("num_channels is not set, auto-detecting from the real data files under dict_root_dirs...")
+            num_channels = detect_num_channels(dataset, conf['data']['dict_root_dirs'])
+            if dist.get_rank() == 0:
+                print(f"Detected num_channels: {num_channels}")
+
+    for i,k in enumerate(num_channels):
+        if i == 0:
+            num_chan = num_channels[k]
+        else:
+            if not use_channel_aggregation: 
+                assert num_chan == num_channels[k], "If not using channel aggregation, num_channels across different datasets must be the same"
+    #in_chans is the num_channels to be used acrossed all datasets 
+    in_chans = num_chan
+        
+    #Create default dict_in_variables if it doesn't exist that assumes the channels are the same across different datasets
+    #"sst" is required, not defaulted: dict_in_variables' entries there aren't
+    #just informational labels, read_process_file uses them as real filename
+    #prefixes ("<variable>_<timestamp>") -- the generic numeric-placeholder
+    #default below would silently point at files that don't exist.
+    if dataset == "sst" and 'dict_in_variables' not in conf['data']:
+        sys.exit("data.dict_in_variables is required for dataset:\"sst\" -- its entries are real filename prefixes, not just labels")
+    try:
+        dict_in_variables = conf['data']['dict_in_variables']
+        #Check if number of variables is valid
+        for i,k in enumerate(conf['data']['dict_in_variables']):
+            assert len(conf['data']['dict_in_variables'][k]) == num_channels[k], "dict_in_variables must have the same amount as the num_channels"
+    except KeyError:
+        if dist.get_rank() == 0:
+            print("Using a default in_variables, which assumes the datasets have channels that are all arranged in the same order. If you want to track input channels for uses such as training multi-modal data in a flexible manner it is recommended to create your own dict_in_variables giving each channel appropriate unique labels")
+        dict_in_variables = {}
+        for i,k in enumerate(num_channels):
+            in_variables_list = []
+            for i in range(num_channels[k]):
+                in_variables_list.append(str(i))
+            dict_in_variables.update(in_variables_list)
+
+    #"sst" only -- entries may be a plain variable name (offset 0, no real
+    #timestepping) or a `[variable, offset]` pair; normalize the latter to a
+    #real tuple so downstream code (FileReader.read_process_file, time_offsets
+    #below) can dispatch on isinstance(entry, tuple). See
+    #_normalize_sst_variable_entry's own docstring.
+    if dataset == "sst":
+        dict_in_variables = {k: [_normalize_sst_variable_entry(e) for e in v] for k, v in dict_in_variables.items()}
+
+    #Create default_vars from dict_in_variables -- variable *names* only,
+    #dropping any "sst" (variable, offset) pair's offset (the model's
+    #variable embedding is keyed on the name alone; a future timestep
+    #embedding, keyed on offset, is entirely separate -- see time_offsets
+    #below). Deduped in first-occurrence order, not via set() -- set()'s
+    #iteration order depends on Python's per-process string hash
+    #randomization, which would make var_map's name->row assignment
+    #(create_var_embedding, in arch.py) inconsistent across separate
+    #process launches (different DDP ranks, or a training run vs. a later
+    #eval run). Dedup is required (not just cosmetic) once a key's own
+    #variable list can repeat a name at multiple offsets -- e.g. "sst"
+    #time-stepping's dict_in_variables=[["u",-2],...,["u",-1],...].
+    default_vars = []
+    for k in dict_in_variables:
+        for name in (e[0] if isinstance(e, tuple) else e for e in dict_in_variables[k]):
+            if name not in default_vars:
+                default_vars.append(name)
+
+    #dict_out_variables: regression-target variable names per dataset key --
+    #only meaningful for "sst" (every other dataset's label comes from a
+    #fixed location relative to the input, e.g. basic_ct's sibling
+    #labelsTr/, rather than a separate named variable). Required, not
+    #defaulted, when dataset:"sst" and this model type actually returns a
+    #label (VIT/SAP/UNETR) -- no sensible default target variable exists.
+    if dataset == "sst" and model_conf["type"] in ["VIT", "SAP", "UNETR"]:
+        try:
+            dict_out_variables = conf['data']['dict_out_variables']
+        except KeyError:
+            sys.exit("data.dict_out_variables is required for dataset:\"sst\" with a model type that returns a label")
+    else:
+        dict_out_variables = conf['data'].get('dict_out_variables')
+
+    if dataset == "sst" and dict_out_variables is not None:
+        dict_out_variables = {k: [_normalize_sst_variable_entry(e) for e in v] for k, v in dict_out_variables.items()}
+
+    #time_offsets: sorted list of every distinct timestep offset referenced
+    #across dict_in_variables/dict_out_variables (e.g. [-2, -1, 0] for "2
+    #past steps predict the current step") -- only meaningful for "sst"; see
+    #UCF_VIT.utils.misc.process_root_dirs's own docstring. A plain-string
+    #entry means offset 0, so an all-plain-string config (every "sst" config
+    #shipped before time-stepping existed) always resolves to [0] here,
+    #which process_root_dirs treats identically to no real timestepping.
+    if dataset == "sst":
+        var_lists = list(dict_in_variables.values()) + (list(dict_out_variables.values()) if dict_out_variables else [])
+        time_offsets = sorted({e[1] if isinstance(e, tuple) else 0 for var_list in var_lists for e in var_list})
+    else:
+        time_offsets = None
+
+    #normalize_stats: {dataset_key: {variable_name: {"mean":..., "std":...}}},
+    #precomputed once (utils/compute_normalization_stats.py, over the train
+    #split only) and applied by FileReader.read_process_file/CatsDogsDataset
+    #.__getitem__ (UCF_VIT.utils.normalize.zscore_normalize) right after
+    #loading, before any tiling/adaptive patching runs. Optional -- omitted
+    #(or a dataset key/variable missing from the file) means that data stays
+    #unnormalized, exactly today's behavior; this is never required. A
+    #relative path is resolved against the repo root, same as
+    #trainer.checkpoint_path.
+    normalize_stats_path = conf['data'].get('normalize_stats_path')
+    if normalize_stats_path:
+        normalize_stats_path = os.path.join(find_repo_root(), normalize_stats_path)
+        assert os.path.exists(normalize_stats_path), (
+            f"data.normalize_stats_path does not exist: {normalize_stats_path}\n"
+            f"Generate it with: python utils/compute_normalization_stats.py {args.config} --output {conf['data']['normalize_stats_path']}"
+        )
+        with open(normalize_stats_path) as f:
+            normalize_stats = yaml.load(f, Loader=yaml.FullLoader) or {}
+    else:
+        normalize_stats = {}
+
+    #If using adaptive patching check if fixed length is compatible with tile_size
+    if ap_conf['do_ap']:
+        # Neither adaptive-patching path actually requires data.tile_size to be
+        # a power of 2 anymore -- both pad the input up to a clean size via
+        # edge-replication before running: Patchify/Patchify_3D (do_gpu_ap:
+        # False) pad up to the next power of two per axis (see UCF_VIT.
+        # dataloaders.transform._pad_to_power_of_two), so FixedQuadTree/
+        # FixedOctTree's integer-midpoint split always halves evenly regardless
+        # of the real tile_size; GPUPatchify2D/GPUPatchify3D (do_gpu_ap:True)
+        # pad up to the next multiple of their coarsest min_size block via
+        # their own _pad_tensor. Warn (don't reject) when this padding will
+        # actually kick in, since it does change the output: patches/blocks
+        # near the padded edge may cover some replicated (not real) content.
+        checkDims = 2 if twoD else 3
+        non_power_of_two_dims = [i for i in range(checkDims) if not is_power_of_two(tile_size[i])]
+        if non_power_of_two_dims:
+            patchify_name = "GPUPatchify2D/GPUPatchify3D" if ap_conf["do_gpu_ap"] else "Patchify/Patchify_3D"
+            print(
+                f"Warning: data.tile_size {tuple(tile_size[:checkDims])} is not a power of 2 "
+                f"in dimension(s) {non_power_of_two_dims} -- {patchify_name} will pad the "
+                f"input up to a clean size via edge-replication before adaptive patching runs, "
+                f"so patches/blocks near the padded edge may include replicated (not real) "
+                f"content instead of real image data."
+            )
+
+        if ap_conf["do_gpu_ap"]:
+            # Mirrors GPUPatchify2D/GPUPatchify3D.__init__'s own identical
+            # computation (dispatched on twoD, matching arch.py's own
+            # GPUPatchify2D/GPUPatchify3D dispatch): the real level-0 grid
+            # run_merge_batch operates on is the *padded* grid, not
+            # tile_size[0] // min_size directly -- whenever tile_size isn't
+            # already a multiple of the coarsest block size, padding grows
+            # the real block count (this is normally a no-op since
+            # tile_size and the default min_size=2 are both powers of 2,
+            # but a non-power-of-2 min_size would otherwise make this check
+            # silently disagree with the real module and either wrongly
+            # reject or wrongly allow a config). tile_size[0] is always the
+            # reference axis (GPUPatchify2D/3D's own shortest-axis
+            # convention -- tile_size must already be sorted ascending for
+            # do_gpu_ap, same as GPUPatchify3D's own D <= H <= W
+            # requirement).
+            max_blocks = tile_size[0] // ap_conf["min_size"]
+            max_level = int(math.floor(math.log2(max_blocks))) if max_blocks >= 1 else 0
+            pad_b = ap_conf["min_size"] * (2 ** max_level)
+            padded_ref = -(-tile_size[0] // pad_b) * pad_b
+            real_max_blocks = padded_ref // ap_conf["min_size"]
+            exponent = 2 if twoD else 3
+            modulus = 3 if twoD else 7
+            gpu_patchify_name = "GPUPatchify2D" if twoD else "GPUPatchify3D"
+            initial_leaves = real_max_blocks ** exponent
+            assert (initial_leaves - ap_conf["fixed_length"]) % modulus == 0, (
+                f"ap.fixed_length ({ap_conf['fixed_length']}) must satisfy "
+                f"(real_max_blocks**{exponent} - fixed_length) % {modulus} == 0 for "
+                f"{gpu_patchify_name}'s bottom-up merge -- real_max_blocks**{exponent} is "
+                f"{initial_leaves} here (tile_size[0] {tile_size[0]} padded to a multiple of "
+                f"{pad_b}, ap.min_size {ap_conf['min_size']}). See "
+                f"{gpu_patchify_name}.__init__'s own identical assertion for why."
+            )
+        elif twoD:
+            assert ap_conf["fixed_length"] % 3 == 1 % 3, "Quadtree fixed length needs to be 3n+1, where n is some integer"
+        else:
+            assert ap_conf["fixed_length"] % 7 == 1 % 7, "Octtree fixed length needs to be 7n+1, where n is some integer"
+        # SAP's mask_head no longer needs fixed_length to be an exact
+        # square/cube -- see UCF_VIT.model.arch.SAP's own docstring: it
+        # computes its own (balanced, but functionally arbitrary) grid
+        # factorization from fixed_length directly.
+            
+        
+    # Resolves per-dataset-key train/val/test root dirs and start/end idx ratios --
+    # used for both dataloader.type values (iterative_dataloader via FileReader,
+    # the map-style dataloader/catsdogs path via a plain list slice). See
+    # _resolve_dataset_splits's own docstring for the full semantics;
+    # get_split_conf is what val.py/test.py use to consume the results below.
+    (resolved_train_start_idx, resolved_train_end_idx,
+     resolved_val_root_dirs, resolved_val_start_idx, resolved_val_end_idx,
+     resolved_test_root_dirs, resolved_test_start_idx, resolved_test_end_idx) = _resolve_dataset_splits(
+        dict_root_dirs=conf['data']['dict_root_dirs'],
+        dict_start_idx=conf['dataloader'].get('dict_start_idx', {}) or {},
+        dict_end_idx=conf['dataloader'].get('dict_end_idx', {}) or {},
+        dict_val_root_dirs=conf['data'].get('dict_val_root_dirs', {}) or {},
+        dict_val_start_idx=conf['dataloader'].get('dict_val_start_idx', {}) or {},
+        dict_val_end_idx=conf['dataloader'].get('dict_val_end_idx', {}) or {},
+        dict_test_root_dirs=conf['data'].get('dict_test_root_dirs', {}) or {},
+        dict_test_start_idx=conf['dataloader'].get('dict_test_start_idx', {}) or {},
+        dict_test_end_idx=conf['dataloader'].get('dict_test_end_idx', {}) or {},
+        val_split_ratio=conf['dataloader'].get('val_split_ratio', 0.1),
+        test_split_ratio=conf['dataloader'].get('test_split_ratio', 0.1),
+    )
+
+    data_conf = {
+        "dataset": dataset,
+        "img_size": img_size,
+        "tile_size": tile_size,
+        "patch_size": patch_size,
+        "interp_size": interp_size,
+        "default_vars": default_vars,
+        "twoD": twoD,
+        "dict_root_dirs": conf['data']['dict_root_dirs'],
+        "dict_val_root_dirs": resolved_val_root_dirs,
+        "dict_test_root_dirs": resolved_test_root_dirs,
+        "num_channels": num_channels,
+        "dict_in_variables": dict_in_variables,
+        "dict_out_variables": dict_out_variables,
+        "normalize_stats": normalize_stats,
+        "time_offsets": time_offsets,
+        "in_chans": in_chans,
+    }
+
+# ---------------------------- DATALOADER ----------------------------------------
+    if model_conf["type"] in ["VIT", "SAP", "UNETR"]:
+        return_label = True
+    else:
+        return_label = False
+
+    if return_label:
+        if data_conf['dataset'] in ['imagenet', 'catsdogs']:
+            assert model_conf['type'] in ["VIT"], "This dataset can only be used for classification"
+
+        elif data_conf['dataset'] in ["basic_ct"]:
+            assert model_conf['type'] in ["SAP", "UNETR"], "This dataset can only be used for segmentation"
+
+        elif data_conf['dataset'] in ["sst"]:
+            assert model_conf['type'] in ["UNETR"], "This dataset can only be used for regression (UNETR with model.loss_fn:\"MSE\")"
+
+    dataloader_type = conf['dataloader']['type']
+    assert dataloader_type in ["dataloader", "iterative_dataloader"], "dataloader type not valid"
+
+    if dataloader_type == "dataloader":
+        assert dataset in ["catsdogs"], "Only the catsdogs datset is supported with the standard torch dataloader, add your dataset to UCF_VIT/datasets"
+        if data_conf['dataset'] == 'catsdogs':
+            from UCF_VIT.datasets.catsdogs import CatsDogsDataset as dataset_module
+            from UCF_VIT.datasets.catsdogs import CatsDogsCollate as collate_fn
+
+    dataloader_conf = {
+        "type": dataloader_type,
+        # dict_start_idx/dict_end_idx are train's own (possibly narrowed by
+        # _resolve_dataset_splits's auto-split above) start/end idx -- populated
+        # for both dataloader.type values; train.py's catsdogs branch applies
+        # these via slice_file_list, same as iterative_dataloader's FileReader.
+        "dict_start_idx": resolved_train_start_idx,
+        "dict_end_idx": resolved_train_end_idx,
+        "dict_val_start_idx": resolved_val_start_idx,
+        "dict_val_end_idx": resolved_val_end_idx,
+        "dict_test_start_idx": resolved_test_start_idx,
+        "dict_test_end_idx": resolved_test_end_idx,
+        "dict_buffer_sizes": conf['dataloader']['dict_buffer_sizes'] if dataloader_type == "iterative_dataloader" else None,
+        "batch_size": conf['dataloader']['batch_size'],
+        "num_workers": conf['dataloader']['num_workers'],
+        "pin_memory": conf['dataloader']['pin_memory'],
+        "dataset_module": dataset_module if dataloader_type == "dataloader" else None,
+        "collate_fn": collate_fn if dataloader_type == "dataloader" else None,
+        "return_label": return_label,
+        # Optional, default False. When a dataset key has fewer files than its
+        # assigned DDP ranks/workers, training normally fails loudly (calculate_
+        # load_balancing_on_the_fly's/FileReader's own asserts). True lets every
+        # rank/worker get at least one file instead, reusing files round-robin
+        # with a printed warning -- see NativePytorchDataModule's own docstring entry.
+        "allow_file_reuse": conf['dataloader'].get('allow_file_reuse', False),
+        # Imagenet only -- seeds the shuffle bucket_file_list applies before
+        # dividing the sliced image list into per-rank buckets. Without it,
+        # bucketing is a contiguous split of a class-sorted list, so each rank
+        # only sees a narrow range of classes (skews BatchNorm, correlates
+        # gradients). Defaults to a fixed seed since shuffling is a strict
+        # improvement; `null` opts out -- see NativePytorchDataModule's own
+        # docstring entry for the full rationale.
+        "bucket_shuffle_seed": conf['dataloader'].get('bucket_shuffle_seed', 42),
+        # Seeds FileReader's own per-epoch file-order reshuffle (see its own
+        # epoch_shuffle_seed docstring entry) -- deterministic across every rank/
+        # worker sharing a dataset key is what keeps their disjoint-window sharding
+        # correct with no cross-process communication. Defaults to a fixed seed
+        # since some reshuffle every epoch is a strict improvement over none;
+        # `null` opts out (file order stays fixed for the whole run).
+        "epoch_shuffle_seed": conf['dataloader'].get('epoch_shuffle_seed', 42),
+
+    }
+
+    
+# ---------------------------- DATASET SPECIFIC OPTIONS --------------------------
+    #TODO: Move this to its own function
+    dataset_options_conf = {
+        "resize": resize_conf,
+        # "sst" only -- per dataset key, the true full on-disk domain size
+        # (see process_root_dirs's own docstring). Omitted/empty means every
+        # key has exactly 1 chunk (full_domain_size == img_size), matching
+        # every shipped "sst" config today.
+        "full_domain_size": conf.get('dataset_options', {}).get('full_domain_size', {}) or {},
+    }
+
+# ---------------------------- INFERENCE OUTPUT -----------------------------------
+    # Optional, off by default -- see UCF_VIT.utils.inference_output.save_inference_batch.
+    # Only meaningful for model.type:"UNETR" (eval_epoch is the only caller); a
+    # harmless no-op default for every other model type.
+    try:
+        save_inference = conf["inference_output"]["save"]
+        # Resolved against the repo root, same as trainer.checkpoint_path above
+        # and for the same reason -- see its own comment.
+        output_dir = conf["inference_output"].get("output_dir", "inference_output") if save_inference else "inference_output"
+        inference_output_conf = {
+            "save": save_inference,
+            "all_batches": conf["inference_output"].get("all_batches", False) if save_inference else False,
+            "num_batches": conf["inference_output"].get("num_batches", 1) if save_inference else 1,
+            "output_dir": os.path.join(find_repo_root(), output_dir),
+        }
+    except KeyError:
+        inference_output_conf = {"save": False, "all_batches": False, "num_batches": 1, "output_dir": os.path.join(find_repo_root(), "inference_output")}
+
+    return {
+        "trainer": trainer_conf,
+        "parallelism": parallelism_conf,
+        "optimizer": optimizer_conf,
+        "scheduler": scheduler_conf,
+        "grad_scaler": grad_scaler_conf,
+        "model": model_conf,
+        "tiling": tiling_conf,
+        "ap": ap_conf,
+        "data": data_conf,
+        "dataloader": dataloader_conf,
+        "dataset_options": dataset_options_conf,
+        "inference_output": inference_output_conf,
+    }
+
+def parse_pretrained_config(args, conf):
+    """Load and validate the configuration of a pretrained model to fine-tune from.
+
+    If `conf` indicates a pretrained model should be used (and training is not
+    resuming from a checkpoint), loads the pretrained model's own config YAML file
+    (`args.pretrained_config`) and checks that its architecture and data settings
+    (embed_dim, depth, num_heads, mlp_ratio, tensor_par_size, image dimensionality,
+    tile size, patch size, channel aggregation, input channels/variables) are
+    compatible with the model described by `conf`.
+
+    Args:
+        args: Parsed command-line arguments; must have a `pretrained_config`
+            attribute giving the path to the pretrained model's config YAML file.
+        conf: Validated training configuration dict for the model to be trained, as
+            returned by `parse_config`.
+
+    Returns:
+        A dict with keys "model_type", "default_vars", and "kwargs" describing the
+        pretrained model, or an empty dict if no pretrained model is being used.
+    """
+
+    resume_from_checkpoint = conf['trainer']['resume_from_checkpoint']
+
+    #If not resuming from checkpoint, check if starting from a pretrained model
+    if not resume_from_checkpoint:
+        try:
+            use_pretrained_model = conf["trainer"]["use_pretrained_model"]
+
+        except KeyError:
+            if dist.get_rank() == 0:
+                print("Since use_pretrained_model wasn't given, defaulting to not using a pretrained model")
+            use_pretrained_model = False
+
+    else:
+        use_pretrained_model = False
+
+    if use_pretrained_model:
+        assert args.pretrained_config != "", "If training using a pretrained model, you must pass in the config file for the pretrained model as an argument"
+        
+        try:
+            pretrained_checkpoint_filename = conf["trainer"]["pretrained_checkpoint_filename"]
+
+        except KeyError:
+            sys.exit("pretrained_checkpoint_filename needs to be set in the trainer section")
+
+        if args.pretrained_config != "":
+            with open(args.pretrained_config,'r') as f:
+                pretrained_conf = yaml.load(f,Loader=yaml.FullLoader)
+            # Same resolution as trainer.checkpoint_path in parse_config -- this
+            # file is loaded independently (not through parse_config), so it
+            # needs its own copy of the same fix.
+            pretrained_conf["trainer"]["checkpoint_path"] = os.path.join(find_repo_root(), pretrained_conf["trainer"]["checkpoint_path"])
+
+# ---------------------------- MODEL ---------------------------------------------
+
+        #Get and check model arguments
+        embed_dim=pretrained_conf["model"]["embed_dim"]
+        assert embed_dim == conf["model"]["embed_dim"], "Pretrained embed_dim does not match model to be trained"
+
+        depth=pretrained_conf["model"]["depth"]
+        assert depth == conf["model"]["depth"], "Pretrained depth does not match model to be trained"
+
+        num_heads=pretrained_conf["model"]["num_heads"]
+        assert num_heads == conf["model"]["num_heads"], "Pretrained num_heads does not match model to be trained"
+
+        mlp_ratio=pretrained_conf["model"]["mlp_ratio"]
+        assert mlp_ratio == conf["model"]["mlp_ratio"], "Pretrained num_heads does not match model to be trained"
+
+        #TODO: Checking for drop_path_rate and drop_rate needed?
+        drop_path_rate=pretrained_conf["model"]["drop_path"]
+        drop_rate=pretrained_conf["model"]["drop_rate"]
+
+        tensor_par_size = pretrained_conf["parallelism"]["tensor_par_size"]
+        assert tensor_par_size == conf["parallelism"]["tensor_par_size"], "Tensor_par_size of the pre-trained model needs to match the tensor_par_size of the model to be trained"
+
+        # Real filename save_checkpoint writes is "<pretrained_checkpoint_filename>
+        # _rank_<N>.ckpt", not the bare filename. get_model's pretrained-loading
+        # branch reads a separate file per tensor-parallel rank, so every one of
+        # those must exist, not just rank 0's.
+        missing_ranks = [
+            r for r in range(tensor_par_size)
+            if not os.path.isfile(os.path.join(pretrained_conf["trainer"]["checkpoint_path"], conf["trainer"]["pretrained_checkpoint_filename"]+"_rank_"+str(r)+".ckpt"))
+        ]
+        if missing_ranks:
+            sys.exit(f"Checkpoint file does not exist for tensor-parallel rank(s) {missing_ranks}")
+
+        model_type = pretrained_conf["model"]["type"]
+        # pretrained_conf, not conf: kwargs here construct pretrained_model at its
+        # own true architecture (model/utils.py's get_model pretrained branch), so
+        # its checkpoint loads without a shape mismatch. conf's fields would be
+        # wrong whenever the downstream model type differs (e.g. pretrained MAE ->
+        # downstream UNETR: conf["model"] wouldn't even have MAE's mask_ratio/
+        # decoder_* keys), and subtly wrong even when they match (the pretrained
+        # checkpoint's own decoder shape must match for the initial strict
+        # load_state_dict to succeed, even though only the encoder is kept after).
+        kwargs = get_kwargs(model_type, pretrained_conf)
+
+# ---------------------------- TILING ------------------------------------------
+        pretrained_do_tiling = pretrained_conf["tiling"]["do_tiling"]
+        if pretrained_do_tiling:
+            pretrained_div = pretrained_conf["tiling"]["div"]
+            pretrained_tile_overlap = pretrained_conf["tiling"]["tile_overlap"]
+        else:
+            pretrained_div = 1
+            pretrained_tile_overlap = 0
+
+# ---------------------------- AP ------------------------------------------------
+        pretrained_do_ap = pretrained_conf["ap"]["do_ap"]
+        if pretrained_do_ap:
+            assert conf["ap"]["do_ap"], "If pretrained model was trained with adaptive patching, the downstream model needs to use adaptive patching"
+        else:
+            assert not conf["ap"]["do_ap"], "If pretrained model was trained with standard patching, this model needs to use standard patching"
+        # The pretrained model's own values (not conf's) -- needed so
+        # get_model's pretrained branch can build pretrained_model at
+        # exactly its own original architecture, or its checkpoint (saved
+        # with these settings) won't load into it without a shape mismatch.
+        pretrained_fixed_length = pretrained_conf['ap']['fixed_length'] if pretrained_do_ap else None
+        pretrained_use_adaptive_pos_emb = pretrained_conf['ap']['use_adaptive_pos_emb'] if pretrained_do_ap else False
+
+# ---------------------------- DATA ----------------------------------------------
+        #Get and check data arguments. Same optional/auto-detect fallback
+        #as parse_config's own img_size handling.
+        try:
+            pretrained_img_size = pretrained_conf["data"]["img_size"]
+        except KeyError:
+            if dist.get_rank() == 0:
+                print("img_size is not set in the pretrained config, auto-detecting from the real data files under dict_root_dirs...")
+            pretrained_img_size = detect_img_size(pretrained_conf["data"]["dataset"], pretrained_conf["data"]["dict_root_dirs"])
+            if dist.get_rank() == 0:
+                print(f"Detected img_size: {pretrained_img_size}")
+
+        if len(pretrained_img_size) == 2:
+            twoD = True
+        elif len(pretrained_img_size) == 3:
+            twoD = pretrained_conf['data']['twoD']
+        assert twoD == conf["data"]["twoD"], "Pretrained model and this model do not have the same dimension data"
+
+        if not isinstance(pretrained_tile_overlap, tuple):
+            if twoD:
+                pretrained_tile_overlap = (pretrained_tile_overlap, pretrained_tile_overlap)
+            else:
+                pretrained_tile_overlap = (pretrained_tile_overlap, pretrained_tile_overlap, pretrained_tile_overlap)
+
+        #Require overlap values to be ints (not e.g. a YAML float like 0.0), since a
+        #float would otherwise silently turn pretrained_tile_size into floats downstream
+        assert all(isinstance(v, int) for v in pretrained_tile_overlap), "tiling.tile_overlap must be an int (or tuple of ints) in the pretrained model's config, not a float"
+
+        # Deliberately NOT asserted equal to conf's own img_size/tile_size/patch_size/
+        # interp_size (unlike twoD/do_ap/in_chans/use_channel_aggregation below,
+        # still required to match): pos_embed interpolation (model/utils.py's
+        # get_model pretrained branch, _transplant_pos_embed) exists specifically to
+        # let the pretrained and new models differ in resolution. pretrained_* below
+        # are the pretrained model's own true values, used to build it at its own
+        # original size so its checkpoint loads without a shape mismatch, then its
+        # encoder gets resized into the new model's shape.
+        if twoD:
+            pretrained_tile_size = (pretrained_img_size[0]//pretrained_div+pretrained_tile_overlap[0], pretrained_img_size[1]//pretrained_div+pretrained_tile_overlap[1])
+        else:
+            pretrained_tile_size = (pretrained_img_size[0]//pretrained_div+pretrained_tile_overlap[0], pretrained_img_size[1]//pretrained_div+pretrained_tile_overlap[1], pretrained_img_size[2]//pretrained_div+pretrained_tile_overlap[2])
+
+        #patch_size is unused (and not required in the config) when do_ap:True.
+        pretrained_patch_size = pretrained_conf["data"].get("patch_size") if pretrained_do_ap else pretrained_conf["data"]["patch_size"]
+
+        if pretrained_do_ap:
+            try:
+                pretrained_interp_size = pretrained_conf["ap"]["interp_size"]
+            except KeyError:
+                sys.exit("ap.interp_size is required in the pretrained config when adaptive patching (ap.do_ap) is turned on")
+        else:
+            pretrained_interp_size = None
+
+        try:
+            use_channel_aggregation = pretrained_conf['model']['use_channel_aggregation']
+        except KeyError:
+            if dist.get_rank() == 0:
+                print("use_channel_aggregation is not set, by default this is set to False")
+            use_channel_aggregation = False
+
+        assert use_channel_aggregation == conf['model']['use_channel_aggregation'], "Use_channel_aggregation needs to match between pretrained model and this model"
+
+        ##############################
+        #num_channels required because we aren't requiring dict_in_variables to be specified.
+        #Same optional/auto-detect fallback as parse_config's own num_channels handling.
+        try:
+            num_channels = pretrained_conf['data']['num_channels']
+        except KeyError:
+            if dist.get_rank() == 0:
+                print("num_channels is not set in the pretrained config, auto-detecting from the real data files under dict_root_dirs...")
+            num_channels = detect_num_channels(pretrained_conf['data']['dataset'], pretrained_conf['data']['dict_root_dirs'])
+            if dist.get_rank() == 0:
+                print(f"Detected num_channels: {num_channels}")
+
+        for i,k in enumerate(num_channels):
+            if i == 0:
+                num_chan = num_channels[k]
+            else:
+                if not use_channel_aggregation: 
+                    assert num_chan == num_channels[k], "If not using channel aggregation, num_channels across different datasets must be the same"
+        #in_chans is the num_channels to be used acrossed all datasets 
+        in_chans = num_chan
+
+        assert in_chans == conf['data']['in_chans'], "Number of input channels for the pre-trained model doesn't match the number of inputs for this model" 
+
+        #Create default dict_in_variables if it doesn't exist that assumes the channels are the same across different datasets
+        try:
+            dict_in_variables = pretrained_conf['data']['dict_in_variables']
+            #Check if number of variables is valid
+            for i,k in enumerate(pretrained_conf['data']['dict_in_variables']):
+                assert len(pretrained_conf['data']['dict_in_variables'][k]) == num_channels[k], "dict_in_variables must have the same amount as the num_channels"
+        except KeyError:
+            if dist.get_rank() == 0:
+                print("Using a default in_variables, which assumes the datasets have channels that are all arranged in the same order. If you want to track input channels for uses such as training multi-modal data in a flexible manner it is recommended to create your own dict_in_variables giving each channel appropriate unique labels")
+            dict_in_variables = {}
+            for i,k in enumerate(num_channels):
+                in_variables_list = []
+                for i in range(num_channels[k]):
+                    in_variables_list.append(str(i))
+                dict_in_variables.update(in_variables_list)
+
+        #Create default_vars from dict_in_variables -- deduped in first-
+        #occurrence order, not via set(); see parse_config's own identical
+        #derivation for why (set()'s per-process string hash randomization
+        #would make var_map's name->row assignment inconsistent across
+        #separate process launches).
+        default_vars = []
+        for k in pretrained_conf['data']['dict_in_variables']:
+            for name in pretrained_conf['data']['dict_in_variables'][k]:
+                if name not in default_vars:
+                    default_vars.append(name)
+
+        #Check if dict_in_variables from this model are in the default_vars list for the pre-trained model
+        if use_channel_aggregation: 
+            for i,k in enumerate(conf['data']['dict_in_variables']):
+                for j in range(len(conf['data']['dict_in_variables'][k])):
+                    assert conf['data']['dict_in_variables'][k][j] in default_vars, f"dict_in_variable {conf['data']['dict_in_variables'][k][j]} for this model is not used in the pretrained model"
+
+        p_conf = {
+            "model_type": model_type,
+            "default_vars": default_vars,
+            "kwargs": kwargs,
+            # The pretrained model's own original architecture-determining
+            # values -- see the comment above pretrained_tile_size for why
+            # these are deliberately not required to match conf's own.
+            "img_size": pretrained_img_size,
+            "tile_size": pretrained_tile_size,
+            "twoD": twoD,
+            "patch_size": pretrained_patch_size,
+            "interp_size": pretrained_interp_size,
+            "fixed_length": pretrained_fixed_length,
+            "use_adaptive_pos_emb": pretrained_use_adaptive_pos_emb,
+            # The pretrained model's own checkpoint directory (already read
+            # above for the existence check) -- get_model's pretrained
+            # branch needs this to actually find the checkpoint file; there
+            # is no "pretrained_model" section anywhere in a real config for
+            # it to otherwise come from.
+            "checkpoint_path": pretrained_conf["trainer"]["checkpoint_path"],
+        }
+    else:
+        p_conf = {}
+
+    return p_conf
+

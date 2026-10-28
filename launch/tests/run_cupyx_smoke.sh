@@ -1,0 +1,73 @@
+#!/bin/bash
+#SBATCH -A lrn036
+#SBATCH -J cupyx-smoke
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=7
+#SBATCH -t 00:10:00
+#SBATCH -p batch
+#SBATCH -o cupyx-smoke-%j.out
+#SBATCH -e cupyx-smoke-%j.out
+
+[ -z $JOBID ] && JOBID=$SLURM_JOB_ID
+[ -z $JOBSIZE ] && JOBSIZE=$SLURM_JOB_NUM_NODES
+
+
+#ulimit -n 65536
+
+
+eval "$(/lustre/orion/stf006/proj-shared/irl1/MINI_CLEAN/bin/conda shell.bash hook)"
+conda activate UCF-rocm7.13
+
+module load PrgEnv-gnu
+module load gcc/12.2.0
+
+module load rocm/7.13
+export ROCM_HOME=${ROCM_PATH}
+
+export MIOPEN_DISABLE_CACHE=1
+export MIOPEN_USER_DB_PATH=/tmp/$JOBID
+mkdir -p $MIOPEN_USER_DB_PATH
+
+# cupy defaults its JIT kernel cache to $HOME/.cupy/kernel_cache, which blows
+# past $HOME's disk quota on Frontier -- redirect it to the same node-local
+# /tmp/$JOBID scratch space MIOPEN_USER_DB_PATH already uses above.
+export CUPY_CACHE_DIR=/tmp/$JOBID/cupy_kernel_cache
+mkdir -p $CUPY_CACHE_DIR
+
+
+export PYTHONPATH=$PWD:$PYTHONPATH
+
+# tests/model/test_gpu_adaptive_patching_cupyx_real.py is a single plain
+# process -- no torch.distributed, no srun here, unlike
+# run_distributed_tests.sh. Only needs 1 GPU (GPUPatchify2D/GPUPatchify3D's
+# region_backend="cupyx" path, exercised directly against region_backend=
+# "scipy" on the same input as a real-numerics correctness cross-check --
+# every other region_backend="cupyx" test fakes cupy/cupyx out entirely and
+# can only check dispatch logic, not real numerics).
+#
+# Requires a real cupy install matching this environment's ROCm build, in
+# the UCF-rocm7.13 conda env activated above -- not a project dependency
+# (see gpu_adaptive_patching.py's own _label_regions docstring for why
+# it's opt-in). AMD's prebuilt amd-cupy wheels don't cover rocm-7.13.0 (and
+# the closest one, rocm-7.0.2, hits a real HIPRTC/system-GCC toolchain
+# mismatch on this environment) -- built from source against this exact
+# rocm/7.13 install instead, confirmed working (2 passed here, jobs
+# 5499848 -> 5500276 for the full trail: broken index fallback, toolchain
+# mismatch, $HOME disk quota, then a clean pass). README.md's own
+# "Optional: cupy for region_backend=cupyx" section has the full install
+# steps:
+#   conda activate UCF-rocm7.13
+#   module load PrgEnv-gnu; module load gcc/12.2.0; module load rocm/7.13
+#   export ROCM_HOME=${ROCM_PATH}
+#   export CUPY_INSTALL_USE_HIP=1; export HCC_AMDGPU_TARGET=gfx90a
+#   pip install cupy --no-cache-dir -v 2>&1 | tee /tmp/cupy_build.log
+# ROCM_HOME must be set at runtime too (not just at install time), which is
+# why it's exported above, before this script ever gets here. The test
+# skips cleanly (not a failure) if cupy isn't actually installed here yet.
+# -rs (not just -v) is what actually prints the skip reason here -- this
+# file's skip conditions fire at collection time (module-level, "collected 0
+# items / 1 skipped"), and -v alone doesn't surface why for a collection-time
+# skip the way it does for a skip raised from inside a test function.
+time python -m pytest ../../tests/model/test_gpu_adaptive_patching_cupyx_real.py -v -rs

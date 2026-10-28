@@ -13,7 +13,18 @@ from .transform import Patchify, Patchify_3D
 from PIL import Image
 import cv2 as cv
 
+from UCF_VIT.utils.misc import calculate_tile_bounds, calculate_tile_overlap
+from UCF_VIT.utils.normalize import zscore_normalize
+
 class FileReader(IterableDataset):
+    """Iterable dataset that reads and preprocesses raw data files, sharded across DDP ranks and dataloader workers.
+
+    Slices `file_list` to the `[start_idx, end_idx)` fraction requested, then in
+    `__iter__` further splits the remaining files across the data-parallel group
+    (identified via `gx`) and dataloader workers so each worker yields a disjoint
+    shard.
+    """
+
     def __init__(
         self,
         file_list,
@@ -22,41 +33,153 @@ class FileReader(IterableDataset):
         variables,
         gx,
         ddp_group,
-        multi_dataset_training=False,
         data_par_size: int = 1,
-        twoD: bool = False,
         return_label: bool = False,
         keys_to_add: int = 1,
         dataset: str = "imagenet",
-        imagenet_resize: Optional[list] = [256,256],
+        resize: Optional[list] = None,
+        allow_file_reuse: bool = False,
+        epoch_shuffle_seed: Optional[int] = None,
+        variables_out: Optional[list] = None,
+        chunk_size: Optional[list] = None,
+        full_domain_size: Optional[list] = None,
+        normalize_stats: Optional[Dict] = None,
     ) -> None:
+        """Initializes the reader over the `[start_idx, end_idx)` fraction of `file_list`.
+
+        Args:
+            file_list: Full list of file paths for this dataset. If
+                `epoch_shuffle_seed` is None, this is used exactly as given
+                (the caller is assumed to have already shuffled/replicated it
+                as needed). If `epoch_shuffle_seed` is set, this is instead
+                treated as the *unshuffled* master list, and `__iter__`
+                itself reshuffles and replicates it fresh every call -- see
+                `epoch_shuffle_seed`.
+            start_idx: Fraction (0.0-1.0) of `file_list` to start reading from.
+            end_idx: Fraction (0.0-1.0) of `file_list` to stop reading at.
+            variables: Variable/channel labels to attach to each yielded sample.
+            gx: Colon-separated string of data-parallel GPU counts per dataset,
+                used in `__iter__` to determine this rank's shard.
+            ddp_group: Process group used to determine this rank's position within
+                `gx`.
+            data_par_size: Total number of data-parallel ranks; overridden to 1 if
+                `torch.distributed` is not initialized.
+            return_label: Whether to read and yield a label alongside the data.
+            keys_to_add: Number of times to repeat iteration over the (sharded)
+                file list per epoch, used to balance dataset sizes. Also the
+                number of times `epoch_shuffle_seed`'s internal reshuffle
+                independently re-permutes `file_list` per epoch, when set.
+            dataset: Dataset name, e.g. "imagenet" or "basic_ct"; determines how
+                files are read in `read_process_file`.
+            resize: `[height, width]` to resize images to, only used for
+                `dataset == "imagenet"`. If None, images are left at their
+                native size (every file under this dataset key must then
+                already share the same size, since samples in a batch
+                must have matching shapes).
+            allow_file_reuse: If False (default), `__iter__` raises when this
+                dataset key has fewer files than DDP ranks x dataloader workers
+                to shard across (each shard would otherwise be empty). If True,
+                every shard gets at least one file instead, reused (duplicated,
+                round-robin) across shards as needed -- with a printed warning.
+                See `__iter__`'s own comment for the mechanism.
+            epoch_shuffle_seed: If None (default), `file_list` is used as-is,
+                unchanged across repeated `__iter__` calls (the caller is
+                responsible for reshuffling/replicating between epochs, e.g.
+                by constructing a fresh `FileReader`). If set, `__iter__`
+                instead reshuffles+replicates `file_list` itself, fresh, at
+                the start of every call, seeded with `epoch_shuffle_seed`
+                plus an internal per-instance call counter -- deterministic
+                given the same seed and call count, so every DDP rank/worker
+                sharing this dataset key (each running its own `FileReader`
+                instance, in its own process) computes the *identical*
+                shuffled order for a given epoch without needing to
+                communicate it, which is what keeps `__iter__`'s
+                disjoint-window sharding across ranks/workers correct. This
+                is what lets a single `DataLoader` (`persistent_workers:True`)
+                be reused for an entire run instead of being rebuilt (and its
+                workers re-forked) every epoch -- see
+                `NativePytorchDataModule`'s own docstring entry for why that
+                matters.
+            variables_out: Regression-target variable names, e.g. `["p"]`.
+                Only used (and required, when `return_label`) for "sst" --
+                every other dataset's label comes from a fixed location
+                relative to the input file (e.g. basic_ct's sibling
+                "labelsTr" directory) rather than a separate named variable.
+            chunk_size: This dataset key's per-sample/per-chunk size `[nz,
+                ny, nx]` -- matches `data.img_size` exactly (see
+                `UCF_VIT.utils.misc.process_root_dirs`'s own docstring for
+                why "sst" repurposes img_size as the chunk size). Only used
+                for "sst".
+            full_domain_size: This dataset key's true full on-disk domain
+                size `[nz, ny, nx]` -- what one raw per-variable file
+                actually spans, before any chunk splitting. Only used for
+                "sst"; `chunk_size` itself when omitted (1 chunk).
+            normalize_stats: `{variable_name: {"mean":..., "std":...}}` for
+                this dataset key -- see `UCF_VIT.utils.normalize.
+                zscore_normalize`'s own docstring. `None`/`{}` (default) or
+                a variable missing from it means that channel is returned
+                unnormalized, exactly today's behavior.
+        """
         super().__init__()
         self.num_channels_available = len(variables)
         start_idx = int(start_idx * len(file_list))
         end_idx = int(end_idx * len(file_list))
         file_list = file_list[start_idx:end_idx]
         self.file_list = file_list
-        self.multi_dataset_training = multi_dataset_training
+        # Only actually read by _reshuffled_and_replicated_file_list -- the stable,
+        # un-replicated basis __iter__ rebuilds self.file_list from every epoch when
+        # epoch_shuffle_seed is set. Without this, the second epoch's reshuffle would
+        # read the *previous* epoch's already keys_to_add-times-replicated
+        # self.file_list instead, ballooning it further every epoch.
+        self.master_file_list = file_list
         self.data_par_size = data_par_size
-        self.twoD = twoD
         self.return_label = return_label
         self.variables = variables
+        self.normalize_stats = normalize_stats or {}
         self.gx = gx
         self.keys_to_add = keys_to_add
         self.ddp_group = ddp_group
         self.dataset = dataset
+        self.allow_file_reuse = allow_file_reuse
+        self.epoch_shuffle_seed = epoch_shuffle_seed
+        self._epoch = 0
 
         #Optional Inputs
         if self.dataset == "imagenet":
-            self.imagenet_resize = imagenet_resize
+            self.resize = resize
+        if self.dataset == "sst":
+            self.variables_out = variables_out
+            self.chunk_size = chunk_size
+            self.full_domain_size = full_domain_size or chunk_size
 
     def read_process_file(self, path):
+        """Reads and preprocesses a single data file according to `self.dataset`.
+
+        For "imagenet", loads and resizes an RGB image and, if `return_label`,
+        derives the class label from the parent directory name. For "basic_ct",
+        loads a NIfTI volume and, if `return_label`, loads the corresponding
+        label volume from the sibling "labelsTr" directory. Every branch's
+        real (continuous) data -- and "sst"'s regression label, but never a
+        discrete class-index label -- is z-score normalized via `self.
+        normalize_stats` (`UCF_VIT.utils.normalize.zscore_normalize`) right
+        before returning, a no-op passthrough when unconfigured.
+
+        Args:
+            path: Path to the file to read.
+
+        Returns:
+            `data` (channel-first array), or `(data, label)` if `self.return_label`
+            is True.
+        """
         if self.dataset == "imagenet":
             data = Image.open(path).convert("RGB")
-            data = np.array(data) 
-            data = cv.resize(data, dsize=[self.imagenet_resize[0],self.imagenet_resize[1]])
+            data = np.array(data)
+            if self.resize is not None:
+                # self.resize is (height, width); cv2's dsize is natively
+                # (width, height), so swap locally right here.
+                data = cv.resize(data, dsize=[self.resize[1], self.resize[0]])
             data = np.moveaxis(data,-1,0)
-
+            data = zscore_normalize(data, self.variables, self.normalize_stats, channel_axis=0)
 
             if self.return_label:
                 data_path = Path(path)
@@ -73,7 +196,9 @@ class FileReader(IterableDataset):
         elif self.dataset == "basic_ct":
             data = nib.load(path)
             data = np.array(data.dataobj).astype(np.float32)
-            data = (data-data.min())/(data.max()-data.min())
+            if self.num_channels_available == 1:
+                data = np.expand_dims(data, axis=0)
+            data = zscore_normalize(data, self.variables, self.normalize_stats, channel_axis=0)
 
             if self.return_label:
                 data_path = Path(path)
@@ -84,65 +209,170 @@ class FileReader(IterableDataset):
                 label = nib.load(path4)
                 label = np.array(label.dataobj).astype(np.int64)
                 label = label - 1 # subtract 1 as original labels are [1,4], new will be [0,3]
-
-            if self.num_channels_available == 1:
-                if self.return_label:
-                    return np.expand_dims(data,axis=0), label
-                else:
-                    return np.expand_dims(data,axis=0)
+                return data, label
             else:
-                if self.return_label:
-                    return data, label
-                else:
-                    return data
+                return data
+
+        elif self.dataset == "sst":
+            # "path" is a synthetic identifier (see process_root_dirs's own
+            # docstring), optionally suffixed with "__chunk<z>_<y>_<x>" when
+            # this dataset key is split into more than one chunk per raw
+            # file. Before that, it's either "<root_dir>/<timestamp>" (no
+            # real timestepping -- self.variables/variables_out are
+            # (var, 0) pairs, all reading the one timestamp in the path) or
+            # "<root_dir>/__t<off1>=<ts1>,<off2>=<ts2>,..." (a real
+            # timestepped window -- every offset actually referenced by
+            # self.variables/variables_out resolved to its real timestamp).
+            raw_path, _, chunk_suffix = path.partition("__chunk")
+            chunk_idx = [int(v) for v in chunk_suffix.split("_")] if chunk_suffix else [0, 0, 0]
+
+            root_path = Path(raw_path)
+            parent = root_path.parent
+            stem = root_path.name
+            if stem.startswith("__t"):
+                offset_to_timestamp = dict(pair.split("=") for pair in stem[len("__t"):].split(","))
+                offset_to_timestamp = {int(k): v for k, v in offset_to_timestamp.items()}
+            else:
+                offset_to_timestamp = {0: stem}
+
+            nz_full, ny_full, nx_full = self.full_domain_size
+            nz, ny, nx = self.chunk_size
+            z0, y0, x0 = chunk_idx[0] * nz, chunk_idx[1] * ny, chunk_idx[2] * nx
+
+            def _read_channel(var, offset):
+                channel_path = os.path.join(parent, f"{var}_{offset_to_timestamp[offset]}")
+                # +2 on the x axis: a fixed, real characteristic of this CFD
+                # data's on-disk layout (ghost cells), not a tunable config
+                # value. Confirmed: the real domain is the *first* nx_full
+                # columns -- the trailing 2 are simply never read (every
+                # chunk/tile bound is computed from nx_full, so they're
+                # unreachable by construction, not explicitly trimmed here
+                # for any other reason than clarity/safety).
+                full = np.memmap(channel_path, dtype=np.float32, mode='r', shape=(nz_full, ny_full, nx_full + 2))[:, :, :nx_full]
+                chunk = full[z0:z0 + nz, y0:y0 + ny, x0:x0 + nx]
+                # (nz, ny, nx) -> (nx, ny, nz): matches every other dataset's
+                # channel-first-then-(X, Y, Z) convention (TileDataIter's own
+                # slicing, and everything downstream of it, assumes this),
+                # not the memmap's own on-disk (Z, Y, X) shape. A view, not a
+                # copy -- still lazy, no real read happens until a later
+                # caller (TileDataIter's own tile slice) actually materializes
+                # a (small) piece of it.
+                return chunk.transpose(2, 1, 0)
+
+            # Each entry is either a plain variable name (no real
+            # timestepping -- implicitly offset 0, reading the one
+            # timestamp resolved above) or a (var, offset) pair (real
+            # timestepping).
+            def _var_offset(entry):
+                return entry if isinstance(entry, tuple) else (entry, 0)
+
+            data_list = [_read_channel(*_var_offset(entry)) for entry in self.variables]
+            data_list = zscore_normalize(data_list, self.variables, self.normalize_stats)
+
+            if self.return_label:
+                label_list = [_read_channel(*_var_offset(entry)) for entry in self.variables_out]
+                # A real (continuous) regression target -- unlike basic_ct's/
+                # imagenet's discrete class-index label, this needs the same
+                # normalization as data_list so the loss compares like-scale
+                # values (see UCF_VIT.utils.normalize's own module docstring
+                # for why training loss stays in normalized space).
+                label_list = zscore_normalize(label_list, self.variables_out, self.normalize_stats)
+                return data_list, label_list
+            else:
+                return data_list
+
+    def _reshuffled_and_replicated_file_list(self):
+        """Builds this call's `keys_to_add`-times-replicated, freshly shuffled `file_list`.
+
+        Deterministic given `self.epoch_shuffle_seed` and `self._epoch` alone
+        (see `__init__`'s `epoch_shuffle_seed` docstring entry for why that
+        matters) -- every replicated copy is independently permuted, matching
+        the shuffle `NativePytorchDataModule._shuffle_and_replicate` used to
+        do once, in the main process, before construction.
+        """
+        rng = np.random.RandomState(self.epoch_shuffle_seed + self._epoch)
+        master = self.master_file_list
+        shuffled = rng.choice(master, size=len(master), replace=False).tolist()
+        for _ in range(self.keys_to_add - 1):
+            shuffled.extend(rng.choice(master, size=len(master), replace=False).tolist())
+        return shuffled
 
     def __iter__(self):
+        """Yields preprocessed samples for this worker's shard of `self.file_list`.
+
+        If `self.epoch_shuffle_seed` is set, `self.file_list` is first
+        replaced with a freshly (deterministically) reshuffled+replicated
+        version for this epoch -- see `__init__`'s `epoch_shuffle_seed`
+        docstring entry.
+
+        Determines this dataloader worker's contiguous shard of `self.file_list`
+        based on the data-parallel rank (via `gx`/`ddp_group`) and the worker's
+        index among `torch.utils.data.get_worker_info()`, then repeats iteration
+        over that shard `self.keys_to_add` times, calling `read_process_file` on
+        each file.
+
+        Yields:
+            `(data, label, self.variables)` if `self.return_label` is True,
+            otherwise `(data, self.variables)`.
+        """
+        if self.epoch_shuffle_seed is not None:
+            self.file_list = self._reshuffled_and_replicated_file_list()
+            self._epoch += 1
+
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is None:
+            # No DataLoader multiprocessing workers (num_workers=0) -- stand in with a
+            # single worker per DDP rank so this still shards by DDP rank via
+            # gx/ddp_group below (without this, every DDP rank would read the *entire*
+            # file_list instead of its own shard).
             assert torch.distributed.is_initialized()
             class dummy:
                 num_workers = 1
                 id = 0
             worker_info = dummy()
-            iter_start = 0
-            iter_end = len(self.file_list)
 
+        if not torch.distributed.is_initialized():
+            ddp_rank = 0
+            self.data_par_size = 1
         else:
-            if not torch.distributed.is_initialized():
-                ddp_rank = 0
-                self.data_par_size = 1
+            if self.ddp_group == None:
+                ddp_rank = torch.distributed.get_rank()
             else:
-                if self.ddp_group == None:
-                    ddp_rank = torch.distributed.get_rank()
-                else:
-                    ddp_rank = torch.distributed.get_rank(group=self.ddp_group)
+                ddp_rank = torch.distributed.get_rank(group=self.ddp_group)
 
-            num_workers_per_ddp = worker_info.num_workers
-            assert num_workers_per_ddp == 1
-            if self.multi_dataset_training:
-                group_list = list(map(lambda x: int(x), self.gx.split(":")))
-                group_id = np.where(np.cumsum(group_list) > ddp_rank)[0][0]
-                group_size = group_list[group_id]
-                group_rank = ddp_rank - ([0] + np.cumsum(group_list).tolist())[group_id]
-                num_shards = group_size
-                rank = group_rank
-            else:
-                num_shards = num_workers_per_ddp * self.data_par_size
-                rank = ddp_rank
-            per_worker = int(math.floor(len(self.file_list)/ float(self.keys_to_add) / float(num_shards)))
-            if per_worker == 0:
-                self.file_list = (self.file_list * math.ceil(num_shards/len(self.file_list)))[:num_shards]
-                per_worker = 1
-            assert per_worker > 0
-            worker_id = rank * num_workers_per_ddp + worker_info.id
-            iter_start = worker_id * per_worker
-            iter_end = iter_start + per_worker
+        num_workers_per_ddp = worker_info.num_workers
+        group_list = list(map(lambda x: int(x), self.gx.split(":")))
+        group_id = np.where(np.cumsum(group_list) > ddp_rank)[0][0]
+        group_size = group_list[group_id]
+        group_rank = ddp_rank - ([0] + np.cumsum(group_list).tolist())[group_id]
+        num_shards = group_size * num_workers_per_ddp
+        rank = group_rank
 
-        #print ("global rank %d: ddp rank %d, num_workers_per_ddp %d, worker_info_id %d, worker id %d, iter_start,iter_end = %d %d"%(torch.distributed.get_rank(), ddp_rank, num_workers_per_ddp, worker_info.id, worker_id, iter_start, iter_end), flush=True)
+        per_worker = int(math.floor(len(self.file_list)/ float(self.keys_to_add) / float(num_shards)))
+        if per_worker == 0:
+            # Not enough files for every DDP rank x worker shard to be disjoint and
+            # non-empty. allow_file_reuse:True trades that guarantee for one file
+            # per worker, reused (duplicated) round-robin instead of failing.
+            assert len(self.file_list) > 0, "This dataset key has zero files at all -- check dict_root_dirs/dict_start_idx/dict_end_idx (allow_file_reuse can't reuse files that don't exist)."
+            assert self.allow_file_reuse, "Each worker doesn't have at least one unique file, run utils/load_balance.py to diagnose the issue. Set dataloader.allow_file_reuse: True to let workers reuse (duplicate) files instead."
+            per_worker = 1
+            if ddp_rank == 0 and worker_info.id == 0:
+                print(f"WARNING: only {len(self.file_list)} files available for {num_shards} worker shards "
+                      f"({num_shards / len(self.file_list):.3g}x oversubscribed) -- allow_file_reuse:True means "
+                      f"files will be reused (duplicated) round-robin across workers/ranks this epoch.", flush=True)
+        worker_id = rank * num_workers_per_ddp + worker_info.id
+        iter_start = worker_id * per_worker
+        iter_end = iter_start + per_worker
+
         for m in range(self.keys_to_add):
             start_it = iter_start + m*int(len(self.file_list)/self.keys_to_add)
             end_it = iter_end + m*int(len(self.file_list)/self.keys_to_add)
             for idx in range(start_it, end_it):
+                # % len(self.file_list): a no-op in the normal (enough files)
+                # case, since idx never reaches len(self.file_list) there --
+                # only wraps when allow_file_reuse's per_worker=1 fallback above
+                # pushed idx past the real list length.
+                idx = idx % len(self.file_list)
                 if self.return_label:
                     data, label = self.read_process_file(self.file_list[idx])
                     yield data, label, self.variables
@@ -150,413 +380,212 @@ class FileReader(IterableDataset):
                     data = self.read_process_file(self.file_list[idx])
                     yield data, self.variables
 
-class ImageBlockDataIter_2D(IterableDataset):
+class TileDataIter(IterableDataset):
+    """Iterable dataset that splits each sample from an upstream dataset into overlapping tiles.
+
+    Wraps a `FileReader` (or similarly-shaped iterable) and, for each yielded
+    sample, iterates over a `div x div[ x div]` grid of tiles (optionally slicing
+    3D volumes into 2D slices first), yielding one tile at a time.
+    """
+
     def __init__(
-        self, dataset: FileReader, tile_size_x: int = 64, tile_size_y: int = 64, tile_size_z: int = None, return_label: bool = False, tile_overlap: float = 0.0, use_all_data: bool = False, classification: bool = False,
+        self, dataset: FileReader, tile_size: tuple[int, ...] = (64, 64), twoD: bool = True, return_label: bool = False, div: int = 1, tile_overlap: tuple[int,...] = (0,0), classification: bool = False,
     ) -> None:
+        """Initializes the tiling parameters.
+
+        Args:
+            dataset: Upstream iterable dataset yielding `(data, [label,] variables)`.
+            tile_size: Target tile size (including overlap), one entry per spatial
+                dimension.
+            twoD: If the upstream data is 3D, whether to slice it into 2D tiles
+                along the z-axis (True) or tile it fully in 3D (False). Also
+                controls how many spatial dims `tile_size` has.
+            return_label: Whether upstream samples include a label to also tile
+                (for segmentation) or pass through unchanged (for classification).
+            div: Number of tiles to divide each spatial dimension into.
+            tile_overlap: Total overlap amount per dimension between adjacent
+                tiles, used to compute `start_overlap`/`end_overlap` via
+                `calculate_tile_overlap`.
+            classification: If True, labels are per-sample (not tiled) and passed
+                through unchanged for every tile; if False, labels are tiled the
+                same way as the data (segmentation).
+        """
         super().__init__()
         self.dataset = dataset
-        self.tile_size_x = tile_size_x
-        self.tile_size_y = tile_size_y
-        self.tile_size_z = tile_size_z
+        self.tile_size = tile_size
+        self.twoD = twoD
         self.return_label = return_label
-        self.tile_overlap = tile_overlap
-        self.use_all_data = use_all_data
+        self.div = div
+        self.start_overlap, self.end_overlap = calculate_tile_overlap(tile_overlap)
+        self.tile_size_no_overlap = []
+        # Only the dims with an overlap value (x, y) are ever div'd into
+        # tiles -- `tile_size` can have an extra untiled z entry (3D data
+        # sliced into 2D z-planes; see parse.py's tile_size computation), so
+        # this must iterate over tile_overlap's length, not tile_size's, or
+        # it would index past the end of start_overlap/end_overlap.
+        for i in range(len(tile_overlap)):
+            self.tile_size_no_overlap.append(self.tile_size[i] - (self.start_overlap[i] + self.end_overlap[i]))
+
         self.classification = classification
 
+    @staticmethod
+    def _slice_tile(data, x_bounds, y_bounds, z_bounds, channel_first=True):
+        """Slices one `(start, end)`-bounded tile out of `data` along its 3
+        spatial axes, returning a real, materialized (not lazy) ndarray --
+        only used by the 3D (non-`twoD`) branches below, the only ones
+        "sst" (the one dataset that can pass a list here) ever reaches;
+        `data` is a single already-stacked ndarray for every other dataset.
+
+        `data` is either that single ndarray, or (only for "sst" -- see
+        `FileReader.read_process_file`'s own docstring) a list of per-channel
+        memmap views. In the list case, only the tile actually being cut is
+        ever read from disk: `np.asarray` is what forces the read, and it
+        only ever sees this one small tile's worth, never the whole
+        (potentially many-GB) volume `FileReader` handed off -- `channel_first`
+        is irrelevant here, the stack always has a leading channel dim.
+
+        `channel_first` only matters for the plain-ndarray case: `data`
+        itself is always channel-first (`(C, X, Y, Z)`) for every dataset,
+        but `label` isn't -- `basic_ct`'s real segmentation label is a bare
+        `(X, Y, Z)` array at this point in the pipeline (`ProcessChannels`
+        adds the channel dim later), so slicing it with a leading `:,`
+        would be wrong (and previously *was* wrong -- this parameter fixes
+        a real regression: every non-"sst" 3D label, e.g. basic_ct/UNETR's,
+        crashed with "too many indices" the moment this got unified with
+        `data`'s own always-channel-first slicing).
+        """
+        sx, sy, sz = slice(*x_bounds), slice(*y_bounds), slice(*z_bounds)
+        if isinstance(data, list):
+            return np.stack([np.asarray(channel[sx, sy, sz]) for channel in data], axis=0)
+        if channel_first:
+            return data[:, sx, sy, sz]
+        return data[sx, sy, sz]
+
     def __iter__(self):
-        tile_overlap_size_x = int(self.tile_size_x*self.tile_overlap)
-        tile_overlap_size_y = int(self.tile_size_y*self.tile_overlap)
-        if tile_overlap_size_x == 0.0:
-            OTP2_x = 1
-            tile_overlap_size_x = 0
-        else:
-            OTP2_x = int(self.tile_size_x/tile_overlap_size_x)
-        if tile_overlap_size_y == 0.0:
-            OTP2_y = 1
-            tile_overlap_size_y = 0
-        else:
-            OTP2_y = int(self.tile_size_y/tile_overlap_size_y)
+        """Yields one tile at a time from every sample produced by `self.dataset`.
 
-        if self.return_label:
-            for (data,label,variables) in self.dataset:
-                #Total Tiles Evenly Spaced
-                TTE_x = data.shape[1]//self.tile_size_x
-                TTE_y = data.shape[2]//self.tile_size_y
-                num_blocks_x = (TTE_x-1)*OTP2_x + 1
-                num_blocks_y = (TTE_y-1)*OTP2_y + 1
-                if self.use_all_data:
-                    #Total Tiles
-                    TT_x = data.shape[1]/(self.tile_size_x)
-                    TT_y = data.shape[2]/(self.tile_size_y)
-                    # Number of leftover overlap patches for last tile
-                    LTOP_x = np.floor((TT_x-TTE_x)*OTP2_x)
-                    LTOP_y = np.floor((TT_y-TTE_y)*OTP2_y)
-                    if tile_overlap_size_x == 0:
-                        if data.shape[1] % self.tile_size_x != 0:
-                            LTOP_x += 1
-                    else: #>0
-                        if data.shape[1] % tile_overlap_size_x != 0:
-                            LTOP_x += 1
-                    if tile_overlap_size_y == 0:
-                        if data.shape[2] % self.tile_size_y != 0:
-                            LTOP_y += 1
-                    else: #>0
-                        if data.shape[2] % tile_overlap_size_y != 0:
-                            LTOP_y += 1
-                    num_blocks_x = int(num_blocks_x + LTOP_x)
-                    num_blocks_y = int(num_blocks_y + LTOP_y)
+        For 3D data with `self.twoD=True`, first iterates over z-slices and then
+        the 2D tile grid within each slice; for 3D data with `self.twoD=False`,
+        iterates over the full 3D tile grid; for 2D data, iterates over the 2D tile
+        grid directly.
 
-                channels, datalen_x, datalen_y = data.shape
+        Yields:
+            `(tile, label, variables)` if `self.return_label` is True (with `label`
+            tiled too unless `self.classification` is True), otherwise `(tile,
+            variables)`.
+        """
 
-                x_step_size = self.tile_size_x-tile_overlap_size_x
-                y_step_size = self.tile_size_y-tile_overlap_size_y
-                for ii in range(num_blocks_x):
-                    for jj in range(num_blocks_y):
-                        if not self.use_all_data:
+        if len(self.tile_size) == 3: #Data is 3D
+            if self.return_label:
+                for (data,label,variables) in self.dataset:
+                    if self.twoD: #Loop through slices of 3D data
+                        #The current implementation slices on the z dimension but, could do x or y as well
+                        #TODO: Add an option on which dimension to slice
+                        # self.tile_size[2] is the raw (untiled) z-axis size -- was
+                        # data.shape[2], which is actually the y-axis size, not z
+                        # (data is channel-first (C, X, Y, Z)); only happened to be
+                        # harmless for basic_ct's cubic 256x256x256 volumes.
+                        for z_idx in range(self.tile_size[2]):
+                            for x_idx in range(self.div):
+                                for y_idx in range(self.div):
+                                    start_x, end_x = calculate_tile_bounds(x_idx, self.div, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
+                                    start_y, end_y = calculate_tile_bounds(y_idx, self.div, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
+                                    if self.classification:
+                                        yield data[:, start_x:end_x, start_y:end_y, z_idx], label, variables
+                                    else:
+                                        yield data[:, start_x:end_x, start_y:end_y, z_idx], label[start_x:end_x, start_y:end_y, z_idx], variables
+                                    
+                    else: #Loop through full 3D
+                        for x_idx in range(self.div):
+                            for y_idx in range(self.div):
+                                for z_idx in range(self.div):
+                                    x_bounds = calculate_tile_bounds(x_idx, self.div, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
+                                    y_bounds = calculate_tile_bounds(y_idx, self.div, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
+                                    z_bounds = calculate_tile_bounds(z_idx, self.div, self.tile_size_no_overlap[2], self.start_overlap[2], self.end_overlap[2])
+                                    if self.classification:
+                                        yield self._slice_tile(data, x_bounds, y_bounds, z_bounds), label, variables
+                                    else:
+                                        yield self._slice_tile(data, x_bounds, y_bounds, z_bounds), self._slice_tile(label, x_bounds, y_bounds, z_bounds, channel_first=False), variables
+
+            else:
+                for (data,variables) in self.dataset:
+                    if self.twoD: #Loop through slices of 3D data
+                        #The current implementation slices on the z dimension but, could do x or y as well
+                        #TODO: Add an option on which dimension to slice
+                        # self.tile_size[2] is the raw (untiled) z-axis size -- was
+                        # data.shape[2], which is actually the y-axis size, not z
+                        # (data is channel-first (C, X, Y, Z)); only happened to be
+                        # harmless for basic_ct's cubic 256x256x256 volumes.
+                        for z_idx in range(self.tile_size[2]):
+                            for x_idx in range(self.div):
+                                for y_idx in range(self.div):
+                                    start_x, end_x = calculate_tile_bounds(x_idx, self.div, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
+                                    start_y, end_y = calculate_tile_bounds(y_idx, self.div, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
+                                    yield data[:, start_x:end_x, start_y:end_y, z_idx], variables
+
+                    else: #Loop through full 3D
+                        for x_idx in range(self.div):
+                            for y_idx in range(self.div):
+                                for z_idx in range(self.div):
+                                    x_bounds = calculate_tile_bounds(x_idx, self.div, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
+                                    y_bounds = calculate_tile_bounds(y_idx, self.div, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
+                                    z_bounds = calculate_tile_bounds(z_idx, self.div, self.tile_size_no_overlap[2], self.start_overlap[2], self.end_overlap[2])
+                                    yield self._slice_tile(data, x_bounds, y_bounds, z_bounds), variables
+
+        else: #Data is 2D -- imagenet only in practice (the only
+              #iterative_dataloader dataset with a 2D img_size); catsdogs
+              #never reaches TileDataIter at all (no tiling capability).
+              #img_size/tile_size are stored [height, width], matching
+              #imagenet's real array here directly: cv.resize + moveaxis(-1, 0)
+              #produces (C, H, W), so tile_size_no_overlap[0]/start_overlap[0]/
+              #end_overlap[0] (height) bound dim 1 (H) via start_x, and index 1
+              #(width) bounds dim 2 (W) via start_y -- no swap needed, same as
+              #basic_ct's 3D branch above.
+            if self.return_label:
+                for (data,label,variables) in self.dataset:
+                    for x_idx in range(self.div):
+                        for y_idx in range(self.div):
+                            start_x, end_x = calculate_tile_bounds(x_idx, self.div, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
+                            start_y, end_y = calculate_tile_bounds(y_idx, self.div, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
                             if self.classification:
-                                yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size], label, variables
+                                yield data[:, start_x:end_x, start_y:end_y], label, variables
                             else:
-                                yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size], variables
-                        else:
-                            if self.tile_size_x+ii*x_step_size > (datalen_x-1):
-                                if self.tile_size_y+jj*y_step_size > (datalen_y-1):
-                                    #xy
-                                    if self.classification:
-                                        yield data[:, datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y], label, variables
-                                    else:
-                                        yield data[:, datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y], label[datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y], variables
-                                else:
-                                #x
-                                    if self.classification:
-                                        yield data[:, datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size], label, variables
-                                    else:
-                                        yield data[:, datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size], label[datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size], variables
-                            elif self.tile_size_y+jj*y_step_size > (datalen_y-1):
-                            #y
-                                if self.classification:
-                                    yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y], label, variables
-                                else:
-                                    yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y], variables
-                            else:
-                                if self.classification:
-                                    yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size], label, variables
-                                else:
-                                    yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size], variables
+                                yield data[:, start_x:end_x, start_y:end_y], label[start_x:end_x, start_y:end_y], variables
 
-        else:
-            for (data,variables) in self.dataset:
-                #Total Tiles Evenly Spaced
-                TTE_x = data.shape[1]//self.tile_size_x
-                TTE_y = data.shape[2]//self.tile_size_y
-                num_blocks_x = (TTE_x-1)*OTP2_x + 1
-                num_blocks_y = (TTE_y-1)*OTP2_y + 1
-                if self.use_all_data:
-                    #Total Tiles
-                    TT_x = data.shape[1]/(self.tile_size_x)
-                    TT_y = data.shape[2]/(self.tile_size_y)
-                    # Number of leftover overlap patches for last tile
-                    LTOP_x = np.floor((TT_x-TTE_x)*OTP2_x)
-                    LTOP_y = np.floor((TT_y-TTE_y)*OTP2_y)
-                    if tile_overlap_size_x == 0:
-                        if data.shape[1] % self.tile_size_x != 0:
-                            LTOP_x += 1
-                    else: #>0
-                        if data.shape[1] % tile_overlap_size_x != 0:
-                            LTOP_x += 1
-                    if tile_overlap_size_y == 0:
-                        if data.shape[2] % self.tile_size_y != 0:
-                            LTOP_y += 1
-                    else: #>0
-                        if data.shape[2] % tile_overlap_size_y != 0:
-                            LTOP_y += 1
-                    num_blocks_x = int(num_blocks_x + LTOP_x)
-                    num_blocks_y = int(num_blocks_y + LTOP_y)
+            else:
+                for (data,variables) in self.dataset:
+                    for x_idx in range(self.div):
+                        for y_idx in range(self.div):
+                            start_x, end_x = calculate_tile_bounds(x_idx, self.div, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
+                            start_y, end_y = calculate_tile_bounds(y_idx, self.div, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
+                            yield data[:, start_x:end_x, start_y:end_y], variables
 
-                channels, datalen_x, datalen_y = data.shape
-
-                x_step_size = self.tile_size_x-tile_overlap_size_x
-                y_step_size = self.tile_size_y-tile_overlap_size_y
-                for ii in range(num_blocks_x):
-                    for jj in range(num_blocks_y):
-                        if not self.use_all_data:
-                            yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size], variables
-                        else:
-                            if self.tile_size_x+ii*x_step_size > (datalen_x-1):
-                                if self.tile_size_y+jj*y_step_size > (datalen_y-1):
-                                #xy
-                                    yield data[:, datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y], variables
-                                else:
-                                #x
-                                    yield data[:, datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size], variables
-                            elif self.tile_size_y+jj*y_step_size > (datalen_y-1):
-                                #y
-                                yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y], variables
-                            else:
-                                yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size], variables
-
-class ImageBlockDataIter_3D(IterableDataset):
-    def __init__(
-        self, dataset: FileReader, tile_size_x: int = 64, tile_size_y: int = 64, tile_size_z: int = 64, twoD: bool = True, return_label: bool = False, tile_overlap: float = 0.0, use_all_data: bool = False,
-    ) -> None:
-        super().__init__()
-        self.dataset = dataset
-        self.twoD = twoD
-        self.tile_size_x = tile_size_x
-        self.tile_size_y = tile_size_y
-        self.tile_size_z = tile_size_z
-        self.return_label = return_label
-        self.tile_overlap = tile_overlap
-        self.use_all_data = use_all_data
-
-    def __iter__(self):
-        tile_overlap_size_x = int(self.tile_size_x*self.tile_overlap)
-        tile_overlap_size_y = int(self.tile_size_y*self.tile_overlap)
-        tile_overlap_size_z = int(self.tile_size_z*self.tile_overlap)
-        if tile_overlap_size_x == 0.0:
-            OTP2_x = 1
-            tile_overlap_size_x = 0
-        else:
-            OTP2_x = int(self.tile_size_x/tile_overlap_size_x)
-        if tile_overlap_size_y == 0.0:
-            OTP2_y = 1
-            tile_overlap_size_y = 0
-        else:
-            OTP2_y = int(self.tile_size_y/tile_overlap_size_y)
-        if tile_overlap_size_z == 0.0:
-            OTP2_z = 1
-            tile_overlap_size_z = 0
-        else:
-            OTP2_z = int(self.tile_size_z/tile_overlap_size_z)
-
-        if self.return_label:
-            for (data,label,variables) in self.dataset:
-                #Total Tiles Evenly Spaced
-                TTE_x = data.shape[1]//self.tile_size_x
-                TTE_y = data.shape[2]//self.tile_size_y
-                num_blocks_x = (TTE_x-1)*OTP2_x + 1
-                num_blocks_y = (TTE_y-1)*OTP2_y + 1
-                if self.use_all_data:
-                    #Total Tiles
-                    TT_x = data.shape[1]/(self.tile_size_x)
-                    TT_y = data.shape[2]/(self.tile_size_y)
-                    # Number of leftover overlap patches for last tile
-                    LTOP_x = np.floor((TT_x-TTE_x)*OTP2_x)
-                    LTOP_y = np.floor((TT_y-TTE_y)*OTP2_y)
-                    if tile_overlap_size_x == 0:
-                        if data.shape[1] % self.tile_size_x != 0:
-                            LTOP_x += 1
-                    else: #>0
-                        if data.shape[1] % tile_overlap_size_x != 0:
-                            LTOP_x += 1
-                    if tile_overlap_size_y == 0:
-                        if data.shape[2] % self.tile_size_y != 0:
-                            LTOP_y += 1
-                    else: #>0
-                        if data.shape[2] % tile_overlap_size_y != 0:
-                            LTOP_y += 1
-                    num_blocks_x = int(num_blocks_x + LTOP_x)
-                    num_blocks_y = int(num_blocks_y + LTOP_y)
-
-                if self.twoD:
-                    if self.use_all_data:
-                        num_blocks_z = int(np.ceil(data.shape[3]/self.tile_size_z))
-                    else:
-                        num_blocks_z = data.shape[3]//self.tile_size_z
-                else:
-                    TTE_z = data.shape[3]//self.tile_size_z
-                    num_blocks_z = (TTE_z-1)*OTP2_z + 1
-                    if self.use_all_data:
-                        #Total Tiles
-                        TT_z = data.shape[3]/(self.tile_size_z)
-                        # Number of leftover overlap patches for last tile
-                        LTOP_z = np.floor((TT_z-TTE_z)*OTP2_z)
-                        if tile_overlap_size_z == 0:
-                            if data.shape[3] % self.tile_size_z != 0:
-                                LTOP_z += 1
-                        else: #>0
-                            if data.shape[3] % tile_overlap_size_z != 0:
-                                LTOP_z += 1
-                        num_blocks_z = int(num_blocks_z + LTOP_z)
-
-                channels, datalen_x, datalen_y, datalen_z = data.shape
-
-                x_step_size = self.tile_size_x-tile_overlap_size_x
-                y_step_size = self.tile_size_y-tile_overlap_size_y
-                if not self.twoD:
-                    z_step_size = self.tile_size_z-tile_overlap_size_z
-                for ii in range(num_blocks_x):
-                    for jj in range(num_blocks_y):
-                        for kk in range(num_blocks_z):
-                            if self.twoD:
-                                for kkk in range(self.tile_size_z):
-                                    if not self.use_all_data:
-                                        yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kkk+kk*self.tile_size_z], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kkk+kk*self.tile_size_z], variables
-                                    else:
-                                        if kkk+kk*self.tile_size_z > (datalen_z-1):
-                                            continue
-                                        elif self.tile_size_x+ii*x_step_size > (datalen_x-1):
-                                            if self.tile_size_y+jj*y_step_size > (datalen_y-1):
-                                            #xy
-                                                yield data[:, datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y, kkk+kk*self.tile_size_z], label[datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y, kkk+kk*self.tile_size_z], variables
-                                            else:
-                                            #x
-                                                yield data[:, datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size, kkk+kk*self.tile_size_z], label[datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size, kkk+kk*self.tile_size_z], variables
-                                        elif self.tile_size_y+jj*y_step_size > (datalen_y-1):
-                                        #y
-                                            yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y, kkk+kk*self.tile_size_z], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y, kkk+kk*self.tile_size_z], variables
-                                        else:
-                                            yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kkk+kk*self.tile_size_z], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kkk+kk*self.tile_size_z], variables
-
-                            else:
-                                if not self.use_all_data:
-                                    yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
-                                else:
-                                    if self.tile_size_x+ii*x_step_size > (datalen_x-1):
-                                        if self.tile_size_y+jj*y_step_size > (datalen_y-1):
-                                            if self.tile_size_z+kk*z_step_size > (datalen_z-1):
-                                            #xyz
-                                                yield data[:, datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y, datalen_z-self.tile_size_z:datalen_z], label[datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y, datalen_z-self.tile_size_z:datalen_z], variables
-                                            else:
-                                            #xy
-                                                yield data[:, datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y, kk*z_step_size:self.tile_size_z+kk*z_step_size], label[datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
-                                        elif self.tile_size_z+kk*z_step_size > (datalen_z-1):
-                                        #xz
-                                            yield data[:, datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size, datalen_z-self.tile_size_z:datalen_z], label[datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size, datalen_z-self.tile_size_z:datalen_z], variables
-                                        else:
-                                        #x
-                                            yield data[:, datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], label[datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
-                                    elif self.tile_size_y+jj*y_step_size > (datalen_y-1):
-                                        if self.tile_size_z+kk*z_step_size > (datalen_z-1):
-                                        #yz
-                                            yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y, datalen_z-self.tile_size_z:datalen_z], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y, datalen_z-self.tile_size_z:datalen_z], variables
-                                        else:
-                                        #y
-                                            yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y, kk*z_step_size:self.tile_size_z+kk*z_step_size], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
-                                    elif self.tile_size_z+kk*z_step_size > (datalen_z-1):
-                                    #z
-                                        yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, datalen_z-self.tile_size_z:datalen_z], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, datalen_z-self.tile_size_z:datalen_z], variables
-                                    else:
-                                        yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], label[ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
-
-        else:
-            for (data,variables) in self.dataset:
-                #Total Tiles Evenly Spaced
-                TTE_x = data.shape[1]//self.tile_size_x
-                TTE_y = data.shape[2]//self.tile_size_y
-                num_blocks_x = (TTE_x-1)*OTP2_x + 1
-                num_blocks_y = (TTE_y-1)*OTP2_y + 1
-                if self.use_all_data:
-                    #Total Tiles
-                    TT_x = data.shape[1]/(self.tile_size_x)
-                    TT_y = data.shape[2]/(self.tile_size_y)
-                    # Number of leftover overlap patches for last tile
-                    LTOP_x = np.floor((TT_x-TTE_x)*OTP2_x)
-                    LTOP_y = np.floor((TT_y-TTE_y)*OTP2_y)
-                    if tile_overlap_size_x == 0:
-                        if data.shape[1] % self.tile_size_x != 0:
-                            LTOP_x += 1
-                    else: #>0
-                        if data.shape[1] % tile_overlap_size_x != 0:
-                            LTOP_x += 1
-                    if tile_overlap_size_y == 0:
-                        if data.shape[2] % self.tile_size_y != 0:
-                            LTOP_y += 1
-                    else: #>0
-                        if data.shape[2] % tile_overlap_size_y != 0:
-                            LTOP_y += 1
-                    num_blocks_x = int(num_blocks_x + LTOP_x)
-                    num_blocks_y = int(num_blocks_y + LTOP_y)
-
-                if self.twoD:
-                    if self.use_all_data:
-                        num_blocks_z = np.ceil(data.shape[3]/self.tile_size_z).astype(int)
-                    else:
-                        num_blocks_z = data.shape[3]//self.tile_size_z
-                else:
-                    TTE_z = data.shape[3]//self.tile_size_z
-                    num_blocks_z = (TTE_z-1)*OTP2_z + 1
-                    if self.use_all_data:
-                        #Total Tiles
-                        TT_z = data.shape[3]/(self.tile_size_z)
-                        # Number of leftover overlap patches for last tile
-                        LTOP_z = np.floor((TT_z-TTE_z)*OTP2_z)
-                        if tile_overlap_size_z == 0:
-                            if data.shape[3] % self.tile_size_z != 0:
-                                LTOP_z += 1
-                        else: #>0
-                            if data.shape[3] % tile_overlap_size_z != 0:
-                                LTOP_z += 1
-                        num_blocks_z = int(num_blocks_z + LTOP_z)
-
-                channels, datalen_x, datalen_y, datalen_z = data.shape
-
-                x_step_size = self.tile_size_x-tile_overlap_size_x
-                y_step_size = self.tile_size_y-tile_overlap_size_y
-                if not self.twoD:
-                    z_step_size = self.tile_size_z-tile_overlap_size_z
-                for ii in range(num_blocks_x):
-                    for jj in range(num_blocks_y):
-                        for kk in range(num_blocks_z):
-                            if self.twoD:
-                                for kkk in range(self.tile_size_z):
-                                    if not self.use_all_data:
-                                        yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kkk+kk*self.tile_size_z], variables
-                                    else:
-                                        if kkk+kk*self.tile_size_z > (datalen_z-1):
-                                            continue
-                                        elif self.tile_size_x+ii*x_step_size > (datalen_x-1):
-                                            if self.tile_size_y+jj*y_step_size > (datalen_y-1):
-                                            #xy
-                                                yield data[:, datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y, kkk+kk*self.tile_size_z], variables
-                                            else:
-                                            #x
-                                                yield data[:, datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size, kkk+kk*self.tile_size_z], variables
-                                        elif self.tile_size_y+jj*y_step_size > (datalen_y-1):
-                                        #y
-                                            yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y, kkk+kk*self.tile_size_z], variables
-                                        else:
-                                            yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kkk+kk*self.tile_size_z], variables
-
-                            else:
-                                if not self.use_all_data:
-                                    yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
-                                else:
-                                    if self.tile_size_x+ii*x_step_size > (datalen_x-1):
-                                        if self.tile_size_y+jj*y_step_size > (datalen_y-1):
-                                            if self.tile_size_z+kk*z_step_size > (datalen_z-1):
-                                            #xyz
-                                                yield data[:, datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y, datalen_z-self.tile_size_z:datalen_z], variables
-                                            else:
-                                            #xy
-                                                yield data[:, datalen_x-self.tile_size_x:datalen_x, datalen_y-self.tile_size_y:datalen_y, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
-                                        elif self.tile_size_z+kk*z_step_size > (datalen_z-1):
-                                        #xz
-                                            yield data[:, datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size, datalen_z-self.tile_size_z:datalen_z], variables
-                                        else:
-                                        #x
-                                            yield data[:, datalen_x-self.tile_size_x:datalen_x, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
-                                    elif self.tile_size_y+jj*y_step_size > (datalen_y-1):
-                                        if self.tile_size_z+kk*z_step_size > (datalen_z-1):
-                                        #yz
-                                            yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y, datalen_z-self.tile_size_z:datalen_z], variables
-                                        else:
-                                        #y
-                                            yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, datalen_y-self.tile_size_y:datalen_y, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
-                                    elif self.tile_size_z+kk*z_step_size > (datalen_z-1):
-                                    #z
-                                        yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, datalen_z-self.tile_size_z:datalen_z], variables
-                                    else:
-                                        yield data[:, ii*x_step_size:self.tile_size_x+ii*x_step_size, jj*y_step_size:self.tile_size_y+jj*y_step_size, kk*z_step_size:self.tile_size_z+kk*z_step_size], variables
-            
 class ShuffleIterableDataset(IterableDataset):
+    """Iterable dataset that approximately shuffles an upstream iterable using a fixed-size reservoir buffer."""
+
     def __init__(self, dataset, buffer_size: int) -> None:
+        """Initializes the shuffle buffer over an upstream dataset.
+
+        Args:
+            dataset: Upstream iterable dataset to shuffle.
+            buffer_size: Size of the reservoir buffer; must be greater than 0.
+                Larger values give better shuffling at the cost of memory.
+        """
         super().__init__()
         assert buffer_size > 0
         self.dataset = dataset
         self.buffer_size = buffer_size
 
     def __iter__(self):
+        """Yields samples from `self.dataset` in reservoir-shuffled order.
+
+        Fills a buffer of `self.buffer_size` samples, then for each new sample
+        swaps it with a random buffer slot and yields the evicted sample; once the
+        upstream dataset is exhausted, shuffles and drains the remaining buffer.
+
+        Yields:
+            Samples from `self.dataset`, in shuffled order.
+        """
         buf = []
 
         for x in self.dataset:
@@ -571,217 +600,186 @@ class ShuffleIterableDataset(IterableDataset):
             yield buf.pop()
 
 class ProcessChannels(IterableDataset):
-    def __init__(self, dataset, num_channels: int, single_channel: bool, batch_size: int, return_label: bool, adaptive_patching: bool, separate_channels: bool, patch_size: int, fixed_length: int, twoD: bool, _dataset: str, return_qdt: bool) -> None:
+    """Iterable dataset that batches samples from an upstream dataset and optionally adaptively patchifies them.
+
+    Buffers `batch_size` upstream samples (tiles/images and, if present, labels)
+    before draining them one at a time, applying `Patchify`/`Patchify_3D` per sample
+    when `adaptive_patching` is enabled (including patchifying segmentation labels
+    with the same quadtree/octree used for the image).
+    """
+
+    def __init__(self, dataset, num_channels: int, batch_size: int, return_label: bool, adaptive_patching: bool, separate_channels: bool, interp_size: int, fixed_length: int, twoD: bool, _dataset: str, return_qdt: bool, profile: bool = False, score_fn: str = "canny", min_size: int = 2, canny_sigma=None, canny_low_threshold=None, canny_high_threshold=None) -> None:
+        """Initializes the batching buffer and, if needed, the adaptive-patching transform.
+
+        Args:
+            dataset: Upstream iterable dataset yielding `(data, [label,]
+                variables)`.
+            num_channels: Number of channels in each sample, used to configure the
+                adaptive-patching transform.
+            batch_size: Number of upstream samples to buffer before yielding.
+            return_label: Whether upstream samples include a label.
+            adaptive_patching: Whether to adaptively patchify each sample (and its
+                label, for segmentation datasets) via a quadtree/octree.
+            separate_channels: Whether adaptive patching is done independently per
+                channel (True, using a `num_channels=1` patcher applied per
+                channel) or jointly across all channels (False).
+            interp_size: Leaf patch size used by the adaptive-patching transform.
+            fixed_length: Fixed output sequence length for adaptive patching.
+            twoD: Whether samples are 2D (`Patchify`) or 3D (`Patchify_3D`).
+            _dataset: Dataset name, e.g. "imagenet" or "basic_ct"; determines label
+                handling and the patchifier's edge-detection behavior.
+            return_qdt: Whether to also yield the quadtree/octree object(s) used
+                for each sample.
+            profile: Diagnostic only, off by default -- forwarded to
+                `Patchify_3D` (3D only, see its own `profile` docstring entry);
+                times the real per-sample Canny/octree-build/serialize cost
+                from inside this DataLoader worker process.
+            score_fn: `"canny"` (default) or `"variance"` -- forwarded to
+                `Patchify`/`Patchify_3D`, see their own `score_fn` docstring
+                entries for what each means.
+            min_size: Smallest leaf side length the adaptive-patching
+                transform will ever produce -- forwarded to `Patchify`/
+                `Patchify_3D`'s own `min_size`.
+            canny_sigma: Forwarded to `Patchify`/`Patchify_3D`'s own
+                `canny_sigma` -- see their own docstring entries.
+            canny_low_threshold: Forwarded to `Patchify`/`Patchify_3D`'s own
+                `canny_low_threshold` -- see their own docstring entries.
+            canny_high_threshold: See `canny_low_threshold`.
+        """
         super().__init__()
         self.dataset = dataset
         self.num_channels = num_channels
-        self.single_channel = single_channel
-        if self.single_channel:
-            self.num_buffers = num_channels
-        else:
-            self.num_buffers = 1
         self.batch_size = batch_size
         self.return_label = return_label
         self.adaptive_patching = adaptive_patching
         self.separate_channels = separate_channels
-        self.patch_size = patch_size
+        self.interp_size = interp_size
         self.twoD = twoD
         self._dataset = _dataset
         self.return_qdt = return_qdt
+        self.score_fn = score_fn
+        self.min_size = min_size
         if self.adaptive_patching:
-            if self.single_channel:
+            if self.separate_channels:
                 if self.twoD:
-                    self.patchify = Patchify(fixed_length=fixed_length, patch_size=patch_size, num_channels=1, dataset=self._dataset)
+                    self.patchify = Patchify(fixed_length=fixed_length, interp_size=interp_size, num_channels=1, dataset=self._dataset, score_fn=self.score_fn, min_size=self.min_size, canny_sigma=canny_sigma, canny_low_threshold=canny_low_threshold, canny_high_threshold=canny_high_threshold)
                 else:
-                    self.patchify = Patchify_3D(fixed_length=fixed_length, patch_size=patch_size, num_channels=1, dataset=self._dataset)
+                    self.patchify = Patchify_3D(fixed_length=fixed_length, interp_size=interp_size, num_channels=1, dataset=self._dataset, profile=profile, score_fn=self.score_fn, min_size=self.min_size, canny_sigma=canny_sigma, canny_low_threshold=canny_low_threshold, canny_high_threshold=canny_high_threshold)
             else:
-                if self.separate_channels:
-                    if self.twoD:
-                        self.patchify = Patchify(fixed_length=fixed_length, patch_size=patch_size, num_channels=1, dataset=self._dataset)
-                    else:
-                        self.patchify = Patchify_3D(fixed_length=fixed_length, patch_size=patch_size, num_channels=1, dataset=self._dataset)
+                if self.twoD:
+                    self.patchify = Patchify(fixed_length=fixed_length, interp_size=interp_size, num_channels=num_channels, dataset=self._dataset, score_fn=self.score_fn, min_size=self.min_size, canny_sigma=canny_sigma, canny_low_threshold=canny_low_threshold, canny_high_threshold=canny_high_threshold)
                 else:
-                    if self.twoD:
-                        self.patchify = Patchify(fixed_length=fixed_length, patch_size=patch_size, num_channels=num_channels, dataset=self._dataset)
-                    else:
-                        self.patchify = Patchify_3D(fixed_length=fixed_length, patch_size=patch_size, num_channels=num_channels, dataset=self._dataset)
+                    self.patchify = Patchify_3D(fixed_length=fixed_length, interp_size=interp_size, num_channels=num_channels, dataset=self._dataset, profile=profile, score_fn=self.score_fn, min_size=self.min_size, canny_sigma=canny_sigma, canny_low_threshold=canny_low_threshold, canny_high_threshold=canny_high_threshold)
 
     def __iter__(self):
+        """Buffers `self.batch_size` upstream samples, then yields them one by one, patchified if configured.
+
+        Yields:
+            A tuple whose composition depends on `self.adaptive_patching`,
+            `self.return_label`, `self._dataset`, and `self.return_qdt`; broadly:
+            `(image, [seq_image, seq_size, seq_pos,] [label,] variables, [qdt])`.
+        """
         yield_x_list = []
         yield_var_list = []
         if self.return_label:
             yield_label_list = []
-        #Make a buffer for each channel
-        for i in range(self.num_buffers):
-            yield_x_list.append([])
-            yield_var_list.append([])
-            if self.return_label:
-                yield_label_list.append([])
 
         for x in self.dataset:
-            for i in range(self.num_buffers):
-                if self.single_channel:
+            if self.return_label:
+                yield_x_list.append(x[0])
+                yield_label_list.append(x[1])
+                yield_var_list.append(x[2])
+            else:
+                yield_x_list.append(x[0])
+                yield_var_list.append(x[1])
+            #TODO: Don't need these lists anymore
+              
+            if len(yield_x_list) == self.batch_size:
+                while yield_x_list:
                     if self.return_label:
-                        yield_x_list[i].append(x[0][i])
-                        yield_label_list[i].append(x[1])
-                        yield_var_list[i].append(x[2][i])
-                    else:
-                        yield_x_list[i].append(x[0][i])
-                        yield_var_list[i].append(x[1][i])
-                else:
-                    if self.return_label:
-                        yield_x_list[i].append(x[0])
-                        yield_label_list[i].append(x[1])
-                        yield_var_list[i].append(x[2])
-                    else:
-                        yield_x_list[i].append(x[0])
-                        yield_var_list[i].append(x[1])
-                  
-                if len(yield_x_list[i]) == self.batch_size:
-                    while yield_x_list[i]:
-                        if self.return_label:
-                            if self.adaptive_patching:
-                                np_image = yield_x_list[i].pop()
-                                if self.single_channel:
-                                    seq_image, seq_size, seq_pos, qdt = self.patchify(np.expand_dims(np_image,axis=-1))
-                                    if self._dataset != "imagenet":
-                                        np_label = yield_label_list[i].pop()
-                                        if self._dataset == "basic_ct":
-                                            np_label = np.expand_dims(np_label,axis=0)
-                                        seq_label_list = []
-                                        for j in range(np_label.shape[0]):
-                                            if self.twoD:
-                                                if self._dataset == "basic_ct":
-                                                    seq_label, _, _ = qdt.serialize_labels(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,1))
-                                                    seq_label = np.asarray(seq_label)
-                                                    seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size, -1, 1])
-                                                else:
-                                                    seq_label, _, _ = qdt.serialize(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,1))
-                                                    seq_label = np.asarray(seq_label, dtype=np.float32)
-                                                    seq_label = np.reshape(seq_label, [-1, self.patch_size*self.patch_size])
-                                            else:
-                                                if self._dataset == "basic_ct":
-                                                    seq_label, _, _ = qdt.serialize_labels(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,self.patch_size,1))
-                                                    seq_label = np.asarray(seq_label)
-                                                    seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size*self.patch_size, -1, 1])
-                                                else:
-                                                    seq_label, _, _ = qdt.serialize(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,self.patch_size,1))
-                                                    seq_label = np.asarray(seq_label, dtype=np.float32)
-                                                    seq_label = np.reshape(seq_label, [-1, self.patch_size*self.patch_size*self.patch_size])
-                                            seq_label_list.append(seq_label)
-                                else:
-                                    if self.separate_channels:
-                                        seq_image_list = []
-                                        seq_size_list = []
-                                        seq_pos_list = []
-                                        qdt_list = []
-                                        for j in range(self.num_channels):
-                                            seq_image, seq_size, seq_pos, qdt = self.patchify(np.expand_dims(np_image[j],axis=-1))
-                                            seq_image_list.append(seq_image)
-                                            seq_size_list.append(seq_size)
-                                            seq_pos_list.append(seq_pos)
-                                            qdt_list.append(qdt)
-                                        seq_image = np.stack([seq_image_list[k] for k in range(len(seq_image_list))])
-                                        seq_size = np.stack([seq_size_list[k] for k in range(len(seq_size_list))])
-                                        seq_pos = np.stack([seq_pos_list[k] for k in range(len(seq_pos_list))])
-                                        qdt = qdt_list
+                        if self.adaptive_patching:
+                            np_image = yield_x_list.pop()
+                            if self.separate_channels:
+                                seq_image_list = []
+                                seq_size_list = []
+                                seq_pos_list = []
+                                qdt_list = []
+                                for j in range(self.num_channels):
+                                    seq_image, seq_size, seq_pos, qdt = self.patchify(np.expand_dims(np_image[j],axis=-1))
+                                    seq_image_list.append(seq_image)
+                                    seq_size_list.append(seq_size)
+                                    seq_pos_list.append(seq_pos)
+                                    qdt_list.append(qdt)
+                                seq_image = np.stack([seq_image_list[k] for k in range(len(seq_image_list))])
+                                seq_size = np.stack([seq_size_list[k] for k in range(len(seq_size_list))])
+                                seq_pos = np.stack([seq_pos_list[k] for k in range(len(seq_pos_list))])
+                                qdt = qdt_list
 
-                                    else:
-                                        seq_image, seq_size, seq_pos, qdt = self.patchify(np.moveaxis(np_image,0,-1))
-
-                                    if self._dataset != "imagenet":
-                                        np_label = yield_label_list[i].pop()
-                                        if self._dataset == "basic_ct":
-                                            np_label = np.expand_dims(np_label,axis=0)
-
-                                        #TODO: If separate_channel=True, which qdt from qdt_list to use? Default to using the first in the list for now
-                                        if self.separate_channels:
-                                            qdt_ = qdt[0]
-                                        else:
-                                            qdt_ = qdt
-
-                                        seq_label_list = []
-                                        for j in range(np_label.shape[0]):
-                                            if self.twoD:
-                                                if self._dataset == "basic_ct":
-                                                    seq_label, _, _ = qdt_.serialize_labels(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,1))
-                                                    seq_label = np.asarray(seq_label)
-                                                    seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size, -1, 1])
-                                                else:
-                                                    seq_label, _, _ = qdt_.serialize(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,1))
-                                                    seq_label = np.asarray(seq_label, dtype=np.float32)
-                                                    seq_label = np.reshape(seq_label, [-1, self.patch_size*self.patch_size])
-                                            else:
-                                                if self._dataset == "basic_ct":
-                                                    seq_label, _, _ = qdt_.serialize_labels(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,self.patch_size, 1))
-                                                    seq_label = np.asarray(seq_label)
-                                                    seq_label = np.reshape(seq_label, [self.patch_size*self.patch_size*self.patch_size, -1, 1])
-                                                else:
-                                                    seq_label, _, _ = qdt_.serialize(np.expand_dims(np_label[j],axis=-1), size=(self.patch_size,self.patch_size,self.patch_size, 1))
-                                                    seq_label = np.asarray(seq_label, dtype=np.float32)
-                                                    seq_label = np.reshape(seq_label, [-1, self.patch_size*self.patch_size*self.patch_size])
-                                            seq_label_list.append(seq_label)
-
-                                if self._dataset == "imagenet":
-                                    if self.return_qdt:
-                                        yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_label_list[i].pop(), yield_var_list[i].pop(), qdt
-                                    else:
-                                        yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_label_list[i].pop(), yield_var_list[i].pop()
-                                else:
-                                    if self._dataset == "basic_ct":
-                                        if self.return_qdt:
-                                            yield np_image, seq_image, seq_size, seq_pos, np.asarray(np_label,dtype=np.uint8), seq_label_list, yield_var_list[i].pop(), qdt
-                                        else:
-                                            yield np_image, seq_image, seq_size, seq_pos, np.asarray(np_label,dtype=np.uint8), seq_label_list, yield_var_list[i].pop()
-                                    else:
-                                        if self.return_qdt:
-                                            yield np_image, seq_image, seq_size, seq_pos, np_label, seq_label_list, yield_var_list[i].pop(), qdt
-                                        else:
-                                            yield np_image, seq_image, seq_size, seq_pos, np_label, seq_label_list, yield_var_list[i].pop()
                             else:
-                                if self._dataset == "imagenet":
-                                    np_image = yield_x_list[i].pop()
-                                    yield np.asarray(np_image,dtype=np.float32), yield_label_list[i].pop(), yield_var_list[i].pop()
-                                else:
-                                    yield yield_x_list[i].pop(), yield_label_list[i].pop(), yield_var_list[i].pop()
+                                seq_image, seq_size, seq_pos, qdt = self.patchify(np.moveaxis(np_image,0,-1))
 
+                            if self._dataset != "imagenet":
+                                np_label = yield_label_list.pop()
+                                if self._dataset == "basic_ct":
+                                    np_label = np.expand_dims(np_label,axis=0)
+
+                            if self._dataset == "imagenet":
+                                if self.return_qdt:
+                                    yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_label_list.pop(), yield_var_list.pop(), qdt
+                                else:
+                                    yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_label_list.pop(), yield_var_list.pop()
+                            else:
+                                if self._dataset == "basic_ct":
+                                    if self.return_qdt:
+                                        yield np_image, seq_image, seq_size, seq_pos, np.asarray(np_label,dtype=np.uint8), yield_var_list.pop(), qdt
+                                    else:
+                                        yield np_image, seq_image, seq_size, seq_pos, np.asarray(np_label,dtype=np.uint8), yield_var_list.pop()
+                                else:
+                                    if self.return_qdt:
+                                        yield np_image, seq_image, seq_size, seq_pos, np_label, yield_var_list.pop(), qdt
+                                    else:
+                                        yield np_image, seq_image, seq_size, seq_pos, np_label, yield_var_list.pop()
                         else:
-                            if self.adaptive_patching:
-                                np_image = yield_x_list[i].pop()
-                                if self.single_channel:
-                                    seq_image, seq_size, seq_pos, _ = self.patchify(np.expand_dims(np_image,axis=-1))
-                                else:
-                                    if self.separate_channels:
-                                        seq_image_list = []
-                                        seq_size_list = []
-                                        seq_pos_list = []
-                                        qdt_list = []
-                                        for j in range(self.num_channels):
-                                            seq_image, seq_size, seq_pos, _ = self.patchify(np.expand_dims(np_image[j],axis=-1))
-                                            seq_image_list.append(seq_image)
-                                            seq_size_list.append(seq_size)
-                                            seq_pos_list.append(seq_pos)
-                                            qdt_list.append(qdt)
-                                        seq_image = np.stack([seq_image_list[k] for k in range(len(seq_image_list))])
-                                        seq_size = np.stack([seq_size_list[k] for k in range(len(seq_size_list))])
-                                        seq_pos = np.stack([seq_pos_list[k] for k in range(len(seq_pos_list))])
-                                        qdt = qdt_list
-
-                                    else:
-                                        seq_image, seq_size, seq_pos, _ = self.patchify(np.moveaxis(np_image,0,-1))
-                                if self._dataset == "imagenet":
-                                    if self.return_qdt:
-                                        yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_var_list[i].pop(), qdt
-                                    else:
-                                        yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_var_list[i].pop()
-                                else:
-                                    if self.return_qdt:
-                                        yield np_image, seq_image, seq_size, seq_pos, yield_var_list[i].pop(), qdt 
-                                    else:
-                                        yield np_image, seq_image, seq_size, seq_pos, yield_var_list[i].pop()
+                            if self._dataset == "imagenet":
+                                np_image = yield_x_list.pop()
+                                yield np.asarray(np_image,dtype=np.float32), yield_label_list.pop(), yield_var_list.pop()
                             else:
-                                if self._dataset == "imagenet":
-                                    np_image = yield_x_list[i].pop()
-                                    yield np.asarray(np_image,dtype=np.float32), yield_var_list[i].pop()
+                                yield yield_x_list.pop(), yield_label_list.pop(), yield_var_list.pop()
+
+                    else:
+                        if self.adaptive_patching:
+                            np_image = yield_x_list.pop()
+                            if self.separate_channels:
+                                seq_image_list = []
+                                seq_size_list = []
+                                seq_pos_list = []
+                                qdt_list = []
+                                for j in range(self.num_channels):
+                                    seq_image, seq_size, seq_pos, qdt = self.patchify(np.expand_dims(np_image[j],axis=-1))
+                                    seq_image_list.append(seq_image)
+                                    seq_size_list.append(seq_size)
+                                    seq_pos_list.append(seq_pos)
+                                    qdt_list.append(qdt)
+                                seq_image = np.stack([seq_image_list[k] for k in range(len(seq_image_list))])
+                                seq_size = np.stack([seq_size_list[k] for k in range(len(seq_size_list))])
+                                seq_pos = np.stack([seq_pos_list[k] for k in range(len(seq_pos_list))])
+                                qdt = qdt_list
+
+                            else:
+                                seq_image, seq_size, seq_pos, qdt = self.patchify(np.moveaxis(np_image,0,-1))
+                            if self._dataset == "imagenet":
+                                if self.return_qdt:
+                                    yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_var_list.pop(), qdt
                                 else:
-                                    yield yield_x_list[i].pop(), yield_var_list[i].pop()
+                                    yield np.asarray(np_image,dtype=np.float32), seq_image, seq_size, seq_pos, yield_var_list.pop()
+                            else:
+                                if self.return_qdt:
+                                    yield np_image, seq_image, seq_size, seq_pos, yield_var_list.pop(), qdt
+                                else:
+                                    yield np_image, seq_image, seq_size, seq_pos, yield_var_list.pop()
+                        else:
+                            if self._dataset == "imagenet":
+                                np_image = yield_x_list.pop()
+                                yield np.asarray(np_image,dtype=np.float32), yield_var_list.pop()
+                            else:
+                                yield yield_x_list.pop(), yield_var_list.pop()

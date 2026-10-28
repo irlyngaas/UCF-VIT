@@ -5,8 +5,24 @@ import cv2 as cv
 import numpy as np
 import torch
 from UCF_VIT.dataloaders.transform import Patchify, Patchify_3D
+from UCF_VIT.utils.misc import calculate_tile_bounds, calculate_tile_overlap
+from UCF_VIT.utils.normalize import zscore_normalize
 
-def CatsDogsCollate(batch, adaptive_patching):
+def CatsDogsCollate(batch, adaptive_patching, return_label):
+    """Collate function for `CatsDogsDataset`, stacking per-sample numpy arrays into batched tensors.
+
+    Args:
+        batch: List of samples as returned by `CatsDogsDataset.__getitem__`.
+        adaptive_patching: Whether each sample includes adaptive-patching sequence
+            data (patch sequence, size, and position) in addition to the raw image.
+        return_label: Whether to include the label in the returned tuple.
+
+    Returns:
+        A tuple of batched tensors/values. With `adaptive_patching=True`:
+        `(inp, seq, size, pos, [label,] variables, dict_key)`. Otherwise:
+        `(inp, [label,] variables, dict_key)`. The label is included only when
+        `return_label` is True.
+    """
     if adaptive_patching:
         inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
         seq = torch.stack([torch.from_numpy(batch[i][1]) for i in range(len(batch))])
@@ -14,47 +30,180 @@ def CatsDogsCollate(batch, adaptive_patching):
         pos = torch.stack([torch.from_numpy(np.expand_dims(batch[i][3],axis=0)) for i in range(len(batch))])
         label = torch.stack([torch.tensor(batch[i][4]) for i in range(len(batch))])
         variables = batch[0][5]
-        return (inp, seq, size, pos, label, variables)
+        dict_key = batch[0][6]
+        if return_label:
+            return (inp, seq, size, pos, label, variables, dict_key)
+        else:
+            return (inp, seq, size, pos, variables, dict_key)
     else:
         inp = torch.stack([torch.from_numpy(batch[i][0]) for i in range(len(batch))])
         label = torch.stack([torch.tensor(batch[i][1]) for i in range(len(batch))])
         variables = batch[0][2]
-        return (inp, label, variables)
+        dict_key = batch[0][3]
+        if return_label:
+            return (inp, label, variables, dict_key)
+        else:
+            return (inp, variables, dict_key)
 
 
 class CatsDogsDataset(Dataset):
-    def __init__(self, file_list, variables, tile_size, twoD = True, adaptive_patching = False, fixed_length=196, patch_size=16, num_channels=3, dataset="catsdogs"):
+    """Torch `Dataset` for the Kaggle cats-vs-dogs image classification dataset.
+
+    Loads each image, optionally resizes it to `resize` (leaving it at native
+    size if `resize` is None), optionally divides it into a `div x div` grid
+    of tiles (mirroring `UCF_VIT.dataloaders.dataset.TileDataIter`'s tiling
+    for `imagenet`/`basic_ct`, adapted for this class's map-style
+    `Dataset`/`__getitem__` interface rather than `TileDataIter`'s
+    `IterableDataset` on-the-fly expansion), derives a binary label from the
+    filename, and optionally adaptively patchifies the (possibly tiled)
+    image.
+    """
+
+    def __init__(self, file_list, variables, tile_size, twoD = True, adaptive_patching = False, fixed_length=196, interp_size=16, num_channels=3, dataset="catsdogs", resize=None, div=1, tile_overlap=(0, 0), score_fn="canny", min_size=2, canny_sigma=None, canny_low_threshold=None, canny_high_threshold=None, normalize_stats=None):
+        """Initializes the dataset over a list of image file paths.
+
+        Args:
+            file_list: List of image file paths, each named like ".../cat.123.jpg"
+                or ".../dog.123.jpg".
+            variables: Variable/channel labels to attach to each returned sample.
+            tile_size: `(height, width)` size tiling/patch-size math is based
+                on. When `div == 1` (no tiling), this is the size the whole
+                image actually is once `resize` (if any) has been applied.
+                When `div > 1`, this is the *per-tile* size (matches
+                `parse.py`'s own `tile_size` computation:
+                `effective_size[i] // div + tile_overlap[i]`) -- already
+                divided by `div`, not divided again internally here.
+            twoD: Whether to use the 2D (`Patchify`) or 3D (`Patchify_3D`) adaptive
+                patcher when `adaptive_patching` is True.
+            adaptive_patching: Whether to also compute an adaptive-patching sequence
+                for each (possibly tiled) image.
+            fixed_length: Fixed output sequence length for adaptive patching.
+            interp_size: Side length each adaptive leaf patch is interpolated to.
+            num_channels: Number of image channels.
+            dataset: Dataset name to attach to each returned sample.
+            resize: `(height, width)` to resize each image to, or None to leave
+                images at their native size (every file must then already share
+                the same size, since samples in a batch must have matching
+                shapes). cv2's own `dsize` convention is `(width, height)`, so
+                this gets swapped locally right before the `cv.resize` call.
+            div: Number of tiles to divide each image into per axis (`div * div`
+                tiles total). `1` (the default) means no tiling.
+            tile_overlap: `(height overlap, width overlap)` total overlap between
+                adjacent tiles per axis, only used when `div > 1`.
+            score_fn: `"canny"` (default) or `"variance"` -- forwarded to
+                `Patchify`/`Patchify_3D`, when `adaptive_patching` is True.
+            min_size: Smallest leaf side length the adaptive-patching
+                transform will ever produce -- forwarded to `Patchify`/
+                `Patchify_3D`'s own `min_size`, when `adaptive_patching` is
+                True.
+            canny_sigma: Forwarded to `Patchify`/`Patchify_3D`'s own
+                `canny_sigma`, when `adaptive_patching` is True -- see
+                their own docstring entries.
+            canny_low_threshold: Forwarded to `Patchify`/`Patchify_3D`'s own
+                `canny_low_threshold`, when `adaptive_patching` is True --
+                see their own docstring entries.
+            canny_high_threshold: See `canny_low_threshold`.
+            normalize_stats: `{variable_name: {"mean":..., "std":...}}` --
+                see `UCF_VIT.utils.normalize.zscore_normalize`'s own
+                docstring. `None` (default) or a variable missing from it
+                means that channel is returned unnormalized.
+        """
         self.file_list = file_list
         self.variables = variables
         self.tile_size = tile_size
         self.adaptive_patching = adaptive_patching
         self.fixed_length = fixed_length
-        self.patch_size = patch_size
+        self.interp_size = interp_size
         self.num_channels = num_channels
         self.dataset = dataset
         self.twoD = twoD
+        self.resize = resize
+        self.div = div
+        self.score_fn = score_fn
+        self.min_size = min_size
+        self.normalize_stats = normalize_stats or {}
+
+        # start_overlap/end_overlap and tile_size_no_overlap use the same
+        # [height, width]-ordered convention as tile_size/tile_overlap
+        # themselves (see calculate_tile_bounds's own docstring for how
+        # this is combined with div/tile_idx into per-tile bounds) --
+        # matches TileDataIter.__init__'s identical computation exactly.
+        self.start_overlap, self.end_overlap = calculate_tile_overlap(tile_overlap)
+        self.tile_size_no_overlap = [
+            self.tile_size[i] - (self.start_overlap[i] + self.end_overlap[i]) for i in range(2)
+        ]
 
         if self.adaptive_patching:
             if self.twoD:
-                self.patchify = Patchify(fixed_length=fixed_length, patch_size=patch_size, num_channels=num_channels, dataset=self.dataset)
+                self.patchify = Patchify(fixed_length=fixed_length, interp_size=interp_size, num_channels=num_channels, dataset=self.dataset, score_fn=self.score_fn, min_size=self.min_size, canny_sigma=canny_sigma, canny_low_threshold=canny_low_threshold, canny_high_threshold=canny_high_threshold)
             else:
-                self.patchify = Patchify_3D(fixed_length=fixed_length, patch_size=patch_size, num_channels=num_channels, dataset=self.dataset)
+                self.patchify = Patchify_3D(fixed_length=fixed_length, interp_size=interp_size, num_channels=num_channels, dataset=self.dataset, score_fn=self.score_fn, min_size=self.min_size, canny_sigma=canny_sigma, canny_low_threshold=canny_low_threshold, canny_high_threshold=canny_high_threshold)
 
     def __len__(self):
-        self.filelength = len(self.file_list)
+        """Returns the number of (file, tile) samples in the dataset.
+
+        Returns:
+            `len(self.file_list) * self.div * self.div` -- `self.div == 1`
+            (no tiling) reduces this to the plain file count.
+        """
+        self.filelength = len(self.file_list) * self.div * self.div
         return self.filelength
 
     def __getitem__(self, idx):
-        img_path = self.file_list[idx]
+        """Loads, resizes, optionally tiles, and labels the image at `idx`, optionally adaptively patchifying it.
+
+        Args:
+            idx: Flat index over every (file, tile) combination -- decomposed
+                below into `file_idx` (which file) and `w_idx`/`h_idx` (which
+                tile of that file's `div x div` grid; both `0` when
+                `self.div == 1`).
+
+        Returns:
+            If `self.adaptive_patching` is True: `(image, seq_img, seq_size, seq_pos,
+            label, self.variables, self.dataset)`. Otherwise: `(image, label,
+            self.variables, self.dataset)`. `image` is a channel-first numpy array
+            and `label` is 1 for "dog" and 0 for "cat" -- the same label for
+            every tile of one image, since `catsdogs` is classification-only
+            (no per-tile/segmentation label to also tile, unlike
+            `TileDataIter`'s general case).
+        """
+        file_idx, tile_idx = divmod(idx, self.div * self.div)
+        w_idx, h_idx = divmod(tile_idx, self.div)
+
+        img_path = self.file_list[file_idx]
         img = Image.open(img_path)
         img = np.array(img)
-        img = cv.resize(img, dsize=[self.tile_size[0],self.tile_size[1]])
+        if self.resize is not None:
+            # self.resize is (height, width); cv2's dsize is natively
+            # (width, height), so swap locally right here.
+            img = cv.resize(img, dsize=[self.resize[1], self.resize[0]])
+
+        if self.div > 1:
+            # img is still channel-last (H, W[, C]) here -- Patchify's own
+            # docstring documents that as its expected input, and this
+            # matches catsdogs.py's existing pipeline order (moveaxis to
+            # channel-first only happens at the return lines below).
+            # tile_size/tile_overlap are [height, width]-ordered, matching
+            # img's own (H, W[, C]) axis order directly -- index 0 bounds
+            # dim 0 (H), index 1 bounds dim 1 (W), no swap needed.
+            start_h, end_h = calculate_tile_bounds(h_idx, self.div, self.tile_size_no_overlap[0], self.start_overlap[0], self.end_overlap[0])
+            start_w, end_w = calculate_tile_bounds(w_idx, self.div, self.tile_size_no_overlap[1], self.start_overlap[1], self.end_overlap[1])
+            img = img[start_h:end_h, start_w:end_w]
+
+        # Normalized before self.patchify (if any) runs below, so the
+        # model-visible data (both the raw image and, for adaptive
+        # patching, seq_img's own resized leaf patches, built from this
+        # same array) is actually normalized -- matches FileReader.read_
+        # process_file's own convention (UCF_VIT.dataloaders.dataset).
+        # channel_axis=-1: img is still channel-last (H, W, C) here.
+        img = zscore_normalize(img, self.variables, self.normalize_stats, channel_axis=-1)
+
         label = img_path.split("/")[-1].split(".")[0]
         label = 1 if label == "dog" else 0
 
 
         if self.adaptive_patching:
             seq_img, seq_size, seq_pos, qdt = self.patchify(img)
-            return np.moveaxis(img,-1,0), seq_img, seq_size, seq_pos, label, self.variables
+            return np.moveaxis(img,-1,0), seq_img, seq_size, seq_pos, label, self.variables, self.dataset
         else:
-            return np.moveaxis(img,-1,0), label, self.variables
+            return np.moveaxis(img,-1,0), label, self.variables, self.dataset

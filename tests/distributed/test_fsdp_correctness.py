@@ -1,0 +1,252 @@
+"""Real multi-rank numerical-correctness test for FSDP (fsdp_size > 1,
+sharding_strategy=FULL_SHARD).
+
+Verifies that wrapping a small stack of real UCF_VIT.model.building_blocks.
+Block instances in torch.distributed.fsdp.FullyShardedDataParallel
+(mirroring model/utils.py's get_model FULL_SHARD branch: fsdp_size > 1,
+simple_ddp_size == 1) produces (approximately) the same forward-pass output
+as running the same, unwrapped model directly -- using real FSDP parameter
+sharding/gathering, not a simulation. Also verifies the backward pass:
+that FSDP's own gradient reduce-scatter across shards produces the same
+per-parameter gradients as the unwrapped reference, via
+FSDP.summon_full_params(..., with_grads=True) -- see
+test_fsdp_full_shard_backward_matches_reference's own docstring.
+
+Deliberately scoped to fsdp_size > 1 alone (tensor_par_size=1) -- combined
+fsdp_size > 1 + tensor_par_size > 1 (production's real HYBRID_SHARD
+branch) is covered separately by test_hybrid_shard_correctness.py, once
+this and test_tensor_parallel_correctness.py were both proven
+independently.
+
+Requires timm/monai/xformers (building_blocks.py's real, unconditional
+top-level imports) -- see test_tensor_parallel_correctness.py's module
+docstring for why this skips cleanly via importorskip instead of erroring
+at collection.
+
+IMPORTANT: same collective-call-safety note as test_init_par_groups.py --
+init_par_groups and FSDP's own collectives require every process in the job
+to make the same calls in the same order, so which tests run/parametrize
+here must be decided identically on every rank, only from world-size-derived
+values, never from this rank's own rank id.
+"""
+
+import functools
+import os
+
+import pytest
+import torch
+import torch.nn as nn
+
+pytest.importorskip("xformers", reason="needs the real UCF_VIT.model.building_blocks deps -- run in the forge-vit env")
+pytest.importorskip("timm", reason="needs the real UCF_VIT.model.building_blocks deps -- run in the forge-vit env")
+pytest.importorskip("monai", reason="needs the real UCF_VIT.model.building_blocks deps -- run in the forge-vit env")
+
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP  # noqa: E402
+from torch.distributed.fsdp import MixedPrecision, ShardingStrategy  # noqa: E402
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy  # noqa: E402
+
+from UCF_VIT.model.building_blocks import Block  # noqa: E402
+from UCF_VIT.utils.misc import init_par_groups  # noqa: E402
+
+WORLD_SIZE = int(os.environ.get("SLURM_NTASKS", "0"))
+
+SEED = 5678
+DIM = 64
+NUM_HEADS = 8
+MLP_RATIO = 4
+DEPTH = 2
+BATCH = 2
+SEQ_LEN = 16
+TOL = dict(rtol=1e-4, atol=1e-5)
+
+# float32-only, unlike model/utils.py's real bfloatPolicy -- keeps this
+# test's tolerance tight and meaningful (same reasoning as
+# test_tensor_parallel_correctness.py's float32 choice).
+FLOAT32_POLICY = MixedPrecision(param_dtype=torch.float32, reduce_dtype=torch.float32, buffer_dtype=torch.float32)
+
+
+def _valid_fsdp_sizes(world_size):
+    """fsdp_size values that evenly divide world_size, excluding the
+    trivial 1 (that's the reference path itself, not an interesting case).
+    """
+    if world_size <= 0:
+        return []
+    return [n for n in (2, 4, 8) if world_size % n == 0]
+
+
+def _build_model():
+    return nn.Sequential(*[Block(dim=DIM, num_heads=NUM_HEADS, mlp_ratio=MLP_RATIO) for _ in range(DEPTH)])
+
+
+def _build_input(local_rank):
+    """A fixed input, identical across every rank -- deterministic CPU RNG
+    given the same seed, same technique as the reference-weight construction
+    below.
+    """
+    g = torch.Generator(device="cpu").manual_seed(SEED + 1)
+    x = torch.randn(BATCH, SEQ_LEN, DIM, generator=g)
+    return x.to(f"cuda:{local_rank}")
+
+
+def _build_grad_weight(local_rank):
+    """A fixed, non-uniform per-output-element weighting for the
+    backward-pass test's loss (`(output * weight).sum()`), identical across
+    every rank -- same determinism technique as `_build_input`, different
+    seed offset so it's independent of it. Deliberately not a plain
+    `.sum()`: that hands every output element an incoming gradient of
+    exactly 1, a special/symmetric case a broken gradient sync could still
+    accidentally satisfy; a non-uniform weighting is more sensitive to
+    that class of bug. Same shape as the model's output (BATCH, SEQ_LEN,
+    DIM) since Block preserves its input shape.
+    """
+    g = torch.Generator(device="cpu").manual_seed(SEED + 2)
+    w = torch.randn(BATCH, SEQ_LEN, DIM, generator=g)
+    return w.to(f"cuda:{local_rank}")
+
+
+@pytest.mark.skipif(WORLD_SIZE == 0, reason="requires SLURM_NTASKS (run via srun)")
+@pytest.mark.parametrize("fsdp_size", _valid_fsdp_sizes(WORLD_SIZE))
+def test_fsdp_full_shard_forward_matches_reference(fsdp_size, dist_info):
+    world_rank = dist_info["world_rank"]
+    local_rank = dist_info["local_rank"]
+    device = f"cuda:{local_rank}"
+
+    torch.manual_seed(SEED)
+    reference = _build_model().to(device).eval()
+
+    x = _build_input(local_rank)
+    with torch.no_grad():
+        expected = reference(x)
+
+    # data_par_size must span the *entire* world (tensor_par_size=1 here,
+    # and production's own parse.py asserts data_par_size*tensor_par_size
+    # == world_size) -- NOT just fsdp_size. init_par_groups's dist.new_group
+    # calls only ever reference ranks inside range(data_par_size); passing
+    # data_par_size=fsdp_size (< WORLD_SIZE whenever fsdp_size is 2 or 4)
+    # left every rank >= fsdp_size with fsdp_group=None, so their FSDP(...,
+    # process_group=None, ...) call below silently fell back to the
+    # world-default 8-rank group -- a real, different-sized group than the
+    # fsdp_size-rank group ranks < fsdp_size got for the *same* nominal
+    # wrap call. That mismatch is exactly what caused a real Frontier run
+    # (job 5339980) to abort inside FSDP's own _move_states_to_device.
+    # simple_ddp_size = data_par_size // fsdp_size (not 1) is what actually
+    # partitions the full world into data_par_size/fsdp_size independent
+    # fsdp_size-rank FULL_SHARD groups, matching the FULL_SHARD selection
+    # in model/utils.py's get_model (fsdp_size > 1, simple_ddp_size == 1
+    # there refers to *one* replica's own config -- not a constraint this
+    # test's group construction needs to mirror literally).
+    data_par_size = WORLD_SIZE
+    simple_ddp_size = data_par_size // fsdp_size
+    _, _, _, fsdp_group, _ = init_par_groups(
+        world_rank=world_rank,
+        data_par_size=data_par_size,
+        tensor_par_size=1,
+        fsdp_size=fsdp_size,
+        simple_ddp_size=simple_ddp_size,
+    )
+
+    # Same seed as the reference -> bit-identical pre-wrap weights (same
+    # technique test_tensor_parallel_correctness.py uses). sync_module_states
+    # below is a real backstop on top of that, mirroring production's own
+    # FSDP(...) call, not a substitute for it.
+    torch.manual_seed(SEED)
+    to_wrap = _build_model()
+    auto_wrap_policy = functools.partial(transformer_auto_wrap_policy, transformer_layer_cls={Block})
+    wrapped = FSDP(
+        to_wrap,
+        device_id=local_rank,
+        process_group=fsdp_group,
+        sync_module_states=True,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        auto_wrap_policy=auto_wrap_policy,
+        mixed_precision=FLOAT32_POLICY,
+        forward_prefetch=True,
+        limit_all_gathers=False,
+    ).eval()
+
+    with torch.no_grad():
+        actual = wrapped(x)
+
+    torch.testing.assert_close(actual, expected, **TOL)
+
+
+@pytest.mark.skipif(WORLD_SIZE == 0, reason="requires SLURM_NTASKS (run via srun)")
+@pytest.mark.parametrize("fsdp_size", _valid_fsdp_sizes(WORLD_SIZE))
+def test_fsdp_full_shard_backward_matches_reference(fsdp_size, dist_info):
+    """Companion to test_fsdp_full_shard_forward_matches_reference, covering
+    the backward pass: forward-only correctness says nothing about whether
+    FSDP's own gradient reduce-scatter across shards (real PyTorch
+    machinery, not custom code in this repo) produces the right result for
+    this repo's actual wrapping (auto_wrap_policy, sync_module_states,
+    mixed_precision, etc.) -- e.g. a wrong process_group here could corrupt
+    gradient synchronization without necessarily corrupting the forward
+    pass.
+
+    Uses FSDP.summon_full_params(..., with_grads=True), the documented way
+    to materialize each full (unsharded) parameter's gradient for
+    inspection, rather than hand-reconstructing FSDP's own internal
+    FlatParameter sharding.
+    """
+    world_rank = dist_info["world_rank"]
+    local_rank = dist_info["local_rank"]
+    device = f"cuda:{local_rank}"
+
+    torch.manual_seed(SEED)
+    reference = _build_model().to(device).eval()
+
+    x_ref = _build_input(local_rank).requires_grad_(True)
+    weight = _build_grad_weight(local_rank)
+    expected = reference(x_ref)
+    (expected * weight).sum().backward()
+
+    # Same data_par_size/simple_ddp_size reasoning as the forward test above.
+    data_par_size = WORLD_SIZE
+    simple_ddp_size = data_par_size // fsdp_size
+    _, _, _, fsdp_group, _ = init_par_groups(
+        world_rank=world_rank,
+        data_par_size=data_par_size,
+        tensor_par_size=1,
+        fsdp_size=fsdp_size,
+        simple_ddp_size=simple_ddp_size,
+    )
+
+    torch.manual_seed(SEED)
+    to_wrap = _build_model()
+    auto_wrap_policy = functools.partial(transformer_auto_wrap_policy, transformer_layer_cls={Block})
+    wrapped = FSDP(
+        to_wrap,
+        device_id=local_rank,
+        process_group=fsdp_group,
+        sync_module_states=True,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        auto_wrap_policy=auto_wrap_policy,
+        mixed_precision=FLOAT32_POLICY,
+        forward_prefetch=True,
+        limit_all_gathers=False,
+        # Only needed for this backward test, not the forward test/
+        # production's own FSDP(...) call: summon_full_params(...,
+        # with_grads=True) below requires it -- PyTorch's own
+        # _validate_unshard_params_args raises NotImplementedError for
+        # with_grads=True unless use_orig_params=True (confirmed against
+        # a real Frontier run, job 5341269). Doesn't change FULL_SHARD's
+        # actual sharding/gradient math, just how parameters are exposed
+        # for access (original nn.Parameter objects vs. one internal
+        # FlatParameter).
+        use_orig_params=True,
+    ).eval()
+
+    x_actual = _build_input(local_rank).requires_grad_(True)
+    actual = wrapped(x_actual)
+    (actual * weight).sum().backward()
+
+    # x's gradient needs no FSDP-specific unsharding -- it's a normal,
+    # never-sharded activation tensor, not a parameter.
+    torch.testing.assert_close(x_actual.grad, x_ref.grad, **TOL)
+
+    # reference and to_wrap share the same _build_model() structure (same
+    # seed, same module tree) -- FSDP wraps submodules in place without
+    # reordering them, so matching parameters by iteration position (zip)
+    # is safe without needing to reconcile FSDP's name-prefixed FQNs.
+    with FSDP.summon_full_params(wrapped, writeback=False, with_grads=True):
+        for p_ref, p_wrapped in zip(reference.parameters(), wrapped.parameters()):
+            torch.testing.assert_close(p_wrapped.grad, p_ref.grad, **TOL)

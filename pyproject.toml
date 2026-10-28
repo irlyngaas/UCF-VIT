@@ -24,12 +24,27 @@ dependencies = [
 "opencv-python-headless>=4.11.0.86",
 "matplotlib>=3.10.1",
 "scipy>=1.15.2",
-"torch>=2.6.0",
+"scikit-image>=0.24.0",
+"SimpleITK>=2.3.0",
 "timm>=1.0.15",
-"xformers>=0.0.30"
 ]
+# torch and xformers are intentionally NOT listed here -- they must be
+# installed separately, per platform, matching the target GPU vendor's
+# ROCm/CUDA build (see the Install section of README.md).
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
 
 [project.urls]
 "Homepage" = "https://github.com/irlyngaas/UCF-VIT"
 "Bug Tracker" = "https://github.com/irlyngaas/UCF-VIT/issues"
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+pythonpath = ["src", "utils"]
+markers = [
+    "dataloader_speed: informational dataloader throughput measurements (buffer_size/num_workers) -- not run by default, no pass/fail threshold; run explicitly with `pytest -m dataloader_speed`",
+]
+addopts = "-m 'not dataloader_speed'"
 

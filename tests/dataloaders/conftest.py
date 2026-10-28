@@ -1,0 +1,103 @@
+import os
+import socket
+
+import pytest
+import torch.distributed as dist
+import yaml
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _ensure_single_process_distributed():
+    """Guarantees a single-process `torch.distributed` group for every test in
+    this directory, regardless of SLURM environment variables.
+
+    `tests/conftest.py`'s own autouse fixture steps aside (does no init at
+    all) whenever `SLURM_PROCID`/`SLURM_NTASKS`/`SLURM_LOCALID` are all set,
+    on the assumption that means real multi-rank `tests/distributed/` tests
+    are running, which do their own real init instead. But
+    `launch/tests/run_dataloader_speed.sh` submits via a real `sbatch` job
+    too, just without `srun` -- and a real Frontier run (job 5421658) showed
+    this specific cluster setup populates those same `SLURM_*` variables for
+    a bare `sbatch` script even with no `srun` involved at all, so that
+    fixture wrongly stepped aside here too, leaving `torch.distributed` never
+    initialized -- `NativePytorchDataModule._my_dataset_key()`'s own
+    `if not torch.distributed.is_initialized()` guard then raised
+    `NotImplementedError` before any real decode/timing work ever ran.
+
+    None of `tests/dataloaders/`'s own tests are ever real multi-rank (see
+    `test_dataset_speed_real_data.py`'s own module docstring -- deliberately
+    single-process, even under a real Frontier job) and this file only
+    applies within `tests/dataloaders/` and its subdirectories (pytest scopes
+    conftest.py fixtures to the directory tree they're defined in), so this
+    can't affect `tests/distributed/`'s own real multi-rank init at all --
+    safe to just always ensure single-process init here, independent of the
+    SLURM-launch heuristic that exists for the parent conftest's own,
+    different reasons.
+    """
+    if dist.is_available() and not dist.is_initialized():
+        # Forced (not setdefault): a real Frontier run (job 5421778) showed
+        # MASTER_ADDR already set in the ambient shell environment to a
+        # hostname ("localhost.localdomain") whose DNS/NSS resolution trips a
+        # real gloo error on this cluster ("Address family not supported by
+        # protocol", an IPv6-resolution mismatch) -- setdefault left it alone
+        # since it was already set. This process group is a throwaway,
+        # loopback-only, single-process group with nothing to do with
+        # whatever that ambient MASTER_ADDR is for -- force our own numeric
+        # loopback literal (no DNS involved at all) and a freshly-bound free
+        # port, regardless of what's already in the environment.
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            os.environ["MASTER_PORT"] = str(s.getsockname()[1])
+        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+        yield
+        dist.destroy_process_group()
+    else:
+        yield
+
+
+def _config_default(config, option, key):
+    """Reads a single int default out of --speed-config's own raw YAML, for
+    whichever of --speed-buffer-sizes/--speed-num-workers wasn't given
+    explicitly. Returns None if --speed-config itself wasn't given either --
+    the test function's own skip (no --speed-config) handles that case, this
+    just needs to not blow up at collection time.
+    """
+    speed_config = config.getoption("--speed-config")
+    if not speed_config:
+        return None
+    with open(speed_config) as f:
+        raw = yaml.load(f, Loader=yaml.FullLoader)
+    if key == "num_workers":
+        return raw["dataloader"]["num_workers"]
+    # buffer_size: dict_buffer_sizes is keyed per dataset-dict-key -- take the
+    # first (real shipped configs here only ever have one real key).
+    dict_buffer_sizes = raw["dataloader"].get("dict_buffer_sizes")
+    if not dict_buffer_sizes:
+        return None  # "dataloader"-type config (catsdogs) -- no buffer_size concept
+    return next(iter(dict_buffer_sizes.values()))
+
+
+def pytest_generate_tests(metafunc):
+    """Dynamically parametrizes test_real_decode_throughput_config's
+    speed_buffer_size/speed_num_workers fixtures from --speed-buffer-sizes/
+    --speed-num-workers, since pytest.mark.parametrize can't read a CLI
+    option (or --speed-config's own YAML) at collection time on its own.
+    """
+    if "speed_buffer_size" in metafunc.fixturenames:
+        raw = metafunc.config.getoption("--speed-buffer-sizes")
+        if raw:
+            values = [int(v.strip()) for v in raw.split(",") if v.strip()]
+        else:
+            default = _config_default(metafunc.config, "speed_buffer_size", "buffer_size")
+            values = [default]  # None if --speed-config omitted or catsdogs-style -- test skips/no-ops on it
+        metafunc.parametrize("speed_buffer_size", values)
+
+    if "speed_num_workers" in metafunc.fixturenames:
+        raw = metafunc.config.getoption("--speed-num-workers")
+        if raw:
+            values = [int(v.strip()) for v in raw.split(",") if v.strip()]
+        else:
+            default = _config_default(metafunc.config, "speed_num_workers", "num_workers")
+            values = [default]  # None if --speed-config omitted -- test skips on it
+        metafunc.parametrize("speed_num_workers", values)

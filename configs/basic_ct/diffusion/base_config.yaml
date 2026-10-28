@@ -1,64 +1,104 @@
 # ---------------------------- TRAINER -------------------------------------------
 trainer:
   max_epochs: 600
-  data_type: "bfloat16"
-  gpu_type: "amd"
-  checkpoint_path: "../../checkpoint/basic_ct/diffusion/base"
-  checkpoint_filename: "multi_last"
-  checkpoint_filename_for_loading: "multi_last_odd" #multi_last_odd or multi_last_even
-
+  data_type: "float32" #float 32 or bfloat16
+  gpu_type: "amd" #amd or nvidia
+  checkpoint_path: "checkpoint/basic_ct/diffusion/base"
   resume_from_checkpoint: False
+  checkpoint_filename: "epoch_0"
+  use_pretrained_model: False
+  pretrained_checkpoint_filename: ""
+  save_frequency: 2
 
-# ---------------------------- PARALLELISM -------------------------------------
+# ---------------------------- PARALLELISM ---------------------------------------
 parallelism:
-  fsdp_size: 8
-  simple_ddp_size: 1
+  fsdp_size: 1
+  simple_ddp_size: 8
   tensor_par_size: 1
-  seq_par_size: 1
-  
-# ---------------------------- MODEL -------------------------------------------
-model:
+
+# ---------------------------- OPTIMIZER -----------------------------------------
+optimizer:
+  type: "AdamW"
   lr: 0.0001
   beta_1: 0.9
   beta_2: 0.95
   weight_decay: 1e-5
-  warmup_steps: 1000
-  max_steps: 20000
+
+# ---------------------------- SCHEDULER -----------------------------------------
+scheduler:
+  type: "linear-warmup-cosine-annealing"
+  warmup_epochs: 4
   warmup_start_lr: 1e-8
   eta_min: 1e-8
-  loss_fn: "MSE"
-  use_grad_scaler: True
 
-  net:
-    init_args:
-      default_vars: [
-        "ct_res1",
-      ]
-      tile_size: [64, 64, 64]
-      patch_size: 4
-      embed_dim: 768
-      depth: 12
-      num_heads: 12
-      decoder_embed_dim: 576
-      decoder_depth: 8
-      decoder_num_heads: 16
-      mlp_ratio: 4
-      mlp_ratio_decoder: 4
-      drop_path: 0.0
-      linear_decoder: False
-      twoD: True
-      use_varemb: False
-      adaptive_patching: False
-      fixed_length: 196
-      separate_channels: False
-      num_time_steps: 1000
+# ---------------------------- GRAD SCALER ---------------------------------------
+grad_scaler:
+  use_grad_scaler: False
+  init_scale: 8192
+  min_scale: 128
+  growth_interval: 100
 
-# ---------------------------- DATA -------------------------------------------
+# ---------------------------- MODEL ---------------------------------------------
+model:
+  type: "DiffusionVIT"
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  mlp_ratio: 4
+  drop_path: 0.0
+  drop_rate: 0.0
+  use_channel_aggregation: False
+
+  num_time_steps: 1000
+  linear_decoder: False
+  decoder_embed_dim: 576
+  decoder_depth: 8
+  decoder_num_heads: 16
+  decoder_mlp_ratio: 4
+  
+# ---------------------------- TILING --------------------------------------------
+tiling:
+  do_tiling: False
+  div: 1
+  tile_overlap: 0
+
+# ---------------------------- AP ------------------------------------------------
+
+ap:
+  do_ap: False
+  fixed_length: 512
+  separate_channels: False
+  use_adaptive_pos_emb: True
+  interp_size: 32 # Side length each adaptive leaf patch is interpolated to (see UCF_VIT.model.arch.VIT.effective_patch_size); only used when do_ap:True, ignored otherwise. Not used by this baseline (do_ap:False) -- shown here so it's easy to find if you turn adaptive patching on.
+  do_gpu_ap: False # Whether adaptive patching runs on-device inside the model's forward() (UCF_VIT.model.gpu_adaptive_patching.GPUPatchify2D/GPUPatchify3D, dispatched on data.twoD) instead of in the dataloader; only used when do_ap:True. Not used here (do_gpu_ap:False) -- shown so it's easy to find if you turn it on.
+  min_size: 2 # Smallest leaf/patch side length either adaptive-patching path will ever produce -- FixedQuadTree/FixedOctTree's own splitting floor on the CPU side, GPUPatchify2D/GPUPatchify3D's finest starting block size on the GPU side.
+  score_fn: canny # "canny" (edge-density) or "variance" -- scoring measure deciding where to concentrate patches, shared by the CPU (Patchify/Patchify_3D) and GPU (GPUPatchify2D/GPUPatchify3D) adaptive-patching paths. Only used when do_ap:True.
+  canny_sigma: 1.0 # Gaussian smoothing sigma before gradient computation -- shared by the CPU (Patchify/Patchify_3D) and GPU (GPUPatchify2D/GPUPatchify3D) Canny paths. Only used when do_ap:True and score_fn:"canny". Not used here (do_ap:False) -- shown so it's easy to find if you turn it on.
+  canny_low_threshold: 0.1 # Lower ("weak" edge) gradient-magnitude threshold -- shared by the CPU (Patchify/Patchify_3D) and GPU (GPUPatchify2D/GPUPatchify3D) Canny paths. Only used when do_ap:True and score_fn:"canny". Not used here (do_ap:False) -- shown so it's easy to find if you turn it on.
+  canny_high_threshold: 0.2 # Upper ("strong" edge) gradient-magnitude threshold -- shared by the CPU (Patchify/Patchify_3D) and GPU (GPUPatchify2D/GPUPatchify3D) Canny paths. Only used when do_ap:True and score_fn:"canny". Not used here (do_ap:False) -- shown so it's easy to find if you turn it on.
+  canny_hysteresis_iters: 2 # Binary-dilation passes approximating hysteresis edge-linking, GPU path only. Only used when do_gpu_ap:True and score_fn:"canny".
+  
+# ---------------------------- DATA ----------------------------------------------
 data:
   dataset: "basic_ct"
+  img_size: [256, 256, 256] #Can be 2D or 3D. Optional -- if omitted, auto-detected from the real data files under dict_root_dirs (see UCF_VIT.utils.misc.detect_img_size). Always the actual/native size of the data, never a resize target.
+  twoD: False #If true when img_size is 3D, dataloader slices on the z dimension. If data is 2D, this variable will be ignored and default to True
+  patch_size: 32 #Only used when do_ap:False (standard patching); changes sequence length. Ignored when do_ap:True -- see ap.interp_size for that case's equivalent.
   dict_root_dirs: {
-    'ct1': '/lustre/orion/world-shared/nro108/anikat/dataset/Tr8_Training',
+    'ct1': '/lustre/orion/stf006/proj-shared/irl1/Tr8_Training',
   }
+  num_channels: {
+    'ct1': 1,
+  } #Important to define because not all datasets need to have the same channels or amount of channels when using variable aggregation depending on the training task chosen
+  dict_in_variables: {
+    'ct1': [
+     "ct_res1", 
+    ],
+  } #Needs to match the order of the channels in the raw data files, if using variable aggregation. If not using variable aggregation you may just fill this in with placeholders using the correct amount of channels as this will not be used
+  
+# ---------------------------- DATALOADER ----------------------------------------
+dataloader:
+  type: "iterative_dataloader"
   dict_start_idx: {
     'ct1': 0,
   }
@@ -68,25 +108,12 @@ data:
   dict_buffer_sizes: {
     'ct1': 100,
   }
-  num_channels_used: {
-    'ct1': 1,
-  }
-  dict_in_variables: {
-    'ct1': [
-     "ct_res1", 
-    ],
-  }
-  batch_size: 2
+  batch_size: 32
   num_workers: 1
   pin_memory: False
-  single_channel: True
-  tile_overlap: 0.0
-  use_all_data: False
-
-# ---------------------------- LOAD BALANCING -------------------------------------------
-load_balancing:
-  auto_load_balancing: True
-  batches_per_rank_epoch: {
-    'ct1': 217088,
-  }
-  dataset_group_list: '8'
+  # Optional -- default 0.1/0.1 when omitted (see UCF_VIT.parse._resolve_dataset_splits).
+  # Only used for dataset keys with no separate data.dict_val_root_dirs/dict_test_root_dirs
+  # entry: reserves this fraction of that key's own [dict_start_idx, dict_end_idx) window for
+  # val.py/test.py, narrowing what train.py itself uses down from dict_end_idx accordingly.
+  val_split_ratio: 0.1
+  test_split_ratio: 0.1

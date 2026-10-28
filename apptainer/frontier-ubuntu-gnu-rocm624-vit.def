@@ -43,16 +43,6 @@ zypper install -y sudo git
 
 git --version
 
-# install ViT dependencies
-${CONDA_DIR}/bin/pip install timm \
- monai \
- nibabel \
- torchdata==0.9.0 \
- einops \
- opencv-python-headless \
- matplotlib \
- scipy
-
 # Install UCF_VIT
 mkdir -p /source
 cd /source
