@@ -2244,17 +2244,22 @@ class DiffusionVIT(VIT):
                 mutually exclusive with every residual option). See
                 `forward_head`'s own docstring for exactly how each is
                 applied. Independently, `use_modality_conditioning` (default
-                False) adds per-block modality/variable conditioning
-                alongside the per-block timestep conditioning every
-                `Block_diffusion` already has -- for a paired multi-
-                modality dataset (e.g. "nct"/"xct"), each block also learns
-                a correction for which modality the current batch is, not
-                just which diffusion timestep. Requires `default_vars` to
-                list at least 2 modalities (the model's own fixed universe
-                of possible variables, same `default_vars` `VIT.__init__`
-                already takes); `False` (default) adds no parameters and no
-                behavior change -- see `forward_features`'s own docstring
-                for how the modality index is determined at call time.
+                False) adds per-block modality conditioning alongside the
+                per-block timestep conditioning every `Block_diffusion`
+                already has -- for a paired multi-modality dataset (e.g.
+                "nct"/"xct"), each block also learns a correction for which
+                modality the current batch is, not just which diffusion
+                timestep. Requires `modality_keys` (the model's fixed list
+                of dataset keys it can ever be trained on, e.g.
+                `["nct1", "xct1"]`, one entry per real modality regardless
+                of how many channels each has -- deliberately *not* keyed
+                on `default_vars`/variable names, since a single modality
+                can have more than one channel) to list at least 2 entries.
+                `False` (default) adds no parameters, requires no
+                `modality_keys`, and no behavior change -- see
+                `forward_features`'s own docstring for how the modality
+                index is determined at call time, from `dict_key`, not
+                `variables`.
         """
         self.linear_decoder = kwargs.pop('linear_decoder', '')
         self.residual_mlp_decoder = kwargs.pop('residual_mlp_decoder', False)
@@ -2272,24 +2277,24 @@ class DiffusionVIT(VIT):
         self.decoder_num_heads = kwargs.pop('decoder_num_heads', '')
         self.decoder_mlp_ratio = kwargs.pop('decoder_mlp_ratio', '')
         self.use_modality_conditioning = kwargs.pop('use_modality_conditioning', False)
+        modality_keys = kwargs.pop('modality_keys', None)
         if self.use_modality_conditioning:
-            # default_vars (a real VIT.__init__ kwarg already) is every
-            # variable/modality name this model can ever see, e.g.
-            # ["nct", "xct"] for a paired dataset -- not popped here, since
-            # VIT.__init__ still needs to consume it normally; just peeked
-            # at to size the per-block modality-embedding table (built
-            # inside VIT.__init__'s own block-construction loop, via
+            # modality_keys: one entry per real modality (dataset key),
+            # e.g. ["nct1", "xct1"] -- deliberately not default_vars
+            # (variable names), since a single modality can have more than
+            # one channel/variable; see __init__'s own docstring for why.
+            # Sizes the per-block modality-embedding table (built inside
+            # VIT.__init__'s own block-construction loop, via
             # num_modalities, since self.blocks is built there, before this
             # method's own body resumes after super().__init__()).
-            default_vars_for_modality = kwargs.get('default_vars')
-            if not default_vars_for_modality or len(default_vars_for_modality) < 2:
-                raise ValueError("use_modality_conditioning requires default_vars with at least 2 modalities")
-            kwargs['num_modalities'] = len(default_vars_for_modality)
+            if not modality_keys or len(modality_keys) < 2:
+                raise ValueError("use_modality_conditioning requires modality_keys with at least 2 modalities")
+            kwargs['num_modalities'] = len(modality_keys)
         super().__init__(*args, **kwargs)
         #Remove decoder from VIT
         self.head = None
         if self.use_modality_conditioning:
-            self.var_map = {var: i for i, var in enumerate(self.default_vars)}
+            self.modality_map = {key: i for i, key in enumerate(modality_keys)}
 
         residual_decoder_count = sum((
             bool(self.residual_mlp_decoder),
@@ -2577,24 +2582,28 @@ class DiffusionVIT(VIT):
 
         named_apply(get_init_weights_vit(head_bias), self)
 
-    def forward_features(self, x: torch.Tensor, t, variables) -> torch.Tensor:
+    def forward_features(self, x: torch.Tensor, t, variables, dict_key=None) -> torch.Tensor:
         """Embeds patches/tokens, adds positional and timestep embeddings, and runs the transformer encoder.
 
         Like `VIT.forward_features`, but additionally computes a sinusoidal
         embedding of `t` and adds it (broadcast across the sequence dimension) to
         the token sequence after the positional embedding. When `self.
-        use_modality_conditioning` is set, also looks up `variables[0]` in
-        `self.var_map` and passes that index to every block alongside `t`,
-        so each block's `Block_diffusion` also conditions on which
-        modality/variable this batch is (see `__init__`'s own docstring).
+        use_modality_conditioning` is set, also looks up `dict_key` in
+        `self.modality_map` and passes that index to every block alongside
+        `t`, so each block's `Block_diffusion` also conditions on which
+        modality this batch is (see `__init__`'s own docstring).
 
         Args:
             x: Input patch/pixel tensor.
             t: Diffusion timestep indices, one per batch element.
-            variables: Variable/channel names for `x`; only `variables[0]`
-                is used for modality conditioning (the whole batch is
-                assumed to be one modality -- true today, since batches
-                already come from one dataset key at a time).
+            variables: Variable/channel names for `x` (unrelated to modality
+                conditioning -- that's keyed on `dict_key`, not these names,
+                since a single modality/dataset key can have more than one
+                channel).
+            dict_key: Which dataset key this whole batch came from (every
+                batch is one dataset key -- this codebase's own dataloading
+                convention). Required exactly when `self.
+                use_modality_conditioning` is set; ignored otherwise.
 
         Returns:
             Encoded token sequence, shape (B, N[+prefix], embed_dim).
@@ -2636,12 +2645,12 @@ class DiffusionVIT(VIT):
             dist.broadcast(x, src_rank, group=self.tensor_par_group)
 
         if self.use_modality_conditioning:
-            # The whole batch is one modality (matches this codebase's own
-            # dataloading convention -- each batch comes from one dataset
-            # key/variable at a time), so a single looked-up index is
-            # broadcast across every sample, same as the colleague's own
-            # reference implementation this was ported from.
-            modality_id = torch.full((x.shape[0],), self.var_map[variables[0]], dtype=torch.long, device=x.device)
+            if dict_key is None:
+                raise ValueError("dict_key must be given when use_modality_conditioning is set")
+            # The whole batch is one dataset key (this codebase's own
+            # dataloading convention), so a single looked-up index is
+            # broadcast across every sample.
+            modality_id = torch.full((x.shape[0],), self.modality_map[dict_key], dtype=torch.long, device=x.device)
         else:
             modality_id = None
         for blk in self.blocks:
@@ -2715,19 +2724,22 @@ class DiffusionVIT(VIT):
             prediction = prediction + self._volume_to_3d_tokens(residual_volume)
         return prediction
 
-    def forward(self, x: torch.Tensor, t, variables) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, t, variables, dict_key=None) -> torch.Tensor:
         """Runs the full timestep-conditioned forward pass: encode then decode.
 
         Args:
             x: Noised input patch/pixel tensor.
             t: Diffusion timestep indices, one per batch element.
             variables: Variable/channel names for `x`.
+            dict_key: Which dataset key this batch came from -- see
+                `forward_features`'s own docstring; required exactly when
+                `self.use_modality_conditioning` is set.
 
         Returns:
             Predicted per-patch pixel values (e.g. predicted noise), shape (B, L,
             patch_dim).
         """
         t = t.to('cpu')
-        x = self.forward_features(x, t, variables)
+        x = self.forward_features(x, t, variables, dict_key)
         x = self.forward_head(x,t)
         return x

@@ -238,7 +238,7 @@ def forward_step(conf, batch, model):
         return loss, output
 
     elif conf["model"]["type"] == "DiffusionVIT":
-        output = model.forward(batch["data"], batch["t"], batch["variables"])
+        output = model.forward(batch["data"], batch["t"], batch["variables"], batch["dict_key"])
         output = unpatchify(output, batch["data"], conf["data"]["patch_size"], conf["data"]["twoD"])
         criterion = nn.MSELoss()
         loss = criterion(output,batch["e"])

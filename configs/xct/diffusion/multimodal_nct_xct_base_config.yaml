@@ -14,12 +14,12 @@
 # data.dataset stays "xct" (singular) even though this spans two dict_
 # root_dirs keys -- it's the *file format* dispatch (both keys are raw
 # .npy volumes needing the same load+axis-swap treatment; see dataset.py's
-# "xct" branch), not the modality. The actual modality distinction is
-# carried entirely by dict_in_variables's per-key variable name ("nct" vs
-# "xct"), which becomes model.default_vars (auto-derived, deduplicated,
-# across every dict_in_variables entry -- see parse.py) -- exactly what
-# use_modality_conditioning requires (at least 2 entries) and what each
-# block's var_map is built from.
+# "xct" branch), not the modality. The modality distinction use_modality_
+# conditioning actually uses is each dict_root_dirs key itself (["nct1",
+# "xct1"], auto-derived by parse.py -- no separate config key needed) --
+# deliberately *not* dict_in_variables's variable names ("nct"/"xct"),
+# since a single modality/dataset key could in principle have more than
+# one channel/variable, which variable names alone can't disambiguate.
 #
 # Both paths are already offline-standardized by the colleague's own
 # preprocessing the same way the single-modality base_config.yaml's is --

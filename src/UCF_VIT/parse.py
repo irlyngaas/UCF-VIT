@@ -209,12 +209,18 @@ def get_kwargs(model_type, conf):
         kwargs.update({"num_time_steps": num_time_steps})
 
         # Opt-in per-block modality conditioning, for a paired multi-
-        # modality dataset (e.g. "nct"/"xct") -- default_vars itself is
-        # not a separate config key here, it's already derived above from
-        # dict_in_variables (data_conf's own "default_vars"), deduplicated
-        # across every configured dataset key; DiffusionVIT.__init__
-        # requires it to list at least 2 modalities when this is on.
-        kwargs.update({"use_modality_conditioning": conf['model'].get('use_modality_conditioning', False)})
+        # modality dataset (e.g. "nct"/"xct") -- modality_keys is each
+        # dataset key directly (e.g. ["nct1", "xct1"]), not a separate
+        # config key: deliberately not conf['data']['default_vars']
+        # (variable names), since a single modality/dataset key can have
+        # more than one channel/variable -- see DiffusionVIT.__init__'s
+        # own docstring for why. DiffusionVIT.__init__ requires at least 2
+        # modality_keys when this is on.
+        use_modality_conditioning = conf['model'].get('use_modality_conditioning', False)
+        kwargs.update({
+            "use_modality_conditioning": use_modality_conditioning,
+            "modality_keys": list(conf['data']['dict_root_dirs'].keys()) if use_modality_conditioning else None,
+        })
 
         # Opt-in decoder refinements (DiffusionVIT.__init__ validates
         # mutual exclusivity/dimensionality itself) -- all of them require
