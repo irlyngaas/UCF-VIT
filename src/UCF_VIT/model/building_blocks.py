@@ -336,6 +336,7 @@ class Block(nn.Module):
             tensor_par_size: int = 1,
             tensor_par_group: Optional[dist.ProcessGroup] = None,
             num_time_steps: int = None,
+            num_modalities: Optional[int] = None,
     ) -> None:
         """Initializes the block's attention, MLP, normalization, layer-scale, and drop-path sublayers.
 
@@ -361,11 +362,18 @@ class Block(nn.Module):
             num_time_steps: Number of diffusion timesteps to embed; unused by
                 `Block` itself, only stored for `Block_diffusion` (a subclass)
                 to read in its own `__init__`.
+            num_modalities: Number of distinct modalities/variables to embed
+                for per-block conditioning (e.g. 2 for a paired "nct"/"xct"
+                dataset); unused by `Block` itself, only stored for
+                `Block_diffusion` to read in its own `__init__`. `None`
+                (default) means no modality conditioning at all -- see
+                `Block_diffusion`'s own docstring.
         """
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.dim = dim
         self.num_time_steps = num_time_steps
+        self.num_modalities = num_modalities
         self.attn = Attention(
             dim,
             fused_attn=fused_attn,
@@ -407,17 +415,26 @@ class Block(nn.Module):
         return x
 
 class Block_diffusion(Block):
-    """`Block` with per-block diffusion-timestep conditioning.
+    """`Block` with per-block diffusion-timestep (and optional modality) conditioning.
 
     Adds its own `SinusoidalEmbeddings` + `EmbeddingDenseLayer` (a learned
     projection of the fixed sinusoidal timestep encoding) and re-injects the
     result into `x` before attention, at every block -- rather than adding a
     timestep embedding once, before the first block, and letting it
     propagate implicitly through the residual stream.
+
+    Optionally (`num_modalities` set, e.g. for a paired "nct"/"xct" dataset)
+    also adds a per-block, per-modality `nn.Embedding` + its own
+    `EmbeddingDenseLayer` projection, injected at the same point, added
+    together with the timestep embedding -- so each block learns both *when*
+    in the diffusion process it is and *which* modality the current batch
+    is. `num_modalities=None` (default) builds neither sublayer and
+    `forward`'s `modality_id` must stay `None` too -- zero added parameters,
+    zero behavior change, for anyone not using multiple modalities.
     """
 
     def __init__(self, *args, **kwargs):
-        """Builds a `Block`, then adds its own timestep-embedding sublayers.
+        """Builds a `Block`, then adds its own timestep- (and optional modality-) embedding sublayers.
 
         Args:
             *args: Positional arguments forwarded to `Block.__init__`.
@@ -425,24 +442,38 @@ class Block_diffusion(Block):
                 include `num_time_steps` (number of diffusion timesteps to
                 embed) and `dim` (used as both the timestep embedding's
                 dimension and `EmbeddingDenseLayer`'s hidden/output
-                dimension).
+                dimension); optionally `num_modalities` (see this class's
+                own docstring).
         """
         super().__init__(*args, **kwargs)
         self.temporalEmbeddings = SinusoidalEmbeddings(time_steps=self.num_time_steps, embed_dim=self.dim)
         self.timeEmbeddingMap = EmbeddingDenseLayer(self.dim, self.dim, 0.1) # dropout_prob
+        if self.num_modalities is not None:
+            self.cond_map = nn.Embedding(num_embeddings=self.num_modalities, embedding_dim=self.dim)
+            self.condEmbeddingMap = EmbeddingDenseLayer(self.dim, self.dim, 0.1) # dropout_prob
 
-    def forward(self, x: torch.Tensor, t) -> torch.Tensor:
-        """Adds a per-block timestep embedding to `x`, then runs the attention and MLP sublayers.
+    def forward(self, x: torch.Tensor, t, modality_id=None) -> torch.Tensor:
+        """Adds a per-block timestep (and optional modality) embedding to `x`, then runs the attention and MLP sublayers.
 
         Args:
             x: Input tensor, shape (B, N, dim).
             t: Diffusion timestep indices, shape (B,).
+            modality_id: Per-sample modality index, shape (B,); required
+                exactly when this block was built with `num_modalities` set
+                (checked explicitly, rather than silently ignoring a value
+                passed to a block that can't use it, or silently skipping
+                conditioning a caller expected).
 
         Returns:
             Output tensor, shape (B, N, dim).
         """
+        if (modality_id is None) != (self.num_modalities is None):
+            raise ValueError("modality_id must be given if and only if this block was built with num_modalities set")
         time_emb = self.temporalEmbeddings(x,t)
         time_emb = self.timeEmbeddingMap(time_emb.to(x.dtype))[:,None,:]
+        if self.num_modalities is not None:
+            cond_emb = self.condEmbeddingMap(self.cond_map(modality_id))[:,None,:]
+            time_emb = time_emb + cond_emb
         x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x + time_emb))))
         x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
         return x

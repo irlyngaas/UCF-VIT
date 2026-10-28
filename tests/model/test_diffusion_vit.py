@@ -256,3 +256,79 @@ def test_all_decoder_refinements_require_linear_decoder():
             spatial_feature_conv3d_decoder=True, linear_decoder=False,
             decoder_depth=1, decoder_embed_dim=8, decoder_num_heads=1, decoder_mlp_ratio=1.0,
         )
+
+
+# ---------------------------------------------------------------------------
+# Opt-in per-block modality conditioning (use_modality_conditioning), for a
+# paired multi-modality dataset (e.g. "nct"/"xct") -- ported from the
+# colleague's AKZ-upd4 branch (its Block.forward's cond_map/cond_emb,
+# DiffusionVIT's own var_map). Unlike the decoder refinements above, this
+# has no step-zero-equivalence property in the reference it was ported from
+# (cond_map/condEmbeddingMap are freshly, randomly initialized, not
+# zero-init) -- the real correctness property to check is that it's wired
+# end to end: different modalities must produce different output, the same
+# way test_diffusion_vit_different_timesteps_change_the_output already
+# checks for t.
+# ---------------------------------------------------------------------------
+
+
+def test_modality_conditioning_off_by_default_adds_no_parameters():
+    model = _make_diffusion_vit()
+    assert not any(name.startswith(("cond_map", "condEmbeddingMap")) for name, _ in model.blocks[0].named_parameters())
+    assert model.blocks[0].num_modalities is None
+
+
+def test_modality_conditioning_requires_at_least_two_default_vars():
+    with pytest.raises(ValueError, match="at least 2 modalities"):
+        _make_diffusion_vit(use_modality_conditioning=True, default_vars=["nct"])
+    with pytest.raises(ValueError, match="at least 2 modalities"):
+        _make_diffusion_vit(use_modality_conditioning=True)
+
+
+def test_modality_conditioning_builds_per_block_sublayers_and_var_map():
+    model = _make_diffusion_vit(use_modality_conditioning=True, default_vars=["nct", "xct"])
+    assert model.var_map == {"nct": 0, "xct": 1}
+    for blk in model.blocks:
+        assert blk.num_modalities == 2
+        assert hasattr(blk, "cond_map") and hasattr(blk, "condEmbeddingMap")
+
+
+def test_different_modalities_change_the_output():
+    """The actual point of modality conditioning: "nct" and "xct" batches
+    must produce genuinely different output, not just be plumbed through
+    and ignored -- mirrors test_diffusion_vit_different_timesteps_change_
+    the_output's own check for t.
+    """
+    model = _make_diffusion_vit(use_modality_conditioning=True, default_vars=["nct", "xct"])
+    model.eval()
+    x = torch.randn(2, 1, 16, 16)
+    t = torch.zeros(2, dtype=torch.long)
+
+    with torch.no_grad():
+        out_nct = model(x, t, ["nct"])
+        out_xct = model(x, t, ["xct"])
+
+    assert not torch.equal(out_nct, out_xct)
+
+
+def test_modality_conditioning_receives_gradient():
+    model = _make_diffusion_vit(use_modality_conditioning=True, default_vars=["nct", "xct"])
+    x = torch.randn(2, 1, 16, 16, requires_grad=True)
+    t = torch.zeros(2, dtype=torch.long)
+
+    output = model(x, t, ["xct"])
+    output.sum().backward()
+
+    blk = model.blocks[0]
+    assert blk.cond_map.weight.grad is not None
+    assert blk.cond_map.weight.grad.abs().sum().item() > 0
+
+
+def test_block_diffusion_rejects_mismatched_modality_id():
+    plain_block = _make_diffusion_vit().blocks[0]
+    with pytest.raises(ValueError, match="if and only if"):
+        plain_block(torch.randn(2, 4, 8), torch.zeros(2, dtype=torch.long), torch.zeros(2, dtype=torch.long))
+
+    modality_block = _make_diffusion_vit(use_modality_conditioning=True, default_vars=["nct", "xct"]).blocks[0]
+    with pytest.raises(ValueError, match="if and only if"):
+        modality_block(torch.randn(2, 4, 8), torch.zeros(2, dtype=torch.long))

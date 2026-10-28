@@ -197,6 +197,7 @@ class VIT(nn.Module):
             FusedAttn_option = FusedAttn.NONE,
             use_adaptive_pos_emb: bool = False,
             num_time_steps: int = None,
+            num_modalities: Optional[int] = None,
     ) -> None:
         """Builds the patch/token embedding, positional embedding, transformer blocks, and optional classification head.
 
@@ -349,6 +350,7 @@ class VIT(nn.Module):
         self.FusedAttn_option = FusedAttn_option
         self.use_adaptive_pos_emb = use_adaptive_pos_emb
         self.num_time_steps = num_time_steps
+        self.num_modalities = num_modalities
 
         if self.adaptive_patching:
             assert self.interp_size is not None, "interp_size is required when adaptive_patching is turned on"
@@ -423,7 +425,8 @@ class VIT(nn.Module):
                 mlp_layer=mlp_layer,
                 tensor_par_size=tensor_par_size,
                 tensor_par_group=tensor_par_group,
-                num_time_steps=num_time_steps
+                num_time_steps=num_time_steps,
+                num_modalities=num_modalities,
             )
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
@@ -2240,7 +2243,18 @@ class DiffusionVIT(VIT):
                 head instead of adding to it -- no step-zero equivalence,
                 mutually exclusive with every residual option). See
                 `forward_head`'s own docstring for exactly how each is
-                applied.
+                applied. Independently, `use_modality_conditioning` (default
+                False) adds per-block modality/variable conditioning
+                alongside the per-block timestep conditioning every
+                `Block_diffusion` already has -- for a paired multi-
+                modality dataset (e.g. "nct"/"xct"), each block also learns
+                a correction for which modality the current batch is, not
+                just which diffusion timestep. Requires `default_vars` to
+                list at least 2 modalities (the model's own fixed universe
+                of possible variables, same `default_vars` `VIT.__init__`
+                already takes); `False` (default) adds no parameters and no
+                behavior change -- see `forward_features`'s own docstring
+                for how the modality index is determined at call time.
         """
         self.linear_decoder = kwargs.pop('linear_decoder', '')
         self.residual_mlp_decoder = kwargs.pop('residual_mlp_decoder', False)
@@ -2257,9 +2271,25 @@ class DiffusionVIT(VIT):
         self.decoder_embed_dim = kwargs.pop('decoder_embed_dim', '')
         self.decoder_num_heads = kwargs.pop('decoder_num_heads', '')
         self.decoder_mlp_ratio = kwargs.pop('decoder_mlp_ratio', '')
+        self.use_modality_conditioning = kwargs.pop('use_modality_conditioning', False)
+        if self.use_modality_conditioning:
+            # default_vars (a real VIT.__init__ kwarg already) is every
+            # variable/modality name this model can ever see, e.g.
+            # ["nct", "xct"] for a paired dataset -- not popped here, since
+            # VIT.__init__ still needs to consume it normally; just peeked
+            # at to size the per-block modality-embedding table (built
+            # inside VIT.__init__'s own block-construction loop, via
+            # num_modalities, since self.blocks is built there, before this
+            # method's own body resumes after super().__init__()).
+            default_vars_for_modality = kwargs.get('default_vars')
+            if not default_vars_for_modality or len(default_vars_for_modality) < 2:
+                raise ValueError("use_modality_conditioning requires default_vars with at least 2 modalities")
+            kwargs['num_modalities'] = len(default_vars_for_modality)
         super().__init__(*args, **kwargs)
         #Remove decoder from VIT
         self.head = None
+        if self.use_modality_conditioning:
+            self.var_map = {var: i for i, var in enumerate(self.default_vars)}
 
         residual_decoder_count = sum((
             bool(self.residual_mlp_decoder),
@@ -2552,12 +2582,19 @@ class DiffusionVIT(VIT):
 
         Like `VIT.forward_features`, but additionally computes a sinusoidal
         embedding of `t` and adds it (broadcast across the sequence dimension) to
-        the token sequence after the positional embedding.
+        the token sequence after the positional embedding. When `self.
+        use_modality_conditioning` is set, also looks up `variables[0]` in
+        `self.var_map` and passes that index to every block alongside `t`,
+        so each block's `Block_diffusion` also conditions on which
+        modality/variable this batch is (see `__init__`'s own docstring).
 
         Args:
             x: Input patch/pixel tensor.
             t: Diffusion timestep indices, one per batch element.
-            variables: Variable/channel names for `x`.
+            variables: Variable/channel names for `x`; only `variables[0]`
+                is used for modality conditioning (the whole batch is
+                assumed to be one modality -- true today, since batches
+                already come from one dataset key at a time).
 
         Returns:
             Encoded token sequence, shape (B, N[+prefix], embed_dim).
@@ -2598,8 +2635,17 @@ class DiffusionVIT(VIT):
             x = x.contiguous()
             dist.broadcast(x, src_rank, group=self.tensor_par_group)
 
+        if self.use_modality_conditioning:
+            # The whole batch is one modality (matches this codebase's own
+            # dataloading convention -- each batch comes from one dataset
+            # key/variable at a time), so a single looked-up index is
+            # broadcast across every sample, same as the colleague's own
+            # reference implementation this was ported from.
+            modality_id = torch.full((x.shape[0],), self.var_map[variables[0]], dtype=torch.long, device=x.device)
+        else:
+            modality_id = None
         for blk in self.blocks:
-            x = blk(x, t)
+            x = blk(x, t, modality_id)
         x = self.norm(x)
 
         if self.tensor_par_size > 1:
