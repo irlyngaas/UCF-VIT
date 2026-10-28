@@ -46,6 +46,53 @@ def get_1Dgrid(Lh, nx, nxoffset, nxsl, nxskip):
     return np.linspace(xin, xfi, nxsl)
 
 
+def plot_3d_center_slices(volumes, filename):
+    """Plots the center X-axis slice of a batch of generated 3D volumes at each saved step.
+
+    Args:
+        volumes: List of arrays, one per saved reverse-diffusion step, each
+            shaped `[B, H, W, D, C]` (channel-last).
+        filename: Path to save the figure to.
+    """
+    colormap = "gray"
+    batch_size = volumes[0].shape[0]
+    num_steps = len(volumes)
+
+    fig, ax = plt.subplots(batch_size, num_steps, figsize=(num_steps * 2, batch_size * 2), squeeze=False)
+    for i in range(batch_size):
+        for j in range(num_steps):
+            volume = volumes[j][i, ..., 0]
+            ax[i, j].imshow(volume[volume.shape[0] // 2, :, :], cmap=colormap)
+            ax[i, j].axis('off')
+
+    plt.subplots_adjust(left=0.01, right=0.99, hspace=0.05, wspace=0.05, top=0.99, bottom=0.01)
+    fig.savefig(filename, format='png', dpi=300)
+    plt.close(fig)
+
+
+def plot_2d_slices(images, filename):
+    """Plots a batch of generated 2D images at each saved reverse-diffusion step.
+
+    Args:
+        images: List of arrays, one per saved reverse-diffusion step, each
+            shaped `[B, H, W, C]` (channel-last).
+        filename: Path to save the figure to.
+    """
+    colormap = "gray"
+    batch_size = images[0].shape[0]
+    num_steps = len(images)
+
+    fig, ax = plt.subplots(batch_size, num_steps, figsize=(num_steps * 2, batch_size * 2), squeeze=False)
+    for i in range(batch_size):
+        for j in range(num_steps):
+            ax[i, j].imshow(images[j][i, ..., 0], cmap=colormap)
+            ax[i, j].axis('off')
+
+    plt.subplots_adjust(left=0.01, right=0.99, hspace=0.05, wspace=0.05, top=0.99, bottom=0.01)
+    fig.savefig(filename, format='png', dpi=300)
+    plt.close(fig)
+
+
 def plot_contour_box(x, y, z, datacube, gravity):
     """Plots a 3D contour box: filled contours on 3 faces of a volume, plus its wireframe edges.
 
