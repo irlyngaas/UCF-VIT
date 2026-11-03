@@ -38,8 +38,7 @@ export C_INCLUDE_PATH=${C_INCLUDE_PATH%:}
 export CPLUS_INCLUDE_PATH=${CPLUS_INCLUDE_PATH%:}
 
 # Installing some prerequisites
-#sudo apt-get install git 
-zypper install -y sudo git
+sudo apt-get install -y git
 
 git --version
 

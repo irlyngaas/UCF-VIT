@@ -1,0 +1,108 @@
+Bootstrap: docker
+From: savannah.ornl.gov/olcf-container-images/frontier/ubuntu/gnu/cpe:24.11
+
+
+%environment
+export ROCM_PATH=/opt/rocm
+export LD_LIBRARY_PATH="/opt/rocm/lib:/opt/rocm/lib64:$LD_LIBRARY_PATH"
+export PATH="/opt/rocm/bin:$PATH"
+export PYTORCH_DIR=/pytorch
+export PYTHONPATH=${PYTORCH_DIR}:${PYTHONPATH}
+export CONDA_DIR=/conda/envs/vit
+export PATH=${CONDA_DIR}/bin:/conda/bin:$PATH
+export MPICH_SMP_SINGLE_COPY_MODE=NONE
+
+#Remove trailing : to avoid including CWD to system search paths
+export C_INCLUDE_PATH=${C_INCLUDE_PATH%:}
+export CPLUS_INCLUDE_PATH=${CPLUS_INCLUDE_PATH%:}
+
+# Enable conda on apptainer run (https://github.com/apptainer/singularity/issues/5075)
+action="${0##*/}"
+if [ "$action" == "shell" ]; then
+    if [ "${SINGULARITY_SHELL:-}" == "/bin/bash" ]; then
+        set -- --noprofile --init-file /.singularity_bash
+    elif test -z "${SINGULARITY_SHELL:-}"; then
+        export SINGULARITY_SHELL=/bin/bash
+        set -- --noprofile --init-file /.singularity_bash
+    fi
+fi
+
+
+%post -c /bin/bash
+# Misc setup
+export ROCM_PATH=/opt/rocm
+export LD_LIBRARY_PATH="/opt/rocm/lib:/opt/rocm/lib64:$LD_LIBRARY_PATH"
+export PATH="/opt/rocm/bin:$PATH"
+export MPICH_SMP_SINGLE_COPY_MODE=NONE
+
+#Remove trailing : to avoid including CWD to system search paths
+export C_INCLUDE_PATH=${C_INCLUDE_PATH%:}
+export CPLUS_INCLUDE_PATH=${CPLUS_INCLUDE_PATH%:}
+
+# Installing some prerequisites
+sudo apt-get install -y lua53 lua53-luaposix lua-lmod which
+sudo apt-get install -y libtool autoconf automake tar wget gnupg
+sudo apt-get install -y libatomic1 libquadmath0  # required by some ROCm tools -- see https://rocm.docs.amd.com/en/7.13.0-preview/install/rocm.html
+
+# Install ROCm 7.13.0-preview userspace packages for gfx90a (MI250X), to match
+# the Conda env's own target in README.md's Install section. The base CPE
+# image above only bundles ROCm 6.2.4 -- this installs 7.13.0-preview
+# alongside/over it. NOT YET TESTED on real hardware -- confirm the base
+# image's actual Ubuntu release (`cat /etc/os-release`) matches "ubuntu2204"
+# below before building; swap to ubuntu2404/ubuntu2604 if it doesn't.
+# See: https://rocm.docs.amd.com/en/7.13.0-preview/install/rocm.html
+sudo mkdir --parents --mode=0755 /etc/apt/keyrings
+wget https://repo.amd.com/rocm/packages/gpg/rocm.gpg -O - | \
+  gpg --dearmor | sudo tee /etc/apt/keyrings/amdrocm.gpg > /dev/null
+sudo tee /etc/apt/sources.list.d/rocm.list << EOF
+deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://repo.amd.com/rocm/packages/ubuntu2204 stable main
+EOF
+sudo apt update
+sudo apt install -y amdrocm7.13-gfx90a amdrocm-core-dev7.13
+
+# Install CONDA and required conda packages
+export CONDA_DIR=/conda/envs/vit
+export PATH=${CONDA_DIR}/bin:/conda/bin:$PATH
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh && \
+  bash /tmp/miniconda.sh -b -p /conda && \
+  rm -f /tmp/miniconda.sh && \
+  . /conda/etc/profile.d/conda.sh && \
+  . /conda/bin/activate && \
+  conda create -n vit python=3.11 -y
+  conda install -n vit -y git
+
+echo "## Activate conda environment" >> /.singularity_bashrc
+echo "conda activate vit" >> /.singularity_bashrc
+
+# Install PyTorch -- exact command from AMD's own ROCm 7.13.0-preview +
+# PyTorch 2.10.0 + MI250X/gfx90a install guide (matches README.md's Conda
+# install section): https://rocm.docs.amd.com/en/7.13.0-preview/frameworks/pytorch/install.html
+export PYTORCH_DIR=/pytorch
+export PYTHONPATH=${PYTORCH_DIR}:${PYTHONPATH}
+${CONDA_DIR}/bin/pip install --index-url https://repo.amd.com/rocm/whl/gfx90a/ \
+  "torch==2.10.0+rocm7.13.0" \
+  "torchvision==0.25.0+rocm7.13.0" \
+  "torchaudio==2.10.0+rocm7.13.0" \
+  --target ${PYTORCH_DIR}
+
+# Install XFormers
+${CONDA_DIR}/bin/pip install -U xformers --index-url https://download.pytorch.org/whl/rocm7.1
+
+# Install mpi4py -- same two-step pattern as README.md's Conda install
+# section: a conda-forge fallback build, then rebuilt via pip against the
+# Cray compiler wrapper (`cc`, provided by this CPE base image) so it's
+# actually linked against Cray MPICH once bound in at runtime (see
+# launch/basic_ct/unetr_apptainer.sh)
+conda install -n vit -y -c conda-forge mpi4py mpich
+MPICC="cc -shared" ${CONDA_DIR}/bin/pip install --no-cache-dir --no-binary=mpi4py mpi4py
+
+# Install UCF_VIT
+#mkdir -p /source
+#cd /source
+#git clone https://github.com/irlyngaas/UCF-VIT.git
+#${CONDA_DIR}/bin/python -m pip install -e /source/UCF-VIT --verbose
+
+%runscript
+exec /bin/bash --noprofile --init-file /.singularity_bash "$@"
+%startscript
+exec /bin/bash --noprofile --init-file /.singularity_bash "$@"

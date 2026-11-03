@@ -40,7 +40,7 @@ Installation instruction are provide for running on systems with both AMD and NV
 Every platform-independent package we depend on (`monai`, `nibabel`, `torchdata`, `einops`, `opencv-python-headless`, `matplotlib`, `scipy`, `scikit-image`, `SimpleITK`, `timm`) is declared in `pyproject.toml` and gets installed automatically by `pip install -e .`. `torch` and `xformers` are deliberately left out of `pyproject.toml` since the correct build depends on your GPU vendor (ROCm for AMD, CUDA for NVIDIA) -- install those manually first with the platform-specific commands below, then run `pip install -e .` to pull in everything else.
 
 ## Systems with AMD GPUs
-There are two options available for creating software environments for systems with AMD GPUs 1) creating Conda environment from scratch or 2) using an apptainer container (the installation instructions for this are currently limited to use on the Frontier supercomputer). Creating a Conda environment from scratch is recommended as the Apptainer containers currently only work in limited scenarios due to missing ROCM packages in the base apptainer image.
+There are two options available for creating software environments for systems with AMD GPUs 1) creating Conda environment from scratch or 2) using an apptainer container (the installation instructions for this are currently limited to use on the Frontier supercomputer). Creating a Conda environment from scratch is recommended -- it's the actively-used, validated path. The Apptainer containers are still being revised and haven't been validated on real hardware yet; see the Apptainer section below for current status.
 
 ### Conda
 Create Conda Environment from Scratch. Example below uses similar options from the corresponding Apptainer definition files
@@ -89,15 +89,14 @@ mkdir -p $CUPY_CACHE_DIR
 See `launch/tests/run_cupyx_smoke.sh` for a working example job.
 
 ### Apptainer (on Frontier)
-Use Apptainer container definition files (Only use this on Frontier)
+Use Apptainer container definition files (Only use this on Frontier). Two sets are provided: `frontier-ubuntu-gnu-rocm624*.def` (ROCm 6.2.4, matches OLCF's own current container examples) and `frontier-ubuntu-gnu-rocm7130*.def` (ROCm 7.13.0-preview, matching the Conda path's own target above -- **not yet tested on real hardware**, see `launch/basic_ct/unetr_apptainer.sh`'s own header).
 ```
 cd apptainer
-apptainer build frontier-ubuntu-gnu-rocm624.sif frontier-ubuntu-gnu-rocm624.def
-apptainer build frontier-ubuntu-gnu-rocm624-vit.sif frontier-ubuntu-gnu-rocm624-vit.def
-mkdir lib/8.1.31
-cd lib/8.1.31
-ln -s $CRAY_MPICH_DIR/lib/libfmpich.so libmpicxx.so
+apptainer build frontier-ubuntu-gnu-rocm7130.sif frontier-ubuntu-gnu-rocm7130.def
+apptainer build frontier-ubuntu-gnu-rocm7130-vit.sif frontier-ubuntu-gnu-rocm7130-vit.def
 ```
+
+MPI/ROCm host libraries aren't baked into the container at build time -- they're bound in at job-submission time instead, following OLCF's own [Containers on Frontier](https://docs.olcf.ornl.gov/software/containers_on_frontier.html) guide (`cray-mpich-abi` module + `APPTAINER_BINDPATH`/`APPTAINERENV_LD_LIBRARY_PATH`/`APPTAINER_CONTAINLIBS`). Launch scripts with `_apptainer` in the filename (e.g. `launch/basic_ct/unetr_apptainer.sh`) run this way; every other launch script activates the Conda environment directly instead.
 
 
 ## Local DGX System
