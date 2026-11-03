@@ -94,7 +94,7 @@ tee /etc/apt/sources.list.d/rocm.list << EOF
 deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://repo.amd.com/rocm/packages/ubuntu2204 stable main
 EOF
 apt update
-apt install -y amdrocm7.13-gfx90a amdrocm-core-dev7.13
+apt install -y amdrocm7.13-gfx90a amdrocm-core-dev7.13-gfx90a
 
 # Install CONDA and required conda packages
 export CONDA_DIR=/conda/envs/vit
