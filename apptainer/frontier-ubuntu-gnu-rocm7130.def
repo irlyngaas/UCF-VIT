@@ -1,11 +1,12 @@
 Bootstrap: docker
-From: savannah.ornl.gov/olcf-container-images/cpe:25.09_gnu_ubuntu
+From: ubuntu:22.04
 
 
 %environment
 export ROCM_PATH=/opt/rocm
-export LD_LIBRARY_PATH="/opt/rocm/lib:/opt/rocm/lib64:$LD_LIBRARY_PATH"
-export PATH="/opt/rocm/bin:$PATH"
+export MPICH_DIR=/opt/mpich
+export LD_LIBRARY_PATH="/opt/mpich/lib:/opt/rocm/lib:/opt/rocm/lib64:$LD_LIBRARY_PATH"
+export PATH="/opt/mpich/bin:/opt/rocm/bin:$PATH"
 export PYTORCH_DIR=/pytorch
 export PYTHONPATH=${PYTORCH_DIR}:${PYTHONPATH}
 export CONDA_DIR=/conda/envs/vit
@@ -31,25 +32,53 @@ fi
 %post -c /bin/bash
 # Misc setup
 export ROCM_PATH=/opt/rocm
+export MPICH_DIR=/opt/mpich
 export LD_LIBRARY_PATH="/opt/rocm/lib:/opt/rocm/lib64:$LD_LIBRARY_PATH"
 export PATH="/opt/rocm/bin:$PATH"
 export MPICH_SMP_SINGLE_COPY_MODE=NONE
+export DEBIAN_FRONTEND=noninteractive
 
 #Remove trailing : to avoid including CWD to system search paths
 export C_INCLUDE_PATH=${C_INCLUDE_PATH%:}
 export CPLUS_INCLUDE_PATH=${CPLUS_INCLUDE_PATH%:}
 
+# This base image is plain ubuntu:22.04 from Docker Hub, not OLCF's own
+# savannah.ornl.gov CPE registry -- that registry is currently blocking
+# pulls of its own documented images on a vulnerability-severity policy
+# (OLCF's own docs acknowledge this and point at building your own image
+# as the workaround: https://docs.olcf.ornl.gov/software/containers_on_frontier.html).
+# This also means CPE was never actually bundled in those images anyway --
+# OLCF's docs say outright they can't ship real CPE in a container due to
+# licensing, so this approach (plain base + our own ABI-matched MPICH, same
+# as OLCF's own olcf_containers_examples repo) isn't a downgrade.
+apt-get update
+apt-get install -y sudo
+
 # Installing some prerequisites
-sudo apt-get install -y lua53 lua53-luaposix lua-lmod which
-sudo apt-get install -y libtool autoconf automake tar wget gnupg
+sudo apt-get install -y build-essential gfortran git tar wget gnupg \
+  autoconf automake libtool m4 texinfo zlib1g-dev pkg-config ca-certificates
 sudo apt-get install -y libatomic1 libquadmath0  # required by some ROCm tools -- see https://rocm.docs.amd.com/en/7.13.0-preview/install/rocm.html
 
+# Build MPICH 3.4.2 from source, matching the ANL MPICH release Cray MPICH's
+# own ABI is based on (confirmed via `module show cray-mpich/8.1.31` on
+# Frontier -> "based upon ANL MPICH 3.4a2"; 3.4.2 is the nearest stable
+# release and is the same version OLCF's own example targets for this ABI --
+# see opensusempich342rocm624.def in https://github.com/olcf/olcf_containers_examples).
+# This container's own MPICH is never meant to run anything itself -- it only
+# needs to be ABI-compatible so the real Cray MPICH (bound in from the host
+# at job-submission time, see launch/basic_ct/unetr_apptainer.sh) can replace
+# it at runtime without breaking anything linked against it at build time.
+export MPICH_VERSION=3.4.2
+export MPICH_URL="http://www.mpich.org/static/downloads/${MPICH_VERSION}/mpich-${MPICH_VERSION}.tar.gz"
+mkdir -p /mpich
+cd /mpich && wget -O mpich-${MPICH_VERSION}.tar.gz ${MPICH_URL} && tar --no-same-owner -xzf mpich-${MPICH_VERSION}.tar.gz
+cd /mpich/mpich-${MPICH_VERSION} && ./configure --with-device=ch4:ofi --prefix=${MPICH_DIR} && make -j32 install
+cd / && rm -rf /mpich
+export PATH="${MPICH_DIR}/bin:$PATH"
+export LD_LIBRARY_PATH="${MPICH_DIR}/lib:$LD_LIBRARY_PATH"
+
 # Install ROCm 7.13.0-preview userspace packages for gfx90a (MI250X), to match
-# the Conda env's own target in README.md's Install section. The base CPE
-# image above only bundles ROCm 6.4.2 -- this installs 7.13.0-preview
-# alongside/over it. NOT YET TESTED on real hardware -- confirm the base
-# image's actual Ubuntu release (`cat /etc/os-release`) matches "ubuntu2204"
-# below before building; swap to ubuntu2404/ubuntu2604 if it doesn't.
+# the Conda env's own target in README.md's Install section.
 # See: https://rocm.docs.amd.com/en/7.13.0-preview/install/rocm.html
 sudo mkdir --parents --mode=0755 /etc/apt/keyrings
 wget https://repo.amd.com/rocm/packages/gpg/rocm.gpg -O - | \
@@ -88,13 +117,10 @@ ${CONDA_DIR}/bin/pip install --index-url https://repo.amd.com/rocm/whl/gfx90a/ \
 # Install XFormers
 ${CONDA_DIR}/bin/pip install -U xformers --index-url https://download.pytorch.org/whl/rocm7.1
 
-# Install mpi4py -- same two-step pattern as README.md's Conda install
-# section: a conda-forge fallback build, then rebuilt via pip against the
-# Cray compiler wrapper (`cc`, provided by this CPE base image) so it's
-# actually linked against Cray MPICH once bound in at runtime (see
-# launch/basic_ct/unetr_apptainer.sh)
-conda install -n vit -y -c conda-forge mpi4py mpich
-MPICC="cc -shared" ${CONDA_DIR}/bin/pip install --no-cache-dir --no-binary=mpi4py mpi4py
+# Install mpi4py against the MPICH we just built above, so it's linked
+# against something ABI-compatible with Cray MPICH once bound in at runtime
+# (see launch/basic_ct/unetr_apptainer.sh)
+MPICC="${MPICH_DIR}/bin/mpicc" ${CONDA_DIR}/bin/pip install --no-cache-dir --no-binary=mpi4py mpi4py
 
 # Install UCF_VIT
 #mkdir -p /source

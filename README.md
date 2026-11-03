@@ -89,7 +89,7 @@ mkdir -p $CUPY_CACHE_DIR
 See `launch/tests/run_cupyx_smoke.sh` for a working example job.
 
 ### Apptainer (on Frontier)
-Use Apptainer container definition files (Only use this on Frontier). Two sets are provided: `frontier-ubuntu-gnu-rocm624*.def` (ROCm 6.2.4, matches OLCF's own current container examples) and `frontier-ubuntu-gnu-rocm7130*.def` (ROCm 7.13.0-preview, matching the Conda path's own target above -- **not yet tested on real hardware**, see `launch/basic_ct/unetr_apptainer.sh`'s own header).
+Use Apptainer container definition files (Only use this on Frontier). Two sets are provided: `frontier-ubuntu-gnu-rocm624*.def` (ROCm 6.2.4, builds on top of OLCF's own `savannah.ornl.gov` base image -- as of 2026-11, that registry is blocking pulls of its own documented images due to a vulnerability-severity policy, so this path may not currently build) and `frontier-ubuntu-gnu-rocm7130*.def` (ROCm 7.13.0-preview, matching the Conda path's own target above; builds from a plain `ubuntu:22.04` base plus a from-source MPICH matched to Frontier's Cray MPICH ABI instead, sidestepping that registry entirely -- **not yet tested end-to-end on real hardware**, see `launch/basic_ct/unetr_apptainer.sh`'s own header).
 ```
 cd apptainer
 apptainer build frontier-ubuntu-gnu-rocm7130.sif frontier-ubuntu-gnu-rocm7130.def
