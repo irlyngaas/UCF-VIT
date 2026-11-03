@@ -30,7 +30,7 @@ fi
 
 
 %post -c /bin/bash
-set -e
+set -eo pipefail
 # Misc setup
 export ROCM_PATH=/opt/rocm
 export MPICH_DIR=/opt/mpich
@@ -78,9 +78,14 @@ apt-get install -y libatomic1 libquadmath0  # required by some ROCm tools -- see
 export MPICH_VERSION=3.4.2
 export MPICH_URL="http://www.mpich.org/static/downloads/${MPICH_VERSION}/mpich-${MPICH_VERSION}.tar.gz"
 mkdir -p /mpich
-cd /mpich && wget -O mpich-${MPICH_VERSION}.tar.gz ${MPICH_URL} && tar --no-same-owner -xzf mpich-${MPICH_VERSION}.tar.gz
-cd /mpich/mpich-${MPICH_VERSION} && ./configure --with-device=ch4:ofi --prefix=${MPICH_DIR} && make -j32 install
-cd / && rm -rf /mpich
+cd /mpich
+wget -O mpich-${MPICH_VERSION}.tar.gz ${MPICH_URL}
+tar --no-same-owner -xzf mpich-${MPICH_VERSION}.tar.gz
+cd /mpich/mpich-${MPICH_VERSION}
+./configure --with-device=ch4:ofi --prefix=${MPICH_DIR}
+make -j32 install
+cd /
+rm -rf /mpich
 export PATH="${MPICH_DIR}/bin:$PATH"
 export LD_LIBRARY_PATH="${MPICH_DIR}/lib:$LD_LIBRARY_PATH"
 
