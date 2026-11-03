@@ -1,5 +1,5 @@
 Bootstrap: docker
-From: savannah.ornl.gov/olcf-container-images/frontier/ubuntu/gnu/cpe:24.11
+From: savannah.ornl.gov/olcf-container-images/cpe:25.09_gnu_ubuntu
 
 
 %environment
@@ -46,7 +46,7 @@ sudo apt-get install -y libatomic1 libquadmath0  # required by some ROCm tools -
 
 # Install ROCm 7.13.0-preview userspace packages for gfx90a (MI250X), to match
 # the Conda env's own target in README.md's Install section. The base CPE
-# image above only bundles ROCm 6.2.4 -- this installs 7.13.0-preview
+# image above only bundles ROCm 6.4.2 -- this installs 7.13.0-preview
 # alongside/over it. NOT YET TESTED on real hardware -- confirm the base
 # image's actual Ubuntu release (`cat /etc/os-release`) matches "ubuntu2204"
 # below before building; swap to ubuntu2404/ubuntu2604 if it doesn't.
