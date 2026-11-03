@@ -11,6 +11,7 @@
 5. [Diffusion Vision Transformer](#diffusion-vision-transformer-diffusionvit)
 - [Dataloader](#dataloader)
 - [Dataset Integration](#dataset-integration)
+- [Normalization](#normalization)
 - [Load Balancing](#load-balancing)
 - [Parallelism Modes](#parallelism-modes)
 - [Training Scripts](#training-scripts)
@@ -22,7 +23,7 @@ This repository provides a unified coding framework for scalable Vision Transfor
 
 At the same time, the codebase is modular and flexible, allowing researchers and practitioners to run the same models on smaller compute environments without sacrificing performance or usability. This unified approach lowers the barrier to entry for next-generation large-scale vision model research while ensuring reproducibility and scalability across diverse computing platforms.
 
-The repository is open-source and maintained on GitLab to foster collaboration and accelerate innovation in ViT research at scale.
+The repository is open-source and maintained on GitHub to foster collaboration and accelerate innovation in ViT research at scale.
 
 ## Motivation
 The purpose of this framework is to provide capabilities to train large scale ViT models with state-of-the-art efficient computing techniques while still being usable and adaptable for a general audience looking to train on various different types of data and downstream tasks. While frameworks for scalable computing with transformers currently exist they are 1) mostly focused on training with 1D text data with generative tasks, 2) provide inefficient implementations for scaling to more accelerator resources when targetting large models and inputs, and 3) are difficult for users to adapt the code to their desired data and downstream tasks.
@@ -67,20 +68,7 @@ pip install -e .
 ```
 
 #### Optional: `cupy` for `region_backend="cupyx"`
-`cupy` is not installed by the steps above -- it's an opt-in dependency, only
-needed if you want `UCF_VIT.model.gpu_adaptive_patching.GPUPatchify2D`/
-`GPUPatchify3D`'s `region_backend="cupyx"` option (GPU-native connected-
-components labeling, vs. the default `"scipy"`, which round-trips through
-the CPU; currently test-only -- not wired into any config, see
-`launch/tests/run_cupyx_smoke.sh`). AMD hosts prebuilt ROCm-matched `cupy`
-wheels (`amd-cupy`) at `pypi.amd.com`, but only for specific ROCm releases
-(confirmed `rocm-7.0.2` has one, `rocm-7.13.0` does not -- `pip` silently
-falls back to an unrelated, non-functional `amd-cupy` package on regular
-PyPI if you point `--extra-index-url` at a release path that doesn't
-exist there, rather than erroring). Building from source against the
-exact `rocm/7.13` install avoids both that trap and a real toolchain
-mismatch hit when trying the `rocm-7.0.2` wheel anyway (its bundled HIPRTC
-picked up an incompatible system GCC's headers) -- confirmed working here:
+`cupy` is not installed by the steps above -- it's an opt-in dependency, only needed if you want `UCF_VIT.model.gpu_adaptive_patching.GPUPatchify2D`/`GPUPatchify3D`'s `region_backend="cupyx"` option (GPU-native connected-components labeling, vs. the default `"scipy"`; currently test-only, see `launch/tests/run_cupyx_smoke.sh`). Build from source against your ROCm install:
 ```
 conda activate UCF-rocm7.13
 module load PrgEnv-gnu
@@ -91,25 +79,19 @@ export ROCM_HOME=${ROCM_PATH}
 export CUPY_INSTALL_USE_HIP=1
 export HCC_AMDGPU_TARGET=gfx90a   # MI250X's ISA
 
-pip install cupy --no-cache-dir -v 2>&1 | tee /tmp/cupy_build.log
+pip install cupy --no-cache-dir -v
 ```
-`ROCM_HOME` needs to be set both at install time and at runtime (i.e.
-`module load rocm/7.13; export ROCM_HOME=${ROCM_PATH}` again in any job
-script before running code that imports `cupy`) -- not just once during
-this install. At runtime, also redirect `cupy`'s JIT kernel cache off
-`$HOME` (it defaults to `$HOME/.cupy/kernel_cache`, which hit a real disk
-quota error on Frontier) to node-local scratch instead:
+`ROCM_HOME` also needs to be set at runtime (`module load rocm/7.13; export ROCM_HOME=${ROCM_PATH}` in any job script), and `cupy`'s JIT kernel cache should be redirected off `$HOME` to node-local scratch:
 ```
 export CUPY_CACHE_DIR=/tmp/$JOBID/cupy_kernel_cache
 mkdir -p $CUPY_CACHE_DIR
 ```
-See `launch/tests/run_cupyx_smoke.sh` for both of these wired into a
-working example job.
+See `launch/tests/run_cupyx_smoke.sh` for a working example job.
 
 ### Apptainer (on Frontier)
 Use Apptainer container definition files (Only use this on Frontier)
 ```
-cd apptainter
+cd apptainer
 apptainer build frontier-ubuntu-gnu-rocm624.sif frontier-ubuntu-gnu-rocm624.def
 apptainer build frontier-ubuntu-gnu-rocm624-vit.sif frontier-ubuntu-gnu-rocm624-vit.def
 mkdir lib/8.1.31
@@ -117,7 +99,6 @@ cd lib/8.1.31
 ln -s $CRAY_MPICH_DIR/lib/libfmpich.so libmpicxx.so
 ```
 
-Various example scripts for launching jobs are in the launch folder. Those identified with `_apptainer` in the filename are for running with the Apptainer container
 
 ## Local DGX System
 To run on a local NVIDIA system we provide instructions for creating a Conda environment from scratch
@@ -140,220 +121,56 @@ pip install -e .
 
 To run on a local DGX system using one of our training scripts invoke the following command `mpirun -n [NUM_GPUS] python -u [TRAINING_SCRIPT] [CONFIG_FILE] MPI` or `python [TRAINING_SCRIPT] [CONFIG_FILE] MPI` to run on a single GPU. If you are running on a shared resource machine and you want to use a subset of the available GPUS be sure to set the visible devices before running, e.g. `os.environ["CUDA_VISIBLE_DEVICES"] = '0,1,2,3'`.
 
-## DGX Cluster System
-To run on NVIDIA DGX cluster systems we rely on Pytorch Docker containers maintained by NVIDIA. The following instructions give commands to build a docker container with our codebase.
-
-```
-cd Docker
-docker build -t ucf-vit:25.05 .
-docker tag ucf-vit:25.05 [DOCKER_USERNAME]/ucf-vit:25.05
-docker push [DOCKER_USERNAME]/ucf-vit:25.05
-```
-
-or alternatively pull an already created image from the public dockerhub repo with
-
-```
-docker pull irlyngaas/ucf-vit:25.05-upd2
-```
-
-Various example scripts for launching jobs are in the launch folder. Those identified with `_dgx` in the filename are for running with a Docker container
-
 # Features
 In this codebase, we provide various Advanced Parallelism & Efficient Computing techniques that we have used to explore larger model and input sizes with VITs than has been previously possible. These techniques range from novel methods to the utilization of several techniques provided by external libraries that are integrated with these novel techniques.
 
 ## Hybrid-OP 
-Hybrid Sharded Tensor-Data Orthogonal Parallelism (Hybrid-OP) [[1]](#1),[[11]](#11) is a novel parallelism algorithm that combines tensor parallelism and Fully Sharded Data Parallelism (FSDP). It avoids the peak memory use problem in FSDP by working in coordination with Tensor Parallel ranks. 
+Hybrid Sharded Tensor-Data Orthogonal Parallelism (Hybrid-OP) [[1]](#1),[[11]](#11) is a novel parallelism algorithm that combines tensor parallelism and Fully Sharded Data Parallelism (FSDP). It avoids the peak memory use problem in FSDP by working in coordination with Tensor Parallel ranks.
 ### Usage
-The Hybrid-OP algorithm is available when using our fsdp [parallelism mode](#parallelism-modes). The following example shows how to initialize and do the forward pass of a [MAE](#masked-autoencoder-mae) model using this algorithm for different number of simple_ddp, fsdp, and tensor parallel ranks (see scripts in the training_script folder for full end-to-end training examples). Our custom [dataloader](#dataloader) with the [Imagenet](#imagenet) dataset is used to facilitate proper dataloading when tensor parallelism is > 1 (In this case each tensor parallel rank needs the same batch of input data). 
-
-To run with a single node on a system with a slurm scheduler use the following command `srun -n [NUM_TASKS] -c [NUM_CPUS_PER_TASK] --gpus [NUM_GPUS] python test-hstop.py SLURM`. To run on a local system via MPI use the following command `mpirun -n [NUM_GPUS] python -u test-hybrid-op.py MPI`
+Hybrid-OP is driven entirely by three config values -- `parallelism.fsdp_size`, `parallelism.simple_ddp_size`, and `parallelism.tensor_par_size`. The snippet below is excerpted from `get_model` (`src/UCF_VIT/model/utils.py`), which every training/eval script uses to build its model:
 
 ```python
-#test-hybrid-op.py
-
-import os
-import sys
-import torch
-import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from datetime import timedelta
 from UCF_VIT.utils.misc import init_par_groups
-from UCF_VIT.fsdp.arch import MAE
+from UCF_VIT.model.arch import MAE  # or VIT/UNETR/SAP/DiffusionVIT
 from UCF_VIT.utils.fused_attn import FusedAttn
-from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 
-LAUNCHER = sys.argv[1]
-
-if LAUNCHER == "SLURM":
-
-    os.environ['MASTER_ADDR'] = str(os.environ['HOSTNAME'])
-    os.environ['WORLD_SIZE'] = os.environ['SLURM_NTASKS']
-    os.environ['RANK'] = os.environ['SLURM_PROCID']
-
-    world_size = int(os.environ['SLURM_NTASKS'])
-    world_rank = int(os.environ['SLURM_PROCID'])
-    local_rank = int(os.environ['SLURM_LOCALID'])
-
-    torch.cuda.set_device(local_rank)
-    device = torch.cuda.current_device()
-
-elif LAUNCHER == "MPI":
-    from mpi4py import MPI
-    import socket 
-
-    num_gpus_per_node = torch.cuda.device_count()
-    comm = MPI.COMM_WORLD
-    world_size = comm.Get_size()
-    world_rank = rank = comm.Get_rank()
-    local_rank = int(rank) % int(num_gpus_per_node) if num_gpus_per_node>0 else 0 # local_rank and device are 0 when using 1 GPU per task
-    os.environ['WORLD_SIZE'] = str(world_size)
-    os.environ['RANK'] = str(world_rank)
-    os.environ['LOCAL_RANK'] = str(local_rank)
-
-    master_addr = None
-    if rank == 0:
-        hostname = socket.gethostname()
-        ip_address = socket.gethostbyname(hostname)
-        master_addr = ip_address
-    master_addr = comm.bcast(master_addr, root=0)
-    os.environ['MASTER_ADDR'] = master_addr
-
-    torch.cuda.set_device(local_rank)
-    device = torch.device(local_rank) if torch.cuda.is_available() else torch.device("cpu")
-
-dist.init_process_group('nccl', timeout=timedelta(seconds=7200000), rank=world_rank, world_size=world_size)
-
-#Assume we have 8 GPUs for training. Change these variables in any way desired such that fsdp_size*simple_ddp_size*tensor_par_size=8
+# Assume we have 8 GPUs for training. Change these in any way desired such
+# that fsdp_size * simple_ddp_size * tensor_par_size == world_size.
 fsdp_size = 2
 simple_ddp_size = 2
 tensor_par_size = 2
-seq_par_size = 1 
-
-
 data_par_size = fsdp_size * simple_ddp_size
-assert seq_par_size == 1, "Sequence parallelism not implemented"
-assert (data_par_size * seq_par_size * tensor_par_size)==world_size, "DATA_PAR_SIZE * SEQ_PAR_SIZE * TENSOR_PAR_SIZE must equal to world_size"
-num_heads = 12
-assert (num_heads % tensor_par_size) == 0, "model heads % tensor parallel size must be 0"
-decoder_num_heads = 8
-assert (decoder_num_heads % tensor_par_size) == 0, "decoder model heads % tensor parallel size must be 0"
+assert (data_par_size * tensor_par_size) == world_size, "DATA_PAR_SIZE * TENSOR_PAR_SIZE must equal world_size"
 
-seq_par_group, ddp_group, tensor_par_group, data_seq_ort_group, fsdp_group, simple_ddp_group = init_par_groups(world_rank = world_rank, data_par_size = data_par_size, tensor_par_size = tensor_par_size, seq_par_size = seq_par_size, fsdp_size = fsdp_size, simple_ddp_size = simple_ddp_size)
+ddp_group, tensor_par_group, data_seq_ort_group, fsdp_group, simple_ddp_group = init_par_groups(
+    world_rank=world_rank, data_par_size=data_par_size, tensor_par_size=tensor_par_size,
+    fsdp_size=fsdp_size, simple_ddp_size=simple_ddp_size,
+)
 
 model = MAE(
-        img_size=[256,256],
-        patch_size=16,
-        in_chans=3,
-        embed_dim=768,
-        depth=12,
-        num_heads=num_heads,
-        linear_decoder=False,
-        decoder_depth=8,
-        decoder_embed_dim=512,
-        decoder_num_heads=decoder_num_heads,
-        mlp_ratio=4,
-        drop_path_rate=0.1,
-        mask_ratio=0.1,
-        twoD=True,
-        mlp_ratio_decoder=4,
-        default_vars=["red", "green", "blue"],
-        single_channel=False,
-        use_varemb=False,
-        adaptive_patching=False,
-        fixed_length=None,
-        FusedAttn_option=FusedAttn.DEFAULT,
-        tensor_par_size=tensor_par_size,
-        tensor_par_group=tensor_par_group,
-        class_token=False,
-        weight_init='skip',
-    ).to(device)
+    img_size=[256, 256], patch_size=16, in_chans=3, embed_dim=768, depth=12, num_heads=12,
+    linear_decoder=False, decoder_depth=8, decoder_embed_dim=512, decoder_num_heads=8, decoder_mlp_ratio=4,
+    mlp_ratio=4, drop_path_rate=0.1, mask_ratio=0.1, twoD=True,
+    default_vars=["red", "green", "blue"], use_varemb=False,
+    adaptive_patching=False, fixed_length=None,
+    FusedAttn_option=FusedAttn.DEFAULT,
+    tensor_par_size=tensor_par_size, tensor_par_group=tensor_par_group,
+    class_token=False, weight_init='skip',
+).to(device)
 
-if world_rank==0:
-    #save initial model weights and distribute to all GPUs in the tensor parallel group to synchronize model weights that do not belong to the training block
-    init_model_dict = {k: v for k, v in model.state_dict().items() if ('attn' not in  k and 'mlp' not in k and 'var_agg' not in k)}
-    torch.save(init_model_dict,
-        'initial_'+str(dist.get_rank())+'.pth')
-    del init_model_dict
-
-dist.barrier()
-
-if world_rank!=0 and world_rank <tensor_par_size:
-   #load initial model weights and synchronize model weights that are not in the training block among tensor parallel GPUs
-   src_rank = dist.get_rank() - dist.get_rank(group=tensor_par_group)
-
-   map_location = 'cpu'
-   model.load_state_dict(torch.load('initial_'+str(0)+'.pth',map_location=map_location),strict=False)
-
-dist.barrier()
-
-precision_dt = torch.float32
 if fsdp_size > 1 and simple_ddp_size > 1:
-    model = FSDP(model, device_id=local_rank, process_group= (fsdp_group,simple_ddp_group), sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.HYBRID_SHARD, forward_prefetch=True, limit_all_gathers = False )
+    model = FSDP(model, device_id=local_rank, process_group=(fsdp_group, simple_ddp_group), sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.HYBRID_SHARD, forward_prefetch=True, limit_all_gathers=False)
 elif fsdp_size > 1 and simple_ddp_size == 1:
-    model = FSDP(model, device_id=local_rank, process_group= fsdp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.FULL_SHARD, forward_prefetch=True, limit_all_gathers = False )
+    model = FSDP(model, device_id=local_rank, process_group=fsdp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.FULL_SHARD, forward_prefetch=True, limit_all_gathers=False)
 else:
-    model = FSDP(model, device_id=local_rank, process_group= simple_ddp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.NO_SHARD, forward_prefetch=True, limit_all_gathers = False )
-
-
-if dist.get_rank(tensor_par_group) == 0:
-    data_module = NativePytorchDataModule(dict_root_dirs={'imagenet': '~/imagenet/train',},
-            dict_start_idx={'imagenet': 0},
-            dict_end_idx={'imagenet': 1},
-            dict_buffer_sizes={'imagenet': 100},
-            dict_in_variables={'imagenet': ["red", "green", "blue"]},
-            num_channels_used = {'imagenet': 3},
-            batch_size=32,
-            num_workers=1,
-            pin_memory=False,
-            patch_size = 16,
-            tile_size_x = 256,
-            tile_size_y = 256,
-            tile_size_z = None,
-            twoD = True,
-            single_channel = False,
-            return_label = False,
-            dataset_group_list = '1:1:1:1', #Calculated from running utils/load_balance.py with a corresponding config file, these values will change if data_par_size changes
-            batches_per_rank_epoch = {'imagenet':9945}, #Calculated from running utils/load_balance.py with a corresponding config file, these values will change if data_par_size changes
-            tile_overlap = 0.0,
-            use_all_data = False,
-            adaptive_patching = False,
-            fixed_length = None,
-            separate_channels = False,
-            data_par_size = data_par_size,
-            ddp_group = ddp_group,
-            dataset = 'imagenet',
-            imagenet_resize = {'imagenet': [256,256]},
-        ).to(device)
-
-    data_module.setup()
-
-    train_dataloader = data_module.train_dataloader()
-
-    it_loader = iter(train_dataloader)
-
-counter = 0
-while counter < 9945:
-    if tensor_par_size > 1:
-        if dist.get_rank(tensor_par_group) == 0:
-            data, variables, _ = next(it_loader)
-            data = data.to(precision_dt)
-            data = data.to(device)
-        else:
-            data = torch.zeros(32, 3, 256, 256, dtype=precision_dt).to(device)
-            variables = [None] * 3
-        dist.broadcast(data, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
-        dist.broadcast_object_list(variables, src=(dist.get_rank()//tensor_par_size*tensor_par_size), group=tensor_par_group)
-
-    else: #Avoid unnecesary broadcasts if not using tensor parallelism
-        data, variables, _ = next(it_loader)
-        data = data.to(precision_dt)
-        data = data.to(device)
-    model_output = model.forward(data, variables)
-
+    model = FSDP(model, device_id=local_rank, process_group=simple_ddp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.NO_SHARD, forward_prefetch=True, limit_all_gathers=False)
 ```
 
+For the full training loop (distributed init, dataloader construction, etc.), see `training_scripts/train.py` directly.
+
 ### Implementation Details 
-In order to properly implement the Hybrid-OP algorithm, specifically the tensor parallelism aspects, the architecture code requires modifications (from that of the code for the ([simple architecture mode](#parallelism-modes)) to correctly split up and communicate the tensor calculations amongst the tensor parallel ranks. Currently tensor parallelism is only enacted over the attention and mlp calculations, which are the costliest components of transformer architectures. The below code snippet shows how the tensor parallel implementation is implemented in the FSDP parallelism mode, corresponding modifications are built into the attention mechanism in `src/UCF-VIT/fsdp/building_blocks.py`. Tensor parallelism is not implemented in simple parallelism mode, so the tensor_par_group communicator group is not required to be passed to the neural network architecture for that case. Here `self.blocks` corresponds to the attention and multi-layer perceptron (mlp) layers that consist of the bulk of the computing in each of the VIT architectures.  
+Tensor parallelism is enacted over the attention and MLP calculations (the costliest components of transformer architectures), implemented in `src/UCF_VIT/model/building_blocks.py`'s `Attention`/`Mlp` classes. `self.tensor_par_group` is only meaningful when `tensor_par_size > 1`; every architecture always receives it (see `get_model`), but every sharding guard checks `self.tensor_par_size > 1` first. Here `self.blocks` is the `nn.Sequential` of transformer blocks shared by every architecture:
 
 ```python
 if self.tensor_par_size > 1:
@@ -365,15 +182,16 @@ x = self.norm(x)
 
 if self.tensor_par_size > 1:
     x = F_Identity_B_Broadcast(x, src_rank, group=self.tensor_par_group)
-
 ```
 
 ## Lower Precision Support
-The ability to implement lower precision support is facilitated by using a MixedPrecision Policy which is passed as an argument to the FSDP wrapper. Using lower precision data types such as bfloat16 reduces storage size to allow for large model sizes and increased throughput due to the faster computing that is possible with lower precision.
+The ability to implement lower precision support is facilitated by using a MixedPrecision Policy which is passed as an argument to the FSDP wrapper. Using lower precision data types such as bfloat16 reduces storage size to allow for large model sizes and increased throughput due to the faster computing that is possible with lower precision. In the real code this is driven by `trainer.data_type` in the config (`"float32"` or `"bfloat16"`) -- see `get_model` in `src/UCF_VIT/model/utils.py`.
 
 ### Usage 
-Add the following code and replace the FSDP Wrapper calls in the [full example](#Hybrid-OP) to apply mixed precision training (specifically bfloat16 in this case). 
+Add the following code and replace the FSDP Wrapper calls in the [Hybrid-OP example](#hybrid-op) to apply mixed precision training (specifically bfloat16 in this case).
 ```python
+from torch.distributed.fsdp import MixedPrecision
+
 precision_dt = torch.bfloat16
 mixedPrecisionPolicy = MixedPrecision(
     param_dtype=precision_dt,
@@ -382,53 +200,50 @@ mixedPrecisionPolicy = MixedPrecision(
 )
 
 if fsdp_size > 1 and simple_ddp_size > 1:
-    model = FSDP(model, device_id=local_rank, process_group= (fsdp_group,simple_ddp_group), sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.HYBRID_SHARD mixed_precision=mixedPrecisionPolicy, forward_prefetch=True, limit_all_gathers = False )
+    model = FSDP(model, device_id=local_rank, process_group=(fsdp_group, simple_ddp_group), sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.HYBRID_SHARD, mixed_precision=mixedPrecisionPolicy, forward_prefetch=True, limit_all_gathers=False)
 elif fsdp_size > 1 and simple_ddp_size == 1:
-    model = FSDP(model, device_id=local_rank, process_group= fsdp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.FULL_SHARD, mixed_precision=mixedPrecisionPolicy, forward_prefetch=True, limit_all_gathers = False )
+    model = FSDP(model, device_id=local_rank, process_group=fsdp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.FULL_SHARD, mixed_precision=mixedPrecisionPolicy, forward_prefetch=True, limit_all_gathers=False)
 else:
-    model = FSDP(model, device_id=local_rank, process_group= simple_ddp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.NO_SHARD, mixed_precision=mixedPrecisionPolicy, forward_prefetch=True, limit_all_gathers = False )
+    model = FSDP(model, device_id=local_rank, process_group=simple_ddp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.NO_SHARD, mixed_precision=mixedPrecisionPolicy, forward_prefetch=True, limit_all_gathers=False)
 ```
 
 ## Layer Wrapping
-The ability to use layer wrapping is facilitated by using a custom autowrap policy which is passed as an argument to the FSDP wrapper. The purpose of this wrapping is to control how and when the parameters of each layer are sharded and gathered during the forward and backward passes. By wrapping layers in the Block submodule (which contains the transformer computational layers) peak GPU memory usage is reduced, and communication and computations have improved overlapping.
+The ability to use layer wrapping is facilitated by using a custom autowrap policy which is passed as an argument to the FSDP wrapper. The purpose of this wrapping is to control how and when the parameters of each layer are sharded and gathered during the forward and backward passes. By wrapping layers in the `Block` submodule (which contains the transformer computational layers) peak GPU memory usage is reduced, and communication and computations have improved overlapping. This is exactly what `get_model` (`src/UCF_VIT/model/utils.py`) does for every architecture:
 ### Usage 
-Add the following code and replace the FSDP Wrapper calls in the [full example](#Hybrid-OP) to apply layer wrapping
 ```python
-from UCF_VIT.fsdp.building_blocks import Block
-from torch.nn import Sequential
 import functools
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.nn import Sequential
+from UCF_VIT.model.building_blocks import Block
 
 my_auto_wrap_policy = functools.partial(
     transformer_auto_wrap_policy,
-    transformer_layer_cls={
-        Block, Sequential
-    },
+    transformer_layer_cls={Block, Sequential},
+)
 
 if fsdp_size > 1 and simple_ddp_size > 1:
-    model = FSDP(model, device_id=local_rank, process_group= (fsdp_group,simple_ddp_group), sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.HYBRID_SHARD, auto_wrap_policy = my_auto_wrap_policy, forward_prefetch=True, limit_all_gathers = False )
+    model = FSDP(model, device_id=local_rank, process_group=(fsdp_group, simple_ddp_group), sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.HYBRID_SHARD, auto_wrap_policy=my_auto_wrap_policy, forward_prefetch=True, limit_all_gathers=False)
 elif fsdp_size > 1 and simple_ddp_size == 1:
-    model = FSDP(model, device_id=local_rank, process_group= fsdp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.FULL_SHARD, auto_wrap_policy = my_auto_wrap_policy, forward_prefetch=True, limit_all_gathers = False )
+    model = FSDP(model, device_id=local_rank, process_group=fsdp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.FULL_SHARD, auto_wrap_policy=my_auto_wrap_policy, forward_prefetch=True, limit_all_gathers=False)
 else:
-    model = FSDP(model, device_id=local_rank, process_group= simple_ddp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.NO_SHARD, auto_wrap_policy = my_auto_wrap_policy, forward_prefetch=True, limit_all_gathers = False )
-)
+    model = FSDP(model, device_id=local_rank, process_group=simple_ddp_group, sync_module_states=True, sharding_strategy=dist.fsdp.ShardingStrategy.NO_SHARD, auto_wrap_policy=my_auto_wrap_policy, forward_prefetch=True, limit_all_gathers=False)
 ```
 
 ## Activation Checkpointing
-The ability to invoke activation checkpointing to the model is provided through FSDP's `apply_activation_checkpointing` function. In our cases we apply activation checkpointing only to the `Block` submodule containing the transformer computational layers to reduce the memory storage required by that component of the model training. With activation checkpointing, the gradients are no longer stored for that component to be used during the backward pass of optimatization. Rather the gradients are recomputed from previously stored states when necessary during the backwards pass, significantly reducing the amount of GPU memory used during runtime.
+The ability to invoke activation checkpointing to the model is provided through FSDP's `apply_activation_checkpointing` function. In our cases we apply activation checkpointing only to the `Block` submodule containing the transformer computational layers to reduce the memory storage required by that component of the model training. With activation checkpointing, the gradients are no longer stored for that component to be used during the backward pass of optimization. Rather the gradients are recomputed from previously stored states when necessary during the backwards pass, significantly reducing the amount of GPU memory used during runtime.
 ### Usage
-Add the following code after the FSDP Wrapper
+Add the following code after the FSDP Wrapper (again, this is the real code from `get_model`):
 ```python
-from UCF_VIT.fsdp.building_blocks import Block
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
    checkpoint_wrapper,
    apply_activation_checkpointing,
 )
+from UCF_VIT.model.building_blocks import Block
 
 check_fn = lambda submodule: isinstance(submodule, Block)
 apply_activation_checkpointing(
     model, checkpoint_wrapper_fn=checkpoint_wrapper, check_fn=check_fn
 )
-
 ```
 ## Fused Attention (Flash Attention)
 In order to use computationally efficient implementations of the fused multi-head attention (FMHA) kernel on different GPU accelerated hardware, we provide several different options. One option is to use the native implementation of FlashAttention [[4]](#4),[[5]](#5) provided through Pytorch. Otherwise we can use flash attention implementations provided by the XFormers [[2]](#2) libary. The XFormers library provides an interface to memory efficient implementations of FMHA for various different hardwares. On AMD GPUs we use the ComposableKernel (CK)[[3]](#3) implementation of FMHA, and on NVIDIA GPUs we again use the FlashAttention implementation of FMHA, similar to the implementation provided through Pytorch. The XFormer implementations only have compatibility with bfloat16 operations, thus with float32 data types we use the default torch FMHA implementation.
@@ -436,58 +251,62 @@ In order to use computationally efficient implementations of the fused multi-hea
 ### Usage 
 We provide an enumerated class with which to choose the FMHA implementation to use in the architecture class.
 ```python
+import torch
+from UCF_VIT.model.arch import VIT
 from UCF_VIT.utils.fused_attn import FusedAttn
 
-#Choose from these options
-FusedAttn_option = FusedAttn.DEFAULT #Default torch implementation of FlashAttention FMHA compatible with float32 and bfloat16 datatypes
-#FusedAttn_option = FusedAttn.FLASH #Flash Attention implementation of FMHA comatible with bloat16 datatype and NVIDIA GPUs
-#FusedAttn_option = FusedAttn.CK #Composable Kernel implementation of FMHA comatible with bloat16 datatype and AMD GPUs
-#FusedAttn_option = FusedAttn.None #Basic Python implementation of FMHA
+# Choose from these options
+FusedAttn_option = FusedAttn.DEFAULT  # Default torch implementation of FMHA, compatible with float32 and bfloat16
+# FusedAttn_option = FusedAttn.FLASH  # FlashAttention implementation of FMHA, bfloat16 + NVIDIA GPUs
+# FusedAttn_option = FusedAttn.CK     # ComposableKernel implementation of FMHA, bfloat16 + AMD GPUs
+# FusedAttn_option = FusedAttn.NONE   # Basic Python implementation of FMHA
 
 model = VIT(
-    img_size = [256,256],
-    patch_size = 16,
-    num_classes = 1000,
-    in_chans = 3,
-    embed_dim = 768,
-    depth = 12,
-    num_heads = 12,
-    mlp_ratio = 4,
-    drop_path_rate = 0.1,
-    drop_rate = 0.1,
-    twoD = True, # set False if 3D
-    use_varemb = False,
-    default_vars = ["red", "green", "blue"]
-    single_channel = False,
-    adaptive_patching = False,
-    fixed_length = None,
-    FusedAttn_option = FusedAttn_option,
+    img_size=[256, 256],
+    patch_size=16,
+    num_classes=1000,
+    in_chans=3,
+    embed_dim=768,
+    depth=12,
+    num_heads=12,
+    mlp_ratio=4,
+    drop_path_rate=0.1,
+    drop_rate=0.1,
+    twoD=True,  # set False if 3D
+    use_varemb=False,
+    default_vars=["red", "green", "blue"],
+    adaptive_patching=False,
+    fixed_length=None,
+    FusedAttn_option=FusedAttn_option,
 )
-
 ```
 
 ## Adaptive Patching
-A recent innovation for efficient computing with VITs that we have implemented within this codebase is adaptive patching [[6]](#6). Traditionally in VITs, input images (or data) are separated in to groups of individual nonoverlapping pixels (or individual datapoints) called tokens of size patch_size x patch_size in 2D (or patch_size x patch_size x patch_size in 3D), these tokens are then flattened to be used as input to the ViT. When input image sizes become too large, the sequence length of tokens being fed into the network can become intractably large except for at very large patch sizes which can hinder the ability to train more accurate models. Often it is the case that there are large portions of regions of input that are largely homogenous, thus it is wasteful to consider all of the input tokens equally. Adaptive patching is an approach inspired by Adaptive Mesh Refinement (AMR) techniques in which a tree is used to break down input data into adaptively sized regions based on some quantity such as the magnitude of the gradient to indicate how much variation is in each spatial region. In our case we use a Canny Edge detection method to break down the images with a quadtree (2D) or octtree (3D) into a smaller regions adaptively depending on the amount of edges in certain regions of the image. To control the amount of regions the image is broken into we use the integer variable `fixed_length`, to tell adaptive patching to stop splitting the image. Each adaptively sized region is then resized into tokens of size patch_size x patch_size or (patch_size x patch_size x patch_size in 3D) to be in a form suitable for being input into a VIT. This approach can drastrically reduce the sequence length of tokens and consequently significantly reduced the amount of compute time required to feed through the network.
+A recent innovation for efficient computing with VITs that we have implemented within this codebase is adaptive patching [[6]](#6). Traditionally in VITs, input images (or data) are separated into groups of individual nonoverlapping pixels (or individual datapoints) called tokens of size patch_size x patch_size in 2D (or patch_size x patch_size x patch_size in 3D), these tokens are then flattened to be used as input to the ViT. When input image sizes become too large, the sequence length of tokens being fed into the network can become intractably large except for at very large patch sizes which can hinder the ability to train more accurate models. Often it is the case that there are large portions of regions of input that are largely homogenous, thus it is wasteful to consider all of the input tokens equally. Adaptive patching is an approach inspired by Adaptive Mesh Refinement (AMR) techniques in which a tree is used to break down input data into adaptively sized regions based on some quantity such as the magnitude of the gradient to indicate how much variation is in each spatial region. In our case we use a Canny Edge detection method (or, alternatively, a variance-based score -- see below) to break down the images with a quadtree (2D) or octree (3D) into smaller regions adaptively depending on the amount of edges in certain regions of the image. To control the amount of regions the image is broken into we use the integer variable `fixed_length`, to tell adaptive patching to stop splitting the image. Each adaptively sized region is then resized (via `interp_size`, not `patch_size`) into tokens of size `interp_size` x `interp_size` (or `interp_size`^3 in 3D) to be in a form suitable for being input into a VIT. This approach can drastically reduce the sequence length of tokens and consequently significantly reduce the amount of compute time required to feed through the network. **Not currently supported for `DiffusionVIT`** -- `parse.py` asserts `ap.do_ap` is `False` whenever `model.type: DiffusionVIT`.
 
 ### Usage
-In our implementation, adaptive patching is currently handled during dataloading time. Therefore if `adaptive_patching` is set to True rather then the dataloader passing back a batch of input images, instead a batch of adaptively patched input images are passed through the dataloader. If adaptive patching is being used, an integer fixed length needs to be defined and it must be chosen such that 3n+1 = fixed_length where n is some integer if the input is 2D or such that 7n+1 = fixed_length where n is some integer if the input is 3D, to satisify the requirements for the underlying quadtree/octtree. Also it is a requirement that the each dimension of the input images be of a size that is a power of 2, i.e. 32, 64, ..., in order to properly split the data. 
+Adaptive patching can run in one of two places:
+- **Dataloader-side** (`ap.do_ap: True`, `ap.do_gpu_ap: False`, the original/default): the dataloader itself returns an already-patchified sequence instead of a raw image -- `model.forward` receives that sequence directly rather than a dense image tensor.
+- **GPU-side** (`ap.do_gpu_ap: True`): the dataloader still returns the full raw image, and patchification (`UCF_VIT.model.gpu_adaptive_patching.GPUPatchify2D`/`GPUPatchify3D`) runs on-device as the first step of the model's own forward pass instead -- useful to avoid doing this CPU-bound work in a dataloader worker.
+
+Either way, `fixed_length` must be chosen such that `3n+1 = fixed_length` (2D) or `7n+1 = fixed_length` (3D) for some integer `n`, to satisfy the underlying quadtree/octree's leaf-count math, and each spatial dimension of the input must be a power of 2 (32, 64, ...). `interp_size` (not `patch_size`) is required whenever `adaptive_patching=True` -- see `VIT.effective_patch_size`.
 
 ## Variable Aggregation
-Another advanced technique that we have introduced into this codebase particularly for the purpose of foundational model training is the capability to incorporate variable aggregation [[12]](#12). Variable aggregation is a technique where instead of tokenizing multi-channel inputs all at once and transforming them into the latent embedding dimension space, each channel is tokenized individually and transformed into the latent embedding dimensions space based on the type of channel data, given some direction via the `variables` argument in the forward pass. Each of these channel embedding vectors are then fed through an additional attention mechanism to compress all of the input into a single dimension, a process we call variable aggregation. The reason it is important that these input channels be tokenized and embedded separately is because it allows the flexibility to use a pre-trained foundational model in a flexible manner. Variable aggregation allows for the ability to use different types of data during training, e.g. data that does not contain all of the input channels contained in other datasets that the model is being trained with.
+Another advanced technique that we have introduced into this codebase particularly for the purpose of foundational model training is the capability to incorporate variable aggregation [[12]](#12). Variable aggregation is a technique where instead of tokenizing multi-channel inputs all at once and transforming them into the latent embedding dimension space, each channel is tokenized individually and transformed into the latent embedding dimension space based on the type of channel data, given some direction via the `variables` argument in the forward pass. Each of these channel embedding vectors are then fed through an additional attention mechanism to compress all of the input into a single dimension, a process we call variable aggregation. The reason it is important that these input channels be tokenized and embedded separately is because it allows the flexibility to use a pre-trained foundational model in a flexible manner. Variable aggregation allows for the ability to use different types of data during training, e.g. data that does not contain all of the input channels contained in other datasets that the model is being trained with.
 
 ### Usage 
-In order to use variable aggregation set the `use_varemb` to True. In the case where `use_varemb=False` multi-channel tokenization will be performed and thus any further training or finetuning with that model will require data to match the specific number of channels as the original data used with that model. Variable aggregation is controlled by sending a list of variables identifiers to the forward pass of the model architecture, i.e. `["red","green","blue"]` for the case of RGB images. This list of variables must correspond correctly with the order that the data is formatted in and this process is facilitated through our [dataloader](#dataloader) via passing in the identifier list to the `dict_in_variables` argument of the config file. `default_vars` controls the type of types of input channels that the model will allow for ingestion. Thus every variable in `dict_in_variables` must be in `default_vars`, however not every input channel is necessary when passing through the model. 
+In order to use variable aggregation set `use_varemb` to True. In the case where `use_varemb=False` multi-channel tokenization will be performed and thus any further training or finetuning with that model will require data to match the specific number of channels as the original data used with that model. Variable aggregation is controlled by sending a list of variable identifiers to the forward pass of the model architecture, i.e. `["red","green","blue"]` for the case of RGB images. This list of variables must correspond correctly with the order that the data is formatted in, and this process is facilitated through our [dataloader](#dataloader) via passing in the identifier list to the `dict_in_variables` argument of the config file. `default_vars` controls the types of input channels that the model will allow for ingestion. Thus every variable in `dict_in_variables` must be in `default_vars`, however not every input channel is necessary when passing through the model.
 
 # Model Architectures
-Currently we provide 5 different model architecutres **(VIT, MAE, UNETR, SAP, VIT-DIFFUSION)**, all of which use the same VIT encoder, but a different decoder architecture depending on the task being trained. All code for the different architectures inherit the encoder from the VIT architecture class in order to facilitate using the same encoder. In the following sections we provide working examples for exectuing a forward pass with each of these architectures that can be ran on a single CPU. For more complex full training runs on multiple GPUs look to the example scripts in the `training_scripts/` directory.
+Currently we provide 5 different model architectures **(VIT, MAE, UNETR, SAP, DiffusionVIT)**, all of which use the same `VIT` encoder (`src/UCF_VIT/model/arch.py`), but a different decoder architecture depending on the task being trained. All code for the different architectures inherit the encoder from the `VIT` architecture class in order to facilitate using the same encoder. In the following sections we provide working examples for executing a forward pass with each of these architectures that can be run on a single CPU. For real multi-GPU training runs, use `training_scripts/train.py` (generic across every architecture, driven entirely by a config file) rather than hand-assembling the pieces below yourself -- see [Training Scripts](#training-scripts).
 
 ## Vision Transformer (VIT)
-VIT based on [[7]](#7). Code slimmed down from (https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/vision_transformer.py#L425) to only contain basic options for VIT Training and adapted to integrate our [innovations](#innovations). Task: Image Classification. Input: Image or Image Tile (A tile is a contiguous subset of a full image).
+VIT based on [[7]](#7). Code slimmed down from (https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/vision_transformer.py#L425) to only contain basic options for VIT Training and adapted to integrate our [innovations](#features). Task: Image Classification. Input: Image or Image Tile (A tile is a contiguous subset of a full image).
 
 ### Usage
 ```python
 import torch
-from UCF_VIT.simple.arch import VIT
+from UCF_VIT.model.arch import VIT
 from UCF_VIT.utils.fused_attn import FusedAttn
 
 model = VIT(
@@ -504,7 +323,6 @@ model = VIT(
     twoD = True, # set False if 3D
     use_varemb = False,
     default_vars = ["red", "green", "blue"],
-    single_channel = False,
     adaptive_patching = False,
     fixed_length = None,
     FusedAttn_option = FusedAttn.DEFAULT,
@@ -513,7 +331,7 @@ model = VIT(
 img = torch.randn(1, 3, 256, 256) # (batch_size, num_channels, tile_size_x, tile_size_y)
 variables = ["red", "green", "blue"]
 
-preds = model.forward(img, variables) # (1, 1000)
+preds = model.forward(img, variables) # torch.Size([1, 1000])
 ```
 
 ### Parameters
@@ -557,9 +375,6 @@ Variable for indicating whether to use variable embedding tokens. When using var
 - `default_vars`: List[str].
 List of different potential modalities to be used as input. When **use_varemb** is set to true, this list contains the available input channels.
 
-- `single_channel`: Bool.
-Variable for indicating that multiple modalities will be used, but the model will be fed with modalities separated into batches only containing a single modality
-
 - `adaptive_patching`: Bool.
 Variable for indicating whether to use adaptive patching. See [Adaptive Patching](#adaptive-patching) for more details. 
 
@@ -575,7 +390,7 @@ Masked Autoencoder pre-training based on [[8]](#8). Task: Masked Image Predictio
 ### Usage
 ```python
 import torch
-from UCF_VIT.simple.arch import MAE
+from UCF_VIT.model.arch import MAE
 from UCF_VIT.utils.fused_attn import FusedAttn
 from UCF_VIT.utils.misc import unpatchify
 
@@ -594,9 +409,8 @@ model = MAE(
         drop_path_rate=0.1,
         mask_ratio=0.1,
         twoD=True,
-        mlp_ratio_decoder=4,
+        decoder_mlp_ratio=4,
         default_vars=["red", "green", "blue"],
-        single_channel=False,
         use_varemb=False,
         adaptive_patching=False,
         fixed_length=None,
@@ -609,10 +423,10 @@ model = MAE(
 img = torch.randn(1, 3, 256, 256) # (batch_size, num_channels, tile_size_x, tile_size_y)
 variables = ["red", "green", "blue"]
 
-preds, _ = model.forward(img, variables) # (1, 16*16, 16*16*3) -> (batch_size, num_tokens_x * num_tokens_y, patch_size * patch_size * num_channels)
+preds, mask = model.forward(img, variables) # preds: torch.Size([1, 256, 768]) -> (batch_size, num_tokens_x * num_tokens_y, patch_size * patch_size * num_channels); mask: torch.Size([1, 256])
 
 #Move masked image prediction from patched space back to original image space
-pred_img = unpatchify(preds, img, 16, True) # (1, 3, 256, 256) 
+pred_img = unpatchify(preds, img, 16, True) # torch.Size([1, 3, 256, 256])
 ```
 
 ### Parameters (if not listed here see descriptions in the architectures above)
@@ -629,7 +443,7 @@ Embedding dimension for Inputs to the Transformer decoder. Not used if **linear_
 - `decoder_num_heads`: Int.  
 Number of heads in Multi-head Attention layer for the Transformer decoder. Not used if **linear_decoder** is set to True
 
-- `mlp_ratio_decoder`: Int.
+- `decoder_mlp_ratio`: Int.
 Ratio of MLP hidden dimension to embedding dimension, used to set the dimension of the MLP (FeedForward) layer in the Transfomer decoder. Not used if **linear_decoder** is set to True
 
 - `mask_ratio`: Float in (0, 1).
@@ -647,7 +461,7 @@ Image segmentation architecture based on [[9]](#9). Task: Image Segmentation. In
 ### Usage
 ```python
 import torch
-from UCF_VIT.simple.arch import UNETR
+from UCF_VIT.model.arch import UNETR
 from UCF_VIT.utils.fused_attn import FusedAttn
 
 model = UNETR(
@@ -665,7 +479,6 @@ model = UNETR(
         linear_decoder=False,
         skip_connection=True,
         feature_size=16,
-        single_channel=False,
         use_varemb=False,
         adaptive_patching=False,
         fixed_length=None,
@@ -678,7 +491,7 @@ model = UNETR(
 img = torch.randn(1, 3, 256, 256) # (batch_size, num_channels, tile_size_x, tile_size_y)
 variables = ["red", "green", "blue"]
 
-preds = model.forward(img, variables) # (1, 4, 256, 256) # (batch_size, num_classes, tile_size_x, tile_size_y)
+preds = model.forward(img, variables) # torch.Size([1, 4, 256, 256]) -> (batch_size, num_classes, tile_size_x, tile_size_y)
 ```
 
 ### Parameters (if not listed here see descriptions in the architectures above)
@@ -699,10 +512,11 @@ Variable to set how the embedding features are expanded through the UNETR convol
 Image segmentation architecture for adaptively patched input based on [[6]](#6). Task: Image Segmentation. Input: Adaptively Patching Image or Image Tile
 
 ### Usage
+Adaptive patching needs `interp_size` (not `patch_size`, and no `sqrt_len` -- see [Adaptive Patching](#adaptive-patching)), and `Patchify` (the dataloader-side transform that actually does the patching) takes `interp_size`, not `patch_size`, either:
 ```python
 import torch
 import numpy as np
-from UCF_VIT.simple.arch import SAP
+from UCF_VIT.model.arch import SAP
 from UCF_VIT.utils.fused_attn import FusedAttn
 from UCF_VIT.dataloaders.transform import Patchify
 
@@ -718,36 +532,35 @@ model = SAP(
         drop_path_rate=0.1,
         twoD=True,
         default_vars=["red", "green", "blue"],
-        single_channel=False,
         use_varemb=False,
         adaptive_patching=True,
+        interp_size=16,
         fixed_length=64,
-        sqrt_len=int(np.sqrt(64)),
         FusedAttn_option=FusedAttn.DEFAULT,
         class_token=False,
         weight_init='skip',
     )
 
 
-img = np.random.randn(1, 3, 256, 256).astype(np.uint8) # (batch_size, num_channels, tile_size_x, tile_size_y)
-patchify = Patchify(fixed_length=64, patch_size=16, num_channels=3)
-adaptive_patch_img, _, _, _ = patchify(np.moveaxis(np.squeeze(img),0,-1)) # -> (num_channels, fixed_length, patch_size*patch_size)
-adaptive_patch_img = np.expand_dims(adaptive_patch_img,axis=0).astype(np.float32) # Add back batch dimension
-adaptive_patch_img = torch.from_numpy(adaptive_patch_img)
-
+img = np.random.randn(1, 3, 256, 256).astype(np.float32) # (batch_size, num_channels, tile_size_x, tile_size_y)
+patchify = Patchify(fixed_length=64, interp_size=16, num_channels=3, dataset="imagenet")
+seq_img, seq_size, seq_pos, qdt = patchify(np.moveaxis(np.squeeze(img), 0, -1)) # seq_img: (num_channels, fixed_length, interp_size*interp_size) == (3, 64, 256)
+adaptive_patch_img = torch.from_numpy(np.expand_dims(seq_img, axis=0).astype(np.float32)) # Add back batch dimension
 
 variables = ["red", "green", "blue"]
 
-preds = model.forward(adaptive_patch_img, variables) # (1, 4, sqrt(64)*16, sqrt(64)*16)
+preds = model.forward(adaptive_patch_img, variables) # torch.Size([1, 64, 4, 16, 16]) -> (batch_size, fixed_length, num_classes, interp_size, interp_size); one prediction per adaptive token, not a reassembled dense image -- see mask_head's own docstring for why
 ```
 
 ## Diffusion Vision Transformer (DiffusionVIT)
 Diffusion model training based on [[10]](#10). Task: Generate Image via noise that matches distribution of data trained on. Input: Noise
 
 ### Usage
+`DiffusionVIT`'s per-block timestep conditioning (`Block_diffusion`) is a different block class from every other architecture's plain `Block` -- it must be passed explicitly as `block_fn`, unlike the other architectures above which all use the default:
 ```python
 import torch
-from UCF_VIT.simple.arch import DiffusionVIT
+from UCF_VIT.model.arch import DiffusionVIT
+from UCF_VIT.model.building_blocks import Block_diffusion
 from UCF_VIT.utils.fused_attn import FusedAttn
 from UCF_VIT.ddpm.ddpm import DDPM_Scheduler
 from UCF_VIT.utils.misc import unpatchify
@@ -757,7 +570,6 @@ model = DiffusionVIT(
         img_size=[256,256],
         patch_size=16,
         in_chans=3,
-        num_classes=4,
         embed_dim=768,
         depth=12,
         num_heads=12,
@@ -768,13 +580,12 @@ model = DiffusionVIT(
         drop_path_rate=0.1,
         linear_decoder=True,
         twoD=True,
-        mlp_ratio_decoder=4,
         default_vars=["red", "green", "blue"],
-        single_channel=False,
         use_varemb=False,
         adaptive_patching=False,
         fixed_length=None,
-        time_steps=num_time_steps,
+        num_time_steps=num_time_steps,
+        block_fn=Block_diffusion,
         FusedAttn_option=FusedAttn.DEFAULT,
         class_token=False,
         weight_init='skip',
@@ -784,20 +595,36 @@ model = DiffusionVIT(
 img = torch.randn(1, 3, 256, 256)
 variables = ["red", "green", "blue"]
 
+# One forward-noising step, matching training_scripts/train.py's own DiffusionVIT
+# forward_step formula -- this predicts the noise for ONE step, it does not
+# generate a sample. For the real reverse-diffusion sampling loop (pure noise
+# -> a generated sample), see training_scripts/inference_diffusion.py below.
 t = torch.randint(0,num_time_steps,(1,))
 e = torch.randn_like(img, requires_grad=False)
 ddpm_scheduler = DDPM_Scheduler(num_time_steps=num_time_steps)
 a = ddpm_scheduler.alpha[t].view(1,1,1,1)
 data = (torch.sqrt(a)*img) + (torch.sqrt(1-a)*e)
-output = model.forward(data, t, variables) # (1, 16*16, 16*16*3) -> (batch_size, num_tokens_x * num_tokens_y, patch_size * patch_size * num_channels)
+output = model.forward(data, t, variables) # torch.Size([1, 256, 768]) -> (batch_size, num_tokens_x * num_tokens_y, patch_size * patch_size * num_channels)
 
-#Move generated image from patched space back to original image space
-output = unpatchify(output, data, 16, True) #(1, 3, 256, 256)
+#Move predicted noise from patched space back to original image space
+output_img = unpatchify(output, data, 16, True) # torch.Size([1, 3, 256, 256])
 ```
+
+### Generating samples
+The snippet above only predicts noise for a single step -- it's the same thing training does, not generation. To actually generate a sample (pure noise -> a plausible output, via the full reverse-diffusion chain), use `training_scripts/inference_diffusion.py`, which loads a trained checkpoint through the same `get_model`/`parse_config` pipeline every other script uses and runs `UCF_VIT.ddpm.ddpm.diffusion_reverse_step` `num_time_steps` times:
+```
+cd launch/eval
+sbatch inference_diffusion.sh ../../configs/basic_ct/diffusion/base_config.yaml --num_samples 4 --seed 1234
+```
+See that script's own docstring for the full set of flags (`--dict_key`, `--variance_mode`, `--output_dir`, etc.).
+
 ### Parameters (if not listed here see descriptions in the architectures above)
 
-- `time_steps`: int.
+- `num_time_steps`: int.
 Number of time steps in the diffusion process
+
+- `block_fn`: Type[nn.Module], must be `UCF_VIT.model.building_blocks.Block_diffusion` for this architecture.
+Adds a per-block sinusoidal timestep embedding re-injected before every block's attention, instead of `VIT`'s plain `Block`. `get_model` (`src/UCF_VIT/model/utils.py`) always passes this automatically for `model.type: DiffusionVIT` -- only needed explicitly when constructing the architecture class directly, as above.
 
 ## Dataloader
 The dataloader we provide is a custom native pytorch iterative dataloader. For simplicity, we assume that we are receiving unprocessed data files and we leave it to the user to normalize the data properly within in the dataloader module for training. The reasons for making this assumption of unprocessed data files as input is 1) we intend this repo to be used on very large datasets, thus preprocessing and storing all of the data before training can quickly take up a massive amount of storage, and 2) it removes the need for further data preprocessing scripts to be included in this repo. If performing preprocessing during the dataloading phase is too computationally intensive, we recommend doing it offline and properly storing it in a manner that the dataloader module can handle. 
@@ -807,88 +634,45 @@ The dataloader is built in a fashion such that it can handle multiple different 
 This dataloader provides the flexibility to add a plethora of different options for customizing how the data is broken up for training. Since we are using a VIT, at least 2D data is expected. However, we have capability for both 2D and 3D spatial data currently. If desired, we have the utilities implemented to break given data into smaller tiled chunks. Also, we have a number of different options for how to tile this data, e.g. tile overlapping.
 
 ### Usage
-This example is meant to be run on a system that uses a slurm resource scheduler or with an installed MPI library. To run with a single node on a system with a slurm scheduler use the following command `srun -n [NUM_TASKS] -c [NUM_CPUS_PER_TASK] --gpus [NUM_GPUS] python test-hstop.py SLURM`. To run on a local system via MPI use the following command `mpirun -n [NUM_GPUS] python -u test-hstop.py MPI`
+In practice, every real script (`train.py`/`val.py`/`test.py`/`inference_diffusion.py`) builds this from a parsed YAML config rather than hand-specifying every kwarg -- see [Config Files](#config-files). This is the real construction (from `training_scripts/train.py`), shown directly rather than a hand-maintained duplicate:
 ```python
-#test_dataloader.py
 from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
-import torch.distributed as dist
-import sys
+from UCF_VIT.utils.misc import calculate_load_balancing_on_the_fly
+from UCF_VIT.parse import parse_config
 
-LAUNCHER = sys.argv[1]
+conf = parse_config(args)  # args.config is a path to a YAML file -- see Config Files
+batches_per_rank_epoch, dataset_group_list = calculate_load_balancing_on_the_fly(conf)
 
-if LAUNCHER == "SLURM":
-
-    os.environ['MASTER_ADDR'] = str(os.environ['HOSTNAME'])
-    os.environ['WORLD_SIZE'] = os.environ['SLURM_NTASKS']
-    os.environ['RANK'] = os.environ['SLURM_PROCID']
-
-    world_size = int(os.environ['SLURM_NTASKS'])
-    world_rank = int(os.environ['SLURM_PROCID'])
-    local_rank = int(os.environ['SLURM_LOCALID'])
-
-    torch.cuda.set_device(local_rank)
-    device = torch.cuda.current_device()
-
-elif LAUNCHER == "MPI":
-    from mpi4py import MPI
-    import socket 
-
-    num_gpus_per_node = torch.cuda.device_count()
-    comm = MPI.COMM_WORLD
-    world_size = comm.Get_size()
-    world_rank = rank = comm.Get_rank()
-    local_rank = int(rank) % int(num_gpus_per_node) if num_gpus_per_node>0 else 0 # local_rank and device are 0 when using 1 GPU per task
-    os.environ['WORLD_SIZE'] = str(world_size)
-    os.environ['RANK'] = str(world_rank)
-    os.environ['LOCAL_RANK'] = str(local_rank)
-
-    master_addr = None
-    if rank == 0:
-        hostname = socket.gethostname()
-        ip_address = socket.gethostbyname(hostname)
-        master_addr = ip_address
-    master_addr = comm.bcast(master_addr, root=0)
-    os.environ['MASTER_ADDR'] = master_addr
-
-    torch.cuda.set_device(local_rank)
-    device = torch.device(local_rank) if torch.cuda.is_available() else torch.device("cpu")
-
-dist.init_process_group('nccl', timeout=timedelta(seconds=7200000), rank=world_rank, world_size=world_size)
-
-data_module = NativePytorchDataModule(dict_root_dirs={'imagenet': '~/imagenet/train',},
-        dict_start_idx={'imagenet': 0},
-        dict_end_idx={'imagenet': 1},
-        dict_buffer_sizes={'imagenet': 100},
-        dict_in_variables={'imagenet': ["red", "green", "blue"]},
-        num_channels_used = {'imagenet': 3},
-        batch_size=32,
-        num_workers=1,
-        pin_memory=False,
-        patch_size = 16,
-        tile_size_x = 256,
-        tile_size_y = 256,
-        tile_size_z = None,
-        twoD = True,
-        single_channel = False,
-        return_label = False,
-        dataset_group_list = '1:1:1:1:1:1:1:1', #Calculated from running utils/load_balance.py with a corresponding config file, these values will change if data_par_size changes
-        batches_per_rank_epoch = {'imagenet':4935}, #Calculated from running utils/load_balance.py with a corresponding config file, these values will change if data_par_size changes
-        tile_overlap = 0.0,
-        use_all_data = False,
-        adaptive_patching = False,
-        fixed_length = None,
-        separate_channels = False,
-        data_par_size = dist.get_world_size(),
-        dataset = 'imagenet',
-        imagenet_resize = {'imagenet':[256,256]},
-    ).to(device)
-
+data_module = NativePytorchDataModule(
+    dict_root_dirs=conf["data"]["dict_root_dirs"],
+    dict_start_idx=conf["dataloader"]["dict_start_idx"],
+    dict_end_idx=conf["dataloader"]["dict_end_idx"],
+    dict_buffer_sizes=conf["dataloader"]["dict_buffer_sizes"],
+    dict_in_variables=conf["data"]["dict_in_variables"],
+    num_channels_used=conf["data"]["num_channels"],
+    batch_size=conf["dataloader"]["batch_size"],
+    num_workers=conf["dataloader"]["num_workers"],
+    pin_memory=conf["dataloader"]["pin_memory"],
+    interp_size=conf["data"]["interp_size"],
+    tile_size=conf["data"]["tile_size"],
+    twoD=conf["data"]["twoD"],
+    return_label=conf["dataloader"]["return_label"],
+    dataset_group_list=dataset_group_list,
+    batches_per_rank_epoch=batches_per_rank_epoch,
+    div=conf["tiling"]["div"],
+    tile_overlap=conf["tiling"]["tile_overlap"],
+    adaptive_patching=conf["ap"]["do_ap"],
+    fixed_length=conf["ap"]["fixed_length"],
+    separate_channels=conf["ap"]["separate_channels"],
+    data_par_size=conf["parallelism"]["data_par_size"],
+    dataset=conf["data"]["dataset"],
+    resize=conf["dataset_options"]["resize"],
+)
 data_module.setup()
-
 train_dataloader = data_module.train_dataloader()
 
 for batch_idx, batch in enumerate(train_dataloader):
-    data, variables = batch
+    data, variables, dict_key = batch
 ```
 
 ### Parameters
@@ -903,13 +687,13 @@ Starting indices ratio (between 0.0 and 1.0) to determine amount of files in dir
 Ending indices ratio (between 0.0 and 1.0) to determine amount of files in directory to use
 
 - `dict_val_root_dirs` / `dict_test_root_dirs`: Dictionary of paths, optional.
-Paths to directories with dedicated validation/test data files, for datasets that have their own real split. Only needs an entry for dataset keys that actually have a separate directory -- any key present in `dict_root_dirs` but absent here gets an automatic split instead (see below). None of the datasets shipped with this repo currently have a dedicated split, but the option exists for one that does.
+Paths to directories with dedicated validation/test data files, for datasets that have their own real split. Any key present in `dict_root_dirs` but absent here gets an automatic split instead (see below).
 
 - `dict_val_start_idx` / `dict_val_end_idx` / `dict_test_start_idx` / `dict_test_end_idx`: Dictionary of floats (0,1), optional.
-Same idea as `dict_start_idx`/`dict_end_idx`, but for trimming a *separate* `dict_val_root_dirs`/`dict_test_root_dirs` directory. Only meaningful for keys that have one; defaults to the full `[0.0, 1.0)` range (the whole directory) when omitted.
+Same idea as `dict_start_idx`/`dict_end_idx`, but for trimming a *separate* `dict_val_root_dirs`/`dict_test_root_dirs` directory.
 
 - `val_split_ratio` / `test_split_ratio`: Float (0,1), default `0.1` each.
-For any dataset key with **no** separate `dict_val_root_dirs`/`dict_test_root_dirs` entry, this fraction of that key's own `[dict_start_idx, dict_end_idx)` window is automatically carved out and reserved for validation/testing instead -- `train.py` itself only trains on the remaining share (`1 - val_split_ratio - test_split_ratio`). Set both to `0` to disable auto-splitting and use 100% of `[dict_start_idx, dict_end_idx)` for training, matching the behavior before this option existed. See [Training Scripts](#training-scripts) for `val.py`/`test.py`, which consume whichever split (dedicated or auto-split) ends up resolved.
+For any dataset key with **no** separate `dict_val_root_dirs`/`dict_test_root_dirs` entry, this fraction of that key's own `[dict_start_idx, dict_end_idx)` window is automatically carved out for validation/testing instead -- `train.py` only trains on the remaining share. Set both to `0` to use the full range for training. See [Training Scripts](#training-scripts) for `val.py`/`test.py`, which consume whichever split ends up resolved.
 
 - `dict_buffer_sizes`: Dictionary of ints.
 Buffer Size to use when filling iterative dataloader with prospective tiles for creation of batches
@@ -917,46 +701,40 @@ Buffer Size to use when filling iterative dataloader with prospective tiles for 
 - `num_channels_used`: Dictionary of ints.
 Number of Channels to use during training, currently no control of choosing modalities, but will cycle through the channels in order
 
-- `dict_in_variables`: Diction of Lists of strings.
-Variables corresponding to the different channels in the dataset, used in the dataloader to find corresponding correct values in the default_var_list. Needs to be in the correct order of the data files
+- `dict_in_variables`: Dictionary of Lists of strings.
+Variables corresponding to the different channels in the dataset, used in the dataloader to find corresponding correct values in `default_vars`. Needs to be in the correct order of the data files
 
 - `batch_size`: Int.
 Per GPU batch size
 
 - `num_workers`: Int.
-Number of data loader workers, should be set at 1 for now
+Number of data loader workers
 
 - `pin_memory`: Bool.
 Variable whether to use pinned memory on GPU for dataloading
 
-- `patch_size`: Int.
-Patch Size to use when creating patch Embeddings Sequences for the network input
+- `interp_size`: Int.
+Side length each adaptive (quadtree/octree) leaf patch is interpolated to -- the dataloader's own name for the same concept `VIT`'s `interp_size` parameter uses. Only meaningful when `adaptive_patching=True`.
 
-- `tile_size_[x,y,z]`: Int.
-Desired tile size to generate from the input data files. If tile_size is smaller than the size of the input files, multiple tiles will be created from each data file
+- `tile_size`: Tuple[int, ...].
+Desired tile size (one entry per spatial dimension) to generate from the input data files. If smaller than the full input file, multiple tiles will be created per file -- see `div`/`tile_overlap` below and [Load Balancing](#load-balancing).
 
-- `twoD`: Bool. Variable for indicating two or three dimensionsal input, if False, three-dimensional data will be created from the dataloader. If the dataloader is three-dimensional and twoD is set to True, two-dimensional slices will be created from the three-dimensional data by iterating over the final spatial dimension of the data
-
-- `single_channel`: Bool.
-Variable for indicating that multiple modalities will be used, but the model will be fed with modalities separated into batches only containing a single modality
+- `twoD`: Bool. Variable for indicating two or three dimensional input, if False, three-dimensional data will be created from the dataloader. If the dataloader is three-dimensional and twoD is set to True, two-dimensional slices will be created from the three-dimensional data by iterating over the final spatial dimension of the data
 
 - `return_label`: Bool.
 Whether to return back a corresponding label to each tile when loading data
 
-- `auto_load_balancing`: Bool
-Whether to allow [Load Balancing](#load-balancing) to be done automatically in the training script. If True, then both both dataset_group_list and batches_per_rank_epoch do not need to specified in the config file.
-
 - `dataset_group_list`: Str of colon separated ints.
-How to split available GPUs amongst the available datasets. Run "python utils/load_balance.py [CONFIG_FILE] [NUM_GPUS]" to obtain. See [Load Balancing](#load-balancing) for more details
+How to split available GPUs amongst the available datasets. Run `python utils/load_balance.py [CONFIG_FILE]` to obtain, or set `auto_load_balancing: True` in the config to have the training script compute it automatically instead. See [Load Balancing](#load-balancing) for more details
 
 - `batches_per_rank_epoch`: Dictionary of Ints.
-How many batches per rank per epoch for a given dataset. Used to get a full epoch from the Dataset with largest value. If a dataset has less than the maximum. Reuse data to obtain enough data to run until the largest data has been fully trained on. Run "python utils/load_balance.py [CONFIG_FILE] [NUM_GPUS]" to obtain. See [Load Balancing](#load-balancing) for more details
+How many batches per rank per epoch for a given dataset. Used to get a full epoch from the Dataset with largest value. If a dataset has less than the maximum, data is reused to obtain enough to run until the largest dataset has been fully trained on. See [Load Balancing](#load-balancing) for more details
 
-- `tile_overlap`: Float (0,1).
-Amount of tile overlapping to use, multiplies tile_size by tile_overlap to determine step size. Use 0.0 for no overlapping
+- `div`: Int.
+Number of tiles to divide each spatial dimension of the full input into (a `div x div[ x div]` grid). `1` means no real tiling -- `tile_size` equals the full input size.
 
-- `use_all_data`: Bool. 
-Whether or not to use all data in dataloading. Including if tile size doesn't evenly split images. If tile size splits an image unevenly on last tile of a dimension go from last pixel backwards to get a full tile
+- `tile_overlap`: Tuple[int, ...].
+Per-dimension overlap amount (in the same units as `tile_size`) between adjacent tiles, used to compute `start_overlap`/`end_overlap`. `(0, 0[, 0])` for no overlap.
 
 - `adaptive_patching`: Bool.
 Variable for indicating whether to use adaptive patching. If set to True, Adaptive Patching is done within the dataloader before being fed into a model. See [Adaptive Patching](#adaptive-patching)
@@ -965,49 +743,58 @@ Variable for indicating whether to use adaptive patching. If set to True, Adapti
 How many adaptive patches used to tokenize the input image. Only used if **adaptive_patching** is set to true
 
 - `separate_channels`: Bool.
-Whether or not to separate channels and adaptively patch with different quadtrees/octtrees rather than a single one for all input channels
+Whether or not to separate channels and adaptively patch with different quadtrees/octrees rather than a single one for all input channels
 
 - `data_par_size`: Int.
 The amount of data parallel training ranks being used
 
 - `allow_file_reuse`: Bool, default `False`.
-A dataset key with fewer files than the DDP ranks/dataloader workers assigned to it normally fails loudly at startup, rather than silently letting some ranks/workers train on no data at all. Setting this `True` instead lets every rank/worker get at least one file, reusing (duplicating) files round-robin across ranks/workers as needed -- a printed warning quantifies how much reuse is actually happening. This isn't only a small/debug-dataset concern: at the scale this framework targets (potentially thousands of nodes), `data_par_size` can exceed a real dataset's file count too, not just a toy one. Only applies to `train.py` -- `val.py`/`test.py` always evaluate with it off, regardless of what the config says, since their whole point is a fixed, exact computation over the same files every time so results stay directly comparable across different amounts of training; reuse would make the aggregate loss/accuracy a distorted, weighted (not uniform) average instead.
+If a dataset key has fewer files than the DDP ranks/dataloader workers assigned to it, startup normally fails. Set this `True` to instead reuse (duplicate) files round-robin across ranks/workers as needed. Only applies to `train.py` -- `val.py`/`test.py` always evaluate with it off, so results stay directly comparable across runs.
 
 - `bucket_shuffle_seed`: Int or `null`, default `42`. Imagenet only.
-Imagenet's images are divided into `data_par_size`-many buckets (one per DDP-rank group), and arrive sorted class-by-class before that division happens -- without shuffling first, each bucket (and therefore each rank) ends up with a narrow, contiguous range of classes rather than a representative cross-section, which can skew BatchNorm statistics and correlate gradients within a rank's own step sequence. This seeds a deterministic shuffle applied before bucketing (same seed always gives the same shuffle, independent of `data_par_size`/checkpoint restarts, same as everything else about the train/val/test split) so each bucket gets a representative mix of classes instead. Set to `null` in the config to opt out and keep the original contiguous ordering.
+Imagenet's files arrive sorted class-by-class; this seeds a deterministic shuffle applied before splitting them into per-rank buckets, so each bucket gets a representative mix of classes instead of a narrow range. Set to `null` to keep the original ordering instead.
 
-- `dataset`: String. 
--Variable for telling dataloader how to handle data and how to break up root directories into files within source code (Each dataset potentially needs it's own code to do this depending on the data type and layout of files). See [Datset Integration](#dataset-integration)
+- `dataset`: String.
+Variable for telling dataloader how to handle data and how to break up root directories into files within source code (Each dataset potentially needs its own code to do this depending on the data type and layout of files). One of `"imagenet"`, `"catsdogs"`, `"basic_ct"`, `"sst"` on `main`. See [Dataset Integration](#dataset-integration)
 
-- `imagenet_resize`: List of Ints.
--Optional argument specific to the imagenet datset which tells the dataloader what size to resize all images to so that the same input size is used.
+- `resize`: Dict, optional.
+Maps a dataset key to the `[height, width]` size to resize that key's inputs to -- e.g. imagenet's images are all different sizes and need a standard size (`data.dict_in_variables`'s own real shape). Not specific to any one dataset name.
 
 ## Dataset Integration
-For Examples, see the XCT-Diffusion, SST, and S8D branches
-1. Name your dataset and use it in place of the dataset option of the config file
-2. Write code to process file keys for the different datasets
-- Add a new branch to if/else in the process_root_dirs function of the NativePytorchDataModule in `src/UCF_VIT/dataloaders/datamodule.py`, to process datafile paths from each dataset into a corresponding dictionary
-3. Write code that uses appropriate iterative dataloader functions from `src/UCF_VIT/dataloaders/dataset.py` to handle the data files
-- Add a new branch to if/else in the set_iterative_dataloader function of the NativePytorchDataModule class in `src/UCF_VIT/dataloaders/datamodule.py`, using the correct Tile Iterator (ImageBlockDataIter_2D or ImageBlockDataIter_3D) depending on the dimension of your data
-4. Write code to appropriately read and process (including normalization) data files
-- Add a new branch to if/else in the read_process_file function of the FileReader class in `src/UCF_VIT/dataloaders/dataset.py`, using an appropriate python function to read the data files depending on the type
-5. Write code to appropriately load balance data files across the computing hardware
-- Add a new branch to if/else in the process_root_dirs function of `src/UCF_VIT/utils/misc.py` (similar to step 2)
-- Add a new bracnh to if/else in the read_process_file function of `src/UCF_VIT/utils/misc.py` (similar to step 4)
+Adding a new dataset means giving it a name, then teaching four places in the code how to find, read, and normalize its files.
+
+1. Pick a name for your dataset and add it to `parse.py`'s dataset allow-list (`assert dataset in [...]`), and use that name as `data.dataset` in your config.
+2. **List files**: add a branch to `UCF_VIT.utils.misc.process_root_dirs` (and, if your layout needs a representative file picked out separately, `_find_representative_file`) to list your dataset's real files under each `dict_root_dirs` entry.
+3. **Read and process files**: add a branch to `FileReader.read_process_file` in `src/UCF_VIT/dataloaders/dataset.py` -- read each file with whatever library fits its format (`nibabel` for NIfTI, `np.load` for `.npy`, etc.), apply any fixed axis/layout conventions your format needs, and run it through the existing `zscore_normalize`/`normalize_stats` call (or deliberately skip that, if your data is already normalized upstream -- document why, as `xct`'s config does). See [Normalization](#normalization) for precomputing the stats this call needs.
+4. **Detect size/channels for config auto-detection**: add a branch to `UCF_VIT.utils.misc.detect_num_channels`/`detect_img_size` so `parse_config` can infer `data.img_size`/`data.num_channels` from a real file instead of requiring them to be hand-specified.
+5. If your dataset can't pair with every model type (e.g. no labels, so no `VIT`/`SAP`/`UNETR`), add the rejection to `parse.py`'s `return_label`-compatibility dispatch.
+
+The shared `TileDataIter` (`src/UCF_VIT/dataloaders/dataset.py`) handles tiling for every dataset uniformly once your `read_process_file` branch hands it a correctly-shaped array -- you don't need your own tiling code.
+
+## Normalization
+Per-(dataset key, variable) z-score stats (mean/std) are not computed automatically. Precompute them once with `utils/compute_normalization_stats.py`:
+```
+python utils/compute_normalization_stats.py configs/basic_ct/sap/base_config.yaml
+```
+This reads the config's training split, writes the stats to a YAML file (default: mirrored under `stats/`), and edits the config file itself in place to set `data.normalize_stats_path` to that file, so the config is ready to train with immediately -- no separate manual edit step. It scales across multiple SLURM ranks automatically -- see `launch/utils/run_compute_normalization_stats.sh` for a launchable example.
+
+If `data.normalize_stats_path` isn't set, training still runs, just on raw (unnormalized) data -- this is never a hard requirement, but skipping it can hurt training stability/accuracy for data whose raw scale isn't already well-behaved.
 
 ## Load Balancing
-In order for the dataloader to handle multiple datasets at the same time, the data needs to be spread out amongst the GPUs evenly. In the case where different datasets have different amounts and/or different sizes of images, it's difficult to evenly spread this data amongst the GPUs evenly. We provide example load balancing scripts that for a given setting in a config file determines how the data should be split amongst a given set of N GPUs, in order to evenly balance the data amongst the compute resources. The output from this script gives the necessary information to the dataloader in order to do this in a proper fashion. If you want this load_balancing to be done automatically set `auto_load_balancing` to True in your config file. If you want to do the load balancing manually to check for correct implementation run `python utils/load_balance.py [CONFIG_FILE] [NUM_GPUS]` and use the output from this script to add to the load balancing portion of the config file.
+In order for the dataloader to handle multiple datasets at the same time, the data needs to be spread out amongst the GPUs evenly. In the case where different datasets have different amounts and/or different sizes of images, it's difficult to evenly spread this data amongst the GPUs evenly. `UCF_VIT.utils.misc.calculate_load_balancing_on_the_fly` computes, for a given config, how many DDP ranks each dataset key should get (proportional to its real file count, with every key guaranteed at least one rank) and how many batches-per-rank-epoch that implies. If you want this done automatically, set `trainer.auto_load_balancing: True` in your config and `train.py` computes it itself at startup -- nothing else to do. If you want to check the result manually (or you're using a dataloader type that doesn't support the automatic path), run it offline instead: `python utils/load_balance.py [CONFIG_FILE]`, then copy its `dataset_group_list`/`batches_per_rank_epoch` output into the config's load-balancing fields.
 
 ## Parallelism Modes
-All of the currently existing architectures exist in 2 independent sub-folders, simple and fsdp, for which we separate the network architecture code into what we call modes. The choice of mode to be used will depend on the types of advanced parallelism and computing techniques needed for the model being trained.  The first `src/UCF_VIT/simple`, provides a simplified version for training in Distributed Data Parallel (DDP) fashion only. The second `src/UCF_VIT/fsdp`, provides a more complex version with different parallel and efficient computing training techniques. This includes options for training with a combination of Sharded Data Parallelism , DDP, and Tensor Parallelism. These parallelisms are all integrated via the [Hybrid-Op](#hybrid-op) algorithm. Both modes can be used with the same data loading module and load balancing scripts provided. While the training done within the simple mode can be done with the correct choice of options in the fsdp mode, the purpose of keeping the simple mode is 1) to provide an entry point for new users and developers to add new architectures without the intricacies of the advanced features and 2) to provide a simple reference point to compare with when new innovations are added in order to test how they interact with the more complex parallelism methods.
+There is a single, unified architecture implementation (`src/UCF_VIT/model/`). Every architecture goes through the same `get_model` (`src/UCF_VIT/model/utils.py`), and parallelism is controlled purely by config (`parallelism.fsdp_size`/`simple_ddp_size`/`tensor_par_size`). Set `tensor_par_size: 1` to disable tensor/model parallelism entirely. See [Hybrid-OP](#hybrid-op) for how these three sizes combine.
 
 ### Building Blocks
-The main building blocks for the VIT based archictectures are in the **Attention** and **Feed-forward** functions, provided in the Attention class and MLP class in `src/UCF_VIT/simple/building_blocks.py` and `src/UCF_VIT/fsdp/building_blocks.py`. We ask that you use these functions as is and do not modify them, as these common building blocks will be used across the different network architectures.
+The main building blocks for the VIT based architectures are in the **Attention** and **Feed-forward** functions, provided in the `Attention`/`Mlp` classes in `src/UCF_VIT/model/building_blocks.py` (also home to `Block`/`Block_diffusion`, the per-architecture block classes -- see [DiffusionVIT](#diffusion-vision-transformer-diffusionvit)). We ask that you use these functions as is and do not modify them, as these common building blocks are used across every architecture.
 
 ## Training Scripts
-We provide several example training scripts. These include all of the necessary things for running the main training loop, including utilities such as checkpoint loading and saving and mechanisms for launching across hardware for different systems. Training scripts are provided for each of the training architectures for the simple mode. We also have several scripts to train architectures in the fdsp mode. To convert the simple scripts to use fsdp mode, implement the code changes that were done for, e.g. `training_scripts/train_masked_simple.py` to `training_scripts/train_masked_fsdp.py`. 
+`training_scripts/train.py` is the single, generic training entry point for every architecture -- which model/dataset/parallelism settings it uses is entirely config-driven (see [Config Files](#config-files)), there's no separate script per architecture or per parallelism mode to pick between.
 
-Alongside `training_scripts/train.py`, we also provide `training_scripts/val.py` and `training_scripts/test.py` -- forward-only counterparts that evaluate an already-trained checkpoint against a validation/test split (no backward pass, no optimizer/scheduler, `model.eval()` + `torch.no_grad()` throughout). Both take the *same* config file as the training run being evaluated (same `checkpoint_path`/`checkpoint_filename`) -- just invoked as `python val.py [CONFIG_FILE]`/`python test.py [CONFIG_FILE]` instead of `train.py`. Which data they evaluate against is controlled by `dict_val_root_dirs`/`dict_test_root_dirs` (and the `val_split_ratio`/`test_split_ratio` auto-split fallback) in the [Dataloader](#dataloader) config section -- see that section's own parameter descriptions for the full train/val/test split behavior.
+Alongside `train.py`, we also provide `val.py` and `test.py` -- forward-only counterparts that evaluate an already-trained checkpoint against a validation/test split (no backward pass, no optimizer/scheduler, `model.eval()` + `torch.no_grad()` throughout). Both take the *same* config file as the training run being evaluated (same `checkpoint_path`/`checkpoint_filename`) -- just invoked as `python val.py [CONFIG_FILE]`/`python test.py [CONFIG_FILE]` instead of `train.py`. Which data they evaluate against is controlled by `dict_val_root_dirs`/`dict_test_root_dirs` (and the `val_split_ratio`/`test_split_ratio` auto-split fallback) in the [Dataloader](#dataloader) config section -- see that section's own parameter descriptions for the full train/val/test split behavior.
+
+For `model.type: DiffusionVIT` specifically, there's also `inference_diffusion.py` -- unlike the three scripts above, it doesn't evaluate against real data at all; it loads a trained checkpoint and runs the actual reverse-diffusion sampling loop to generate new samples from pure noise. See [DiffusionVIT](#diffusion-vision-transformer-diffusionvit)'s "Generating samples" section.
 
 The training scripts have the capability to launch in different modes for compatibility with different systems. Each training script takes two arguments the first is the config file containing all the different parameters for the particular run and an argument for specifying the specific launching mechanism used to work across the hardware on the system. Currently we provide two launch modes: MPI and SLURM. 
 
@@ -1016,7 +803,7 @@ For a local DGX system specify `MPI` as the LAUNCHER, then we use the `mpi4py` l
 For systems that use resource schedulers to use multiple nodes acrossed a system, such as DGX Clusters or Frontier, specify `SLURM` as the launcher. In this case, SLURM environment variables are used to set up the distributed training across the resources. See some of the various examples in the `launch/` folder to see how this is done. Again in this case we assume that there this is one task per every GPU utilized for computing.
 
 ### Writing your own script
-Config files store paths like `trainer.checkpoint_path`/`inference_output.output_dir` as relative paths (e.g. `"checkpoint/basic_ct/unetr/base"`), meant to be relative to the repo root -- not to wherever a launch script happens to invoke `python` from, and not to wherever `sbatch`/`python` was actually run from either. `parse_config` (`src/UCF_VIT/parse.py`) resolves both of these itself, joining them against `UCF_VIT.utils.misc.find_repo_root()` (computed from that helper's own fixed location in the package, not from the calling script's location, so it gives the right answer regardless of where a script lives or how deep it's nested) -- by the time your script sees `conf["trainer"]["checkpoint_path"]`, it's already an absolute path. If you write your own script around `parse_config`, you get this for free; you don't need to do anything extra, and the process's own working directory is never touched (so relative paths for anything *else* your script does -- reading a local file, writing a log -- still resolve exactly the way you'd expect, relative to wherever you actually ran it from).
+Config files store paths like `trainer.checkpoint_path`/`inference_output.output_dir` as relative paths (e.g. `"checkpoint/basic_ct/unetr/base"`), meant to be relative to the repo root. `parse_config` (`src/UCF_VIT/parse.py`) resolves these to absolute paths itself via `UCF_VIT.utils.misc.find_repo_root()`, so if you write your own script around `parse_config`, you get this for free.
 
 
 ## Config Files
@@ -1024,17 +811,16 @@ We store the arguments for each individual run in a yaml file. This config file 
 
 1. Trainer
 - max_epochs: Max number of epochs to train
-- data_type: Data type to be used during training
-- checkpoint_path: Directory to save checkpoint to
-- checkpoint_filename: File prefix to save checkpoint to, "even" or "odd" will be appended to the for checkpoint file robustness
-- checkpoint_filename_for_loading: Prefix of file to use when starting from checkpoint, append with "even" or "odd"
+- data_type: Data type to be used during training (`"float32"` or `"bfloat16"`)
+- checkpoint_path: Directory to save checkpoints to (resolved relative to the repo root -- see [Writing your own script](#writing-your-own-script))
+- checkpoint_filename: File prefix to save checkpoints to -- real files are written as `<checkpoint_path>/<checkpoint_filename>_rank_<N>.ckpt`, one per tensor-parallel rank
 - resume_from_checkpoint: Whether to start from checkpoint or from scratch
+- auto_load_balancing: Whether to have `train.py` compute [Load Balancing](#load-balancing) itself at startup, instead of requiring `dataset_group_list`/`batches_per_rank_epoch` to already be filled in by hand
 
-2. Parallelism (only used in fsdp mode and load balancing script)
+2. Parallelism (used by every script, and by `utils/load_balance.py`'s offline precompute)
 - fsdp_size: Number of Fully Sharded Data Parallel ranks to use, for sharding model states
-- simple_ddp_size: Number of Data Parallel ranks to use, for distributing different data to ranks. Set to the literal string `"auto"` to derive this from however many ranks the current launch actually has instead of a fixed number -- `simple_ddp_size = world_size / (fsdp_size * tensor_par_size)`. Useful since fsdp_size/tensor_par_size are usually architecture choices that stay fixed while the node count a given launch uses varies (e.g. a training run using more nodes than the val.py/test.py run evaluating its checkpoints) -- the same config then works unmodified either way instead of needing simple_ddp_size hand-edited to match every time. Requires world_size to be evenly divisible by `fsdp_size * tensor_par_size`, and a live distributed process group (not available to `utils/load_balance.py`'s offline precompute step -- use an explicit integer there).
-- tensor_par_size: Number of Tensor Parallel ranks to use, for distributing tensor across multiple ranks
-- seq_par_size: Number of Sequence Parallel ranks to use, for distributing input sequence across multiple ranks (NOT IMPLEMENTED YET)
+- simple_ddp_size: Number of Data Parallel ranks to use, for distributing different data to ranks. Set to the literal string `"auto"` to derive this from however many ranks the current launch actually has instead of a fixed number (`simple_ddp_size = world_size / (fsdp_size * tensor_par_size)`) -- useful so the same config works whether a run uses more or fewer nodes. Not available to `utils/load_balance.py`'s offline precompute step -- use an explicit integer there.
+- tensor_par_size: Number of Tensor Parallel ranks to use, for distributing tensor across multiple ranks. `1` disables model/tensor parallelism entirely -- see [Parallelism Modes](#parallelism-modes).
 
 3. Model Optimizer and Scheduler
 - lr: Initial learning rate for optimizer
@@ -1059,19 +845,19 @@ We store the arguments for each individual run in a yaml file. This config file 
 - If on Frontier Change project allocation to one you have access to `#SBATCH -A PROJXXX`.
 - Set number of nodes you want to run with `#SBATCH --nodes=N`
 
-6. Run Load Balancing Script (or set `auto_load_balancing` to True in config file and skip to step 8)
-- `python utils/load_balance.py [CONFIG_FILE] [NUM_GPUS]`
+6. Run Load Balancing Script (or set `trainer.auto_load_balancing: True` in the config and skip to step 8)
+- `python utils/load_balance.py [CONFIG_FILE]`
 
 7. Modify Config File with the output from load balancing output
 - dataset_group_list
 - batches_per_rank_epoch
 
-8. Launch job `sbatch launch/[DATASET]/train_[MODEL]_[MODE]_[OPTIONAL].sh`
-- Existing launch scripts follow the following naming conventions
-- [DATASET] is the particular dataset you want to use. The examples use (imagenet or basic_ct)
-- [MODEL] is the type of model you want to use chose from those in [Model Architectures](#Model-Architectures)
-- [MODE] is the training mode you want to use. There are two options (simple and fsdp). See [Parallelism Modes](#Parallelism-Modes) for a more detailed description
-- [OPTIONAL] is an optional keyword for launch scripts using the apptainer method for installing containers on Frontier or the docker method for installing containers for running on DGX machines
+8. Launch job `sbatch launch/[DATASET]/[MODEL].sh`
+- Existing launch scripts follow `launch/[DATASET]/[MODEL].sh`, e.g. `launch/basic_ct/unetr.sh`, `launch/imagenet/diffusion.sh`
+- [DATASET] is the particular dataset you want to use (examples use `imagenet`/`basic_ct`)
+- [MODEL] is the model/task from [Model Architectures](#model-architectures) (lowercased, e.g. `unetr`, `mae`, `diffusion`)
+- Unlike the eval scripts in step 9 below, these training launch scripts don't take the config path as a `sbatch` argument -- each one hardcodes its own config path at the bottom. Edit that line to point it at your own config (this is the "Create/Modify Launch Script" step above).
+- There's no separate parallelism-"mode" launch script anymore -- see [Parallelism Modes](#parallelism-modes); the same script works for any `fsdp_size`/`simple_ddp_size`/`tensor_par_size` combination in the config
 
 9. Evaluate a checkpoint with `training_scripts/val.py`/`test.py`
 - Unlike the training launch scripts above, `launch/eval/val.sh` and `launch/eval/test.sh` are generic across every dataset/model -- pass the config path as an argument instead of hardcoding it per-launch-script. They live one directory down (`launch/eval/`), matching the training launch scripts' own depth (`launch/[DATASET]/`), so the config path argument uses the same `../../` convention either way:
@@ -1081,15 +867,17 @@ We store the arguments for each individual run in a yaml file. This config file 
 
 
 ## Datasets
-We use two example datasets to test functionality of our code, their descriptions and instructions for downloading are below.
+`data.dataset` (in [Config Files](#config-files)) selects one of these on `main`: `"imagenet"`, `"catsdogs"`, `"basic_ct"`, `"sst"`. See [Dataset Integration](#dataset-integration) for adding your own.
 ### Imagenet
 Download data at `https://www.image-net.org/challenges/LSVRC/2012/2012-downloads.php`
 
-Directory consists of 1000 sub-folders of 2D JPEG images, each folder corresponding to different classification labels. In order to use data in this format in data distributed fashion across N GPUs, we make individual datasets within the dataloader code, each with 1000/N of these subfolders. Since ImageNet has images of all different sizes, all input images are resized to a standard size, chosen by the imagenet_resize argument in the config file.
+Directory consists of 1000 sub-folders of 2D JPEG images, each folder corresponding to a different classification label. Since ImageNet has images of all different sizes, all input images are resized to a standard size via the `resize` argument in the config file (`data.resize` with an `"imagenet"` key -- see [Dataloader](#dataloader)).
+### Catsdogs
+Binary cats-vs-dogs 2D image classification/diffusion dataset -- see `configs/catsdogs/` for real shipped configs (classification, MAE, diffusion). This dataset is intended as a worked example of plugging in a simple, map-style PyTorch `Dataset` + `DistributedSampler` (`dataloader.type: dataloader`), as opposed to the iterative dataloader (`dataloader.type: iterative_dataloader`) used by imagenet/basic_ct/sst -- see `UCF_VIT.datasets.catsdogs` and `train.py`'s own branching on `dataloader.type`.
 ### Basic_CT
-Download data at
-
-Directory consists of 3D synthetic CT images of concrete including corresponding labels for segmentation.
+3D synthetic CT volumes of concrete, with corresponding segmentation labels. We don't have a public download link for this one documented anywhere in the repo currently -- ask a maintainer/collaborator for access if you need it.
+### SST
+3D CFD (computational fluid dynamics) volumes with multiple fields (density `r`, velocity components `u`/`v`/`w`, pressure `p`), used for both MAE pretraining and UNETR regression (predicting `p` from the others) -- see `configs/sst/` for real shipped configs, and their header comments for the real data layout (large volumes, chunked and tiled via `tiling.div`). The one dataset that makes real use of `data.time_offsets`/`use_timeemb`'s time-stepping conditioning -- see [Variable Aggregation](#variable-aggregation).
 
 ## Citations
 ### [1]
