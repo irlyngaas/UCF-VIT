@@ -30,6 +30,7 @@ fi
 
 
 %post -c /bin/bash
+set -e
 # Misc setup
 export ROCM_PATH=/opt/rocm
 export MPICH_DIR=/opt/mpich
@@ -51,13 +52,19 @@ export CPLUS_INCLUDE_PATH=${CPLUS_INCLUDE_PATH%:}
 # OLCF's docs say outright they can't ship real CPE in a container due to
 # licensing, so this approach (plain base + our own ABI-matched MPICH, same
 # as OLCF's own olcf_containers_examples repo) isn't a downgrade.
+#
+# No `sudo` anywhere below -- %post already runs as root under apptainer's
+# fakeroot build, and `sudo` itself can't allocate a pty in that environment
+# ("unable to allocate pty: Invalid argument"), which silently no-ops every
+# command it prefixes instead of erroring, cascading into later steps failing
+# on missing tools. `set -e` above also makes any future step like this fail
+# loudly instead of silently continuing.
 apt-get update
-apt-get install -y sudo
 
 # Installing some prerequisites
-sudo apt-get install -y build-essential gfortran git tar wget gnupg \
+apt-get install -y build-essential gfortran git tar wget gnupg \
   autoconf automake libtool m4 texinfo zlib1g-dev pkg-config ca-certificates
-sudo apt-get install -y libatomic1 libquadmath0  # required by some ROCm tools -- see https://rocm.docs.amd.com/en/7.13.0-preview/install/rocm.html
+apt-get install -y libatomic1 libquadmath0  # required by some ROCm tools -- see https://rocm.docs.amd.com/en/7.13.0-preview/install/rocm.html
 
 # Build MPICH 3.4.2 from source, matching the ANL MPICH release Cray MPICH's
 # own ABI is based on (confirmed via `module show cray-mpich/8.1.31` on
@@ -80,14 +87,14 @@ export LD_LIBRARY_PATH="${MPICH_DIR}/lib:$LD_LIBRARY_PATH"
 # Install ROCm 7.13.0-preview userspace packages for gfx90a (MI250X), to match
 # the Conda env's own target in README.md's Install section.
 # See: https://rocm.docs.amd.com/en/7.13.0-preview/install/rocm.html
-sudo mkdir --parents --mode=0755 /etc/apt/keyrings
+mkdir --parents --mode=0755 /etc/apt/keyrings
 wget https://repo.amd.com/rocm/packages/gpg/rocm.gpg -O - | \
-  gpg --dearmor | sudo tee /etc/apt/keyrings/amdrocm.gpg > /dev/null
-sudo tee /etc/apt/sources.list.d/rocm.list << EOF
+  gpg --dearmor | tee /etc/apt/keyrings/amdrocm.gpg > /dev/null
+tee /etc/apt/sources.list.d/rocm.list << EOF
 deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://repo.amd.com/rocm/packages/ubuntu2204 stable main
 EOF
-sudo apt update
-sudo apt install -y amdrocm7.13-gfx90a amdrocm-core-dev7.13
+apt update
+apt install -y amdrocm7.13-gfx90a amdrocm-core-dev7.13
 
 # Install CONDA and required conda packages
 export CONDA_DIR=/conda/envs/vit
