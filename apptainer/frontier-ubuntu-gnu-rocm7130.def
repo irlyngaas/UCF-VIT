@@ -99,13 +99,11 @@ apt install -y amdrocm7.13-gfx90a amdrocm-core-dev7.13-gfx90a
 # Install CONDA and required conda packages
 export CONDA_DIR=/conda/envs/vit
 export PATH=${CONDA_DIR}/bin:/conda/bin:$PATH
-wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh && \
-  bash /tmp/miniconda.sh -b -p /conda && \
-  rm -f /tmp/miniconda.sh && \
+wget https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -O /tmp/miniforge.sh && \
+  bash /tmp/miniforge.sh -b -p /conda && \
+  rm -f /tmp/miniforge.sh && \
   . /conda/etc/profile.d/conda.sh && \
   . /conda/bin/activate && \
-  conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main && \
-  conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r && \
   conda create -n vit python=3.11 -y
   conda install -n vit -y git
 
