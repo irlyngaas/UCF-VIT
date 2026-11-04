@@ -24,25 +24,18 @@ CONDA_ENV_DIR=/lustre/orion/stf006/proj-shared/irl1/MINI_CLEAN/envs/UCF-rocm7.13
 module reset
 module load PrgEnv-gnu
 module load rocm/7.13.0
-
-if [ "$SLURM_JOB_NUM_NODES" -gt 1 ]; then
-    module load craype-accel-amd-gfx90a
-    module unload libfabric
-fi
+module load craype-accel-amd-gfx90a
+module unload libfabric
 
 conda activate ${CONDA_ENV_DIR}
 
-if [ "$SLURM_JOB_NUM_NODES" -gt 1 ]; then
-    module load cray-mpich/8.1.31 libfabric rccl-net-plugin
-fi
+module load cray-mpich/8.1.31 libfabric rccl-net-plugin
 
 SDK_CORE=${CONDA_ENV_DIR}/lib/python3.11/site-packages/_rocm_sdk_core
 SDK_LIBS=${CONDA_ENV_DIR}/lib/python3.11/site-packages/_rocm_sdk_libraries_gfx90a
 
 export LD_LIBRARY_PATH=${SDK_CORE}/lib:${SDK_LIBS}/lib:${LD_LIBRARY_PATH}
-if [ "$SLURM_JOB_NUM_NODES" -gt 1 ]; then
-    export LD_PRELOAD=/opt/rocm-7.13.0/lib/librccl.so.1
-fi
+export LD_PRELOAD=/opt/rocm-7.13.0/lib/librccl.so.1
 
 export HSA_NO_SCRATCH_RECLAIM=1
 export GPU_MAX_HW_QUEUES=2
