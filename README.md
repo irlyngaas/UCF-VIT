@@ -67,6 +67,13 @@ cd UCF-VIT
 pip install -e .
 ```
 
+The pip-installed ROCm wheels only ship versioned shared library names; some tools expect unversioned ones too. Add the missing symlinks once, in this same environment:
+```
+SDK_CORE_LIB=$(python -c "import _rocm_sdk_core, os; print(os.path.join(os.path.dirname(_rocm_sdk_core.__file__), 'lib'))")
+ln -sf libamdhip64.so.7 ${SDK_CORE_LIB}/libamdhip64.so
+ln -sf libhsa-runtime64.so.1 ${SDK_CORE_LIB}/libhsa-runtime64.so
+```
+
 #### Optional: `cupy` for `region_backend="cupyx"`
 `cupy` is not installed by the steps above -- it's an opt-in dependency, only needed if you want `UCF_VIT.model.gpu_adaptive_patching.GPUPatchify2D`/`GPUPatchify3D`'s `region_backend="cupyx"` option (GPU-native connected-components labeling, vs. the default `"scipy"`; currently test-only, see `launch/tests/run_cupyx_smoke.sh`). Build from source against your ROCm install:
 ```
