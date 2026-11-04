@@ -22,7 +22,7 @@ from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.utils.fused_attn import FusedAttn
 from UCF_VIT.ddpm.ddpm import DDPM_Scheduler
 
-from utils import warm_up_process_groups
+from utils import warm_up_process_groups, warm_up_kernel_jit
 
 
 
@@ -326,6 +326,16 @@ def main():
         grad_scaler = None
         min_scale = None
 
+    if conf["model"]["type"] == "DiffusionVIT":
+        ddpm_scheduler = DDPM_Scheduler(num_time_steps=conf["model"]["kwargs"]["num_time_steps"]).to(device)
+    else:
+        ddpm_scheduler = None
+
+    #tell the model that we are in train mode before warming up kernels, so the
+    #same kernels/dropout paths real batch 0 will hit are the ones warmed here
+    model.train()
+    warm_up_kernel_jit(conf, train_dataloader, warm_it_loader, model, device, optimizer, grad_scaler, min_scale, tensor_par_group, ddpm_scheduler, world_rank)
+
 #4. Training Loop
 ##############################################################################################################
     #Find iterations per epoch
@@ -348,11 +358,6 @@ def main():
         )
         dist.broadcast(iterations_per_epoch_tensor, src=(dist.get_rank()//conf["parallelism"]["tensor_par_size"]*conf["parallelism"]["tensor_par_size"]), group=tensor_par_group)
         iterations_per_epoch = iterations_per_epoch_tensor.item()
-
-    if conf["model"]["type"] == "DiffusionVIT":
-        ddpm_scheduler = DDPM_Scheduler(num_time_steps=conf["model"]["kwargs"]["num_time_steps"]).to(device)
-    else:
-        ddpm_scheduler = None
 
     for epoch in range(epoch_start,conf["trainer"]["max_epochs"]):
         #tell the model that we are in train mode. Matters because we have the dropout

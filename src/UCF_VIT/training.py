@@ -1,3 +1,5 @@
+import os
+import sys
 import time
 
 import torch
@@ -819,6 +821,15 @@ def train_epoch(conf, model, train_dataloader, epoch, iterations_per_epoch, opti
         else:
             optimizer.step()
         optimizer.zero_grad()
+
+        max_batches = int(os.environ.get("MAX_BATCHES", "0"))
+        if max_batches > 0 and counter >= max_batches - 1:
+            if dist.get_rank() == 0:
+                print(
+                    f"MAX_BATCHES={max_batches} reached at batch_idx {counter}; exiting cleanly.",
+                    flush=True,
+                )
+            sys.exit(0)
 
         if profile:
             torch.cuda.synchronize()
