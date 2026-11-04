@@ -22,6 +22,7 @@ from UCF_VIT.dataloaders.datamodule import NativePytorchDataModule
 from UCF_VIT.utils.fused_attn import FusedAttn
 from UCF_VIT.ddpm.ddpm import DDPM_Scheduler
 
+from utils import warm_up_process_groups
 
 
 
@@ -294,6 +295,19 @@ def main():
 #3. Bind this process to its GPU, then initialize model, optimizer, and scheduler
 ##############################################################################################################
     device = set_cuda_device(local_rank)
+    warm_up_process_groups(
+        {
+            "data_par_group": ddp_group,
+            "tensor_par_group": tensor_par_group,
+            "data_seq_ort_group": data_seq_ort_group,
+            "fsdp_group": fsdp_group,
+            "simple_ddp_group": simple_ddp_group,
+            "world_group (ShardedGradScaler default)": dist.group.WORLD,
+        },
+        device=device,
+        world_rank=world_rank,
+    )
+
     if conf["dataloader"]["type"] == "iterative_dataloader" and data_module is not None:
         data_module.to(device)  # no-op movement (no real nn.Parameters/buffers) -- kept for parity with NativePytorchDataModule being an nn.Module
 
