@@ -82,7 +82,8 @@ cd /mpich
 wget -O mpich-${MPICH_VERSION}.tar.gz ${MPICH_URL}
 tar --no-same-owner -xzf mpich-${MPICH_VERSION}.tar.gz
 cd /mpich/mpich-${MPICH_VERSION}
-./configure --with-device=ch4:ofi --prefix=${MPICH_DIR}
+FFLAGS="-fallow-argument-mismatch" FCFLAGS="-fallow-argument-mismatch" \
+  ./configure --with-device=ch4:ofi --prefix=${MPICH_DIR}
 make -j32 install
 cd /
 rm -rf /mpich

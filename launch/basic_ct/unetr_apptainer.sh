@@ -5,10 +5,11 @@
 #SBATCH --gres=gpu:8
 #SBATCH --ntasks-per-node=8
 #SBATCH --cpus-per-task=7
-#SBATCH -t 00:05:00
+#SBATCH -t 00:15:00
 #SBATCH -p batch
 #SBATCH -o unetr-apptainer-%j.out
 #SBATCH -e unetr-apptainer-%j.out
+#SBATCH --network=disable_rdzv_get
 
 # UNTESTED -- drafted from OLCF's documented container MPI-binding recipe
 # (https://docs.olcf.ornl.gov/software/containers_on_frontier.html), not yet
@@ -18,13 +19,18 @@
 [ -z $JOBID ] && JOBID=$SLURM_JOB_ID
 [ -z $JOBSIZE ] && JOBSIZE=$SLURM_JOB_NUM_NODES
 
+if [[ ! -v CONFIG ]]; then
+    echo "Fatal Error: CONFIG is not set!" >&2
+    exit 1
+fi
+
 SIF=../../apptainer/frontier-ubuntu-gnu-rocm7130-vit.sif
 
 module reset
 module load PrgEnv-gnu
 module load gcc/12.2.0
 # Loading the same rocm module the container's own ROCm install targets
-module load rocm/7.13
+module load rocm/7.13.0
 # Provides the host's libmpi.so that the container's own MPICH build (built
 # only for build-time symbol compatibility, not real MPI performance) will
 # look for at runtime -- see apptainer/frontier-ubuntu-gnu-rocm7130.def
@@ -34,6 +40,14 @@ export MIOPEN_DISABLE_CACHE=1
 export NCCL_PROTO=Simple
 export MIOPEN_USER_DB_PATH=/tmp/$JOBID
 mkdir -p $MIOPEN_USER_DB_PATH
+
+export MIOPEN_DEBUG_AMD_WINOGRAD_MPASS_WORKSPACE_MAX=-1
+export MIOPEN_DEBUG_AMD_MP_BD_WINOGRAD_WORKSPACE_MAX=-1
+export MIOPEN_DEBUG_CONV_WINOGRAD=0
+
+export HSA_NO_SCRATCH_RECLAIM=1
+export GPU_MAX_HW_QUEUES=2
+export TORCH_NCCL_HIGH_PRIORITY=1
 
 export MPICH_GPU_SUPPORT_ENABLED=1
 
@@ -58,6 +72,11 @@ export APPTAINERENV_LD_PRELOAD=$CRAY_MPICH_ROOTDIR/gtl/lib/libmpi_gtl_hsa.so.0:
 
 export OMP_NUM_THREADS=7
 
+# UCF_VIT isn't baked into the image (see the commented-out install step in
+# apptainer/frontier-ubuntu-gnu-rocm7130.def) -- expose the host's live repo
+# checkout instead, so code changes don't require a container rebuild
+export APPTAINERENV_PYTHONPATH="$(realpath ../../src):${APPTAINERENV_PYTHONPATH}"
+
 time srun -n $((SLURM_JOB_NUM_NODES*8)) --gpus-per-task=1 --gpu-bind=closest \
     apptainer exec --rocm --workdir "$(pwd)" "$SIF" \
-    python ../../training_scripts/train.py ../../configs/basic_ct/unetr/base_config.yaml
+    python ../../training_scripts/train.py ${CONFIG}

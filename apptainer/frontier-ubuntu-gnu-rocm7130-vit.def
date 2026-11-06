@@ -37,9 +37,7 @@ export MPICH_SMP_SINGLE_COPY_MODE=NONE
 export C_INCLUDE_PATH=${C_INCLUDE_PATH%:}
 export CPLUS_INCLUDE_PATH=${CPLUS_INCLUDE_PATH%:}
 
-# Installing some prerequisites
-sudo apt-get install -y git
-
+# git is already installed via conda in the base image's own %post
 git --version
 
 # Install UCF_VIT
