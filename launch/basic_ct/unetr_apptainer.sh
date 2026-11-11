@@ -73,6 +73,11 @@ export APPTAINERENV_LD_PRELOAD=$CRAY_MPICH_ROOTDIR/gtl/lib/libmpi_gtl_hsa.so.0:
 
 export OMP_NUM_THREADS=7
 
+# UCF_VIT runs from the image's own baked-in, read-only copy -- override
+# find_repo_root() so checkpoint_path/output_dir resolve against the real,
+# writable repo checkout instead (see src/UCF_VIT/utils/misc.py)
+export APPTAINERENV_UCF_VIT_REPO_ROOT="$(realpath ../..)"
+
 time srun -n $((SLURM_JOB_NUM_NODES*8)) \
     apptainer exec --rocm --pwd "$(pwd)" "$SIF" \
     python ../../training_scripts/train.py ${CONFIG}

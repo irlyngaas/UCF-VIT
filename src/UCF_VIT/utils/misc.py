@@ -28,7 +28,14 @@ def find_repo_root():
     wherever a launch script happens to invoke `python` from) -- see
     `parse_config`'s own comments at each of those fields for the exact
     resolution.
+
+    UCF_VIT_REPO_ROOT, if set, overrides the computed path -- needed when
+    the running package's own file location isn't the writable repo (e.g.
+    inside an Apptainer image, where UCF_VIT is baked in read-only).
     """
+    override = os.environ.get("UCF_VIT_REPO_ROOT")
+    if override:
+        return override
     return os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 def patchify( data, patch_size, twoD):
