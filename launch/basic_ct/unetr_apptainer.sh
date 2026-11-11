@@ -34,7 +34,7 @@ module load rocm/7.13.0
 # Provides the host's libmpi.so that the container's own MPICH build (built
 # only for build-time symbol compatibility, not real MPI performance) will
 # look for at runtime -- see apptainer/frontier-ubuntu-gnu-rocm7130.def
-module load cray-mpich-abi/8.1.31
+module load cray-mpich-abi/9.1.0
 
 export MIOPEN_DISABLE_CACHE=1
 export NCCL_PROTO=Simple
@@ -71,11 +71,6 @@ export APPTAINER_CONTAINLIBS="/usr/lib64/libjansson.so.4,/usr/lib64/libgfortran.
 export APPTAINERENV_LD_PRELOAD=$CRAY_MPICH_ROOTDIR/gtl/lib/libmpi_gtl_hsa.so.0:
 
 export OMP_NUM_THREADS=7
-
-# UCF_VIT isn't baked into the image (see the commented-out install step in
-# apptainer/frontier-ubuntu-gnu-rocm7130.def) -- expose the host's live repo
-# checkout instead, so code changes don't require a container rebuild
-export APPTAINERENV_PYTHONPATH="$(realpath ../../src):${APPTAINERENV_PYTHONPATH}"
 
 time srun -n $((SLURM_JOB_NUM_NODES*8)) --gpus-per-task=1 --gpu-bind=closest \
     apptainer exec --rocm --workdir "$(pwd)" "$SIF" \
