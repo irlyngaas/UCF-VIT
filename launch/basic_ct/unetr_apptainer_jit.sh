@@ -73,6 +73,7 @@ fi
 
 export SEED=${SEED_DIR}/tree
 export NODE_SEED=/tmp/miopen-seed-${USER}-${SLURM_JOB_ID}/tree
+export LOCAL_SCRATCH_ROOT=/tmp
 
 # Stage the seed tree once per node
 srun -N ${SLURM_JOB_NUM_NODES} --ntasks-per-node=1 \

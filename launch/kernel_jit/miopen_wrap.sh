@@ -1,10 +1,13 @@
 #!/bin/bash
 # miopen_wrap.sh
-# Per-rank MIOpen DB/cache on node-local /tmp, seeded from the per-node copy.
-# Expects NODE_SEED (and optionally SEED) to be exported by the batch script.
-# Both point at a "tree" directory containing kcache/ and userdb/.
+# Per-rank MIOpen DB/cache on node-local scratch, seeded from the per-node
+# copy. Expects NODE_SEED (and optionally SEED) to be exported by the batch
+# script. Both point at a "tree" directory containing kcache/ and userdb/.
+# LOCAL_SCRATCH_ROOT defaults to the NVMe burst buffer (requires #SBATCH -C
+# nvme in the batch script); override it (e.g. to /tmp) when not using one.
 
-LOCAL_TREE="/mnt/bb/${USER}/miopen-${SLURM_PROCID}/tree"
+LOCAL_SCRATCH_ROOT="${LOCAL_SCRATCH_ROOT:-/mnt/bb/${USER}}"
+LOCAL_TREE="${LOCAL_SCRATCH_ROOT}/miopen-${SLURM_PROCID}/tree"
 
 rm -rf "$LOCAL_TREE"
 mkdir -p "$LOCAL_TREE/kcache" "$LOCAL_TREE/userdb"
