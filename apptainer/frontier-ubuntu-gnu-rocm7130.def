@@ -3,11 +3,17 @@ From: ubuntu:22.04
 
 
 %environment
-export ROCM_PATH=/opt/rocm
 export MPICH_DIR=/opt/mpich
-export LD_LIBRARY_PATH="/opt/mpich/lib:/opt/rocm/lib:/opt/rocm/lib64:$LD_LIBRARY_PATH"
-export PATH="/opt/mpich/bin:/opt/rocm/bin:$PATH"
 export PYTORCH_DIR=/pytorch
+# PyTorch's own ROCm wheel bundles a complete, self-contained ROCm core
+# install (same pip-wheel mechanism the Conda env uses) -- deliberately not
+# installing a separate system ROCm here, since having both loaded in the
+# same process causes LLVM to register its device-compiler options twice
+export SDK_CORE=${PYTORCH_DIR}/_rocm_sdk_core
+export SDK_LIBS=${PYTORCH_DIR}/_rocm_sdk_libraries_gfx90a
+export ROCM_PATH=${SDK_CORE}
+export LD_LIBRARY_PATH="/opt/mpich/lib:${SDK_CORE}/lib:${SDK_LIBS}/lib:$LD_LIBRARY_PATH"
+export PATH="/opt/mpich/bin:$PATH"
 export PYTHONPATH=${PYTORCH_DIR}:${PYTHONPATH}
 export CONDA_DIR=/conda/envs/vit
 export PATH=${CONDA_DIR}/bin:/conda/bin:$PATH
@@ -32,10 +38,7 @@ fi
 %post -c /bin/bash
 set -eo pipefail
 # Misc setup
-export ROCM_PATH=/opt/rocm
 export MPICH_DIR=/opt/mpich
-export LD_LIBRARY_PATH="/opt/rocm/lib:/opt/rocm/lib64:$LD_LIBRARY_PATH"
-export PATH="/opt/rocm/bin:$PATH"
 export MPICH_SMP_SINGLE_COPY_MODE=NONE
 export DEBIAN_FRONTEND=noninteractive
 
@@ -90,18 +93,6 @@ rm -rf /mpich
 export PATH="${MPICH_DIR}/bin:$PATH"
 export LD_LIBRARY_PATH="${MPICH_DIR}/lib:$LD_LIBRARY_PATH"
 
-# Install ROCm 7.13.0-preview userspace packages for gfx90a (MI250X), to match
-# the Conda env's own target in README.md's Install section.
-# See: https://rocm.docs.amd.com/en/7.13.0-preview/install/rocm.html
-mkdir --parents --mode=0755 /etc/apt/keyrings
-wget https://repo.amd.com/rocm/packages/gpg/rocm.gpg -O - | \
-  gpg --dearmor | tee /etc/apt/keyrings/amdrocm.gpg > /dev/null
-tee /etc/apt/sources.list.d/rocm.list << EOF
-deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://repo.amd.com/rocm/packages/ubuntu2204 stable main
-EOF
-apt update
-apt install -y amdrocm7.13-gfx90a amdrocm-core-dev7.13-gfx90a
-
 # Install CONDA and required conda packages
 export CONDA_DIR=/conda/envs/vit
 export PATH=${CONDA_DIR}/bin:/conda/bin:$PATH
@@ -126,6 +117,12 @@ ${CONDA_DIR}/bin/pip install --index-url https://repo.amd.com/rocm/whl/gfx90a/ \
   "torchvision==0.25.0+rocm7.13.0" \
   "torchaudio==2.10.0+rocm7.13.0" \
   --target ${PYTORCH_DIR}
+
+# The wheel only ships versioned shared library names; some tools expect
+# unversioned ones too (same fix as README.md's Conda install step)
+SDK_CORE_LIB=${PYTORCH_DIR}/_rocm_sdk_core/lib
+ln -sf libamdhip64.so.7 ${SDK_CORE_LIB}/libamdhip64.so
+ln -sf libhsa-runtime64.so.1 ${SDK_CORE_LIB}/libhsa-runtime64.so
 
 # Install XFormers
 ${CONDA_DIR}/bin/pip install -U xformers --index-url https://download.pytorch.org/whl/rocm7.1

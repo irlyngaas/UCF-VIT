@@ -2,10 +2,11 @@ Bootstrap: localimage
 From: ./frontier-ubuntu-gnu-rocm7130.sif
 
 %environment
-export ROCM_PATH=/opt/rocm
-export LD_LIBRARY_PATH="/opt/rocm/lib:/opt/rocm/lib64:$LD_LIBRARY_PATH"
-export PATH="/opt/rocm/bin:$PATH"
 export PYTORCH_DIR=/pytorch
+export SDK_CORE=${PYTORCH_DIR}/_rocm_sdk_core
+export SDK_LIBS=${PYTORCH_DIR}/_rocm_sdk_libraries_gfx90a
+export ROCM_PATH=${SDK_CORE}
+export LD_LIBRARY_PATH="${SDK_CORE}/lib:${SDK_LIBS}/lib:$LD_LIBRARY_PATH"
 export PYTHONPATH=${PYTORCH_DIR}:${PYTHONPATH}
 export CONDA_DIR=/conda/envs/vit
 export PATH=${CONDA_DIR}/bin:/conda/bin:$PATH
@@ -28,9 +29,6 @@ fi
 
 %post -c /bin/bash
 # Misc setup
-export ROCM_PATH=/opt/rocm
-export LD_LIBRARY_PATH="/opt/rocm/lib:/opt/rocm/lib64:$LD_LIBRARY_PATH"
-export PATH="/opt/rocm/bin:$PATH"
 export MPICH_SMP_SINGLE_COPY_MODE=NONE
 
 #Remove trailing : to avoid including CWD to system search paths

@@ -57,9 +57,10 @@ export APPTAINER_BINDPATH=/usr/share/libdrm,/var/spool/slurmd,/opt/cray,${PWD}
 
 # Replaces the container's own LD_LIBRARY_PATH (set at build time) with one
 # that puts the host's Cray MPICH/GTL libraries first, falls back to the
-# container's own ROCm libs, and keeps the host's own LD_LIBRARY_PATH/
-# CRAY_LD_LIBRARY_PATH
-export APPTAINERENV_LD_LIBRARY_PATH="$CRAY_MPICH_ROOTDIR/gtl/lib:/opt/cray/lib64:/opt/rocm/lib:/opt/rocm/lib64:$CRAY_LD_LIBRARY_PATH:$LD_LIBRARY_PATH:/opt/cray/pe/lib64"
+# container's own ROCm libs (PyTorch's bundled _rocm_sdk_core/
+# _rocm_sdk_libraries_gfx90a -- see apptainer/frontier-ubuntu-gnu-rocm7130.def),
+# and keeps the host's own LD_LIBRARY_PATH/CRAY_LD_LIBRARY_PATH
+export APPTAINERENV_LD_LIBRARY_PATH="$CRAY_MPICH_ROOTDIR/gtl/lib:/opt/cray/lib64:/pytorch/_rocm_sdk_core/lib:/pytorch/_rocm_sdk_libraries_gfx90a/lib:$CRAY_LD_LIBRARY_PATH:$LD_LIBRARY_PATH:/opt/cray/pe/lib64"
 
 # Host libraries the bound-in Cray MPICH libraries themselves depend on
 export APPTAINER_CONTAINLIBS="/usr/lib64/libjansson.so.4,/usr/lib64/libgfortran.so.5,/usr/lib64/libnl-3.so.200,/lib64/libtinfo.so.6,/usr/lib64/libjson-c.so.5,/usr/lib64/libcxi.so.1,/opt/xpmem/lib64/libxpmem.so.0"
