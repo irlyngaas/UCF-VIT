@@ -27,13 +27,13 @@ fi
 SIF=../../apptainer/frontier-ubuntu-gnu-rocm7130-vit.sif
 
 module reset
-module load PrgEnv-gnu
-module load gcc/12.2.0
-# Loading the same rocm module the container's own ROCm install targets
-module load rocm/7.13.0
-# Provides the host's libmpi.so that the container's own MPICH build (built
-# only for build-time symbol compatibility, not real MPI performance) will
-# look for at runtime -- see apptainer/frontier-ubuntu-gnu-rocm7130.def
+# cray-mpich-abi only exists under Frontier's default crayclang module
+# family -- switching to PrgEnv-gnu (needed on the host to build things,
+# not needed here since everything runs inside the container) hides it
+# from the hierarchy. Provides the host's libmpi.so that the container's
+# own MPICH build (built only for build-time symbol compatibility, not
+# real MPI performance) will look for at runtime -- see
+# apptainer/frontier-ubuntu-gnu-rocm7130.def
 module load cray-mpich-abi/9.1.0
 
 export MIOPEN_DISABLE_CACHE=1
