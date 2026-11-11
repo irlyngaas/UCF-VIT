@@ -73,6 +73,6 @@ export APPTAINERENV_LD_PRELOAD=$CRAY_MPICH_ROOTDIR/gtl/lib/libmpi_gtl_hsa.so.0:
 
 export OMP_NUM_THREADS=7
 
-time srun -n $((SLURM_JOB_NUM_NODES*8)) --gpus-per-task=1 --gpu-bind=closest \
+time srun -n $((SLURM_JOB_NUM_NODES*8)) \
     apptainer exec --rocm --workdir "$(pwd)" "$SIF" \
     python ../../training_scripts/train.py ${CONFIG}
