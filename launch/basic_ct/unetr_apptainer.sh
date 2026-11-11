@@ -74,5 +74,5 @@ export APPTAINERENV_LD_PRELOAD=$CRAY_MPICH_ROOTDIR/gtl/lib/libmpi_gtl_hsa.so.0:
 export OMP_NUM_THREADS=7
 
 time srun -n $((SLURM_JOB_NUM_NODES*8)) \
-    apptainer exec --rocm --workdir "$(pwd)" "$SIF" \
+    apptainer exec --rocm --pwd "$(pwd)" "$SIF" \
     python ../../training_scripts/train.py ${CONFIG}
