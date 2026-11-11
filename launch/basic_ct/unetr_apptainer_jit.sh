@@ -10,15 +10,18 @@
 #SBATCH -o unetr-apptainer-%j.out
 #SBATCH -e unetr-apptainer-%j.out
 #SBATCH --network=disable_rdzv_get
+#SBATCH -C nvme
 
 # Consumes the seed published by launch/kernel_jit/launch_jit_compile.sh
 # (the bare-metal compile run) -- both paths install the exact same
 # pip-wheel ROCm core (_rocm_sdk_core), so the compiled kernel cache is
 # interchangeable between them.
 #
-# Stages the seed to node-local /tmp rather than NVMe (unlike
-# launch/basic_ct/unetr_jit.sh) -- see project_deferred_nvme_vs_tmp_staging
-# memory note; this is the /tmp half of that comparison.
+# Stages the seed to the NVMe burst buffer, same as
+# launch/basic_ct/unetr_jit.sh -- see project_deferred_nvme_vs_tmp_staging
+# memory note; this is the NVMe half of that comparison (set
+# LOCAL_SCRATCH_ROOT=/tmp and drop -C nvme/the /mnt/bb bind for the other
+# half).
 
 [ -z $JOBID ] && JOBID=$SLURM_JOB_ID
 [ -z $JOBSIZE ] && JOBSIZE=$SLURM_JOB_NUM_NODES
@@ -45,7 +48,7 @@ export TORCH_NCCL_HIGH_PRIORITY=1
 
 export MPICH_GPU_SUPPORT_ENABLED=1
 
-export APPTAINER_BINDPATH=/usr/share/libdrm,/var/spool/slurmd,/opt/cray,${PWD}
+export APPTAINER_BINDPATH=/usr/share/libdrm,/var/spool/slurmd,/opt/cray,/mnt/bb,${PWD}
 export APPTAINERENV_LD_LIBRARY_PATH="$CRAY_MPICH_ROOTDIR/gtl/lib:/opt/cray/lib64:/pytorch/_rocm_sdk_core/lib:/pytorch/_rocm_sdk_libraries_gfx90a/lib:$CRAY_LD_LIBRARY_PATH:$LD_LIBRARY_PATH:/opt/cray/pe/lib64"
 export APPTAINER_CONTAINLIBS="/usr/lib64/libjansson.so.4,/usr/lib64/libgfortran.so.5,/usr/lib64/libnl-3.so.200,/lib64/libtinfo.so.6,/usr/lib64/libjson-c.so.5,/usr/lib64/libcxi.so.1,/opt/xpmem/lib64/libxpmem.so.0"
 export APPTAINERENV_LD_PRELOAD=$CRAY_MPICH_ROOTDIR/gtl/lib/libmpi_gtl_hsa.so.0:
@@ -72,8 +75,7 @@ if [ ! -f "${SEED_TAR}" ]; then
 fi
 
 export SEED=${SEED_DIR}/tree
-export NODE_SEED=/tmp/miopen-seed-${USER}-${SLURM_JOB_ID}/tree
-export LOCAL_SCRATCH_ROOT=/tmp
+export NODE_SEED=/mnt/bb/${USER}/miopen-seed/tree
 
 # Stage the seed tree once per node
 srun -N ${SLURM_JOB_NUM_NODES} --ntasks-per-node=1 \
